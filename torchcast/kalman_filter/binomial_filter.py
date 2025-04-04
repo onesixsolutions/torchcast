@@ -36,6 +36,7 @@ class BinomialStep(EKFStep):
             binary_idx = list(range(input.shape[-1]))
         if (input[:, binary_idx] < 0).any():
             raise ValueError("BinomialFilter does not support negative inputs.")
+        # TODO: should we actually allow/requires counts instead of proportions?
         if (input[:, binary_idx] > 1).any():
             raise ValueError("BinomialFilter expects inputs that are proportions (0 <= p <= 1).")
 
@@ -134,8 +135,10 @@ class BinomialStep(EKFStep):
         # binomial variance:
         newR = torch.zeros_like(R)
         binary_measured_mean = measured_mean[..., binary_idx]
+        # mean of binomial target is n*p, variance is n*p*(1-p)
+        # mean of target that is `binom_target / n` is p, variance is p*(1-p)/n (scaling a RV by N  scales var by N**2)
         newR[..., binary_idx, binary_idx] = (
-                kwargs['num_obs'] * binary_measured_mean * (1 - binary_measured_mean)
+                binary_measured_mean * (1 - binary_measured_mean) / kwargs['num_obs']
         )
 
         if gaussian_idx:
@@ -288,10 +291,11 @@ class BinomialFilter(KalmanFilter):
         """
         device = next(iter(self.parameters())).device
         kwargs['prediction_kwargs'] = kwargs.get('prediction_kwargs', {})
-        kwargs['prediction_kwargs']['white_noise'] = torch.randn(
-            (mc_samples, len(self.binary_measures)),
-            device=device
-        )
+        if mc_samples:
+            wn = torch.randn((mc_samples, len(self.binary_measures)), device=device)
+        else:
+            wn = torch.zeros((1, len(self.binary_measures)), device=device)
+        kwargs['prediction_kwargs']['white_noise'] = wn
         return super().fit(*args, **kwargs)
 
 
@@ -364,7 +368,8 @@ class BinomialPredictions(EKFPredictions):
             corr_white_noise = chol.unsqueeze(0) @ white_noise.view(-1, 1, len(binary_idx), 1)
             mc_samples = corr_white_noise.squeeze(-1) + means[..., binary_idx].unsqueeze(0)
             binom = Binomial(total_count=num_obs.unsqueeze(0), logits=mc_samples, validate_args=False)
-            log_probs = binom.log_prob(obs[..., binary_idx])
+            # we multiply by total_count because our `obs` are proportions, but Binomial expects counts:
+            log_probs = binom.log_prob(obs[..., binary_idx] * binom.total_count)
             binary_lp = log_probs.mean(0).sum(-1)
         else:
             binary_lp = 0
@@ -410,8 +415,10 @@ def main(num_groups: int = 50, num_timesteps: int = 200, bias: float = -1, prop_
     from plotnine import geom_line, aes, ggtitle
     torch.manual_seed(1234)
 
-    measures = ['dim1', 'dim2']
-    binary_measures = ['dim1']
+    total_count = 20
+    measures = ['dim1', 'dim2', 'dim3']
+    binary_measures = ['dim1', 'dim3']
+    binary_idx = [measures.index(m) for m in binary_measures]
     latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
     latent_ind = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, len(measures))), dim=1)
     assert 0 <= prop_common <= 1
@@ -430,7 +437,8 @@ def main(num_groups: int = 50, num_timesteps: int = 200, bias: float = -1, prop_
     y = []
     for i, m in enumerate(measures):
         if m in binary_measures:
-            y.append(torch.distributions.Binomial(logits=latent[..., i]).sample())
+            y.append(torch.distributions.Binomial(logits=latent[..., i], total_count=total_count).sample())
+            y[-1] /= total_count
             y[-1][:, int(num_timesteps * .7):] = float('nan')
         else:
             y.append(torch.distributions.Normal(loc=latent[..., i], scale=.5).sample())
@@ -453,7 +461,10 @@ def main(num_groups: int = 50, num_timesteps: int = 200, bias: float = -1, prop_
         binary_measures=binary_measures
     )
 
-    bf.fit(dataset.tensors[0], mc_samples=64)
+    y = dataset.tensors[0]
+    bf.fit(y,
+           num_obs=total_count * torch.ones_like(y[..., binary_idx]),
+           mc_samples=64)
     preds = bf(dataset.tensors[0])
     df_preds = preds.to_dataframe(dataset)
     df_latent = (dataset.to_dataframe()
