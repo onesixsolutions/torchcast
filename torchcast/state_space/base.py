@@ -163,7 +163,7 @@ class StateSpaceModel(nn.Module):
 
         # see `last_measured_per_group` in forward docstring
         # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
-        any_measured_bool = ~np.isnan(y.numpy()).all(2)
+        any_measured_bool = ~np.isnan(y.cpu().numpy()).all(2)
         kwargs['last_measured_per_group'] = torch.as_tensor(
             [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y.shape[0])],
             dtype=torch.int,
