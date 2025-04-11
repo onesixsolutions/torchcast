@@ -145,7 +145,7 @@ class StateSpaceModel(nn.Module):
                 line_search_fn='strong_wolfe'
             )
         if set_initial_values:
-            self.set_initial_values(y, verbose=verbose > 1)
+            self.set_initial_values(y, verbose=verbose > 1, **kwargs)
 
         if not get_loss:
             get_loss = lambda pred, y: -pred.log_prob(y).mean()
@@ -207,7 +207,11 @@ class StateSpaceModel(nn.Module):
         return self
 
     @torch.jit.ignore()
-    def set_initial_values(self, y: Tensor, ilinks: Optional[Dict[str, callable]] = None, verbose: bool = True):
+    def set_initial_values(self,
+                           y: Tensor,
+                           ilinks: Optional[Dict[str, callable]] = None,
+                           verbose: bool = True,
+                           **kwargs):
         if 'initial_mean' not in self.state_dict():
             return
 
