@@ -290,7 +290,7 @@ class StateSpaceModel(nn.Module):
                 n_step: Union[int, float] = 1,
                 start_offsets: Optional[Sequence] = None,
                 out_timesteps: Optional[Union[int, float]] = None,
-                initial_state: Optional[Tuple[Tensor, Tensor]] = None,
+                initial_state: Union[Tuple[Tensor, Tensor], Tensor, None] = None,
                 every_step: bool = True,
                 include_updates_in_output: bool = False,
                 simulate: Optional[int] = None,
@@ -310,9 +310,11 @@ class StateSpaceModel(nn.Module):
         :param out_timesteps: The number of timesteps to produce in the output. This is useful when passing a tensor
          of predictors that goes later in time than the `input` tensor -- you can specify ``out_timesteps=X.shape[1]``
          to get forecasts into this later time horizon.
-        :param initial_state: The initial prediction for the state of the system: a tuple of mean, cov tensors. This
-         would usually come from a previous call to this model, which produces a ``Predictions`` object, which you can
-         then call :func:`get_state_at_times()` on.
+        :param initial_state: The initial prediction for the state of the system. This is a tuple of mean, cov
+         tensors you might extract from a previous call to forward (see ``include_updates_in_output`` below); you would
+         have a ``Predictions`` object, which you can call :func:`get_state_at_times()` on. If left unset, will learn
+         the initial state from the data. You can also pass a mean but not a cov, in situations where you want to
+         predict the initial state mean but use the default cov.
         :param every_step: By default, ``n_step`` ahead predictions will be generated at every timestep. If
          ``every_step=False``, then these predictions will only be generated every `n_step` timesteps. For example,
          with hourly data, ``n_step=24`` and ``every_step=True``, each timepoint would be a forecast generated with
@@ -422,8 +424,10 @@ class StateSpaceModel(nn.Module):
 
     @torch.jit.ignore
     def _prepare_initial_state(self,
-                               initial_state: Optional[Tuple[Tensor, Tensor]],
+                               initial_state: Union[Tuple[Tensor, Tensor], Tensor, None],
                                start_offsets: Optional[Sequence] = None) -> Tuple[Tensor, Tensor]:
+        if isinstance(initial_state, Tensor):
+            initial_state = (initial_state, None)
 
         if initial_state is None:
             init_mean = self.initial_mean[None, :].clone()
@@ -434,6 +438,8 @@ class StateSpaceModel(nn.Module):
                 raise ValueError(
                     f"Expected ``init_mean`` to have two-dimensions for (num_groups, state_dim), got {init_mean.shape}"
                 )
+            if init_cov is None:
+                init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
             if len(init_cov.shape) != 3:
                 raise ValueError(
                     f"Expected ``init_cov`` to be 3-D with (num_groups, state_dim, state_dim), got {init_cov.shape}"
