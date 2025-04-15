@@ -70,7 +70,13 @@ class EKFPredictions(Predictions):
         """
         raise NotImplementedError
 
-    def _log_prob(self, obs: Tensor, means: Tensor, covs: Tensor, **kwargs) -> Tensor:
+    def _log_prob(self,
+                  obs: Tensor,
+                  state_means: Tensor,
+                  state_covs: Tensor,
+                  R: Tensor,
+                  H: Tensor,
+                  **kwargs) -> Tensor:
         raise NotImplementedError
 
     def __array__(self) -> np.ndarray:
