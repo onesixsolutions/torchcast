@@ -25,10 +25,10 @@ class Predictions:
     """
 
     def __init__(self,
-                 state_means: Sequence[Tensor],
-                 state_covs: Sequence[Tensor],
-                 R: Sequence[Tensor],
-                 H: Sequence[Tensor],
+                 state_means: Union[Sequence[Tensor], Tensor],
+                 state_covs: Union[Sequence[Tensor], Tensor],
+                 R: Union[Sequence[Tensor], Tensor],
+                 H: Union[Sequence[Tensor], Tensor],
                  model: Union['StateSpaceModel', 'StateSpaceModelMetadata'],
                  update_means: Optional[Sequence[Tensor]] = None,
                  update_covs: Optional[Sequence[Tensor]] = None):
@@ -293,27 +293,10 @@ class Predictions:
         n_state_dim = self.state_means.shape[-1]
 
         obs_flat = obs.reshape(-1, n_measure_dim)
-        means_flat = self.means.view(-1, n_measure_dim)
-        covs_flat = self.covs.view(-1, n_measure_dim, n_measure_dim)
-
-        # # if the model used an outlier threshold, under-weight outliers
         if weights is None:
             weights = torch.ones(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
         else:
             weights = weights.reshape(-1, n_measure_dim)
-        # if self.outlier_threshold:
-        #     obs_flat = obs_flat.clone()
-        #     for gt_idx, valid_idx in get_nan_groups(torch.isnan(obs_flat)):
-        #         if valid_idx is None:
-        #             multi = get_outlier_multi(
-        #                 resid=obs_flat[gt_idx] - means_flat[gt_idx],
-        #                 cov=covs_flat[gt_idx],
-        #                 outlier_threshold=torch.as_tensor(self.outlier_threshold)
-        #             )
-        #             weights[gt_idx] /= multi
-        #         else:
-        #             raise NotImplemented
-
         state_means_flat = self.state_means.view(-1, n_state_dim)
         state_covs_flat = self.state_covs.view(-1, n_state_dim, n_state_dim)
         H_flat = self.H.view(-1, n_measure_dim, n_state_dim)
@@ -323,20 +306,23 @@ class Predictions:
         for gt_idx, valid_idx in get_nan_groups(torch.isnan(obs_flat)):
             if valid_idx is None:
                 gt_obs = obs_flat[gt_idx]
-                gt_means_flat = means_flat[gt_idx]
-                gt_covs_flat = covs_flat[gt_idx]
+                gt_R = R_flat[gt_idx]
+                gt_H = H_flat[gt_idx]
             else:
                 mask1d = torch.meshgrid(gt_idx, valid_idx, indexing='ij')
                 mask2d = torch.meshgrid(gt_idx, valid_idx, valid_idx, indexing='ij')
-                gt_means_flat, gt_covs_flat = self.observe(
-                    state_means=state_means_flat[gt_idx],
-                    state_covs=state_covs_flat[gt_idx],
-                    R=R_flat[mask2d],
-                    H=H_flat[mask1d]
-                )
+                gt_R = R_flat[mask2d]
+                gt_H = H_flat[mask1d]
                 gt_obs = obs_flat[mask1d]
             _kwargs = self._get_log_prob_kwargs(gt_idx, valid_idx)
-            lp_flat[gt_idx] = self._log_prob(gt_obs, gt_means_flat, gt_covs_flat, **_kwargs)
+            lp_flat[gt_idx] = self._log_prob(
+                obs=gt_obs,
+                state_means=state_means_flat[gt_idx],
+                state_covs=state_covs_flat[gt_idx],
+                R=gt_R,
+                H=gt_H,
+                **_kwargs
+            )
 
         lp_flat = lp_flat * weights
 
@@ -345,7 +331,14 @@ class Predictions:
     def _get_log_prob_kwargs(self, groups: Tensor, valid_idx: Tensor) -> dict:
         return {}
 
-    def _log_prob(self, obs: Tensor, means: Tensor, covs: Tensor, **kwargs) -> Tensor:
+    def _log_prob(self,
+                  obs: Tensor,
+                  state_means: Tensor,
+                  state_covs: Tensor,
+                  R: Tensor,
+                  H: Tensor,
+                  **kwargs) -> Tensor:
+        means, covs = self.observe(state_means, state_covs, R, H)
         return torch.distributions.MultivariateNormal(means, covs, validate_args=False).log_prob(obs)
 
     def to_dataframe(self,
