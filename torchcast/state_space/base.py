@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Tuple, List, Optional, Sequence, Dict, Iterable, Callable, Union, Type
+from typing import Tuple, List, Optional, Sequence, Dict, Iterable, Callable, Union, Type, TYPE_CHECKING
 from warnings import warn
 
 import numpy as np
@@ -12,6 +12,9 @@ from torchcast.covariance import Covariance
 from torchcast.state_space.predictions import Predictions
 from torchcast.state_space.ss_step import StateSpaceStep
 from torchcast.process.regression import Process
+
+if TYPE_CHECKING:
+    from torchcast.utils.stopping import Stopping
 
 
 class StateSpaceModel(nn.Module):
@@ -98,14 +101,11 @@ class StateSpaceModel(nn.Module):
     @torch.jit.ignore()
     def fit(self,
             *args,
-            tol: float = .0001,
-            patience: int = 1,
-            max_iter: int = 200,
-            optimizer: Optional[torch.optim.Optimizer] = None,
+            optimizer: Union[torch.optim.Optimizer, Callable[[Sequence[torch.Tensor]], torch.optim.Optimizer]] = None,
+            stopping: Union['Stopping', dict] = None,
             verbose: int = 2,
             callbacks: Sequence[Callable] = (),
             get_loss: Optional[Callable] = None,
-            loss_callback: Optional[Callable] = None,
             callable_kwargs: Optional[Dict[str, Callable]] = None,
             set_initial_values: bool = True,
             **kwargs):
@@ -115,19 +115,16 @@ class StateSpaceModel(nn.Module):
         roll your own training loop.
 
         :param args: A tensor containing the batch of time-series(es), see :func:`StateSpaceModel.forward()`.
-        :param tol: Stopping tolerance.
-        :param patience: Patience: if loss changes by less than ``tol`` for this many epochs, then training will be
-         stopped.
-        :param max_iter: The maximum number of iterations after which training will stop regardless of loss.
-        :param optimizer: The optimizer to use. Default is to create an instance of :class:`torch.optim.LBFGS` with
-         args ``(max_iter=10, line_search_fn='strong_wolfe', lr=.5)``.
+        :param optimizer: The optimizer to use. Can also pass a function which takes the parameters and returns an
+         optimizer instance. Default is :class:`torch.optim.LBFGS` with ``(line_search_fn='strong_wolfe', max_eval=8)``.
+        :param stopping: Controls stopping/convergence rules; should be a :class`torchcast.utils.Stopping` instance, or
+         a dict of keyword-args to one. Example: ``stopping={'abstol' : .001, 'monitor' : 'params'}``
         :param verbose: If True (default) will print the loss and epoch; for :class:`torch.optim.LBFGS` optimizer
          (the default) this progress bar will tick within each epoch to track the calls to forward.
         :param callbacks: A list of functions that will be called at the end of each epoch, which take the current
          epoch's loss value.
         :param get_loss: A function that takes the ``Predictions` object and the input data and returns the loss.
          Default is ``lambda pred, y: -pred.log_prob(y).mean()``.
-        :param loss_callback: Deprecated; use ``get_loss`` instead.
         :param set_initial_values: Will set ``initial_mean`` to sensible value given ``y``, which helps speed
          up training if the data are not centered.
         :param kwargs: Further keyword-arguments passed to :func:`StateSpaceModel.forward()`.
@@ -141,28 +138,41 @@ class StateSpaceModel(nn.Module):
         assert len(args) == 1
         y = args[0]
 
-        if optimizer is None:
+        if callable(optimizer):
+            optimizer = optimizer([p for p in self.parameters() if p.requires_grad])
+        elif optimizer is None:
             optimizer = torch.optim.LBFGS(
                 [p for p in self.parameters() if p.requires_grad],
-                max_eval=8,
+                # https://discuss.pytorch.org/t/unclear-purpose-of-max-iter-kwarg-in-the-lbfgs-optimizer/65695/4
+                max_iter=1,
                 line_search_fn='strong_wolfe'
             )
+
         if set_initial_values:
             self.set_initial_values(y, verbose=verbose > 1, **kwargs)
 
         if not get_loss:
             get_loss = lambda pred, y: -pred.log_prob(y).mean()
 
-        prog = None
+        _deprecated = {k: kwargs.pop(k) for k in ['tol', 'patience', 'max_iter'] if k in kwargs}
+        _dmsg = f"The following are deprecated, use `stopping` arg instead:\n{set(_deprecated)}"
+        if stopping is None:
+            stopping = {}
+            if _deprecated:
+                warn(_dmsg, DeprecationWarning)
+                stopping.update(_deprecated)
+        elif _deprecated:
+            raise ValueError(_dmsg)
+        from torchcast.utils.stopping import Stopping
+        if not isinstance(stopping, Stopping):
+            stopping = Stopping.from_dict(**stopping)
+        stopping.optimizer = optimizer
+
+        prog = tqdm(disable=True)
         if verbose > 1:
-            if isinstance(optimizer, torch.optim.LBFGS):
-                prog = tqdm(total=optimizer.param_groups[0]['max_eval'])
-            else:
-                prog = tqdm(total=1)
+            prog = tqdm()
 
         callable_kwargs = callable_kwargs or {}
-        if loss_callback:
-            warn("`loss_callback` is deprecated; use `get_loss` instead.", DeprecationWarning)
 
         # see `last_measured_per_group` in forward docstring
         # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
@@ -178,30 +188,22 @@ class StateSpaceModel(nn.Module):
             kwargs.update({k: v() for k, v in callable_kwargs.items()})
             pred = self(y, **kwargs)
             loss = get_loss(pred, y)
-            if loss_callback:
-                loss = loss_callback(loss)
             loss.backward()
-            if prog:
-                prog.update()
-                prog.set_description(f'Epoch: {epoch}; Loss: {loss:.4f}')
+            prog.update()
+            prog.set_description(f"Epoch {epoch:,}; Loss {loss.item():.4}; Convergence {stopping.convergence}")
             return loss
 
-        prev_train_loss = float('inf')
-        num_lower = 0
-        for epoch in range(max_iter):
+        train_loss = float('nan')
+        for epoch in range(stopping.max_iter):
             try:
-                if prog:
-                    prog.reset()
+                prog.reset()
+                prog.set_description(f"Epoch {epoch:,}; Loss {train_loss:.4}; Convergence {stopping.convergence}")
                 train_loss = optimizer.step(closure).item()
                 for callback in callbacks:
                     callback(train_loss)
-                if abs(train_loss - prev_train_loss) < tol:
-                    num_lower += 1
-                else:
-                    num_lower = 0
-                if num_lower == patience:
+
+                if stopping(train_loss):
                     break
-                prev_train_loss = train_loss
             except KeyboardInterrupt:
                 break
             finally:
@@ -237,10 +239,10 @@ class StateSpaceModel(nn.Module):
                 measure_idx = list(self.measures).index(process.measure)
                 with torch.no_grad():
                     t0 = y[..., measure_idx]
-                    init_mean = ilinks[process.measure](t0[~torch.isnan(t0) & ~torch.isinf(t0)].mean())
+                    orig_mean = t0[~torch.isnan(t0) & ~torch.isinf(t0)].mean().item()
+                    init_mean = ilinks[process.measure](orig_mean)
                     if verbose:
-                        print(f"Initializing {pid}.position to {init_mean.item()}")
-                    # TODO instead of [0], should actually get index of 'position->position'
+                        print(f"Initializing {pid}.position to {init_mean}")
                     self.state_dict()['initial_mean'][self.process_to_slice[pid][se_idx]] = init_mean
 
         for measure, procs in hits.items():
