@@ -1,5 +1,5 @@
 import warnings
-from typing import Optional
+from typing import Optional, Collection, Union, Callable, Iterable
 
 import torch
 
@@ -10,19 +10,26 @@ class Stopping:
 
     :param abstol: The absolute tolerance.
     :param patience: How many iterations monitored metrics need to change less than ``abstol`` before we stop.
-    :param monitor: What should be monitored? Can be 'loss', 'params' or 'loss+params'.
+    :param monitor_loss: Should loss be monitored as part of convergence checks?
+    :param monitor_params: If ``True``, all parameters will be monitored. If a list of names, only those
+     parameters will be monitored. Can also be a function that takes a param-name and returns true/false.
     :param max_iter: The maximum number of iterations after which training will be stopped regardless of convergence.
-    :param optimizer: The optimizer, not required if ``monitor`` doesn't include 'params'.
+    :param module: The module whose parameters are being optimized. Required if ``monitor_params`` is not ``False``.
     """
+
     def __init__(self,
                  abstol: float = .0001,
                  patience: int = 2,
-                 monitor: str = 'loss',
-                 max_iter: int = 200,
-                 optimizer: Optional[torch.optim.Optimizer] = None):
+                 monitor_loss: bool = True,
+                 monitor_params: Union[bool, Collection[str], callable] = False,
+                 max_iter: int = 300,
+                 module: Optional[torch.nn.Module] = None):
 
-        self.monitor = monitor
-        self.optimizer = optimizer
+        if not monitor_loss and not monitor_params:
+            raise ValueError("At least one of `monitor_loss` or `monitor_params` must be True")
+        self.monitor_loss = monitor_loss
+        self.monitor_params = monitor_params
+        self.module = module
         self.abstol = abstol
         self.values = []
         self.patience = patience
@@ -47,15 +54,31 @@ class Stopping:
 
     @torch.inference_mode()
     def _get_new_values(self, loss: Optional[float]):
-        flat_params = []
-        if 'params' in self.monitor:
-            assert self.optimizer is not None
-            for g in self.optimizer.param_groups:
-                for p in g['params']:
-                    flat_params.append(p.view(-1))
-        if 'loss' in self.monitor:
-            flat_params.append(torch.as_tensor([loss]))
-        return torch.cat(flat_params)
+        flat = []
+
+        if self.monitor_params:
+            for p in self._get_module_params():
+                flat.append(p.view(-1))
+
+        if self.monitor_loss:
+            flat.append(torch.as_tensor([loss]))
+
+        return torch.cat(flat)
+
+    def _get_module_params(self) -> Iterable[torch.Tensor]:
+        assert self.module is not None
+        module_parameters = {nm: p for nm, p in self.module.named_parameters() if p.requires_grad}
+
+        assert self.monitor_params  # only called this method if truth-y
+        if self.monitor_params is True:
+            monitor_params = list(module_parameters)
+        elif callable(self.monitor_params):
+            monitor_params = [self.monitor_params(p) for p in module_parameters]
+        else:  # a list:
+            monitor_params = self.monitor_params
+
+        for nm in monitor_params:
+            yield module_parameters[nm]
 
     @torch.inference_mode()
     def __call__(self, loss: Optional[float]) -> bool:
