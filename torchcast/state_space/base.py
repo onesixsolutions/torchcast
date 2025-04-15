@@ -166,7 +166,7 @@ class StateSpaceModel(nn.Module):
         from torchcast.utils.stopping import Stopping
         if not isinstance(stopping, Stopping):
             stopping = Stopping.from_dict(**stopping)
-        stopping.optimizer = optimizer
+        stopping.module = self
 
         prog = tqdm(disable=True)
         if verbose > 1:
