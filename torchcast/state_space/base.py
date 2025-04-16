@@ -28,7 +28,8 @@ class StateSpaceModel(nn.Module):
     def __init__(self,
                  processes: Sequence[Process],
                  measures: Optional[Sequence[str]],
-                 measure_covariance: Covariance):
+                 measure_covariance: Covariance,
+                 **kwargs):
         super().__init__()
 
         if isinstance(measures, str):
@@ -57,9 +58,11 @@ class StateSpaceModel(nn.Module):
         # the initial mean
         self.initial_mean = torch.nn.Parameter(.1 * torch.randn(self.state_rank))
 
-    @property
-    def ss_step(self) -> StateSpaceStep:
-        return self.ss_step_cls()
+        self.ss_step = self.ss_step_cls(**self._get_ss_step_kwargs(**kwargs))
+
+    def _get_ss_step_kwargs(self) -> dict:
+        # child classes can take keyword-arguments
+        return {}
 
     def _infer_dt_unit(self) -> Optional[np.timedelta64]:
         dt_unit_ns = None
