@@ -53,7 +53,7 @@ class Stopping:
         return cls(**kwargs)
 
     @torch.inference_mode()
-    def _get_new_values(self, loss: Optional[float]):
+    def _get_new_values(self, loss: Optional[float]) -> torch.Tensor:
         flat = []
 
         if self.monitor_params:
