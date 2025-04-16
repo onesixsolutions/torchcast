@@ -117,7 +117,8 @@ class KalmanFilter(StateSpaceModel):
                  processes: Sequence[Process],
                  measures: Optional[Sequence[str]] = None,
                  process_covariance: Optional[Covariance] = None,
-                 measure_covariance: Optional[Covariance] = None):
+                 measure_covariance: Optional[Covariance] = None,
+                 **kwargs):
 
         initial_covariance = Covariance.from_processes(processes, cov_type='initial')
 
@@ -132,7 +133,8 @@ class KalmanFilter(StateSpaceModel):
         super().__init__(
             processes=processes,
             measures=measures,
-            measure_covariance=measure_covariance
+            measure_covariance=measure_covariance,
+            **kwargs
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')

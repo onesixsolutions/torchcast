@@ -192,7 +192,8 @@ class BinomialFilter(KalmanFilter):
                  binary_measures: Optional[Sequence[str]] = None,
                  process_covariance: Optional[Covariance] = None,
                  measure_covariance: Optional[Union[Covariance, dict]] = None,
-                 observed_counts: Optional[bool] = None):
+                 observed_counts: Optional[bool] = None,
+                 **kwargs):
 
         if isinstance(measures, str):
             raise ValueError(f"`measures` should be a list of strings not a string.")
@@ -233,14 +234,14 @@ class BinomialFilter(KalmanFilter):
             measures=measures,
             process_covariance=process_covariance,
             measure_covariance=measure_covariance,
+            **kwargs
         )
 
-    @property
-    def ss_step(self) -> 'BinomialStep':
-        return self.ss_step_cls(
-            binary_idx=[idx for idx, m in enumerate(self.measures) if m in self.binary_measures],
-            observed_counts=self.observed_counts
-        )
+    def _get_ss_step_kwargs(self) -> dict:
+        return {
+            'binary_idx': [idx for idx, m in enumerate(self.measures) if m in self.binary_measures],
+            'observed_counts': self.observed_counts
+        }
 
     def _get_measure_scaling(self) -> Tensor:
         # TODO: less code duplication?
