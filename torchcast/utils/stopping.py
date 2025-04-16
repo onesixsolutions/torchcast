@@ -58,7 +58,7 @@ class Stopping:
 
         if self.monitor_params:
             for p in self._get_module_params():
-                flat.append(p.view(-1))
+                flat.append(p.view(-1).cpu())
 
         if self.monitor_loss:
             flat.append(torch.as_tensor([loss]))
