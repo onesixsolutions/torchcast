@@ -70,11 +70,9 @@ class KalmanStep(StateSpaceStep):
             measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
         resid = input - measured_mean
 
-        measured_cov = cov @ H.permute(0, 2, 1)
-
         # kalman-gain:
         K = self._kalman_gain(
-            measured_cov,
+            cov,
             H=H,
             R=R,
             kwargs=kwargs
@@ -94,7 +92,8 @@ class KalmanStep(StateSpaceStep):
         else:
             return ikh @ cov
 
-    def _kalman_gain(self, measured_cov: Tensor, H: Tensor, R: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+    def _kalman_gain(self, cov: Tensor, H: Tensor, R: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+        measured_cov = cov @ H.permute(0, 2, 1)
         system_cov = H @ measured_cov + R
         A = system_cov.permute(0, 2, 1)
         B = measured_cov.permute(0, 2, 1)
