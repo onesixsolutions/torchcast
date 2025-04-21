@@ -63,14 +63,8 @@ class KalmanStep(StateSpaceStep):
         H = kwargs['H']
         R = kwargs['R']
 
-        # residuals:
-        if 'measured_mean' in kwargs:  # calculated by super
-            measured_mean = kwargs['measured_mean']
-        else:
-            measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
-        resid = input - measured_mean
+        resid = self._calculate_residual(input, H=H, mean=mean, kwargs=kwargs)
 
-        # kalman-gain:
         K = self._kalman_gain(
             cov,
             H=H,
@@ -78,7 +72,6 @@ class KalmanStep(StateSpaceStep):
             kwargs=kwargs
         )
 
-        # update:
         new_mean = mean + (K @ resid.unsqueeze(-1)).squeeze(-1)
         new_cov = self._covariance_update(cov=cov, K=K, H=H, R=R)
 
@@ -91,6 +84,13 @@ class KalmanStep(StateSpaceStep):
             return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
         else:
             return ikh @ cov
+
+    def _calculate_residual(self, input: Tensor, H: Tensor, mean: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+        if 'measured_mean' in kwargs:  # calculated by super
+            measured_mean = kwargs['measured_mean']
+        else:
+            measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
+        return input - measured_mean
 
     def _kalman_gain(self, cov: Tensor, H: Tensor, R: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
         measured_cov = cov @ H.permute(0, 2, 1)
