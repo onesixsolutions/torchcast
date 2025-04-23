@@ -78,7 +78,7 @@ class Covariance(nn.Module):
         if cov_type == 'process':
             # by default, assume process cov is less than measure cov:
             if 'init_diag_multi' not in kwargs:
-                kwargs['init_diag_multi'] = .01
+                kwargs['init_diag_multi'] = .05
             if 'method' in kwargs and kwargs['method'] == 'low_rank':
                 warn("``method='low_rank'`` not recommended for processes")
         elif cov_type == 'initial':
