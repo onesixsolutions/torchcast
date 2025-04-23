@@ -1,5 +1,5 @@
 import warnings
-from typing import Optional, Collection, Union, Callable, Iterable
+from typing import Optional, Collection, Union, Iterable
 
 import torch
 
