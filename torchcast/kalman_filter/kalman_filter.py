@@ -20,12 +20,6 @@ from typing_extensions import Final
 
 
 class KalmanStep(StateSpaceStep):
-    """
-    Used internally by ``KalmanFilter`` to apply the kalman-filtering algorithm. Subclasses can implement additional
-    logic such as outlier-rejection, censoring, etc.
-    """
-    use_stable_cov_update: Final[bool] = True
-
     def predict(self,
                 mean: Tensor,
                 cov: Tensor,
@@ -80,10 +74,7 @@ class KalmanStep(StateSpaceStep):
     def _covariance_update(self, cov: Tensor, K: Tensor, H: Tensor, R: Tensor) -> Tensor:
         I = torch.eye(cov.shape[1], dtype=cov.dtype, device=cov.device).unsqueeze(0)
         ikh = I - K @ H
-        if self.use_stable_cov_update:
-            return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
-        else:
-            return ikh @ cov
+        return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
 
     def _calculate_residual(self, input: Tensor, H: Tensor, mean: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
         if 'measured_mean' in kwargs:  # calculated by super
@@ -118,9 +109,11 @@ class KalmanFilter(StateSpaceModel):
                  measures: Optional[Sequence[str]] = None,
                  process_covariance: Optional[Covariance] = None,
                  measure_covariance: Optional[Covariance] = None,
+                 initial_covariance: Optional[Covariance] = None,
                  **kwargs):
 
-        initial_covariance = Covariance.from_processes(processes, cov_type='initial')
+        if initial_covariance is None:
+            initial_covariance = Covariance.from_processes(processes, cov_type='initial')
 
         if process_covariance is None:
             process_covariance = Covariance.from_processes(processes, cov_type='process')

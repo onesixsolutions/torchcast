@@ -191,6 +191,7 @@ class BinomialFilter(KalmanFilter):
                  binary_measures: Optional[Sequence[str]] = None,
                  process_covariance: Optional[Covariance] = None,
                  measure_covariance: Optional[Union[Covariance, dict]] = None,
+                 initial_covariance: Optional[Covariance] = None,
                  observed_counts: Optional[bool] = None,
                  **kwargs):
 
@@ -233,6 +234,7 @@ class BinomialFilter(KalmanFilter):
             measures=measures,
             process_covariance=process_covariance,
             measure_covariance=measure_covariance,
+            initial_covariance=initial_covariance,
             **kwargs
         )
 
