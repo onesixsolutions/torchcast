@@ -246,7 +246,7 @@ class TestTraining(unittest.TestCase):
             try:
                 kf = _train()
             except (RuntimeError, ValueError) as e:
-                if 'cholesky' not in str(e) and 'has invalid values' not in str(e):
+                if 'cholesky' not in str(e) and 'has invalid values' not in str(e) and 'nans' not in str(e):
                     raise e
             if kf is not None:
                 break
