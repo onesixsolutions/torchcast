@@ -350,7 +350,7 @@ class BinomialPredictions(EKFPredictions):
                  white_noise: Optional[Tensor] = None,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        self.num_obs = torch.stack(num_obs, 1)
+        self.num_obs = num_obs if isinstance(num_obs, torch.Tensor) else torch.stack(num_obs, 1)
         self.binary_measures = binary_measures
         self.observed_counts = observed_counts
         self._white_noise = white_noise
@@ -468,6 +468,14 @@ class BinomialPredictions(EKFPredictions):
                 out['mean'] = x
 
             return out
+
+    def _getitem_helper(self, item: tuple) -> dict:
+        kwargs = super()._getitem_helper(item)
+        kwargs['num_obs'] = self.num_obs[item]
+        kwargs['white_noise'] = self._white_noise
+        kwargs['binary_measures'] = self.binary_measures
+        kwargs['observed_counts'] = self.observed_counts
+        return kwargs
 
 
 def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop_common: float = 1.):

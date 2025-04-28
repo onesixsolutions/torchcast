@@ -603,6 +603,11 @@ class Predictions:
         return self.means.detach().numpy()
 
     def __getitem__(self, item: Tuple) -> 'Predictions':
+        kwargs = self._getitem_helper(item)
+        cls = type(self)
+        return cls(**kwargs, model=self._model_attributes)
+
+    def _getitem_helper(self, item: tuple) -> dict:
         kwargs = {
             'state_means': self.state_means[item],
             'state_covs': self.state_covs[item],
@@ -611,17 +616,15 @@ class Predictions:
         }
         if self._update_means is not None:
             kwargs.update({'update_means': self.update_means[item], 'update_covs': self.update_covs[item]})
-        cls = type(self)
+
         for k in list(kwargs):
             expected_shape = getattr(self, k).shape
             v = kwargs[k]
             if len(v.shape) != len(expected_shape):
-                raise TypeError(f"Expected {k} to have shape {expected_shape} but got {v.shape}.")
-            if v.shape[-1] != expected_shape[-1]:
-                raise TypeError(f"Cannot index into non-batch dims of {cls.__name__}")
-            if k == 'H' and v.shape[-2] != self.H.shape[-2]:
-                raise TypeError(f"Cannot index into non-batch dims of {cls.__name__}")
-        return cls(**kwargs, model=self._model_attributes)
+                raise TypeError(f"Expected {k} to have ndims {len(expected_shape)}, but got {len(v.shape)}")
+            if v.shape[2:] != expected_shape[2:]:
+                raise TypeError(f"Cannot index into non-batch dims of {type(self).__name__}")
+        return kwargs
 
 
 @dataclass
