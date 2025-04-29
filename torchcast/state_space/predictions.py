@@ -493,14 +493,14 @@ class Predictions:
 
     @class_or_instancemethod
     def plot(cls,
-             df: Optional[pd.DataFrame] = None,
+             df: Optional[Union[pd.DataFrame, 'TimeSeriesDataset']] = None,
              group_colname: str = None,
              time_colname: str = None,
              max_num_groups: int = 1,
              split_dt: Optional[np.datetime64] = None,
              **kwargs):
         """
-        :param df: The output of :func:`Predictions.to_dataframe()`.
+        :param df: A dataset, or the output of :func:`Predictions.to_dataframe()`.
         :param group_colname: The name of the group-column.
         :param time_colname: The name of the time-column.
         :param max_num_groups: Max. number of groups to plot; if the number of groups in the dataframe is greater than
@@ -513,6 +513,7 @@ class Predictions:
         from plotnine import (
             ggplot, aes, geom_line, geom_ribbon, facet_grid, facet_wrap, theme_bw, theme, ylab, geom_vline
         )
+        from torchcast.utils import TimeSeriesDataset
 
         if isinstance(cls, Predictions):  # using it as an instance-method
             group_colname = group_colname or cls.dataset_metadata.group_colname
@@ -524,18 +525,21 @@ class Predictions:
         elif df is None:
             raise TypeError("Please specify a dataframe `df`")
 
-        is_components = 'process' in df.columns
-        if is_components and 'state_element' not in df.columns:
-            df = df.assign(state_element='all')
-
         if group_colname is None:
             group_colname = 'group'
-            if group_colname not in df.columns:
+            if group_colname not in getattr(df, 'columns', []):
                 raise TypeError("Please specify group_colname")
         if time_colname is None:
             time_colname = 'time'
-            if 'time' not in df.columns:
+            if 'time' not in getattr(df, 'columns', []):
                 raise TypeError("Please specify time_colname")
+
+        if isinstance(df, TimeSeriesDataset):
+            df = cls.to_dataframe(dataset=df, group_colname=group_colname, time_colname=time_colname)
+
+        is_components = 'process' in df.columns
+        if is_components and 'state_element' not in df.columns:
+            df = df.assign(state_element='all')
 
         df = df.copy()
         if 'upper' not in df.columns and 'std' in df.columns:
