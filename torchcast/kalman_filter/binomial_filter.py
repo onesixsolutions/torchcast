@@ -2,6 +2,7 @@ from typing import Tuple, Optional, Sequence, List, TYPE_CHECKING, Union, Dict
 
 import numpy as np
 import pandas as pd
+
 from scipy.special import expit, logit
 
 import torch
@@ -21,9 +22,10 @@ if TYPE_CHECKING:
 
 
 class BinomialStep(EKFStep):
-    def __init__(self, binary_idx: Optional[Sequence[int]] = None):
+    def __init__(self, binary_idx: Optional[Sequence[int]] = None, observed_counts: Optional[bool] = None):
         super().__init__()
         self.binary_idx = binary_idx
+        self.observed_counts = observed_counts
 
     def _update(self,
                 input: Tensor,
@@ -36,8 +38,20 @@ class BinomialStep(EKFStep):
             binary_idx = list(range(input.shape[-1]))
         if (input[:, binary_idx] < 0).any():
             raise ValueError("BinomialFilter does not support negative inputs.")
-        if (input[:, binary_idx] > 1).any():
-            raise ValueError("BinomialFilter expects inputs that are proportions (0 <= p <= 1).")
+
+        if self.observed_counts is None:
+            if 'num_obs' in kwargs and (kwargs['num_obs'] != 1).any():
+                raise ValueError(
+                    "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
+                    "or proportions (observed_counts=False)."
+                )
+        elif self.observed_counts:
+            if 'num_obs' not in kwargs:
+                raise ValueError("num_obs should be passed because observed_counts=True")
+            input = input.clone()
+            input[:, binary_idx] = input[:, binary_idx] / kwargs['num_obs']
+            if (input[:, binary_idx] > 1).any():
+                raise ValueError("Some inputs are > num_obs")
 
         return super()._update(
             input=input,
@@ -134,17 +148,20 @@ class BinomialStep(EKFStep):
         # binomial variance:
         newR = torch.zeros_like(R)
         binary_measured_mean = measured_mean[..., binary_idx]
+        # mean of binomial target is n*p, variance is n*p*(1-p)
+        # mean of target that is `binom_target / n` is p, variance is p*(1-p)/n (scaling a RV by N  scales var by N**2)
+        num_obs = kwargs.get('num_obs', 1)
         newR[..., binary_idx, binary_idx] = (
-                kwargs['num_obs'] * binary_measured_mean * (1 - binary_measured_mean)
+                binary_measured_mean * (1 - binary_measured_mean) / num_obs
         )
 
         if gaussian_idx:
             # for gaussian measures, would be much more readable code if we just looped over the gaussian dims
             # and modified newR in-place. but now that newR has grad, don't want to modify in-place.
             # so we use masking trick
-            gaussian_idx = torch.as_tensor(gaussian_idx, device=measured_mean.device)
+            gaussian_idx = torch.as_tensor(gaussian_idx)
             gaussian_cidx = torch.meshgrid(torch.arange(newR.shape[0]), gaussian_idx, gaussian_idx, indexing='ij')
-            expand_mask = mini_cov_mask(rank=len(all_idx), empty_idx=binary_idx)  # todo: cache?
+            expand_mask = mini_cov_mask(rank=len(all_idx), empty_idx=binary_idx, device=R.device)  # todo: cache?
             gaussianR = expand_mask @ R[gaussian_cidx] @ expand_mask.transpose(-1, -2)
             newR = newR + gaussianR
 
@@ -159,7 +176,7 @@ class BinomialStep(EKFStep):
 
         # again some awkwardness due to avoiding in-place on tensors with grad
         binary_out = torch.zeros_like(x)
-        binary_out[..., binary_idx] = torch.sigmoid(x[..., binary_idx].clamp(-5, 5))
+        binary_out[..., binary_idx] = torch.sigmoid(x[..., binary_idx].clamp(-8, 8))
         gaussian_out = torch.zeros_like(x)
         gaussian_out[..., gaussian_idx] = x[..., gaussian_idx]
         return binary_out + gaussian_out
@@ -173,7 +190,10 @@ class BinomialFilter(KalmanFilter):
                  measures: Optional[Sequence[str]] = None,
                  binary_measures: Optional[Sequence[str]] = None,
                  process_covariance: Optional[Covariance] = None,
-                 measure_covariance: Optional[Union[Covariance, dict]] = None):
+                 measure_covariance: Optional[Union[Covariance, dict]] = None,
+                 initial_covariance: Optional[Covariance] = None,
+                 observed_counts: Optional[bool] = None,
+                 **kwargs):
 
         if isinstance(measures, str):
             raise ValueError(f"`measures` should be a list of strings not a string.")
@@ -207,16 +227,22 @@ class BinomialFilter(KalmanFilter):
         else:
             measure_covariance = Covariance(**measure_covariance)
 
+        self.observed_counts = observed_counts
+
         super().__init__(
             processes=processes,
             measures=measures,
             process_covariance=process_covariance,
             measure_covariance=measure_covariance,
+            initial_covariance=initial_covariance,
+            **kwargs
         )
 
-    @property
-    def ss_step(self) -> 'BinomialStep':
-        return self.ss_step_cls(binary_idx=[idx for idx, m in enumerate(self.measures) if m in self.binary_measures])
+    def _get_ss_step_kwargs(self) -> dict:
+        return {
+            'binary_idx': [idx for idx, m in enumerate(self.measures) if m in self.binary_measures],
+            'observed_counts': self.observed_counts
+        }
 
     def _get_measure_scaling(self) -> Tensor:
         # TODO: less code duplication?
@@ -245,36 +271,54 @@ class BinomialFilter(KalmanFilter):
             H=kwargs.pop('H'),
             model=self,
             binary_measures=self.binary_measures,
+            observed_counts=self.observed_counts,
             **kwargs
         )
         return preds
 
     @torch.jit.ignore()
-    def set_initial_values(self, y: Tensor, ilinks: Optional[dict[str, callable]] = None, verbose: bool = True):
+    def set_initial_values(self,
+                           y: Tensor,
+                           ilinks: Optional[dict[str, callable]] = None,
+                           verbose: bool = True,
+                           num_obs: Optional[Tensor] = None,
+                           **kwargs):
+        y = y.clone()
+        if self.observed_counts:
+            if num_obs is None:
+                raise RuntimeError("num_obs should be passed because observed_counts=True")
+            binary_idx = [i for i, m in enumerate(self.measures) if m in self.binary_measures]
+            y[..., binary_idx] /= num_obs
         ilinks = {m: (logit if m in self.binary_measures else identity) for m in self.measures}
         return super().set_initial_values(y=y, ilinks=ilinks, verbose=verbose)
 
     @torch.jit.ignore()
     def _parse_design_kwargs(self, input: Optional[Tensor], out_timesteps: int, **kwargs) -> Dict[str, dict]:
-        num_obs = kwargs.pop('num_obs', 1)
+        num_obs = kwargs.pop('num_obs', None)
         kwargs_per_process = super()._parse_design_kwargs(input=input, out_timesteps=out_timesteps, **kwargs)
-        kwargs_per_process['num_obs'] = num_obs
+        if num_obs is None:
+            if self.observed_counts:
+                raise RuntimeError("num_obs should be passed because observed_counts=True")
+            kwargs_per_process['num_obs'] = 1
+        else:
+            kwargs_per_process['num_obs'] = num_obs
         return kwargs_per_process
 
     def _build_design_mats(self,
                            kwargs_per_process: Dict[str, Dict[str, Tensor]],
                            num_groups: int,
                            out_timesteps: int) -> Tuple[Dict[str, List[Tensor]], Dict[str, List[Tensor]]]:
-        num_obs = kwargs_per_process.pop('num_obs')
+        num_obs = kwargs_per_process.pop('num_obs', None)
         predict_kwargs, update_kwargs = super()._build_design_mats(
             kwargs_per_process=kwargs_per_process,
             num_groups=num_groups,
             out_timesteps=out_timesteps
         )
         if isinstance(num_obs, int):
-            # todo: device
-            update_kwargs['num_obs'] = [torch.ones(num_groups, len(self.binary_measures)) * num_obs] * out_timesteps
-        else:
+            device = next(iter(self.parameters())).device
+            _nobs = [torch.ones(num_groups, len(self.binary_measures), device=device) * num_obs]
+            update_kwargs['num_obs'] = _nobs * out_timesteps
+        elif num_obs is not None:
             update_kwargs['num_obs'] = num_obs.unbind(1)
         return predict_kwargs, update_kwargs
 
@@ -288,10 +332,11 @@ class BinomialFilter(KalmanFilter):
         """
         device = next(iter(self.parameters())).device
         kwargs['prediction_kwargs'] = kwargs.get('prediction_kwargs', {})
-        kwargs['prediction_kwargs']['white_noise'] = torch.randn(
-            (mc_samples, len(self.binary_measures)),
-            device=device
-        )
+        if mc_samples:
+            wn = torch.randn((mc_samples, len(self.binary_measures)), device=device)
+        else:
+            wn = torch.zeros((1, len(self.binary_measures)), device=device)
+        kwargs['prediction_kwargs']['white_noise'] = wn
         return super().fit(*args, **kwargs)
 
 
@@ -300,12 +345,14 @@ class BinomialPredictions(EKFPredictions):
     def __init__(self,
                  *args,
                  binary_measures: Sequence[str],
+                 observed_counts: Optional[bool] = None,
                  num_obs: List[Tensor],
                  white_noise: Optional[Tensor] = None,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        self.num_obs = torch.stack(num_obs, 1)
+        self.num_obs = num_obs if isinstance(num_obs, torch.Tensor) else torch.stack(num_obs, 1)
         self.binary_measures = binary_measures
+        self.observed_counts = observed_counts
         self._white_noise = white_noise
 
     @property
@@ -337,22 +384,25 @@ class BinomialPredictions(EKFPredictions):
 
         return out
 
+    # noinspection PyMethodOverriding
     def _log_prob(self,
                   obs: Tensor,
-                  means: Tensor,
-                  covs: Tensor,
-                  measures: Sequence[str],
+                  state_means: Tensor,
+                  state_covs: Tensor,
+                  R: Tensor,
+                  H: Tensor,
                   white_noise: Tensor,
-                  num_obs: Optional[Tensor] = None) -> Tensor:
+                  measures: Sequence[str],
+                  num_obs: Optional[Tensor] = None,
+                  **kwargs) -> Tensor:
+        means, covs = self.observe(state_means, state_covs, R, H)
         group_idx = torch.arange(covs.shape[0], dtype=torch.int)
         binary_idx = torch.as_tensor([i for i, m in enumerate(measures) if m in self.binary_measures], dtype=torch.int)
         gauss_idx = torch.as_tensor([i for i in range(covs.shape[-1]) if i not in binary_idx], dtype=torch.int)
         if len(gauss_idx):
             gauss_cidx = torch.meshgrid(group_idx, gauss_idx, gauss_idx, indexing='ij')
-            # super of BinomialPredictions is NotImplemented; we use super of EKFPredictions
-            gauss_lp = super(EKFPredictions, self)._log_prob(
-                obs=obs[..., gauss_idx], means=means[..., gauss_idx], covs=covs[gauss_cidx]
-            )
+            gauss = torch.distributions.MultivariateNormal(means[..., gauss_idx], covs[gauss_cidx], validate_args=False)
+            gauss_lp = gauss.log_prob(obs[..., gauss_idx])
         else:
             gauss_lp = 0
 
@@ -364,8 +414,14 @@ class BinomialPredictions(EKFPredictions):
             corr_white_noise = chol.unsqueeze(0) @ white_noise.view(-1, 1, len(binary_idx), 1)
             mc_samples = corr_white_noise.squeeze(-1) + means[..., binary_idx].unsqueeze(0)
             binom = Binomial(total_count=num_obs.unsqueeze(0), logits=mc_samples, validate_args=False)
-            log_probs = binom.log_prob(obs[..., binary_idx])
-            binary_lp = log_probs.mean(0).sum(-1)
+            _obs = obs[..., binary_idx]
+            if not self.observed_counts:  # multiply by total_count b/c `obs` are props, but Binomial expects counts:
+                _obs = _obs * binom.total_count
+            # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
+            # this is a numerically stable way to do that:
+            mc_log_probs = binom.log_prob(_obs)
+            mc_marginal = torch.logsumexp(mc_log_probs, dim=0) - np.log(mc_samples.shape[0])
+            binary_lp = mc_marginal.sum(-1)
         else:
             binary_lp = 0
 
@@ -395,21 +451,41 @@ class BinomialPredictions(EKFPredictions):
             if hasattr(std, 'to_numpy'):
                 std = std.to_numpy()
 
-            lower, upper = conf2bounds(x, std, conf=conf)
             # todo: this is only state-uncertainty, should we also include measurement-uncertainty: p*(1-p)?
-            out = pd.DataFrame({'mean': x, 'lower': lower, 'upper': upper}, index=None if x_index is None else x_index)
+            lower, upper = conf2bounds(x, std, conf=conf)
+            out = pd.DataFrame({'lower': lower, 'upper': upper}, index=None if x_index is None else x_index)
+
             if measure in cls.binary_measures:
-                out.loc[:, ['mean', 'lower', 'upper']] = expit(out)
+                # if len(x.shape) > 1:
+                #     raise NotImplementedError("TODO")
+                # grid = np.linspace(0, 1, 100, endpoint=False) + 0.5 / 100
+                # points = stats.norm(x[:, None], std[:, None]).ppf(grid[None, :])
+                # out['mean'] = expit(points).mean(1)
+                out['mean'] = expit(x)
+                out['lower'] = expit(out['lower'])
+                out['upper'] = expit(out['upper'])
+            else:
+                out['mean'] = x
+
             return out
 
+    def _getitem_helper(self, item: tuple) -> dict:
+        kwargs = super()._getitem_helper(item)
+        kwargs['num_obs'] = self.num_obs[item]
+        kwargs['white_noise'] = self._white_noise
+        kwargs['binary_measures'] = self.binary_measures
+        kwargs['observed_counts'] = self.observed_counts
+        return kwargs
 
-def main(num_groups: int = 50, num_timesteps: int = 200, bias: float = -1, prop_common: float = 1.):
+
+def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop_common: float = 1.):
     from torchcast.process import LocalLevel
     from torchcast.utils import TimeSeriesDataset
     import pandas as pd
     from plotnine import geom_line, aes, ggtitle
     torch.manual_seed(1234)
 
+    total_count = 20
     measures = ['dim1', 'dim2']
     binary_measures = ['dim1']
     latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
@@ -421,16 +497,12 @@ def main(num_groups: int = 50, num_timesteps: int = 200, bias: float = -1, prop_
             + bias  # global bias
             + torch.randn((num_groups, 1, len(measures)))  # group-level starting-points
     )
-    # num_groups=10, num_timesteps=200
-    # KF no missings: 10/s
-    # KF with missings: 3.5/s
-    # BF no missings: 4.5/s
-    # BF with missings: 2.5/s
 
     y = []
     for i, m in enumerate(measures):
         if m in binary_measures:
-            y.append(torch.distributions.Binomial(logits=latent[..., i]).sample())
+            y.append(torch.distributions.Binomial(logits=latent[..., i], total_count=total_count).sample())
+            # y[-1] /= total_count
             y[-1][:, int(num_timesteps * .7):] = float('nan')
         else:
             y.append(torch.distributions.Normal(loc=latent[..., i], scale=.5).sample())
@@ -450,26 +522,35 @@ def main(num_groups: int = 50, num_timesteps: int = 200, bias: float = -1, prop_
     bf = BinomialFilter(
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
-        binary_measures=binary_measures
+        binary_measures=binary_measures,
+        observed_counts=True
     )
 
-    bf.fit(dataset.tensors[0], mc_samples=64)
-    preds = bf(dataset.tensors[0])
+    y = dataset.tensors[0]
+    bf.fit(y,
+           num_obs=total_count,
+           mc_samples=64)
+    preds = bf(
+        dataset.tensors[0], num_obs=total_count
+    )
     df_preds = preds.to_dataframe(dataset)
+    df_preds.loc[df_preds['measure'].isin(binary_measures), ['mean', 'lower', 'upper']] *= total_count
     df_latent = (dataset.to_dataframe()
                  .drop(columns=measures)
                  .melt(id_vars=['group', 'time'], var_name='measure', value_name='latent')
                  .assign(measure=lambda _df: _df['measure'].str.replace('latent', 'dim')))
     _is_binary = df_latent['measure'].isin(binary_measures)
-    df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent'])
+    df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent']) * total_count
 
     df_plot = df_preds.merge(df_latent, how='left', on=['group', 'time', 'measure'])
     for g, _df in df_plot.query("group.isin(group.drop_duplicates().sample(5))").groupby('group'):
-        print(
-            preds.plot(_df)
-            + geom_line(aes(y='latent'), color='purple')
-            + ggtitle(g)
-        )
+        (
+                preds.plot(_df)
+                + geom_line(aes(y='latent'), color='purple')
+                + ggtitle(g)
+        ).show()
+    # preds._white_noise = torch.zeros((1, len(binary_measures)))
+    # print(preds.log_prob(y).mean())
 
 
 if __name__ == '__main__':

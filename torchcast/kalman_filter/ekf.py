@@ -70,16 +70,17 @@ class EKFPredictions(Predictions):
         """
         raise NotImplementedError
 
-    def _log_prob(self, obs: Tensor, means: Tensor, covs: Tensor, **kwargs) -> Tensor:
+    def _log_prob(self,
+                  obs: Tensor,
+                  state_means: Tensor,
+                  state_covs: Tensor,
+                  R: Tensor,
+                  H: Tensor,
+                  **kwargs) -> Tensor:
         raise NotImplementedError
 
     def __array__(self) -> np.ndarray:
-        with torch.no_grad():
-            stds = torch.diagonal(self.covs, dim1=-1, dim2=-2).sqrt()
-            out = []
-            for i, m in enumerate(self.measures):
-                out.append(self._adjust_measured_mean(self.means[..., i], std=stds[..., i], measure=m))
-            return torch.stack(out, -1).numpy()
+        raise NotImplementedError
 
     def to_dataframe(self,
                      dataset: Optional[TimeSeriesDataset] = None,

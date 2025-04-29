@@ -1,7 +1,10 @@
 import math
-from typing import Union, Optional
+from typing import Union, Optional, TYPE_CHECKING
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from pandas import DataFrame, Series
 
 
 def add_season_features(data: 'DataFrame',
@@ -37,7 +40,7 @@ def add_season_features(data: 'DataFrame',
     return concat([data, df_season], axis=1)
 
 
-def fourier_model_mat(datetimes: np.ndarray,
+def fourier_model_mat(datetimes: Union[np.ndarray, 'Series'],
                       K: int,
                       period: Union[np.timedelta64, str],
                       output_fmt: str = 'float64') -> np.ndarray:
@@ -61,14 +64,19 @@ def fourier_model_mat(datetimes: np.ndarray,
         else:
             raise ValueError("Unrecognized `period`.")
 
+    orig_index = None
     if not isinstance(datetimes, np.ndarray) and isinstance(getattr(datetimes, 'values', None), np.ndarray):
+        orig_index = getattr(datetimes, 'index', None)
         datetimes = datetimes.values
-    period_int = int(period / np.timedelta64(1, 'ns'))
-    time_int = (datetimes.astype("datetime64[ns]") - np.datetime64(0, 'ns')).astype('int64')
 
     output_dataframe = (output_fmt.lower() == 'dataframe')
     if output_dataframe:
+        if len(datetimes.shape) == 2 and datetimes.shape[1] == 1:
+            datetimes = datetimes.squeeze(-1)
         output_fmt = 'float64'
+
+    period_int = int(period / np.timedelta64(1, 'ns'))
+    time_int = (datetimes.astype("datetime64[ns]") - np.datetime64(0, 'ns')).astype('int64')
 
     # fourier matrix:
     out_shape = tuple(datetimes.shape) + (K * 2,)
@@ -85,7 +93,7 @@ def fourier_model_mat(datetimes: np.ndarray,
         if len(out_shape) > 2:
             raise ValueError("Cannot output dataframe when input is 2+D array.")
         from pandas import DataFrame
-        out = DataFrame(out, columns=columns)
+        out = DataFrame(out, columns=columns, index=orig_index)
 
     return out
 

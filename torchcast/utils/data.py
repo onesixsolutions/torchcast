@@ -528,7 +528,7 @@ class TimeSeriesDataset(TensorDataset):
 
         Since TimeSeriesDatasets are padded, this can be a helpful way to get the length of each time-series.
         """
-        any_measured_bool = ~np.isnan(self.tensors[which].numpy()).all(2)
+        any_measured_bool = ~torch.isnan(self.tensors[which]).all(2).cpu()
         last_measured_idx = np.array(
             [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(len(self.group_names))],
             dtype='int'

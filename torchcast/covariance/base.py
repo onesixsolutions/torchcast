@@ -78,15 +78,8 @@ class Covariance(nn.Module):
         if cov_type == 'process':
             # by default, assume process cov is less than measure cov:
             if 'init_diag_multi' not in kwargs:
-                kwargs['init_diag_multi'] = .01
-            if 'method' in kwargs and kwargs['method'] == 'low_rank':
-                warn("``method='low_rank'`` not recommended for processes")
-        elif cov_type == 'initial':
-            if (state_rank - len(no_cov_idx)) >= 10:
-                # by default, use low-rank parameterization for initial cov:
-                if 'method' not in kwargs:
-                    kwargs['method'] = 'low_rank'
-        else:
+                kwargs['init_diag_multi'] = .05
+        elif cov_type != 'initial':
             raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
 
         if predict_variance is True:
@@ -165,7 +158,7 @@ class Covariance(nn.Module):
          This can be useful to provide intelligent starting-values to speed up optimization.
         """
 
-        super(Covariance, self).__init__()
+        super().__init__()
 
         self.id = id
         self.rank = rank
@@ -196,6 +189,7 @@ class Covariance(nn.Module):
             self.cholesky_log_diag = nn.Parameter(.1 * torch.randn(self.param_rank) + math.log(init_diag_multi))
             self.cholesky_off_diag = nn.Parameter(.1 * torch.randn(num_off_diag(self.param_rank)))
         elif method.startswith('low_rank'):
+            warn("``method='low_rank'`` is experimental")
             self.method = 'low_rank'
             low_rank = method.replace('low_rank', '')
             if low_rank:

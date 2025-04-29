@@ -20,12 +20,6 @@ from typing_extensions import Final
 
 
 class KalmanStep(StateSpaceStep):
-    """
-    Used internally by ``KalmanFilter`` to apply the kalman-filtering algorithm. Subclasses can implement additional
-    logic such as outlier-rejection, censoring, etc.
-    """
-    use_stable_cov_update: Final[bool] = True
-
     def predict(self,
                 mean: Tensor,
                 cov: Tensor,
@@ -62,32 +56,16 @@ class KalmanStep(StateSpaceStep):
                 kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
         H = kwargs['H']
         R = kwargs['R']
-        Ht = H.permute(0, 2, 1)
 
-        # residuals:
-        if 'measured_mean' in kwargs:  # calculated by super
-            measured_mean = kwargs['measured_mean']
-        else:
-            measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
-        resid = input - measured_mean
+        resid = self._calculate_residual(input, H=H, mean=mean, kwargs=kwargs)
 
-        HcHt = H @ cov @ Ht
-        system_covariance = HcHt + R
+        K = self._kalman_gain(
+            cov,
+            H=H,
+            R=R,
+            kwargs=kwargs
+        )
 
-        # # outlier-rejection:
-        # if (kwargs['outlier_threshold'] != 0).any():
-        #     multi = get_outlier_multi(
-        #         resid=resid,
-        #         cov=system_covariance,
-        #         outlier_threshold=kwargs['outlier_threshold']
-        #     )
-        #     R = R * multi.unsqueeze(-1).unsqueeze(-1)
-        #     system_covariance = HcHt + R
-
-        # kalman-gain:
-        K = self._kalman_gain(cov=cov, Ht=Ht, system_covariance=system_covariance)
-
-        # update:
         new_mean = mean + (K @ resid.unsqueeze(-1)).squeeze(-1)
         new_cov = self._covariance_update(cov=cov, K=K, H=H, R=R)
 
@@ -96,16 +74,20 @@ class KalmanStep(StateSpaceStep):
     def _covariance_update(self, cov: Tensor, K: Tensor, H: Tensor, R: Tensor) -> Tensor:
         I = torch.eye(cov.shape[1], dtype=cov.dtype, device=cov.device).unsqueeze(0)
         ikh = I - K @ H
-        if self.use_stable_cov_update:
-            return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
-        else:
-            return ikh @ cov
+        return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
 
-    @staticmethod
-    def _kalman_gain(cov: Tensor, Ht: Tensor, system_covariance: Tensor) -> Tensor:
-        covs_measured = cov @ Ht
-        A = system_covariance.permute(0, 2, 1)
-        B = covs_measured.permute(0, 2, 1)
+    def _calculate_residual(self, input: Tensor, H: Tensor, mean: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+        if 'measured_mean' in kwargs:  # calculated by super
+            measured_mean = kwargs['measured_mean']
+        else:
+            measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
+        return input - measured_mean
+
+    def _kalman_gain(self, cov: Tensor, H: Tensor, R: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+        measured_cov = cov @ H.permute(0, 2, 1)
+        system_cov = H @ measured_cov + R
+        A = system_cov.permute(0, 2, 1)
+        B = measured_cov.permute(0, 2, 1)
         Kt = torch.linalg.solve(A, B)
         K = Kt.permute(0, 2, 1)
         return K
@@ -126,9 +108,12 @@ class KalmanFilter(StateSpaceModel):
                  processes: Sequence[Process],
                  measures: Optional[Sequence[str]] = None,
                  process_covariance: Optional[Covariance] = None,
-                 measure_covariance: Optional[Covariance] = None):
+                 measure_covariance: Optional[Covariance] = None,
+                 initial_covariance: Optional[Covariance] = None,
+                 **kwargs):
 
-        initial_covariance = Covariance.from_processes(processes, cov_type='initial')
+        if initial_covariance is None:
+            initial_covariance = Covariance.from_processes(processes, cov_type='initial')
 
         if process_covariance is None:
             process_covariance = Covariance.from_processes(processes, cov_type='process')
@@ -141,7 +126,8 @@ class KalmanFilter(StateSpaceModel):
         super().__init__(
             processes=processes,
             measures=measures,
-            measure_covariance=measure_covariance
+            measure_covariance=measure_covariance,
+            **kwargs
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
