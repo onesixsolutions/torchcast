@@ -1,5 +1,64 @@
 # CHANGELOG
 
+## v0.6.0 (2025-04-25)
+
+### Updated default `fit()` behavior
+
+The `fit()` method of `torchcast.state_space.StateSpaceModel` has been updated:
+
+* The default `LBFGS` settings have been updated to avoid the unnecessary inner loop (see [here](https://discuss.pytorch.org/t/unclear-purpose-of-max-iter-kwarg-in-the-lbfgs-optimizer/65695/4)).
+* The default convergence settings have been updated to increase `patience` to 2 (instead of 1) and increase `max_iter` to 300 (instead of 200).
+* To restore the old behavior, pass `optimizer=lambda p: torch.optim.LBFGS(p, max_eval=8, line_search_fn='strong_wolfe'), stopping={'patience' : 1, 'max_iter' : 200}`.
+* Convergence is now controlled by a `torch.utils.Stopping` instance (or kwargs for one). This means passing `tol`, `patience`, and `max_iter` directly to `fit` is deprecated; instead call `fit(stopping={'patience' : ... etc})`.
+
+### Updated default `Covariance` behavior
+
+* The 'low_rank' method is never chosen by default; if desired it must be selected manually using the 'method' kwarg (previously would automatically be chosen if rank was >= 10). This was based on poor performance empirically.
+* The starting values for the covariance diagonal have been increased.
+* Added `initial_covariance` kwarg to `KalmanFilter` and subclasses.
+
+### Updates to `BinomialFilter`
+
+* Added the `observed_counts` argument, allowing the user to specify whether observations are counts or proportions. If `num_obs==1` then this argument is not required (since they are the same). 
+* Fix bug in BinomialStep's kalman-gain calculation when num_obs > 1
+* Fix issues with BinomialFilter on the GPU.
+* Fix `__getitem__()` for BinomialPredictions.
+* Fix monte-carlo `BinomialPredictions.log_prob()` to properly marginalize over samples.
+
+### Other Fixes
+
+* Fix `get_durations()` on GPU.
+* Remove redundant matmul in `KalmanStep._update()`
+* `ss_step` is no longer a property but is instead an attribute, avoids unnecessary re-instantiation on each timestep
+
+## v0.5.1 (2025-01-09)
+
+### Documentation
+
+* New [Using NN’s for Long-Range Forecasts: Electricity Data](https://docs.strong.io/torchcast/examples/electricity.html#Using-NN's-for-Long-Range-Forecasts:-Electricity-Data) example
+* Documentation/README cleanup
+
+### Trainers
+
+Add `torchcast.utils.training` module with...
+
+* `SimpleTrainer` for training simple `nn.Module`s
+* `SeasonalEmbeddingsTrainer` for training `nn.Module`s to embed seasonal patterns.
+* `StateSpaceTrainer` for training torchcast's `StateSpaceModel`s (when data are too big for the `fit()` method)
+
+### Baseline
+
+* Add `make_baseline` helper to generate baseline forecasts using a simple n-back method 3641e7c137fb7574d13eb744312584dafc622650
+
+### Fixes
+
+* Ensure consistent column-ordering and default RangeIndex in output of `Predictions.to_dataframe()` 0a0fc810a78d4508b029d580483484790005cc6b, f33c6380b94548be5158eb2e2344bd7277a05e48
+* Fix default behavior in how `TimeSeriesDataLoader` forward-fills nans for the `X` tensor 0a0fc810a78d4508b029d580483484790005cc6b
+* Fix seasonal initial values when passing `initial_value` to forward cae28795095110da56f081b3e2ec4fd942c546d1
+* Fix behavior of `StateSpaceModel.simulate()` when num_sims > 1 cae28795095110da56f081b3e2ec4fd942c546d1
+* Fix extra arg in `ExpSmoother._generate_predictions()` b55324879384e30517045b51d475cf5c9d2cf5e2
+* Make `TimeSeriesDataset.split_measures()` usable by removing `which` argument 8f1001b039ce5e6c901774bafe0ffac78b40f02f
+
 
 ## v0.4.1 (2024-10-09)
 
