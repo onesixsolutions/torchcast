@@ -7,6 +7,7 @@ import torch
 from torch import nn, Tensor
 from tqdm.auto import tqdm
 
+from torchcast.internals.hessian import hessian
 from torchcast.internals.utils import get_owned_kwargs, repeat, identity, true1d_idx
 from torchcast.covariance import Covariance
 from torchcast.state_space.predictions import Predictions
@@ -152,7 +153,7 @@ class StateSpaceModel(nn.Module):
             self.set_initial_values(y, verbose=verbose > 1, **kwargs)
 
         if not get_loss:
-            get_loss = lambda pred, y: -pred.log_prob(y).mean()
+            get_loss = lambda _pred, _y: -_pred.log_prob(_y).mean()
 
         _deprecated = {k: kwargs.pop(k) for k in ['tol', 'patience', 'max_iter'] if k in kwargs}
         _dmsg = f"The following are deprecated, use `stopping` arg instead:\n{set(_deprecated)}"
@@ -171,17 +172,9 @@ class StateSpaceModel(nn.Module):
         prog = tqdm(disable=True)
         if verbose > 1:
             prog = tqdm()
-
         callable_kwargs = callable_kwargs or {}
 
-        # see `last_measured_per_group` in forward docstring
-        # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
-        any_measured_bool = ~torch.isnan(y).all(2).cpu()
-        kwargs['last_measured_per_group'] = torch.as_tensor(
-            [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y.shape[0])],
-            dtype=torch.int,
-            device=y.device
-        ) + 1
+        kwargs = self._prepare_fit_kwargs(y, **kwargs)
 
         def closure():
             optimizer.zero_grad()
@@ -210,6 +203,68 @@ class StateSpaceModel(nn.Module):
                 optimizer.zero_grad(set_to_none=True)
 
         return self
+
+    def _prepare_fit_kwargs(self, y: Tensor, **kwargs) -> dict:
+        # see `last_measured_per_group` in forward docstring
+        # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
+        any_measured_bool = ~torch.isnan(y).all(2).cpu()
+        kwargs['last_measured_per_group'] = torch.as_tensor(
+            [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y.shape[0])],
+            dtype=torch.int,
+            device=y.device
+        ) + 1
+        return kwargs
+
+    def get_laplace_mvnorm(self,
+                           y: torch.Tensor,
+                           get_loss: Optional[callable] = None,
+                           **kwargs) -> Tuple[torch.distributions.MultivariateNormal, List[str]]:
+        """
+        :param y: observed data
+        :param get_loss: A function that takes the ``Predictions`` object and the input data and returns the loss; note
+         that unlike in :func:`fit()`, this function should return the summed loss (not mean). Default is just
+         ``-pred.log_prob(y).sum()``, but you can override (e.g. for weights).
+        :param kwargs: Keyword-arguments to the forward pass.
+        :return: The multivariate normal distribution for the Laplace approximation, and the corresponding names of the
+        parameters.
+        """
+        if not get_loss:
+            get_loss = lambda _pred, _y: -_pred.log_prob(_y).sum()
+
+        kwargs = self._prepare_fit_kwargs(y, **kwargs)
+
+        pred = self(y, **kwargs)
+        loss = get_loss(pred, y)
+
+        all_params = []
+        all_param_names = []
+        for nm, par in self.named_parameters():
+            if not par.requires_grad:
+                continue
+            all_param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
+            all_params.append(par)
+        # TODO: any way to verify reshape(-1) matches internals of hessian?
+        means = torch.cat([p.reshape(-1) for p in all_params])
+
+        hess = hessian(output=loss.squeeze(), inputs=all_params, allow_unused=True, progress=False)
+
+        # create mvnorm for laplace approx:
+        with torch.no_grad():
+            try:
+                mvnorm = torch.distributions.MultivariateNormal(
+                    means, precision_matrix=hess, validate_args=True
+                )
+            except (RuntimeError, ValueError) as e:
+                warn(
+                    f"Unable to get valid covariance from optimized parameters (see error below)."
+                    f"If you haven't already, fit the model with ``monitor_params=True`` (see the ``stopping`` argument"
+                    f" of ``fit()``)."
+                    f"\n{str(e)}"
+                )
+                fake_cov = torch.diag(torch.diag(hess).pow(-1).clip(min=1E-5))
+                mvnorm = torch.distributions.MultivariateNormal(means, covariance_matrix=fake_cov)
+
+        return mvnorm, all_param_names
 
     @torch.jit.ignore()
     def set_initial_values(self,
@@ -661,6 +716,7 @@ class StateSpaceModel(nn.Module):
     def _parse_design_kwargs(self, input: Optional[Tensor], out_timesteps: int, **kwargs) -> Dict[str, dict]:
         kwargs_per_process = defaultdict(dict)
         unused = set(kwargs)
+        # TODO: what/why is current_timestep
         kwargs.update(input=input, current_timestep=torch.tensor(list(range(out_timesteps))).view(1, -1, 1))
         for submodule_nm, submodule in self.design_modules():
             for found_key, key_name, value in get_owned_kwargs(submodule, kwargs):

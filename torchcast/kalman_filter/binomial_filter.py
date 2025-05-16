@@ -322,22 +322,26 @@ class BinomialFilter(KalmanFilter):
             update_kwargs['num_obs'] = num_obs.unbind(1)
         return predict_kwargs, update_kwargs
 
-    def fit(self,
-            *args,
-            mc_samples: int,
-            **kwargs):
-        """
-        :param mc_samples: Number of samples to draw for MC approximation to binomial likelihood.
-        :param kwargs: Additional keyword arguments, see `func:torchcast.kalman_filter.KalmanFilter.fit`.
-        """
-        device = next(iter(self.parameters())).device
+    def _prepare_fit_kwargs(self, y: Tensor, mc_samples: torch.Tensor, **kwargs) -> dict:
+        kwargs = super()._prepare_fit_kwargs(y=y, **kwargs)
         kwargs['prediction_kwargs'] = kwargs.get('prediction_kwargs', {})
-        if mc_samples:
-            wn = torch.randn((mc_samples, len(self.binary_measures)), device=device)
+        if isinstance(mc_samples, int):
+            if mc_samples:
+                wn = torch.randn((mc_samples, len(self.binary_measures)), device=y.device)
+            else:
+                wn = torch.zeros((1, len(self.binary_measures)), device=y.device)
+        elif isinstance(mc_samples, torch.Tensor):
+            if len(mc_samples.shape) != 2 or mc_samples.shape[1] != len(self.binary_measures):
+                raise ValueError(
+                    f"If `mc_samples` is a tensor, should be 2D w/shape (num_samples, {len(self.binary_measures)})"
+                )
+            wn = mc_samples
         else:
-            wn = torch.zeros((1, len(self.binary_measures)), device=device)
+            raise ValueError(
+                f"mc_samples should be an int or a tensor, not {type(mc_samples)}"
+            )
         kwargs['prediction_kwargs']['white_noise'] = wn
-        return super().fit(*args, **kwargs)
+        return kwargs
 
 
 class BinomialPredictions(EKFPredictions):
@@ -485,7 +489,7 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
     from plotnine import geom_line, aes, ggtitle
     torch.manual_seed(1234)
 
-    total_count = 20
+    TOTAL_COUNT = 20
     measures = ['dim1', 'dim2']
     binary_measures = ['dim1']
     latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
@@ -501,7 +505,7 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
     y = []
     for i, m in enumerate(measures):
         if m in binary_measures:
-            y.append(torch.distributions.Binomial(logits=latent[..., i], total_count=total_count).sample())
+            y.append(torch.distributions.Binomial(logits=latent[..., i], total_count=TOTAL_COUNT).sample())
             # y[-1] /= total_count
             y[-1][:, int(num_timesteps * .7):] = float('nan')
         else:
@@ -528,19 +532,20 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
 
     y = dataset.tensors[0]
     bf.fit(y,
-           num_obs=total_count,
-           mc_samples=64)
+           stopping={'monitor_params': True},
+           num_obs=TOTAL_COUNT,
+           mc_samples=32)
     preds = bf(
-        dataset.tensors[0], num_obs=total_count
+        dataset.tensors[0], num_obs=TOTAL_COUNT
     )
     df_preds = preds.to_dataframe(dataset)
-    df_preds.loc[df_preds['measure'].isin(binary_measures), ['mean', 'lower', 'upper']] *= total_count
+    df_preds.loc[df_preds['measure'].isin(binary_measures), ['mean', 'lower', 'upper']] *= TOTAL_COUNT
     df_latent = (dataset.to_dataframe()
                  .drop(columns=measures)
                  .melt(id_vars=['group', 'time'], var_name='measure', value_name='latent')
                  .assign(measure=lambda _df: _df['measure'].str.replace('latent', 'dim')))
     _is_binary = df_latent['measure'].isin(binary_measures)
-    df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent']) * total_count
+    df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent']) * TOTAL_COUNT
 
     df_plot = df_preds.merge(df_latent, how='left', on=['group', 'time', 'measure'])
     for g, _df in df_plot.query("group.isin(group.drop_duplicates().sample(5))").groupby('group'):
