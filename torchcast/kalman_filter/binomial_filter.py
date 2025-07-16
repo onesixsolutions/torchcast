@@ -31,25 +31,30 @@ class BinomialStep(EKFStep):
                 input: Tensor,
                 mean: Tensor,
                 cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+                H: Tensor,
+                R: Tensor,
+                binary_idx: Optional[Sequence[int]] = None,
+                num_obs: Optional[Tensor] = None,
+                **kwargs) -> Tuple[Tensor, Tensor]:
 
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
+        if binary_idx is None:
+            binary_idx = self.binary_idx
         if binary_idx is None:
             binary_idx = list(range(input.shape[-1]))
         if (input[:, binary_idx] < 0).any():
             raise ValueError("BinomialFilter does not support negative inputs.")
 
         if self.observed_counts is None:
-            if 'num_obs' in kwargs and (kwargs['num_obs'] != 1).any():
+            if num_obs is not None and (num_obs != 1).any():
                 raise ValueError(
                     "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
                     "or proportions (observed_counts=False)."
                 )
         elif self.observed_counts:
-            if 'num_obs' not in kwargs:
+            if num_obs is None:
                 raise ValueError("num_obs should be passed because observed_counts=True")
             input = input.clone()
-            input[:, binary_idx] = input[:, binary_idx] / kwargs['num_obs']
+            input[:, binary_idx] = input[:, binary_idx] / num_obs
             if (input[:, binary_idx] > 1).any():
                 raise ValueError("Some inputs are > num_obs")
 
@@ -57,7 +62,11 @@ class BinomialStep(EKFStep):
             input=input,
             mean=mean,
             cov=cov,
-            kwargs=kwargs
+            H=H,
+            R=R,
+            binary_idx=binary_idx,
+            num_obs=num_obs,
+            **kwargs
         )
 
     def _mask_mats(self,
@@ -87,7 +96,7 @@ class BinomialStep(EKFStep):
 
         return masked_input, new_kwargs
 
-    def _adjust_h(self, mean: Tensor, H: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+    def _adjust_h(self, mean: Tensor, H: Tensor, binary_idx: Optional[Sequence[int]] = None, **kwargs) -> Tensor:
         """
         >>> import sympy
         >>> from sympy import exp, Matrix
@@ -127,7 +136,8 @@ class BinomialStep(EKFStep):
         # this assert should not fail, b/c all processes only support a single measure
         assert not ((H != 0).sum(-2) > 1).any(), "BinomialFilter does not support the provided measurement-matrix"
         all_idx = list(range(H.shape[-1]))
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
+        if binary_idx is None:
+            binary_idx = self.binary_idx
         if binary_idx is None:
             binary_idx = all_idx
         h_dot_state = (H @ mean.unsqueeze(-1)).squeeze(-1)
@@ -138,9 +148,10 @@ class BinomialStep(EKFStep):
         adjustment[..., binary_idx] = numer / denom
         return H * adjustment.unsqueeze(-1)
 
-    def _adjust_r(self, measured_mean: Tensor, R: Optional[Tensor], kwargs: dict[str, Tensor]) -> Tensor:
+    def _adjust_r(self, measured_mean: Tensor, R: Optional[Tensor], binary_idx: Optional[Sequence[int]] = None, num_obs: Optional[Tensor] = None, **kwargs) -> Tensor:
         all_idx = list(range(R.shape[-1]))
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
+        if binary_idx is None:
+            binary_idx = self.binary_idx
         if binary_idx is None:
             binary_idx = all_idx
         gaussian_idx = [idx for idx in all_idx if idx not in binary_idx]
@@ -150,7 +161,8 @@ class BinomialStep(EKFStep):
         binary_measured_mean = measured_mean[..., binary_idx]
         # mean of binomial target is n*p, variance is n*p*(1-p)
         # mean of target that is `binom_target / n` is p, variance is p*(1-p)/n (scaling a RV by N  scales var by N**2)
-        num_obs = kwargs.get('num_obs', 1)
+        if num_obs is None:
+            num_obs = 1
         newR[..., binary_idx, binary_idx] = (
                 binary_measured_mean * (1 - binary_measured_mean) / num_obs
         )
@@ -167,9 +179,10 @@ class BinomialStep(EKFStep):
 
         return newR
 
-    def _adjust_measurement(self, x: Tensor, kwargs: dict[str, Tensor]) -> Tensor:
+    def _adjust_measurement(self, x: Tensor, binary_idx: Optional[Sequence[int]] = None, **kwargs) -> Tensor:
         all_idx = list(range(x.shape[-1]))
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
+        if binary_idx is None:
+            binary_idx = self.binary_idx
         if binary_idx is None:
             binary_idx = all_idx
         gaussian_idx = [idx for idx in all_idx if idx not in binary_idx]

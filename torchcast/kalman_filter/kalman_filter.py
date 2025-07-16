@@ -16,7 +16,6 @@ from typing import Tuple, Optional
 
 import torch
 from torch import nn, Tensor
-from typing_extensions import Final
 
 
 class KalmanStep(StateSpaceStep):
@@ -24,11 +23,13 @@ class KalmanStep(StateSpaceStep):
                 mean: Tensor,
                 cov: Tensor,
                 mask: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+                F: Tensor,
+                Q: Tensor,
+                **kwargs) -> Tuple[Tensor, Tensor]:
         if mask.all():
             mask = slice(None)
-        F = kwargs['F'][mask]
-        Q = kwargs['Q'][mask]
+        F = F[mask]
+        Q = Q[mask]
 
         new_mean = update_tensor(mean, new=(F @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
         new_cov = update_tensor(cov, new=(F @ cov[mask] @ F.permute(0, 2, 1) + Q), mask=mask)
@@ -53,17 +54,16 @@ class KalmanStep(StateSpaceStep):
                 input: Tensor,
                 mean: Tensor,
                 cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        H = kwargs['H']
-        R = kwargs['R']
-
-        resid = self._calculate_residual(input, H=H, mean=mean, kwargs=kwargs)
+                H: Tensor,
+                R: Tensor,
+                **kwargs) -> Tuple[Tensor, Tensor]:
+        resid = self._calculate_residual(input, H=H, mean=mean, **kwargs)
 
         K = self._kalman_gain(
             cov,
             H=H,
             R=R,
-            kwargs=kwargs
+            **kwargs
         )
 
         new_mean = mean + (K @ resid.unsqueeze(-1)).squeeze(-1)
@@ -76,14 +76,14 @@ class KalmanStep(StateSpaceStep):
         ikh = I - K @ H
         return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
 
-    def _calculate_residual(self, input: Tensor, H: Tensor, mean: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
-        if 'measured_mean' in kwargs:  # calculated by super
-            measured_mean = kwargs['measured_mean']
+    def _calculate_residual(self, input: Tensor, H: Tensor, mean: Tensor, measured_mean: Optional[Tensor] = None, **kwargs) -> Tensor:
+        if measured_mean is not None:  # calculated by super
+            pass
         else:
             measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
         return input - measured_mean
 
-    def _kalman_gain(self, cov: Tensor, H: Tensor, R: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+    def _kalman_gain(self, cov: Tensor, H: Tensor, R: Tensor, **kwargs) -> Tensor:
         measured_cov = cov @ H.permute(0, 2, 1)
         system_cov = H @ measured_cov + R
         A = system_cov.permute(0, 2, 1)

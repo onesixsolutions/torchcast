@@ -602,11 +602,12 @@ class StateSpaceModel(nn.Module):
         mean1s: List[Tensor] = []
         cov1s: List[Tensor] = []
         for t in range(out_timesteps):
+            predict_kwargs_t = {k: v[t] for k, v in predict_kwargs.items()}
             mean1step, cov1step = self.ss_step.predict(
                 meanu,
                 covu,
                 mask=(t <= last_measured_per_group),
-                kwargs={k: v[t] for k, v in predict_kwargs.items()}
+                **predict_kwargs_t
             )
             mean1s.append(mean1step)
             cov1s.append(cov1step)
@@ -620,7 +621,7 @@ class StateSpaceModel(nn.Module):
                     inputs[t],
                     mean1step,
                     cov1step,
-                    update_kwargs_t,
+                    **update_kwargs_t,
                 )
             else:
                 meanu, covu = mean1step, cov1step
@@ -646,11 +647,12 @@ class StateSpaceModel(nn.Module):
                     if tu_h >= out_timesteps:
                         break
                     if h > 1:
+                        predict_kwargs_t = {k: v[tu_h] for k, v in predict_kwargs.items()}
                         meanp, covp = self.ss_step.predict(
                             meanp,
                             covp,
                             mask=(tu_h <= last_measured_per_group),
-                            kwargs={k: v[tu_h] for k, v in predict_kwargs.items()},
+                            **predict_kwargs_t,
                         )
                     if tu_h not in meanps:
                         # idx[tu + h] = tu

@@ -22,33 +22,38 @@ class EKFStep(KalmanStep):
      binomial) via a link function.
     """
 
-    def _adjust_h(self, mean: Tensor, H: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+    def _adjust_h(self, mean: Tensor, H: Tensor, **kwargs) -> Tensor:
         return H
 
-    def _adjust_r(self, measured_mean: Tensor, R: Optional[Tensor], kwargs: Dict[str, Tensor]) -> Tensor:
+    def _adjust_r(self, measured_mean: Tensor, R: Optional[Tensor], **kwargs) -> Tensor:
         assert R is not None
         return R
 
-    def _adjust_measurement(self, x: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
+    def _adjust_measurement(self, x: Tensor, **kwargs) -> Tensor:
         return x
 
     def _update(self,
                 input: Tensor,
                 mean: Tensor,
                 cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        orig_H = kwargs['H']
+                H: Tensor,
+                R: Tensor,
+                **kwargs) -> Tuple[Tensor, Tensor]:
+        orig_H = H
         h_dot_state = (orig_H @ mean.unsqueeze(-1)).squeeze(-1)
         aux_kwargs = {k: v for k, v in kwargs.items() if k not in ('H', 'R')}
-        kwargs['measured_mean'] = self._adjust_measurement(h_dot_state, kwargs)
-        kwargs['H'] = self._adjust_h(mean, orig_H, kwargs)
-        kwargs['R'] = self._adjust_r(kwargs['measured_mean'], kwargs.get('R', None), aux_kwargs)
+        measured_mean = self._adjust_measurement(h_dot_state, **aux_kwargs)
+        adjusted_H = self._adjust_h(mean, orig_H, **kwargs)
+        adjusted_R = self._adjust_r(measured_mean, R, **aux_kwargs)
 
         return super()._update(
             input=input,
             mean=mean,
             cov=cov,
-            kwargs=kwargs
+            H=adjusted_H,
+            R=adjusted_R,
+            measured_mean=measured_mean,
+            **kwargs
         )
 
 

@@ -15,13 +15,13 @@ class StateSpaceStep(torch.nn.Module):
                 mean: Tensor,
                 cov: Tensor,
                 mask: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+                **kwargs) -> Tuple[Tensor, Tensor]:
         """
         :param mean: The current mean tensor.
         :param cov: The current covariance tensor.
         :param mask: A boolean mask tensor. Only masked elements of mean/cov will be updated, and remaining elements
          will be returned as-is.
-        :param kwargs: A dictionary of keyword arguments.
+        :param kwargs: Keyword arguments specific to the implementation.
         :return: A tuple of (new_mean, new_cov) tensors.
         """
         raise NotImplementedError
@@ -30,10 +30,10 @@ class StateSpaceStep(torch.nn.Module):
                 input: Tensor,
                 mean: Tensor,
                 cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+                **kwargs) -> Tuple[Tensor, Tensor]:
         raise NotImplementedError
 
-    def update(self, input: Tensor, mean: Tensor, cov: Tensor, kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+    def update(self, input: Tensor, mean: Tensor, cov: Tensor, **kwargs) -> Tuple[Tensor, Tensor]:
         """
         Handles validation and masking of missing values. Core update logic implemented in ``_update()``.
         """
@@ -60,13 +60,13 @@ class StateSpaceStep(torch.nn.Module):
                     input=masked_input,
                     mean=mean[groups],
                     cov=cov[groups],
-                    kwargs=masked_kwargs
+                    **masked_kwargs
                 )
                 new_mean[groups] = m
                 new_cov[groups] = c
             return new_mean, new_cov
         else:
-            return self._update(input=input, mean=mean, cov=cov, kwargs=kwargs)
+            return self._update(input=input, mean=mean, cov=cov, **kwargs)
 
     def _mask_mats(self,
                    groups: Tensor,

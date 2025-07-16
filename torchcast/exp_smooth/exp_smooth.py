@@ -38,10 +38,13 @@ class ExpSmoothStep(StateSpaceStep):
                 input: Tensor,
                 mean: Tensor,
                 cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        measured_mean = (kwargs['H'] @ mean.unsqueeze(-1)).squeeze(-1)
+                H: Tensor,
+                K: Tensor,
+                R: Tensor,
+                **kwargs) -> Tuple[Tensor, Tensor]:
+        measured_mean = (H @ mean.unsqueeze(-1)).squeeze(-1)
         resid = input - measured_mean
-        new_mean = mean + (kwargs['K'] @ resid.unsqueeze(-1)).squeeze(-1)
+        new_mean = mean + (K @ resid.unsqueeze(-1)).squeeze(-1)
         # _update doesn't waste compute creating new_cov; then in predict below, cov will be replaced by cov1step
         new_cov = torch.tensor(0.0, dtype=mean.dtype, device=mean.device)
         return new_mean, new_cov
@@ -50,16 +53,18 @@ class ExpSmoothStep(StateSpaceStep):
                 mean: Tensor,
                 cov: Tensor,
                 mask: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
+                F: Tensor,
+                cov1step: Tensor,
+                **kwargs) -> Tuple[Tensor, Tensor]:
         if mask.all():
             mask = slice(None)
 
-        F = kwargs['F'][mask]
+        F = F[mask]
 
         new_mean = update_tensor(mean, new=(F @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
 
         # new_cov will at least be cov1step (see note above in _update)
-        new_cov = kwargs['cov1step']
+        new_cov = cov1step
 
         # fastpath: if the call to update returned the zero-dim tensor (see _update above) then we are done
         if len(cov.shape):
