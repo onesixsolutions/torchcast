@@ -16,8 +16,7 @@ import numpy as np
 from filterpy.kalman import KalmanFilter as filterpy_KalmanFilter
 
 from torchcast.process import LocalTrend, LinearModel, LocalLevel
-from torchcast.process.base import Process
-from torchcast.process.utils import SingleOutput
+from torchcast.process.process import Process
 
 
 class TestKalmanFilter(TestCase):

@@ -10,7 +10,7 @@ from torch import Tensor, nn, jit
 from torchcast.process.utils import Identity
 from torchcast.covariance.util import num_off_diag, mini_cov_mask
 from torchcast.internals.utils import is_near_zero, validate_gt_shape
-from torchcast.process.base import Process
+from torchcast.process.process import Process
 
 
 class Covariance(nn.Module):
@@ -67,9 +67,7 @@ class Covariance(nn.Module):
         state_rank = 0
         no_cov_idx = []
         for p in processes:
-            no_cov_elements = []
-            if cov_type == 'process':
-                no_cov_elements = p.fixed_state_elements or []
+            no_cov_elements = [nm for nm, se in p.state_elements.items() if not getattr(se, f'has_{cov_type}_variance')]
             for i, se in enumerate(p.state_elements):
                 if se in no_cov_elements:
                     no_cov_idx.append(state_rank + i)

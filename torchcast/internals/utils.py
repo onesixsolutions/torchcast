@@ -6,6 +6,38 @@ import torch
 import numpy as np
 
 
+@functools.lru_cache(maxsize=100)
+def get_meshgrids(groups: torch.Tensor,
+                  val_idx: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    """
+    Returns meshgrids for the given groups and val_idx.
+    """
+    m1d = torch.meshgrid(groups, val_idx, indexing='ij')
+    m2d = torch.meshgrid(groups, val_idx, val_idx, indexing='ij')
+    return m1d, m2d
+
+
+def mask_mats(groups: torch.Tensor,
+              val_idx: Optional[torch.Tensor],
+              mats: Sequence[tuple[str, torch.Tensor, int]]) -> dict[str, torch.Tensor]:
+    out = {}
+    if val_idx is None:
+        for nm, mat, _ in mats:
+            out[nm] = mat[groups]
+    else:
+        m1d, m2d = get_meshgrids(groups, val_idx)
+        for nm, mat, dim in mats:
+            if dim == 0:
+                out[nm] = mat[groups]
+            elif dim == 1:
+                out[nm] = mat[m1d]
+            elif dim == 2:
+                out[nm] = mat[m2d]
+            else:
+                raise ValueError(f"Invalid dim ({dim}), must be 0, 1, or 2")
+    return out
+
+
 def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[slice, torch.Tensor]]) -> torch.Tensor:
     """
     In some cases we will want to save compute by only performing operations on a subset of a tensor, leaving the other
@@ -69,33 +101,6 @@ def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tor
                 valid_idx = (~nan_combo).nonzero().view(-1)
             out.append((group_idx, valid_idx))
     return out
-
-
-def get_owned_kwargs(module, kwargs: dict) -> Iterable[Tuple[str, str, Optional[torch.Tensor]]]:
-    """
-    Get keyword-arguments belonging to a module from a dictionary of kwargs passed to a multi-module container.
-
-    :param module: Any object with an ``id`` and ``expected_kwargs``.
-    :param kwargs: A dictionary of keyword arguments that are shared.
-    :return: An iterable of tuples: ``(used_key, key_name, value)``. The first is used for indicating what was used
-     (so at the end we can warn about unused keys), the second will be passed to the ``module`` later, and the last is
-     the value that will be passed to the module.
-    """
-    if module.expected_kwargs is None:
-        expected_kwargs = []
-    else:
-        expected_kwargs = module.expected_kwargs
-    for k in kwargs:
-        if k in expected_kwargs:
-            yield k, k, kwargs[k]
-        elif k.startswith(f'{module.id}__'):
-            owner, _, subkey = k.partition("__")
-            if subkey in expected_kwargs:
-                yield k, subkey, kwargs[k]
-            else:
-                raise ValueError(
-                    f"Found {k}, but {module.id} wasn't expecting a kwarg named '{subkey}'; expected:{expected_kwargs}"
-                )
 
 
 def validate_gt_shape(

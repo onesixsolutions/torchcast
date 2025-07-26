@@ -1,39 +1,79 @@
-from typing import Tuple, Optional, Sequence
+from dataclasses import dataclass
+
+from typing import Optional, Union
 from warnings import warn
 
 import torch
 from torch import Tensor, nn
 
 
-class ScriptSequential(nn.ModuleList):
+def standardize_decay(decay: Optional[Union[torch.nn.Module, tuple[float, float]]],
+                      lower: float = .95) -> Union[float, torch.nn.Module]:
+    if decay:
+        if isinstance(decay, bool):
+            decay = (lower, 1.00)
+        if isinstance(decay, tuple):
+            decay = Bounded(*decay)
+    else:
+        decay = 1.0
+
+    if isinstance(decay, (float, int)):
+        assert 0 < decay <= 1.0
+        decay = float(decay)
+    return decay
+
+
+@dataclass
+class ProcessKwarg:
+    name: str
+    is_group_time_tensor: bool
+
+
+class FixedValue(torch.nn.Module):
     """
-    torch.nn.Sequential doesn't handle `Optional[Tensor]` as expected in JIT.
+    Helper class for cases where the user can either input a fixed value or a callable.
+
+    (note: needs to be not just a callable but a module so that it can be stored in a ModuleDict)
     """
 
-    def forward(self, input: Optional[Tensor] = None):
-        out = input
-        for submodule in self:
-            out = submodule(out)
-        return out
+    def __init__(self, value: float):
+        super().__init__()
+        self.value = torch.as_tensor(value)
+
+    def forward(self) -> torch.Tensor:
+        return self.value
 
 
-class SingleOutput(nn.Module):
-    """
-    Basically a callable parameter, with optional transform.
-    """
+class StateElement(torch.nn.Module):
+    def __init__(self,
+                 name: str,
+                 measure_multi: Union[float, torch.nn.Module, None],
+                 has_process_variance: bool,
+                 has_initial_variance: bool = True):
+        super().__init__()
+        self.name = name
+        if not callable(measure_multi) and measure_multi is not None:
+            measure_multi = FixedValue(measure_multi)
+        self._measure_multi = measure_multi
+        self.has_process_variance = has_process_variance
+        self.has_initial_variance = has_initial_variance
+        self.transitions_to = torch.nn.ModuleDict()
+        # self-transitions by default:
+        self.set_transition_to(self, multi=1.0)
 
-    def __init__(self, numel: int = 1, transform: Optional[torch.nn.Module] = None):
-        super(SingleOutput, self).__init__()
-        self.param = nn.Parameter(.1 * torch.randn(numel))
-        self.transform = transform
+    @property
+    def measure_multi(self) -> torch.nn.Module:
+        if self._measure_multi is None:
+            # should not hit this because you'd only set measure_multi to None if
+            # the parent process has a custom method to construct the measurement-matrix (e.g. linearModel)
+            raise RuntimeError(f"StateElement {self.name} has no measure_multi set")
+        return self._measure_multi
 
-    def forward(self, input: Optional[Tensor] = None) -> Tensor:
-        if not (input is None or input.numel() == 0):
-            warn(f"{self} is ignoring `input`")
-        out = self.param
-        if self.transform is not None:
-            out = self.transform(out)
-        return out
+    def set_transition_to(self, state_element: 'StateElement', multi: Union[float, torch.nn.Module]):
+        if not callable(multi):
+            multi = FixedValue(multi)
+        self.transitions_to[state_element.name] = multi
+        return self
 
 
 class Identity(nn.Module):
@@ -51,12 +91,13 @@ class Bounded(nn.Module):
     """
 
     def __init__(self, lower: float, upper: float):
-        super(Bounded, self).__init__()
+        super().__init__()
+        self.raw = torch.nn.Parameter(torch.randn(1) * 0.1)
         self.lower = lower
         self.upper = upper
 
-    def forward(self, input: Tensor) -> Tensor:
-        return torch.sigmoid(input) * (self.upper - self.lower) + self.lower
+    def forward(self) -> Tensor:
+        return torch.sigmoid(self.raw) * (self.upper - self.lower) + self.lower
 
 
 class Multi(nn.Module):
@@ -65,38 +106,8 @@ class Multi(nn.Module):
     """
 
     def __init__(self, value: torch.Tensor):
-        super(Multi, self).__init__()
+        super().__init__()
         self.value = value
 
     def forward(self, input: Tensor) -> Tensor:
         return input * self.value
-
-
-class Assignments(nn.Module):
-    """
-    Takes a (N x K) input and maps it to a (N X G) output by assigning columns of the input to columns of the output.
-    """
-
-    def __init__(self,
-                 input_cols: int,
-                 output_cols: int,
-                 assignments: Sequence[Tuple[int, int]],
-                 padding: float = 0.):
-        """
-        :param input_cols: Number of columns to expect in input.
-        :param output_cols: Number of columns to generate in output.
-        :param assignments: A list of tuples with (from-col, to-col).
-        :param padding: Padding for unassigned output elements, default zero.
-        """
-        super(Assignments, self).__init__()
-        self.input_cols = input_cols
-        self.output_cols = output_cols
-        self.assignments = list(assignments)
-        self.padding = padding
-
-    def forward(self, input: Tensor) -> Tensor:
-        assert input.shape[-1] == self.input_cols
-        output = torch.full(input.shape[:-1] + (self.output_cols,), fill_value=self.padding)
-        for from_, to_ in self.assignments:
-            output[:, to_] = input[:, from_]
-        return output

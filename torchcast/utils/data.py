@@ -333,6 +333,7 @@ class TimeSeriesDataset(TensorDataset):
                             group_colname: str,
                             time_colname: str,
                             measures: Sequence[str]) -> 'DataFrame':
+        # TODO: this could probably be better
         from pandas import DataFrame, concat
 
         tensor = tensor.cpu().numpy()
@@ -505,9 +506,16 @@ class TimeSeriesDataset(TensorDataset):
          constructing the `times` array? Defaults to the one with the most timesteps.
         :return: A 2D numpy array of datetimes (or integers if dt_unit is None).
         """
-        num_timesteps = self.num_timesteps if which is None else self.tensors[which].shape[1]
-        offsets = np.arange(0, num_timesteps) * (self.dt_unit if self.dt_unit else 1)
-        return self.start_times[:, None] + offsets
+        return self.get_dataset_times(
+            start_times=self.start_times,
+            num_timesteps=self.num_timesteps if which is None else self.tensors[which].shape[1],
+            dt_unit=self.dt_unit
+        )
+
+    @classmethod
+    def get_dataset_times(cls, start_times: np.ndarray, num_timesteps: int, dt_unit: Optional[np.timedelta64]):
+        offsets = np.arange(0, num_timesteps) * (dt_unit if dt_unit else 1)
+        return start_times[:, None] + offsets
 
     def datetimes(self) -> np.ndarray:
         return self.times()
@@ -705,5 +713,3 @@ def complete_times(data: 'DataFrame',
              .loc[df_cj[time_colname].between(df_cj['_min'], df_cj['_max']), group_colnames + [time_colname]]
              .reset_index(drop=True))
     return df_cj.merge(data, how='left', on=group_colnames + [time_colname])
-
-
