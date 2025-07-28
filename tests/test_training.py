@@ -42,15 +42,12 @@ class TestTraining(unittest.TestCase):
                 if not isvalid_gt.any():
                     continue
                 if isvalid_gt.all():
-                    lp_gt = torch.distributions.MultivariateNormal(*pred_gt).log_prob(data_gt).item()
+                    lp_gt = torch.distributions.MultivariateNormal(*pred_gt).log_prob(data_gt)
                 else:
-                    pred_gtm = pred_gt.observe(
-                        state_means=pred_gt.state_means,
-                        state_covs=pred_gt.state_covs,
-                        R=pred_gt.R[..., isvalid_gt, :][..., isvalid_gt],
-                        H=pred_gt.H[..., isvalid_gt, :]
-                    )
-                    lp_gt = torch.distributions.MultivariateNormal(*pred_gtm).log_prob(data_gt[..., isvalid_gt]).item()
+                    mmeans = pred_gt.means[..., isvalid_gt]
+                    mcovs = pred_gt.covs[..., isvalid_gt, :][..., isvalid_gt]
+                    lp_gt = torch.distributions.MultivariateNormal(mmeans, mcovs).log_prob(data_gt[..., isvalid_gt])
+                lp_gt = lp_gt.item()
                 self.assertAlmostEqual(lp_method1[g, t].item(), lp_gt, places=4)
                 lp_method2_sum += lp_gt
         self.assertAlmostEqual(lp_method1_sum, lp_method2_sum, places=3)
@@ -60,8 +57,6 @@ class TestTraining(unittest.TestCase):
         simulated data with known parameters, fitted loss should approach the loss given known params
         """
         torch.manual_seed(123)
-
-        # TODO: include nans; make sure performance doesn't take significant hit w/partial nans
 
         def _make_kf():
             kf = KalmanFilter(
@@ -145,6 +140,7 @@ class TestTraining(unittest.TestCase):
             # train:
             optimizer = torch.optim.LBFGS([p for n, p in kf.named_parameters() if 'measure_covariance' not in n],
                                           lr=.20,
+                                          line_search_fn='strong_wolfe',
                                           max_iter=10)
 
             def closure():
@@ -180,7 +176,7 @@ class TestTraining(unittest.TestCase):
         # MSE should be virtually zero
         self.assertLess(torch.mean((pred.means - data) ** 2), .01)
         # trend should be identified:
-        self.assertAlmostEqual(pred.state_means[:, :, 1].mean().item(), 5., places=1)
+        self.assertAlmostEqual(pred.state_means[..., 1].mean().item(), 5., places=1)
 
     def test_training3(self, compile: bool = False):
         """
