@@ -39,6 +39,10 @@ def mask_mats(groups: torch.Tensor,
 
 
 def normalize_index(index: tuple) -> tuple:
+    # Special-case early check for the batched pattern
+    if isinstance(index, tuple) and _is_special_batched_pattern(index):
+        return index  # Return untouched
+
     if not isinstance(index, tuple):
         index = (index,)
     fancy = False
@@ -65,6 +69,17 @@ def normalize_index(index: tuple) -> tuple:
     return tuple(normalized)
 
 
+def _is_special_batched_pattern(index: tuple) -> bool:
+    if len(index) != 2:
+        return False
+    i0, i1 = map(np.asarray, index)
+    if not all(arr.dtype.kind in ('i', 'u') for arr in (i0, i1)):
+        return False
+    if i0.ndim >= 1 and i1.ndim >= 1 and i0.shape[0] == i1.shape[0]:
+        return True
+    return False
+
+
 def _validate_1d_int_array_like(obj: Sequence) -> Optional[np.ndarray]:
     try:
         arr = np.asarray(obj)
@@ -75,21 +90,34 @@ def _validate_1d_int_array_like(obj: Sequence) -> Optional[np.ndarray]:
     return None
 
 
-def compute_index_result_shape(index: Sequence, shape: tuple) -> tuple[int, ...]:
-    """
-    Given a normalized index and a shape, return the resulting shape after indexing.
-    """
+def compute_index_result_shape(index: tuple, shape: tuple) -> tuple:
     ndim = len(shape)
+
+    if not isinstance(index, tuple):
+        index = (index,)
+
     if len(index) > ndim:
         raise IndexError(f"Too many indices for array: expected {ndim}, got {len(index)}")
 
+    # Special batched case: (batch_idx, per-example idx)
+    if _is_special_batched_pattern(index):
+        batch_idx, elem_idx = map(np.asarray, index)
+        if batch_idx.shape != elem_idx.shape:
+            raise IndexError(f"Batched index shapes must match: got {batch_idx.shape}, {elem_idx.shape}")
+        return batch_idx.shape + shape[2:]  # keep remaining trailing dims
+
+    # Normal case
     result_shape = []
     dim = 0
+
     for ix in index:
+        if dim >= ndim:
+            raise IndexError(f"Too many indices for array: expected {ndim}, got more than {dim}")
+
         if isinstance(ix, int):
             if ix < -shape[dim] or ix >= shape[dim]:
-                raise IndexError(f"Index {ix} is out of bounds for axis {dim} with size {shape[dim]}")
-            dim += 1  # drops dimension
+                raise IndexError(f"Index {ix} out of bounds for axis {dim} with size {shape[dim]}")
+            dim += 1
 
         elif isinstance(ix, slice):
             start, stop, step = ix.indices(shape[dim])
@@ -98,13 +126,12 @@ def compute_index_result_shape(index: Sequence, shape: tuple) -> tuple[int, ...]
             dim += 1
 
         elif isinstance(ix, list):
+            for i in ix:
+                if i < -shape[dim] or i >= shape[dim]:
+                    raise IndexError(f"Index {i} out of bounds for axis {dim} with size {shape[dim]}")
             result_shape.append(len(ix))
             dim += 1
 
-        else:
-            raise TypeError(f"Unsupported index type: {type(ix)}")
-
-    # Append any remaining axes untouched
     result_shape.extend(shape[dim:])
     return tuple(result_shape)
 

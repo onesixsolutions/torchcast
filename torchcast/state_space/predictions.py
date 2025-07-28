@@ -32,7 +32,8 @@ class Predictions:
                  measurement_model: 'MeasurementModel',
                  state_means: Sequence[torch.Tensor],
                  state_covs: Sequence[torch.Tensor],
-                 measure_covs: Union[Sequence[torch.Tensor], torch.Tensor]):
+                 measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
+                 white_noise: Optional[torch.Tensor] = None):
         # TODO: white_noise, updates
         self.measurement_model = measurement_model
         self.state_means = _maybe_stack(state_means, 1)
@@ -174,11 +175,13 @@ class Predictions:
         return self._means
 
     @cached_property
-    def covs(self) -> torch.Tensor:
+    def covs(self) -> Optional[torch.Tensor]:
         if self._means is None:
             self._means, self._covs = self._observe()
         if self._covs is None:
-            raise ValueError("Cannot access covariances, since the measurement model is nonlinear")
+            if _warn_once.get('cov', False):
+                warn("The measurement model is nonlinear, so no closed-form covariance is available, returning None.")
+                _warn_once['cov'] = True
         return self._covs
 
     def _to_dataframe(self,
@@ -596,7 +599,7 @@ class Predictions:
 
         return plot + theme_bw() + theme(**kwargs)
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
+    def __iter__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # so that we can do ``mean, cov = predictions``
         yield self.means
         yield self.covs
@@ -660,3 +663,6 @@ def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> to
     if isinstance(x, torch.Tensor):
         return x
     return torch.stack(x, dim=dim)
+
+
+_warn_once = {}
