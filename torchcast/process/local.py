@@ -16,6 +16,7 @@ class LocalLevel(Process):
      rapid and you will run into trouble with vanishing gradients. When passing a pair of floats, the nn.Module will
      assign a parameter representing the decay as a learned parameter somewhere between these bounds.
     """
+
     def __init__(self,
                  id: str,
                  measure: Optional[str] = None,
@@ -44,28 +45,27 @@ class LocalTrend(Process):
      to allow the trend to decay somewhere between .95 (moderate decay) and 1.00 (no decay), with the exact value
      being a learned parameter.
     :param decay_position: See `decay` in :class:`LocalLevel`. Default is no decay.
-    :param velocity_multi: Default 0.1. A multiplier on the velocity, so that
-     ``next_position = position + velocity_multi * velocity``. A value of << 1.0 can be helpful since the
-     trend has such a large effect on the prediction, so that large values can lead to exploding predictions.
     """
+    _velocity_multi = 0.1  # trend has large effect on the prediction -- large values can lead to exploding predictions
+
     def __init__(self,
                  id: str,
                  measure: Optional[str] = None,
                  decay_velocity: Optional[Union[torch.nn.Module, tuple[float, float]]] = (0.95, 1.00),
-                 decay_position: Optional[Union[torch.nn.Module, tuple[float, float]]] = None,
-                 velocity_multi: float = 0.1):
-        state_elements = [
-            StateElement(name='position', measure_multi=1.0, has_process_variance=True),
-            StateElement(name='velocity', measure_multi=velocity_multi, has_process_variance=True)
-        ]
-        super().__init__(id=id, state_elements=state_elements, measure=measure)
-
+                 decay_position: Optional[Union[torch.nn.Module, tuple[float, float]]] = None):
+        # observed, transitions to itself (but with possible decay):
+        position = StateElement(name='position', measure_multi=1.0, has_process_variance=True)
         decay_position = standardize_decay(decay_position)
         self._has_position_decay = not isinstance(decay_position, float) or decay_position < 1.0
-        self.state_elements['position'].set_transition_to(self.state_elements['position'], multi=decay_position)
+        position.set_transition_to(position, multi=decay_position)
 
+        # unobserved, transitions not only to itself but into position:
+        velocity = StateElement(name='velocity', measure_multi=0.0, has_process_variance=True)
         decay_velocity = standardize_decay(decay_velocity)
-        self.state_elements['velocity'].set_transition_to(self.state_elements['position'], multi=decay_velocity)
+        velocity.set_transition_to(velocity, multi=decay_velocity)
+        velocity.set_transition_to(position, multi=self._velocity_multi)
+
+        super().__init__(id=id, state_elements=[position, velocity], measure=measure)
 
     @property
     def intercept_state_element(self) -> Optional[str]:

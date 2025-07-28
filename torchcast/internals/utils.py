@@ -38,6 +38,77 @@ def mask_mats(groups: torch.Tensor,
     return out
 
 
+def normalize_index(index: tuple) -> tuple:
+    if not isinstance(index, tuple):
+        index = (index,)
+    fancy = False
+    normalized = []
+    for i, ix in enumerate(index):
+        if isinstance(ix, (int, slice)):
+            normalized.append(ix)
+            continue
+
+        arr = _validate_1d_int_array_like(ix)
+        if arr is not None:
+            if fancy:
+                raise NotImplementedError("Only one 'fancy' indexing axis is supported")
+            fancy = True
+            normalized.append(arr.tolist())
+
+        else:
+            raise TypeError(f"Unsupported index type: {type(ix)} at position {i}")
+
+    # Drop trailing slice(None) entries (i.e. [:])
+    while normalized and isinstance(normalized[-1], slice) and normalized[-1] == slice(None):
+        normalized.pop()
+
+    return tuple(normalized)
+
+
+def _validate_1d_int_array_like(obj: Sequence) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(obj)
+        if arr.ndim == 1 and arr.dtype.kind in ('i', 'u'):
+            return arr
+    except Exception:
+        pass
+    return None
+
+
+def compute_index_result_shape(index: Sequence, shape: tuple) -> tuple[int, ...]:
+    """
+    Given a normalized index and a shape, return the resulting shape after indexing.
+    """
+    ndim = len(shape)
+    if len(index) > ndim:
+        raise IndexError(f"Too many indices for array: expected {ndim}, got {len(index)}")
+
+    result_shape = []
+    dim = 0
+    for ix in index:
+        if isinstance(ix, int):
+            if ix < -shape[dim] or ix >= shape[dim]:
+                raise IndexError(f"Index {ix} is out of bounds for axis {dim} with size {shape[dim]}")
+            dim += 1  # drops dimension
+
+        elif isinstance(ix, slice):
+            start, stop, step = ix.indices(shape[dim])
+            size = max(0, (stop - start + (step - 1)) // step)
+            result_shape.append(size)
+            dim += 1
+
+        elif isinstance(ix, list):
+            result_shape.append(len(ix))
+            dim += 1
+
+        else:
+            raise TypeError(f"Unsupported index type: {type(ix)}")
+
+    # Append any remaining axes untouched
+    result_shape.extend(shape[dim:])
+    return tuple(result_shape)
+
+
 def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[slice, torch.Tensor]]) -> torch.Tensor:
     """
     In some cases we will want to save compute by only performing operations on a subset of a tensor, leaving the other
@@ -60,7 +131,7 @@ def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[sl
     :return: If ``mask`` is all True, returns ``new`` (not a copy). Otherwise, returns a new tensor with the same shape
      as ``orig`` where the elements in ``mask`` are replaced with the elements in ``new``.
     """
-    if isinstance(mask, slice) and not mask.start and not mask.stop and not mask.step:
+    if isinstance(mask, slice) and mask == slice(None):
         mask = None
     if mask is None or mask.all():
         return new

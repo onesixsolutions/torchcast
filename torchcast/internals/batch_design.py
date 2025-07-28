@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Sequence, Optional, Union, Collection, Iterabl
 
 import torch
 
-from torchcast.internals.utils import update_tensor
+from torchcast.internals.utils import update_tensor, normalize_index, compute_index_result_shape
 
 if TYPE_CHECKING:
     from torchcast.process import Process
@@ -153,10 +153,8 @@ class MeasurementModel(DesignModel):
     def flattened(self) -> 'MeasurementModel':
         return self._copy(flattened=True)
 
-    def subset(self,
-               group_idx: torch.Tensor,
-               measures: Optional[Union[Sequence[str], torch.Tensor]] = None) -> 'MeasurementModel':
-        return self._copy(group_idx=group_idx, measures=measures)
+    def subset(self, *item, measures: Optional[Union[Sequence[str], torch.Tensor]] = None) -> 'MeasurementModel':
+        return self._copy(item=item, measures=measures)
 
     def _get_kwargs_per_process(self, **kwargs) -> tuple[dict[str, dict], set]:
         used = set()
@@ -198,19 +196,24 @@ class MeasurementModel(DesignModel):
         return H.unbind(1)
 
     def _copy(self,
-              group_idx: Optional[torch.Tensor] = None,
+              item: Optional[tuple[torch.Tensor, ...]] = None,
               measures: Optional[Union[Collection[str], torch.Tensor]] = None,
               flattened: bool = False) -> 'MeasurementModel':
 
         num_groups = self.num_groups
         num_timesteps = self.num_timesteps
-        if group_idx is not None and flattened:
+        if item is not None and flattened:
             raise ValueError("Cannot pass both `group_idx` and `flattened` arguments at the same time.")
         elif flattened:
             num_groups = self.num_groups * self.num_timesteps
             num_timesteps = 1
-        elif group_idx is not None:
-            num_groups = len(group_idx)
+        elif item is not None:
+            item = normalize_index(item)
+            if any(isinstance(i, int) for i in item):
+                raise ValueError("Cannot drop a dimension, but received an integer index. ")
+            num_groups, num_timesteps, *other = compute_index_result_shape(item, (self.num_groups, self.num_timesteps))
+            if other:
+                raise ValueError(f"{type(self).__name__} only supports indexing the first two dimensions")
 
         if measures is None:
             measures = self.measures
@@ -235,7 +238,7 @@ class MeasurementModel(DesignModel):
             for pkwarg in self.processes[pid].measurement_kwargs:
                 value = pkwargs[pkwarg.name]
                 if pkwarg.is_group_time_tensor:
-                    value = value.reshape(-1, *value.shape[2:]) if flattened else value[group_idx]
+                    value = value.reshape(num_groups, num_timesteps, *value.shape[2:]) if flattened else value[item]
                 new._kwargs_per_process[pid][pkwarg.name] = value
         new.used_keys = self.used_keys
         new.processes = self.processes
@@ -278,5 +281,4 @@ class TransitionModel(DesignModel):
             mask = slice(None)
         F = self.transition_mats[time]
         new_mean = update_tensor(mean, new=(F[mask] @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
-        print(mean[0], new_mean[0])
         return new_mean.squeeze(-1), F

@@ -85,6 +85,18 @@ class Identity(nn.Module):
         return input
 
 
+class NoInputSequential(torch.nn.Sequential):
+    """
+    Sequential but the first module takes no arguments
+    """
+
+    def forward(self) -> torch.Tensor:
+        input = None
+        for module in self:
+            input = module() if input is None else module(input)
+        return input
+
+
 class Bounded(nn.Module):
     """
     Transforms input to fall within `value`, a tuple of (lower, upper)

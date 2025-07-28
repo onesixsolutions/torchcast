@@ -8,7 +8,7 @@ import torch
 
 from torchcast.internals.utils import update_tensor
 from torchcast.process.process import Process
-from torchcast.process.utils import Multi, standardize_decay, StateElement
+from torchcast.process.utils import Multi, standardize_decay, StateElement, NoInputSequential
 
 
 class Season(Process):
@@ -129,7 +129,7 @@ class Season(Process):
             for se_from, se_from_transitions in _transitions.items():
                 for se_to, multi in se_from_transitions.items():
                     if isinstance(decay, torch.nn.Module):
-                        multi = torch.nn.Sequential(decay, Multi(multi))
+                        multi = NoInputSequential(decay, Multi(multi))
                     else:
                         multi = decay * multi
                     se_from.set_transition_to(se_to, multi=multi)

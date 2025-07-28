@@ -1,5 +1,4 @@
-from torch.distributions.utils import broadcast_all
-from typing import Tuple, List, Optional, Sequence, Union, TYPE_CHECKING, Callable
+from typing import List, Optional, Sequence, Union, TYPE_CHECKING, Callable
 from warnings import warn
 
 import numpy as np
@@ -562,13 +561,10 @@ class StateSpaceModel(torch.nn.Module):
             initial_state = (initial_state, None)
 
         if initial_state is None:
-            init_mean = []
-            for p in self.processes.values():
-                _p_init_mean = p.get_initial_mean(start_offsets)
-                if len(_p_init_mean.shape) == 1:
-                    _p_init_mean = _p_init_mean.expand(1, -1)
-                init_mean.append(_p_init_mean)
-            init_mean = torch.cat(broadcast_all(*init_mean), -1)
+            init_mean = (p.get_initial_mean(start_offsets) for p in self.processes.values())
+            init_mean = [m if len(m.shape) == 2 else m.expand(1, -1) for m in init_mean]
+            ngroups = max(m.shape[0] for m in init_mean)
+            init_mean = torch.cat([m.expand(ngroups, -1) for m in init_mean], -1)
             init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
         else:
             # TODO: we don't call `get_initial_mean` when initial_state is passed...
@@ -589,10 +585,23 @@ class StateSpaceModel(torch.nn.Module):
 
         return init_mean, init_cov
 
+    def _get_measure_scaling(self) -> torch.Tensor:
+        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+        measure_var = mcov.diagonal(dim1=-2, dim2=-1).unbind()
+
+        multi = [
+            measure_var[self.measures.index(process.measure)].expand(process.rank).sqrt()
+            for process in self.processes.values()
+        ]
+        multi = torch.cat(multi)
+        if (multi <= 0).any():
+            raise RuntimeError(f"measure-cov diagonal is not positive:{measure_var}")
+        return multi
+
     def get_laplace_mvnorm(self,
                            y: torch.Tensor,
                            get_loss: Optional[callable] = None,
-                           **kwargs) -> Tuple[torch.distributions.MultivariateNormal, List[str]]:
+                           **kwargs) -> tuple[torch.distributions.MultivariateNormal, List[str]]:
         """
         :param y: observed data
         :param get_loss: A function that takes the ``Predictions`` object and the input data and returns the loss; note
@@ -640,6 +649,47 @@ class StateSpaceModel(torch.nn.Module):
 
         return mvnorm, all_param_names
 
-    # def __repr__(self) -> str:
-    #     return f'{type(self).__name__}' \
-    #            f'(processes={repr(list(self.processes.values()))}, measures={repr(list(self.measures))})'
+    @torch.no_grad()
+    def simulate(self,
+                 out_timesteps: int,
+                 initial_state: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+                 start_offsets: Optional[Sequence] = None,
+                 num_sims: int = 1,
+                 num_groups: Optional[int] = None,
+                 **kwargs):
+        """
+        Generate simulated state-trajectories from your model.
+
+        :param out_timesteps: The number of timesteps to generate in the output.
+        :param initial_state: The initial state of the system: a tuple of `mean`, `cov`. Can be obtained from previous
+         model-predictions by calling ``get_state_at_times()`` on the output predictions.
+        :param start_offsets: If your model includes seasonal processes, then these needs to know the start-time for
+         each group in ``initial_state``. If you passed ``dt_unit`` when constructing those processes, then you should
+         pass an array of datetimes here, otherwise an array of ints. If there are no seasonal processes you can omit.
+        :param num_sims: The number of state-trajectories to simulate per group. The output will be laid out in blocks
+         (e.g. if there are 10 groups, the first ten elements of the output are sim 1, the next 10 elements are sim 2,
+         etc.). Tensors associated with this output can be reshaped with ``tensor.reshape(num_sims, num_groups, ...)``.
+        :param num_groups: The number of groups; if `None` will be inferred from the shape of `initial_state` and/or
+         ``start_offsets``.
+        :param kwargs: Further arguments passed to the `processes`.
+        :return: A :class:`.Predictions` object with zero state-covariance.
+        """
+
+        if num_groups is not None:
+            if start_offsets is not None and len(start_offsets) != num_groups:
+                raise ValueError("Expected `len(start_offsets) == num_groups` (or num_groups=None)")
+            if isinstance(initial_state, torch.Tensor):
+                initial_state = (initial_state, None)
+            if initial_state is None:
+                initial_state = self._prepare_initial_state(initial_state, start_offsets=start_offsets)
+                initial_state = (repeat(x, times=num_groups, dim=0) for x in initial_state)
+            elif len(initial_state[0]) != num_groups:
+                raise ValueError("Expected `initial_state` to have first dimension equal to `num_groups`")
+
+        return self(
+            start_offsets=start_offsets,
+            out_timesteps=out_timesteps,
+            initial_state=initial_state,
+            simulate=num_sims,
+            **kwargs
+        )

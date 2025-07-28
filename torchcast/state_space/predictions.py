@@ -3,7 +3,7 @@ from functools import cached_property
 from math import log
 
 from dataclasses import dataclass, fields
-from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING
+from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Iterator
 from warnings import warn
 
 import torch
@@ -33,13 +33,11 @@ class Predictions:
                  state_means: Sequence[torch.Tensor],
                  state_covs: Sequence[torch.Tensor],
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor]):
-        # TODO: white_noise
+        # TODO: white_noise, updates
         self.measurement_model = measurement_model
-        self.state_means = torch.stack(state_means, 1)
-        self.state_covs = torch.stack(state_covs, 1)
-        self.measure_covs = measure_covs
-        if not isinstance(self.measure_covs, torch.Tensor):
-            self.measure_covs = torch.stack(self.measure_covs, 1)
+        self.state_means = _maybe_stack(state_means, 1)
+        self.state_covs = _maybe_stack(state_covs, 1)
+        self.measure_covs = _maybe_stack(measure_covs, 1)
 
         self._dataset_metadata = None
 
@@ -137,11 +135,7 @@ class Predictions:
         measure_covs_flat = measure_cov.view(-1, nmeasures, nmeasures)
         return (state_means_flat, state_covs_flat), measure_covs_flat
 
-    def _observe(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.measurement_model.is_nonlinear:
-            # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
-            raise RuntimeError("Cannot get observed (mean, cov) pair when measurement-model is nonlinear")
-
+    def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_shape = self.state_means.shape[0:2]
 
         (smeans_flat, scovs_flat), mcovs_flat = self._flatten(
@@ -150,8 +144,25 @@ class Predictions:
         )
         measurement_model_flat = self.measurement_model.flattened()
         measured_mean, measure_mat = measurement_model_flat(mean=smeans_flat, time=0)
-        system_cov = measure_mat @ scovs_flat @ measure_mat.permute(0, 2, 1) + mcovs_flat
-        return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
+        if self.measurement_model.is_nonlinear:
+            # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=measurement_model_flat,
+                state_means=smeans_flat,
+                state_covs=scovs_flat,
+                white_noise=self.white_noise
+            )
+            mvnorm = torch.distributions.MultivariateNormal(
+                loc=mmean_samples,
+                covariance_matrix=mcovs_flat.unsqueeze(0),
+                validate_args=False
+            )
+            samples = mvnorm.sample().squeeze(0)
+            measured_mean = torch.mean(samples, dim=0)
+            return measured_mean, None
+        else:
+            system_cov = measure_mat @ scovs_flat @ measure_mat.permute(0, 2, 1) + mcovs_flat
+            return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
 
     @cached_property
     def means(self) -> torch.Tensor:
@@ -164,8 +175,10 @@ class Predictions:
 
     @cached_property
     def covs(self) -> torch.Tensor:
+        if self._means is None:
+            self._means, self._covs = self._observe()
         if self._covs is None:
-            self._covs, self._covs = self._observe()
+            raise ValueError("Cannot access covariances, since the measurement model is nonlinear")
         return self._covs
 
     def _to_dataframe(self,
@@ -231,19 +244,31 @@ class Predictions:
                 )
 
         from torchcast.utils import TimeSeriesDataset
+
+        actuals = {}
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in by_measure:
+                        continue
+                    actuals[m] = tens[..., mgroup.index(m)]
         out = []
         times = TimeSeriesDataset.get_dataset_times(
             dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
         )
         for measure, (mean, lower, upper) in by_measure.items():
+            _to_stack = {'mean': mean, 'lower': lower, 'upper': upper}
+            mactuals = actuals.get(measure, None)
+            if mactuals is not None:
+                _to_stack['actual'] = mactuals
             out.append(
                 TimeSeriesDataset.tensor_to_dataframe(
-                    tensor=torch.stack([mean, lower, upper], -1),
+                    tensor=torch.stack(list(_to_stack.values()), -1),
                     times=times,
                     group_names=dataset.group_names,
                     group_colname=group_colname,
                     time_colname=time_colname,
-                    measures=['mean', 'lower', 'upper']
+                    measures=list(_to_stack)
                 )
             )
             out[-1]['measure'] = measure
@@ -280,9 +305,9 @@ class Predictions:
             if valid_idx is None:
                 gt_obs = obs_flat[gt_idx]
                 gt_mcov = measure_covs_flat[gt_idx]
-                gt_mmodel = measurement_model_flat.subset(group_idx=gt_idx)
+                gt_mmodel = measurement_model_flat.subset(gt_idx)
             else:
-                gt_mmodel = measurement_model_flat.subset(group_idx=gt_idx, measures=valid_idx)
+                gt_mmodel = measurement_model_flat.subset(gt_idx, measures=valid_idx)
                 mask1d, mask2d = get_meshgrids(gt_idx, valid_idx)
                 gt_mcov = measure_covs_flat[mask2d]
                 gt_obs = obs_flat[mask1d]
@@ -335,9 +360,6 @@ class Predictions:
             measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
             system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
             return torch.distributions.MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
-
-    # @cached_property
-    # def means(self) -> torch.Tensor:
 
     def _get_measured_mean_samples(self,
                                    measurement_model: 'MeasurementModel',
@@ -574,29 +596,31 @@ class Predictions:
 
         return plot + theme_bw() + theme(**kwargs)
 
-    # def __getitem__(self, item: tuple) -> 'Predictions':
-    #     kwargs = self._getitem_helper(item)
-    #     cls = type(self)
-    #     return cls(**kwargs, model=self._model_attributes)
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        # so that we can do ``mean, cov = predictions``
+        yield self.means
+        yield self.covs
 
-    # def _getitem_helper(self, item: tuple) -> dict:
-    #     kwargs = {
-    #         'state_means': self.state_means[item],
-    #         'state_covs': self.state_covs[item],
-    #         'H': self.H[item],
-    #         'R': self.R[item]
-    #     }
-    #     if self._update_means is not None:
-    #         kwargs.update({'update_means': self.update_means[item], 'update_covs': self.update_covs[item]})
-    #
-    #     for k in list(kwargs):
-    #         expected_shape = getattr(self, k).shape
-    #         v = kwargs[k]
-    #         if len(v.shape) != len(expected_shape):
-    #             raise TypeError(f"Expected {k} to have ndims {len(expected_shape)}, but got {len(v.shape)}")
-    #         if v.shape[2:] != expected_shape[2:]:
-    #             raise TypeError(f"Cannot index into non-batch dims of {type(self).__name__}")
-    #     return kwargs
+    def __array__(self) -> np.ndarray:
+        # for numpy.asarray
+        return self.means.detach().numpy()
+
+    def __getitem__(self, item) -> 'Predictions':
+        kwargs = self._getitem_helper(item)
+        cls = type(self)
+        return cls(**kwargs)
+
+    def _getitem_helper(self, item: tuple) -> dict:
+        kwargs = {
+            'measurement_model': self.measurement_model.subset(*item),
+            'state_means': self.state_means[item],
+            'state_covs': self.state_covs[item],
+            'measure_covs': self.measure_covs[item]
+        }
+        # if self._update_means is not None:
+        #     kwargs.update({'update_means': self.update_means[item], 'update_covs': self.update_covs[item]})
+
+        return kwargs
 
 
 @dataclass
@@ -630,3 +654,9 @@ class DatasetMetadata:
             group_colname=self.group_colname,
             time_colname=self.time_colname
         )
+
+
+def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.stack(x, dim=dim)
