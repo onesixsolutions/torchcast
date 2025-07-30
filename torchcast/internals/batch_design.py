@@ -36,7 +36,7 @@ class DesignModel:
         raise NotImplementedError
 
     @cached_property
-    def rank(self) -> int:
+    def state_rank(self) -> int:
         return sum(p.rank for p in self.processes.values())
 
     @cached_property
@@ -141,7 +141,7 @@ class MeasurementModel(DesignModel):
             midx = self.measure2idx[process.measure]
             pidx = self.process2slice[process.id]
             jacobian = process.get_measurement_jacobian(mean, time, self._cache_per_process[process.id])
-            pH = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures), self.rank), device=mean.device)
+            pH = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures), self.state_rank), device=mean.device)
             pH[..., midx, pidx] = jacobian
             adjustment = adjustment + pH
         return adjustment
@@ -176,7 +176,7 @@ class MeasurementModel(DesignModel):
 
     @cached_property
     def _measure_mats(self) -> Sequence[torch.Tensor]:
-        H = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures), self.rank), device=self.device)
+        H = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures), self.state_rank), device=self.device)
         for pid, process in self.processes.items():
             midx = self.measure2idx.get(process.measure, None)
             if not process.linear_measurement or midx is None:
@@ -258,7 +258,7 @@ class TransitionModel(DesignModel):
         )
         self.measures = measures
 
-        zeros = torch.zeros((self.num_groups, self.num_timesteps, self.rank, self.rank), device=self.device)
+        zeros = torch.zeros((self.num_groups, self.num_timesteps, self.state_rank, self.state_rank), device=self.device)
         F = []
         for pid, process in self.processes.items():
             if process.linear_transition:

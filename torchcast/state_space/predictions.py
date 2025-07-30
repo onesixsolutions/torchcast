@@ -30,15 +30,20 @@ class Predictions:
 
     def __init__(self,
                  measurement_model: 'MeasurementModel',
-                 state_means: Sequence[torch.Tensor],
-                 state_covs: Sequence[torch.Tensor],
+                 states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
+                 updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
                  white_noise: Optional[torch.Tensor] = None):
-        # TODO: white_noise, updates
         self.measurement_model = measurement_model
-        self.state_means = _maybe_stack(state_means, 1)
-        self.state_covs = _maybe_stack(state_covs, 1)
+        self.state_means = _maybe_stack(states[0], 1)
+        self.state_covs = _maybe_stack(states[1], 1)
         self.measure_covs = _maybe_stack(measure_covs, 1)
+        self.white_noise = white_noise
+
+        self.update_means = self.update_covs = None
+        if updates is not None:
+            self.update_means = _maybe_stack(updates[0], 1)
+            self.update_covs = _maybe_stack(updates[1], 1)
 
         self._dataset_metadata = None
 
@@ -616,12 +621,13 @@ class Predictions:
     def _getitem_helper(self, item: tuple) -> dict:
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
-            'state_means': self.state_means[item],
-            'state_covs': self.state_covs[item],
+            'states': (self.state_means[item], self.state_covs[item]),
             'measure_covs': self.measure_covs[item]
         }
-        # if self._update_means is not None:
-        #     kwargs.update({'update_means': self.update_means[item], 'update_covs': self.update_covs[item]})
+        if self.update_means is not None:
+            kwargs.update({
+                'updates': (self.update_means[item], self.update_covs[item])
+            })
 
         return kwargs
 

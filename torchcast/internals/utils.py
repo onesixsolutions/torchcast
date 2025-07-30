@@ -1,5 +1,5 @@
 import functools
-from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable
+from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Collection
 
 import torch
 
@@ -19,7 +19,7 @@ def get_meshgrids(groups: torch.Tensor,
 
 def mask_mats(groups: torch.Tensor,
               val_idx: Optional[torch.Tensor],
-              mats: Sequence[tuple[str, torch.Tensor, int]]) -> dict[str, torch.Tensor]:
+              mats: Sequence[tuple[str, torch.Tensor, Collection[int]]]) -> dict[str, torch.Tensor]:
     out = {}
     if val_idx is None:
         for nm, mat, _ in mats:
@@ -27,11 +27,13 @@ def mask_mats(groups: torch.Tensor,
     else:
         m1d, m2d = get_meshgrids(groups, val_idx)
         for nm, mat, dim in mats:
-            if dim == 0:
-                out[nm] = mat[groups]
-            elif dim == 1:
+            dim = set(dim)
+            if dim == {-2}:
+                mat = transpose_last_dims(mat)
+                out[nm] = transpose_last_dims(mat[m1d])
+            elif dim == {-1}:
                 out[nm] = mat[m1d]
-            elif dim == 2:
+            elif dim == {-2, -1}:
                 out[nm] = mat[m2d]
             else:
                 raise ValueError(f"Invalid dim ({dim}), must be 0, 1, or 2")

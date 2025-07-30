@@ -1,3 +1,5 @@
+from typing import Type
+
 import time
 import unittest
 import warnings
@@ -6,8 +8,10 @@ import numpy as np
 import torch
 from parameterized import parameterized
 
+from torchcast.exp_smooth import ExpSmoother
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.process import LocalLevel, LinearModel, LocalTrend, Season
+from torchcast.state_space import StateSpaceModel
 from torchcast.utils.data import TimeSeriesDataset
 
 MAX_TRIES = 3  # we set the seed but not tested across different platforms
@@ -82,6 +86,8 @@ class TestTraining(unittest.TestCase):
             sim = kf_generator.simulate(out_timesteps=num_times, num_groups=num_groups, X=X)
             y = torch.distributions.MultivariateNormal(*sim).sample()
         assert not y.requires_grad
+        # y[0, 1, :] = float('nan')  # introduce a missing value
+        # y[1, 2, 0] = float('nan')  # introduce another missing value
 
         # train:
         kf_learner = _make_kf()
@@ -114,7 +120,8 @@ class TestTraining(unittest.TestCase):
         oracle_loss = -kf_generator(y, X=X).log_prob(y).mean()
         self.assertAlmostEqual(oracle_loss.item(), loss.item(), places=1)
 
-    def test_training2(self, num_groups: int = 50, compile: bool = False):
+    @parameterized.expand([(ExpSmoother,), (KalmanFilter,)])
+    def test_training2(self, klass: Type[StateSpaceModel], num_groups: int = 50, compile: bool = False):
         """
         # manually generated data (sin-wave, trend, etc.) with virtually no noise: MSE should be near zero
         """
@@ -124,10 +131,12 @@ class TestTraining(unittest.TestCase):
         data = torch.stack([
             weekly.roll(-i).repeat(3) + torch.linspace(0, 10, 7 * 3) for i in range(num_groups)
         ]).unsqueeze(-1)
+        # data[0, 1, :] = float('nan')  # introduce a missing value
+        # data[1, 2, 0] = float('nan')  # introduce another missing value
         start_datetimes = np.array([np.datetime64('2019-04-14') + np.timedelta64(i, 'D') for i in range(num_groups)])
 
         def _train(num_epochs: int = 12):
-            kf = KalmanFilter(
+            kf = klass(
                 processes=[
                     LocalTrend(id='trend'),
                     Season(id='day_of_week', period='7D', dt_unit='D', K=3, fixed=True)

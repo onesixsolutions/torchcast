@@ -37,6 +37,39 @@ class ExpSmoother(StateSpaceModel):
         ms = self._get_measure_scaling()
         return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=ms.dtype, device=ms.device)
 
+    @property
+    def _update_mat_dims(self) -> dict:
+        return super()._update_mat_dims | {'K': (-2,)}
+
+    def _parse_kwargs(self,
+                      num_groups: int,
+                      num_timesteps: int,
+                      measure_covs: Sequence[torch.Tensor],
+                      **kwargs) -> tuple[dict[str, Sequence], dict[str, Sequence], set]:
+        predict_kwargs, update_kwargs, used_keys = super()._parse_kwargs(
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+            measure_covs=measure_covs,
+            **kwargs
+        )
+
+        # process-variance:
+        smat_kwargs = {}
+        if self.smoothing_matrix.expected_kwargs:
+            smat_kwargs = {k: kwargs[k] for k in self.smoothing_matrix.expected_kwargs}
+        used_keys |= set(smat_kwargs)
+        Ks = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=num_timesteps)
+        update_kwargs['K'] = Ks.unbind(1)
+
+        if self.smoothing_matrix.expected_kwargs or self.measure_covariance.expected_kwargs:
+            predict_kwargs['cov1step'] = Ks @ torch.stack(measure_covs, 1) @ Ks.transpose(-1, -2)
+        else:
+            K1 = update_kwargs['K'][0]
+            measure_cov = measure_covs[0]
+            cov1step = K1 @ measure_cov @ K1.transpose(-1, -2)
+            predict_kwargs['cov1step'] = [cov1step] * num_timesteps
+
+        return predict_kwargs, update_kwargs, used_keys
     def _update_step(self,
                      input: torch.Tensor,
                      mean: torch.Tensor,

@@ -30,11 +30,6 @@ class KalmanFilter(StateSpaceModel):
         if process_covariance is None:
             process_covariance = Covariance.from_processes(processes, cov_type='process')
 
-        if measure_covariance is None:
-            measure_covariance = Covariance.from_measures(measures)
-        else:
-            assert measure_covariance.rank == 1 or measure_covariance.rank == len(measures)
-
         super().__init__(
             processes=processes,
             measures=measures,
@@ -91,10 +86,12 @@ class KalmanFilter(StateSpaceModel):
     def _parse_kwargs(self,
                       num_groups: int,
                       num_timesteps: int,
+                      measure_covs: Sequence[torch.Tensor],
                       **kwargs) -> tuple[dict[str, Sequence], dict[str, Sequence], set]:
         predict_kwargs, update_kwargs, used_keys = super()._parse_kwargs(
             num_groups=num_groups,
             num_timesteps=num_timesteps,
+            measure_covs=measure_covs,
             **kwargs
         )
 
@@ -102,6 +99,7 @@ class KalmanFilter(StateSpaceModel):
         pcov_kwargs = {}
         if self.process_covariance.expected_kwargs:
             pcov_kwargs = {k: kwargs[k] for k in self.process_covariance.expected_kwargs}
+        used_keys |= set(pcov_kwargs)
         pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
         measure_scaling = torch.diag_embed(self._get_measure_scaling().unsqueeze(0).unsqueeze(0))
         Qs = measure_scaling @ pcov_raw @ measure_scaling
