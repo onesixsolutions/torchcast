@@ -69,4 +69,4 @@ class LocalTrend(Process):
 
     @property
     def intercept_state_element(self) -> Optional[str]:
-        return None if self._has_position_decay else 'level'
+        return None if self._has_position_decay else 'position'

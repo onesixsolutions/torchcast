@@ -298,7 +298,7 @@ class Predictions:
         measure_rank = obs.shape[-1]
         state_rank = self.state_means.shape[-1]
 
-        obs_flat = obs.view(-1, measure_rank)
+        obs_flat = obs.reshape(-1, measure_rank)
         if weights is None:
             weights = torch.ones(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
         else:
