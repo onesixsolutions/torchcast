@@ -619,6 +619,8 @@ class Predictions:
         return cls(**kwargs)
 
     def _getitem_helper(self, item: tuple) -> dict:
+        if not isinstance(item, tuple):
+            item = (item,)
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
             'states': (self.state_means[item], self.state_covs[item]),

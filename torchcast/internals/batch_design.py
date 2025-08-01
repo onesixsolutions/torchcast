@@ -30,6 +30,16 @@ class DesignModel:
                 raise RuntimeError("Multiple devices!")
         return device
 
+    @property
+    def dtype(self) -> torch.dtype:
+        dtype = None
+        for param in self.processes.parameters():
+            if dtype is None:
+                dtype = param.dtype
+            elif dtype != param.dtype:
+                raise RuntimeError("Multiple dtypes!")
+        return dtype
+
     def __call__(self,
                  mean: torch.Tensor,
                  time: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -100,7 +110,7 @@ class MeasurementModel(DesignModel):
 
     def _get_linear_measure_mat(self, time: int) -> torch.Tensor:
         assert time >= 0
-        return self._measure_mats[time]  # [..., measure_idx, :]
+        return self._measure_mats[time]
 
     def _get_nonlinear_processes_and_means(self, mean: torch.Tensor) -> Iterable[tuple['Process', torch.Tensor]]:
         """
@@ -121,7 +131,9 @@ class MeasurementModel(DesignModel):
             midx = self.measure2idx.get(process.measure, None)
             if midx is None:
                 continue  # see note in _initialize_measure_mats()
-            this_mm = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures)), device=mean.device)
+            this_mm = torch.zeros(
+                (self.num_groups, self.num_timesteps, len(self.measures)), device=mean.device, dtype=mean.dtype
+            )
             this_mm[..., midx] = process.get_measured_mean(
                 mean,
                 time=time,
@@ -141,7 +153,11 @@ class MeasurementModel(DesignModel):
             midx = self.measure2idx[process.measure]
             pidx = self.process2slice[process.id]
             jacobian = process.get_measurement_jacobian(mean, time, self._cache_per_process[process.id])
-            pH = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures), self.state_rank), device=mean.device)
+            pH = torch.zeros(
+                (self.num_groups, self.num_timesteps, len(self.measures), self.state_rank),
+                device=mean.device,
+                dtype=mean.dtype
+            )
             pH[..., midx, pidx] = jacobian
             adjustment = adjustment + pH
         return adjustment
@@ -159,10 +175,13 @@ class MeasurementModel(DesignModel):
     def _get_kwargs_per_process(self, **kwargs) -> tuple[dict[str, dict], set]:
         used = set()
         kwargs_per_process = {}
-        for pid, process in self.processes.items():
-            # TODO: support {pid}__{kwargs} syntax
-            kwargs_per_process[pid] = {k.name: kwargs[k.name] for k in process.measurement_kwargs}
-            used.update(set(kwargs_per_process[pid]))
+        for pid, proc in self.processes.items():
+            keys = {
+                k.name: (f'{pid}__{k.name}' if f'{pid}__{k.name}' in kwargs else k.name)
+                for k in proc.measurement_kwargs
+            }
+            kwargs_per_process[pid] = {k1: kwargs[k2] for k1, k2 in keys.items()}
+            used.update(set(keys.values()))
         return kwargs_per_process, used
 
     @cached_property
@@ -176,7 +195,11 @@ class MeasurementModel(DesignModel):
 
     @cached_property
     def _measure_mats(self) -> Sequence[torch.Tensor]:
-        H = torch.zeros((self.num_groups, self.num_timesteps, len(self.measures), self.state_rank), device=self.device)
+        H = torch.zeros(
+            (self.num_groups, self.num_timesteps, len(self.measures), self.state_rank),
+            device=self.device,
+            dtype=self.dtype
+        )
         for pid, process in self.processes.items():
             midx = self.measure2idx.get(process.measure, None)
             if not process.linear_measurement or midx is None:
@@ -258,7 +281,11 @@ class TransitionModel(DesignModel):
         )
         self.measures = measures
 
-        zeros = torch.zeros((self.num_groups, self.num_timesteps, self.state_rank, self.state_rank), device=self.device)
+        zeros = torch.zeros(
+            (self.num_groups, self.num_timesteps, self.state_rank, self.state_rank),
+            device=self.device,
+            dtype=self.dtype
+        )
         F = []
         for pid, process in self.processes.items():
             if process.linear_transition:
@@ -270,7 +297,11 @@ class TransitionModel(DesignModel):
                 F.append(thisF)
             else:
                 raise NotImplementedError
-        self.transition_mats = torch.stack(F, dim=0).sum(0).unbind(1)
+        self._transition_mats = torch.stack(F, dim=0).sum(0)
+
+    @cached_property
+    def transition_mats(self) -> Sequence[torch.Tensor]:
+        return self._transition_mats.to(device=self.device, dtype=self.dtype).unbind(1)
 
     def __call__(self,
                  mean: torch.Tensor,
@@ -281,4 +312,4 @@ class TransitionModel(DesignModel):
             mask = slice(None)
         F = self.transition_mats[time]
         new_mean = update_tensor(mean, new=(F[mask] @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
-        return new_mean.squeeze(-1), F
+        return new_mean, F
