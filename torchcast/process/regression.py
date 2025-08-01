@@ -48,12 +48,12 @@ class LinearModel(Process):
         )
         self.model_mat_kwarg_name = model_mat_kwarg_name
 
-        decay = standardize_decay(decay, lower=.98)
-        _has_decay = not isinstance(decay, float) or decay < 1.0
-        if _has_decay and fixed:
-            warn("decay=True, fixed=True not recommended.")
         for se in self.state_elements.values():
-            se.set_transition_to(se, multi=decay)
+            se_decay = standardize_decay(decay, lower=.98)
+            _has_decay = not isinstance(se_decay, float) or se_decay < 1.0
+            if _has_decay and se.name in fixed:
+                warn(f"[{self.id}.{se.name}]: decay=True, fixed=True not recommended.")
+            se.set_transition_to(se, multi=se_decay)
 
     @property
     def measurement_kwargs(self) -> Sequence[ProcessKwarg]:
