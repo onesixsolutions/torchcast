@@ -29,7 +29,7 @@ class StateSpaceModel(torch.nn.Module):
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Optional[Sequence[str]],
-                 measure_covariance: Optional[Covariance] = None,
+                 measure_covariance: Optional[Covariance] = None):
         super().__init__()
 
         # measures:
@@ -41,7 +41,6 @@ class StateSpaceModel(torch.nn.Module):
         else:
             assert measure_covariance.rank == 1 or measure_covariance.rank == len(measures)
         self.measure_covariance = measure_covariance.set_id('measure_covariance')
-        self.adaptive_measure_var = adaptive_measure_var
 
         # processes:
         self.dt_unit = None
@@ -590,6 +589,9 @@ class StateSpaceModel(torch.nn.Module):
                 raise ValueError(
                     f"Expected ``init_cov`` to be 3-D with (num_groups, state_dim, state_dim), got {init_cov.shape}"
                 )
+
+        measure_scaling = torch.diag_embed(self._get_measure_scaling().unsqueeze(0))
+        init_cov = measure_scaling @ init_cov @ measure_scaling
 
         return init_mean, init_cov
 
