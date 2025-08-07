@@ -3,6 +3,7 @@ from functools import cached_property
 from math import log
 
 from dataclasses import dataclass, fields
+from tqdm.auto import tqdm
 from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Iterator
 from warnings import warn
 
@@ -46,6 +47,10 @@ class Predictions:
             self.update_covs = _maybe_stack(updates[1], 1)
 
         self._dataset_metadata = None
+        self._state_means_flat = None
+        self._state_covs_flat = None
+        self._mcovs_flat = None
+        self._measurement_model_flat = None
 
     @property
     def num_groups(self) -> int:
@@ -116,7 +121,14 @@ class Predictions:
         group_colname = group_colname or self.dataset_metadata.group_colname
         time_colname = time_colname or self.dataset_metadata.time_colname
 
+        if conf is not None:
+            assert conf >= .50
+
         if type.startswith('pred'):
+            if mc_draws is None:
+                mc_draws = 500 if self.measurement_model.is_nonlinear else 0
+            if not mc_draws and self.measurement_model.is_nonlinear:
+                raise RuntimeError("Since there are nonlinearities in the measurement-model, must use `mc_draws`")
             df = self._to_dataframe(
                 dataset=dataset,
                 group_colname=group_colname,
@@ -127,105 +139,120 @@ class Predictions:
             return df
         else:
             assert type.startswith('comp'), "Expected `type` to be 'predictions' or 'components'."
-            return self._to_components_dataframe()
+            if mc_draws is None:
+                mc_draws = round(20 / (1 - conf))
+                if mc_draws > 5000:
+                    warn("`mc_draws` is very high due to high `conf`; this may take a long time to compute...")
+            return self._to_components_dataframe(
+                dataset=dataset,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                conf=conf,
+                mc_draws=mc_draws
+            )
 
-    @classmethod
-    def _flatten(cls,
-                 state: tuple[torch.Tensor, torch.Tensor],
-                 measure_cov: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-
-        nmeasures = measure_cov.shape[-1]
-        state_rank = state[0].shape[-1]
-        state_means_flat = state[0].view(-1, state_rank)
-        state_covs_flat = state[1].view(-1, state_rank, state_rank)
-        measure_covs_flat = measure_cov.view(-1, nmeasures, nmeasures)
-        return (state_means_flat, state_covs_flat), measure_covs_flat
-
-    def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    @torch.inference_mode()
+    def _to_components_dataframe(self,
+                                 dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                                 group_colname: str,
+                                 time_colname: str,
+                                 conf: float,
+                                 mc_draws: int) -> pd.DataFrame:
+        alpha = (1 - conf) / 2
         batch_shape = self.state_means.shape[0:2]
 
-        (smeans_flat, scovs_flat), mcovs_flat = self._flatten(
-            state=(self.state_means, self.state_covs),
-            measure_cov=self.measure_covs
+        # sample from the state distribution:
+        mvnorm = torch.distributions.MultivariateNormal(
+            loc=self.state_means_flat,
+            covariance_matrix=self.state_covs_flat,
+            validate_args=False
         )
-        measurement_model_flat = self.measurement_model.flattened()
-        measured_mean, measure_mat = measurement_model_flat(mean=smeans_flat, time=0)
-        if self.measurement_model.is_nonlinear:
-            # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
-            mmean_samples = self._get_measured_mean_samples(
-                measurement_model=measurement_model_flat,
-                state_means=smeans_flat,
-                state_covs=scovs_flat,
-                white_noise=self.white_noise
+        assert mc_draws
+        state_mean_samples = mvnorm.sample((mc_draws,))
+
+        # pass each sample to the `get_components` function, organize by process:
+        by_proc = {}
+        for smean_samp in tqdm(state_mean_samples):
+            for process_name, se_name, comp_mean in self.measurement_model_flat.get_components(smean_samp, time=0):
+                key = (process_name, se_name)
+                if key not in by_proc:
+                    by_proc[key] = []
+                by_proc[key].append(comp_mean)
+
+        from torchcast.utils import TimeSeriesDataset
+
+        # for each process, get mean/quantiles:
+        times = TimeSeriesDataset.get_dataset_times(
+            dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
+        )
+        out = []
+        for (process_name, se_name), comp_means in by_proc.items():
+            comp_means = torch.stack(comp_means, dim=0).view(mc_draws, *batch_shape)
+            mean = torch.mean(comp_means, dim=0)
+            lower = torch.quantile(comp_means, q=alpha, dim=0)
+            upper = torch.quantile(comp_means, q=1 - alpha, dim=0)
+            _df = TimeSeriesDataset.tensor_to_dataframe(
+                tensor=torch.stack([mean, lower, upper], -1),
+                times=times,
+                group_names=dataset.group_names,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                measures=['mean', 'lower', 'upper']
             )
-            mvnorm = torch.distributions.MultivariateNormal(
-                loc=mmean_samples,
-                covariance_matrix=mcovs_flat.unsqueeze(0),
-                validate_args=False
-            )
-            samples = mvnorm.sample().squeeze(0)
-            measured_mean = torch.mean(samples, dim=0)
-            return measured_mean, None
-        else:
-            system_cov = measure_mat @ scovs_flat @ measure_mat.permute(0, 2, 1) + mcovs_flat
-            return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
+            _df['process'] = process_name
+            _df['state_element'] = se_name
+            _df['measure'] = self.measurement_model.processes[process_name].measure
+            out.append(_df)
 
-    @cached_property
-    def means(self) -> torch.Tensor:
-        """
-        Returns the observed means of the predictions, i.e. the measured means of the state.
-        """
-        if self._means is None:
-            self._means, self._covs = self._observe()
-        return self._means
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in self.measurement_model.measures:
+                        continue
+                    actuals = tens[..., mgroup.index(m)]
+                    preds = self.means[self.measurement_model.measures.index(m)]
+                    _df = TimeSeriesDataset.tensor_to_dataframe(
+                        tensor=preds - actuals,
+                        times=times,
+                        group_names=dataset.group_names,
+                        group_colname=group_colname,
+                        time_colname=time_colname,
+                        measures=['mean'],
+                    )
+                    _df['measure'] = m
+                    _df['process'] = 'residuals'
+                    _df['state_element'] = 'residuals'
+                    out.append(_df)
 
-    @cached_property
-    def covs(self) -> Optional[torch.Tensor]:
-        if self._means is None:
-            self._means, self._covs = self._observe()
-        if self._covs is None:
-            if _warn_once.get('cov', False):
-                warn("The measurement model is nonlinear, so no closed-form covariance is available, returning None.")
-                _warn_once['cov'] = True
-        return self._covs
+        out = pd.concat(out)
+        return out
 
+    @torch.inference_mode()
     def _to_dataframe(self,
                       dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
                       group_colname: str,
                       time_colname: str,
                       conf: float,
-                      mc_draws: Optional[int]) -> pd.DataFrame:
+                      mc_draws: int) -> pd.DataFrame:
         batch_shape = self.state_means.shape[0:2]
-        if mc_draws is None:
-            mc_draws = 500 if self.measurement_model.is_nonlinear else 0
-        if not mc_draws and self.measurement_model.is_nonlinear:
-            raise RuntimeError("Since there are nonlinearities in the measurement-model, must use `monte_carlo`")
-
-        (smeans_flat, scovs_flat), mcovs_flat = self._flatten(
-            state=(self.state_means, self.state_covs),
-            measure_cov=self.measure_covs
-        )
-        measurement_model_flat = self.measurement_model.flattened()
-        if conf is not None:
-            assert conf >= .50
 
         if mc_draws:
             mmean_samples = self._get_measured_mean_samples(
-                measurement_model=measurement_model_flat,
-                state_means=smeans_flat,
-                state_covs=scovs_flat,
+                measurement_model=self.measurement_model_flat,
+                state_means=self.state_means_flat,
+                state_covs=self.state_covs_flat,
                 white_noise=mc_draws
             )
             mvnorm = torch.distributions.MultivariateNormal(
                 loc=mmean_samples,
-                covariance_matrix=mcovs_flat.unsqueeze(0),
+                covariance_matrix=self.measure_covs_flat.unsqueeze(0),
                 validate_args=False
             )
             samples = mvnorm.sample().squeeze(0)
 
             alpha = (1 - conf) / 2
             by_measure = {}
-            for i, measure in enumerate(measurement_model_flat.measures):
+            for i, measure in enumerate(self.measurement_model.measures):
                 mean = torch.mean(samples[..., i], dim=0)
                 lower = torch.quantile(samples[..., i], q=alpha, dim=0)
                 upper = torch.quantile(samples[..., i], q=1 - alpha, dim=0)
@@ -236,11 +263,11 @@ class Predictions:
                 )
         else:
             multi = -stats.norm.ppf((1 - conf) / 2) if conf else .5
-            measured_mean, measure_mat = measurement_model_flat(mean=smeans_flat, time=0)
-            system_cov = measure_mat @ scovs_flat @ measure_mat.permute(0, 2, 1) + mcovs_flat
+            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+            system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
 
             by_measure = {}
-            for i, measure in enumerate(measurement_model_flat.measures):
+            for i, measure in enumerate(self.measurement_model.measures):
                 mean = measured_mean[..., i]
                 var = system_cov[..., i, i]
                 lower = mean - multi * torch.sqrt(var)
@@ -285,6 +312,94 @@ class Predictions:
         if conf is None:
             out['std'] = out.pop('upper') - out.pop('lower')
         return out
+
+    def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_shape = self.state_means.shape[0:2]
+
+        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+        if self.measurement_model.is_nonlinear:
+            # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=self.measurement_model_flat,
+                state_means=self.state_means_flat,
+                state_covs=self.state_covs_flat,
+                white_noise=self.white_noise
+            )
+            mvnorm = torch.distributions.MultivariateNormal(
+                loc=mmean_samples,
+                covariance_matrix=self.measure_covs_flat.unsqueeze(0),
+                validate_args=False
+            )
+            samples = mvnorm.sample().squeeze(0)
+            measured_mean = torch.mean(samples, dim=0)
+            return measured_mean, None
+        else:
+            system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+            return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
+
+    @cached_property
+    def means(self) -> torch.Tensor:
+        """
+        Returns the observed means of the predictions, i.e. the measured means of the state.
+        """
+        if self._means is None:
+            self._means, self._covs = self._observe()
+        return self._means
+
+    @cached_property
+    def covs(self) -> Optional[torch.Tensor]:
+        if self._means is None:
+            self._means, self._covs = self._observe()
+        if self._covs is None:
+            if _warn_once.get('cov', False):
+                warn("The measurement model is nonlinear, so no closed-form covariance is available, returning None.")
+                _warn_once['cov'] = True
+        return self._covs
+
+    @classmethod
+    def _flatten(cls,
+                 state: tuple[torch.Tensor, torch.Tensor],
+                 measure_cov: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+
+        nmeasures = measure_cov.shape[-1]
+        state_rank = state[0].shape[-1]
+        state_means_flat = state[0].view(-1, state_rank)
+        state_covs_flat = state[1].view(-1, state_rank, state_rank)
+        measure_covs_flat = measure_cov.view(-1, nmeasures, nmeasures)
+        return (state_means_flat, state_covs_flat), measure_covs_flat
+
+    @cached_property
+    def state_means_flat(self):
+        if self._state_means_flat is None:
+            (self._state_means_flat, self._state_covs_flat), self._mcovs_flat = self._flatten(
+                state=(self.state_means, self.state_covs),
+                measure_cov=self.measure_covs
+            )
+        return self._state_means_flat
+
+    @cached_property
+    def state_covs_flat(self):
+        if self._state_covs_flat is None:
+            (self._state_means_flat, self._state_covs_flat), self._mcovs_flat = self._flatten(
+                state=(self.state_means, self.state_covs),
+                measure_cov=self.measure_covs
+            )
+        return self._state_covs_flat
+
+    @cached_property
+    def measure_covs_flat(self) -> torch.Tensor:
+        if self._mcovs_flat is None:
+            (self._state_means_flat, self._state_covs_flat), self._mcovs_flat = self._flatten(
+                state=(self.state_means, self.state_covs),
+                measure_cov=self.measure_covs
+            )
+        return self._mcovs_flat
+
+    @cached_property
+    def measurement_model_flat(self) -> 'MeasurementModel':
+        if self._measurement_model_flat is None:
+            self._measurement_model_flat = self.measurement_model.flattened()
+        return self._measurement_model_flat
 
     def log_prob(self, obs: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -550,7 +665,7 @@ class Predictions:
 
         df = df.copy()
         if 'upper' not in df.columns and 'std' in df.columns:
-            df['lower'], df['upper'] = conf2bounds(df['mean'], df.pop('std'), conf=.95)
+            raise RuntimeError("Please convert your 'std' column into lower/upper columns.")
         if df[group_colname].nunique() > max_num_groups:
             subset_groups = df[group_colname].drop_duplicates().sample(max_num_groups).tolist()
             if len(subset_groups) < df[group_colname].nunique():

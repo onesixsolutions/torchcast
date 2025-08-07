@@ -108,6 +108,45 @@ class MeasurementModel(DesignModel):
 
         return measured_mean, measure_mat
 
+    @torch.no_grad()
+    def get_components(self,
+                       mean: torch.Tensor,
+                       time: int,
+                       measured: bool = True) -> Iterable[tuple[str, str, torch.Tensor]]:
+        """
+        :param mean: The mean state vector at the given time step.
+        :param time: The time step for which to get the components.
+        :param measured: If False, returns the underlying state-means; if True, first applies the measurement-matrix
+         elementwise to the state-means, so as to show the contribution of each to the measured mean. For processes
+         that do not have a linear measurement model, this isn't possible so the process is combined into a single
+         state-element in the output (called '__combined__').
+        """
+
+        mmean_adjustments = {}
+        if measured:
+            mmean_adjustments.update(
+                self._get_measured_mean_adjustments(self._get_nonlinear_processes_and_means(mean), time)
+            )
+
+        measure_mat = self._get_linear_measure_mat(time)
+        for pid, process in self.processes.items():
+            midx = self.measure2idx.get(process.measure, None)
+            if midx is None:
+                continue  # see note in _measure_mats
+            pidx = self.process2slice[pid]
+
+            state_elements = list(process.state_elements.values())
+            proc_mean = mean[..., pidx]
+            if measured:
+                if process.linear_measurement:
+                    proc_mean = proc_mean * measure_mat[..., midx, pidx]
+                else:
+                    state_elements = ['__combined__']
+                    proc_mean = mmean_adjustments[pid].sum(-1)
+
+            for se, se_mean in zip(state_elements, proc_mean.T):
+                yield pid, se.name, se_mean
+
     def _get_linear_measure_mat(self, time: int) -> torch.Tensor:
         assert time >= 0
         return self._measure_mats[time]
@@ -117,33 +156,35 @@ class MeasurementModel(DesignModel):
         Returns an iterable of tuples (process, mean) for each process in this model.
         """
         for process in self.nonlinear_processes:
-            midx = self.measure2idx.get(process.measure, None)
-            if midx is None:
-                continue  # see note in _initialize_measure_mats()
             pidx = self.process2slice[process.id]
-            yield process, mean[..., pidx, midx]
+            yield process, mean[..., pidx]
 
     def get_measured_mean_adjustment(self,
                                      nl_processes_and_means: Iterable[tuple['Process', torch.Tensor]],
-                                     time: int) -> torch.Tensor:
-        adjustment = 0
+                                     time: int) -> Union[torch.Tensor, float]:
+        adjustments = []
+        for pid, this_mm in self._get_measured_mean_adjustments(nl_processes_and_means, time):
+            adjustments.append(this_mm)
+        # TODO: measure-wide adjustments (e.g. sigmoid transform that is post H-dot-state) go here
+        if adjustments:
+            return torch.stack(adjustments, dim=0).sum(0)
+        else:
+            return 0.0
+
+    def _get_measured_mean_adjustments(self,
+                                       nl_processes_and_means: Iterable[tuple['Process', torch.Tensor]],
+                                       time: int) -> Iterable[tuple[str, torch.Tensor]]:
         for process, mean in nl_processes_and_means:
             midx = self.measure2idx.get(process.measure, None)
             if midx is None:
-                continue  # see note in _initialize_measure_mats()
-            this_mm = torch.zeros(
-                (self.num_groups, self.num_timesteps, len(self.measures)), device=mean.device, dtype=mean.dtype
-            )
+                continue  # see note in _measure_mats
+            this_mm = torch.zeros((self.num_groups, len(self.measures)), device=mean.device, dtype=mean.dtype)
             this_mm[..., midx] = process.get_measured_mean(
                 mean,
                 time=time,
                 cache=self._cache_per_process[process.id]
             )
-            adjustment = adjustment + this_mm
-
-        # TODO: measure-wide adjustments (e.g. sigmoid transform that is post H-dot-state) go here
-
-        return adjustment
+            yield process.id, this_mm
 
     def _get_measure_mat_adjustment(self,
                                     processes_and_means: Iterable[tuple['Process', torch.Tensor]],
@@ -151,10 +192,12 @@ class MeasurementModel(DesignModel):
         adjustment = 0
         for process, mean in processes_and_means:
             midx = self.measure2idx[process.measure]
+            if midx is None:
+                continue  # see note in _measure_mats
             pidx = self.process2slice[process.id]
             jacobian = process.get_measurement_jacobian(mean, time, self._cache_per_process[process.id])
             pH = torch.zeros(
-                (self.num_groups, self.num_timesteps, len(self.measures), self.state_rank),
+                (self.num_groups, len(self.measures), self.state_rank),
                 device=mean.device,
                 dtype=mean.dtype
             )

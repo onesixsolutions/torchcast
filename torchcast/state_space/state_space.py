@@ -551,7 +551,7 @@ class StateSpaceModel(torch.nn.Module):
             if verbose:
                 print(
                     f"For measure {measure}, setting initial value by setting "
-                    f"'{process.id}.{process.intercept_state_element}' to to {value:.4f}"
+                    f"'{process.id}.{process.intercept_state_element}' to {value:.4f}"
                 )
             process.update_intercept(value)
 

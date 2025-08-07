@@ -154,4 +154,4 @@ class Process(torch.nn.Module):
         return out
 
     def __repr__(self) -> str:
-        return f'{type(self).__name__}(id={self.id}, measure={self._measure})'
+        return f'{type(self).__name__}(id={repr(self.id)}, measure={repr(self._measure)})'
