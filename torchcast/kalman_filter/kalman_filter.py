@@ -18,11 +18,13 @@ import torch
 
 class KalmanFilter(StateSpaceModel):
     def __init__(self,
-                 processes: Sequence[Process],
-                 measures: Optional[Sequence[str]] = None,
-                 process_covariance: Optional[Covariance] = None,
+                 processes: Sequence['Process'],
+                 measures: Sequence[str],
                  measure_covariance: Optional[Covariance] = None,
-                 initial_covariance: Optional[Covariance] = None):
+                 process_covariance: Optional[Covariance] = None,
+                 initial_covariance: Optional[Covariance] = None,
+                 measure_funs: Optional[dict[str, str]] = None,
+                 adaptive_measure_var: bool = False):
 
         if initial_covariance is None:
             initial_covariance = Covariance.from_processes(processes, cov_type='initial')
@@ -34,6 +36,8 @@ class KalmanFilter(StateSpaceModel):
             processes=processes,
             measures=measures,
             measure_covariance=measure_covariance,
+            measure_funs=measure_funs,
+            adaptive_measure_var=adaptive_measure_var,
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')

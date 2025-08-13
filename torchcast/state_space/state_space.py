@@ -6,9 +6,9 @@ import torch
 
 from tqdm.auto import tqdm
 
-from torchcast.internals.batch_design import TransitionModel, MeasurementModel
+from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian
-from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, mask_mats
+from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, mask_mats, get_meshgrids
 from torchcast.covariance import Covariance
 from torchcast.state_space.predictions import Predictions
 from torchcast.process.regression import Process
@@ -28,8 +28,10 @@ class StateSpaceModel(torch.nn.Module):
 
     def __init__(self,
                  processes: Sequence['Process'],
-                 measures: Optional[Sequence[str]],
-                 measure_covariance: Optional[Covariance] = None):
+                 measures: Sequence[str],
+                 measure_covariance: Optional[Covariance] = None,
+                 measure_funs: Optional[dict[str, str]] = None,
+                 adaptive_measure_var: bool = False):
         super().__init__()
 
         # measures:
@@ -41,6 +43,12 @@ class StateSpaceModel(torch.nn.Module):
         else:
             assert measure_covariance.rank == 1 or measure_covariance.rank == len(measures)
         self.measure_covariance = measure_covariance.set_id('measure_covariance')
+
+        self.measure_funs = {}
+        for m, alias in (measure_funs or {}).items():
+            self.measure_funs[m] = MeasureFun.from_alias(alias)
+
+        self.adaptive_measure_var = adaptive_measure_var
 
         # processes:
         self.dt_unit = None
@@ -65,6 +73,10 @@ class StateSpaceModel(torch.nn.Module):
                     )
                 else:
                     self.dt_unit = process.dt_unit
+
+    # @property
+    # def is_nonlinear(self) -> bool:
+    #     return any(not p.linear_measurement for p in self.processes.values()) or self.measure_funs
 
     @torch.jit.ignore()
     def forward(self,
@@ -116,8 +128,7 @@ class StateSpaceModel(torch.nn.Module):
          inference/forecasting. This will automatically be set when calling ``fit()``, but if you're instread using a
          custom training loop, you can pass this manually.
         :param simulate: If specified, will generate `simulate` samples from the model.
-        :param prediction_kwargs: A dictionary of kwargs to pass to initialize ``Predictions()``. Unused for base
-         class, but can be used by subclasses (e.g. ``BinomialFilter``).
+        :param prediction_kwargs: A dictionary of kwargs to pass to initialize ``Predictions()``.
         :param kwargs: Further arguments passed to the `processes`. For example, the :class:`.LinearModel` expects an
          ``X`` argument for predictors.
         :return: A :class:`.Predictions` object with :func:`Predictions.log_prob()` and
@@ -194,6 +205,7 @@ class StateSpaceModel(torch.nn.Module):
             measures=self.measures,
             num_groups=num_groups,
             num_timesteps=out_timesteps,
+            measure_funs=self.measure_funs,
             **kwargs
         )
         used_keys = used_keys.union(measurement_model.used_keys)
@@ -232,6 +244,8 @@ class StateSpaceModel(torch.nn.Module):
                     measure_cov=measure_covs[t],
                     **{k: v[t] for k, v in update_kwargs.items()}
                 )
+                if self.adaptive_measure_var and t < len(measure_covs) - 1:
+                    measure_covs[t + 1] = self._update_measure_cov(measure_covs[t + 1], measured_mean, inputs[t])
             else:
                 meanu, covu = mean1step, cov1step
 
@@ -277,6 +291,17 @@ class StateSpaceModel(torch.nn.Module):
             updates = None
 
         prediction_kwargs = prediction_kwargs or {}
+        if 'mc_white_noise' not in prediction_kwargs and self.is_nonlinear:
+            mc_samples = kwargs.pop('mc_samples', None)
+            if mc_samples is None:
+                warn("`mc_samples` not set, using 250 samples", UserWarning)
+                mc_samples = 250
+            emmat_rank = MeasurementModel.get_extended_mmat_rank(self.processes.values(), self.measures)
+            prediction_kwargs['mc_white_noise'] = torch.randn(
+                (mc_samples, emmat_rank),
+                device=meanu.device,
+                dtype=meanu.dtype
+            )
         preds = self._generate_predictions(preds, updates, measure_covs, measurement_model, **prediction_kwargs)
         return preds.set_metadata(
             start_offsets=start_offsets if start_offsets is not None else np.zeros(num_groups, dtype='int'),
@@ -330,7 +355,7 @@ class StateSpaceModel(torch.nn.Module):
             )
 
         if set_initial_values:
-            self._set_initial_values(y, verbose=verbose > 1)
+            self._set_initial_values(y, verbose=verbose > 1, **kwargs)
 
         if not get_loss:
             get_loss = lambda _pred, _y: -_pred.log_prob(_y).mean()
@@ -384,7 +409,27 @@ class StateSpaceModel(torch.nn.Module):
 
         return self
 
+    @property
+    def is_nonlinear(self) -> bool:
+        return any(not p.linear_measurement for p in self.processes.values()) or self.measure_funs
+
     def _prepare_fit_kwargs(self, y: torch.Tensor, **kwargs) -> dict:
+        mc_samples = kwargs.pop('mc_samples', None)
+
+        if self.is_nonlinear and not mc_samples:
+            raise ValueError("Nonlinear state-space models require `mc_samples` to be set.")
+
+        if mc_samples:
+            prediction_kwargs = kwargs.pop('prediction_kwargs', None) or {}
+            if 'mc_white_noise' not in prediction_kwargs:
+                emmat_rank = MeasurementModel.get_extended_mmat_rank(self.processes.values(), self.measures)
+                prediction_kwargs['mc_white_noise'] = torch.randn(
+                    (mc_samples, emmat_rank),
+                    device=y.device,
+                    dtype=y.dtype
+                )
+            kwargs['prediction_kwargs'] = prediction_kwargs
+
         # see `last_measured_per_group` in forward docstring
         # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
         any_measured_bool = ~torch.isnan(y).all(2).cpu()
@@ -393,6 +438,7 @@ class StateSpaceModel(torch.nn.Module):
             dtype=torch.int,
             device=y.device
         ) + 1
+
         return kwargs
 
     def _generate_predictions(self,
@@ -400,6 +446,7 @@ class StateSpaceModel(torch.nn.Module):
                               updates: Optional[tuple[list[torch.Tensor], list[torch.Tensor]]],
                               measure_covs: torch.Tensor,
                               measurement_model: 'MeasurementModel',
+                              mc_white_noise: Optional[torch.Tensor] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
@@ -409,7 +456,7 @@ class StateSpaceModel(torch.nn.Module):
             states=preds,
             measure_covs=measure_covs,
             updates=updates,
-            **kwargs
+            mc_white_noise=mc_white_noise,
         )
 
     def _parse_kwargs(self,
@@ -468,13 +515,6 @@ class StateSpaceModel(torch.nn.Module):
                      **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
-    @property
-    def _update_mat_dims(self) -> dict:
-        """
-        subclasses can specify dimensionality of optional update matrices
-        """
-        return {}
-
     def _update_step_with_nans(self,
                                input: torch.Tensor,
                                mean: torch.Tensor,
@@ -487,19 +527,24 @@ class StateSpaceModel(torch.nn.Module):
         if isnan.all():
             return mean, cov
         if isnan.any():
-            mats = [
-                ('input', input, (-1,)),
-                ('measured_mean', measured_mean, (-1,)),
-                ('measure_mat', measure_mat, (-1,)),
-                ('measure_cov', measure_cov, (-2, -1))
-            ]
-            for k, dim in self._update_mat_dims.items():
-                mats.append((k, kwargs[k], dim))
             new_mean = mean.clone()
             new_cov = cov.clone()
             for groups, val_idx in get_nan_groups(isnan):
-                masked = mask_mats(groups, val_idx, mats=mats)
-                new_mean[groups], new_cov[groups] = self._update_step(mean=mean[groups], cov=cov[groups], **masked)
+                masked = self._mask_mats(
+                    groups,
+                    val_idx,
+                    input=input,
+                    measured_mean=measured_mean,
+                    measure_mat=measure_mat,
+                    measure_cov=measure_cov,
+                    **kwargs
+                )
+                new_mean[groups], new_cov[groups] = self._update_step(
+                    mean=mean[groups],
+                    cov=cov[groups],
+                    **masked,
+                    **{k: v for k, v in kwargs.items() if k not in masked}
+                )
             return new_mean, new_cov
         else:
             return self._update_step(
@@ -512,6 +557,23 @@ class StateSpaceModel(torch.nn.Module):
                 **kwargs
             )
 
+    def _mask_mats(self,
+                   groups: torch.Tensor,
+                   val_idx: Optional[torch.Tensor],
+                   **kwargs) -> dict[str, torch.Tensor]:
+        out = {}
+        if val_idx is None:
+            for nm, mat in kwargs.items():
+                out[nm] = mat[groups]
+        else:
+            m1d, m2d = get_meshgrids(groups, val_idx)
+            for nm, mat in kwargs.items():
+                if nm in ('input', 'measured_mean', 'measure_mat'):
+                    out[nm] = mat[m1d]
+                elif nm == 'measure_cov':
+                    out[nm] = mat[m2d]
+        return out
+
     def _update_step(self,
                      input: torch.Tensor,
                      mean: torch.Tensor,
@@ -522,11 +584,17 @@ class StateSpaceModel(torch.nn.Module):
                      **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    def _update_measure_cov(self,
+                            measure_cov: torch.Tensor,
+                            measured_mean: torch.Tensor,
+                            input: torch.Tensor):
+        raise NotImplementedError
+
     @staticmethod
     def _mean_update(mean: torch.Tensor, K: torch.Tensor, resid: torch.Tensor) -> torch.Tensor:
         return mean + (K @ resid.unsqueeze(-1)).squeeze(-1)
 
-    def _set_initial_values(self, y: torch.Tensor, verbose: bool = True):
+    def _set_initial_values(self, y: torch.Tensor, verbose: bool = True, **kwargs):
         intercept_proceses = {}
         for process in self.processes.values():
             if process.intercept_state_element:
@@ -547,7 +615,7 @@ class StateSpaceModel(torch.nn.Module):
                 return
 
         for measure, process in intercept_proceses.items():
-            value = self._get_good_initial_value_from_y(y, measure)
+            value = self._get_good_initial_value_from_y(y, measure, **kwargs)
             if verbose:
                 print(
                     f"For measure {measure}, setting initial value by setting "
@@ -556,10 +624,17 @@ class StateSpaceModel(torch.nn.Module):
             process.update_intercept(value)
 
     @torch.no_grad()
-    def _get_good_initial_value_from_y(self, y: torch.Tensor, measure: str) -> torch.Tensor:
-        # TODO: measure funs
+    def _get_good_initial_value_from_y(self,
+                                       y: torch.Tensor,
+                                       measure: str,
+                                       **kwargs) -> torch.Tensor:
+
         midx = self.measures.index(measure)
-        return torch.nanmean(y[..., midx])
+        mean = torch.nanmean(y[..., midx])
+        measure_fun = self.measure_funs.get(measure, None)
+        if measure_fun:
+            return measure_fun.inverse_transform(mean)
+        return mean
 
     def _prepare_initial_state(self,
                                initial_state: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor, None],
@@ -607,6 +682,8 @@ class StateSpaceModel(torch.nn.Module):
             measure_var[self.measures.index(process.measure)].expand(process.rank).sqrt()
             for process in self.processes.values()
         ]
+        for idx in self.measure_covariance.empty_idx:
+            multi[idx] = torch.ones_like(multi[idx])  # empty measures have no variance, so set to 1
         multi = torch.cat(multi)
         if (multi <= 0).any():
             raise RuntimeError(f"measure-cov diagonal is not positive:{measure_var}")

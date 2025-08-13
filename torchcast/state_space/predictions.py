@@ -1,10 +1,7 @@
-from functools import cached_property
-
 from math import log
 
 from dataclasses import dataclass, fields
-from tqdm.auto import tqdm
-from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Iterator
+from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING
 from warnings import warn
 
 import torch
@@ -34,27 +31,45 @@ class Predictions:
                  states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
                  updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-                 white_noise: Optional[torch.Tensor] = None):
-        self.measurement_model = measurement_model
+                 mc_white_noise: Optional[torch.Tensor] = None):
         self.state_means = _maybe_stack(states[0], 1)
         self.state_covs = _maybe_stack(states[1], 1)
         self.measure_covs = _maybe_stack(measure_covs, 1)
-        self.white_noise = white_noise
+
+        self.measurement_model = measurement_model
+        self.measurement_model_flat = self.measurement_model.flattened()
 
         self.update_means = self.update_covs = None
         if updates is not None:
             self.update_means = _maybe_stack(updates[0], 1)
             self.update_covs = _maybe_stack(updates[1], 1)
 
+        _expected_mc_lastdim = self.measurement_model_flat.extended_measure_mat.shape[-2]
+        if mc_white_noise is None:
+            if self.measurement_model.is_nonlinear:
+                raise ValueError(
+                    "Since the measurement model is nonlinear, the `mc_white_noise` argument must be specified."
+                )
+        elif len(mc_white_noise.shape) != 2 or mc_white_noise.shape[-1] != _expected_mc_lastdim:
+            raise ValueError(
+                f"`mc_white_noise` must be a 2D tensor with shape ({{n_samples}}, {_expected_mc_lastdim}), "
+                f"got {mc_white_noise.shape}."
+            )
+        self.mc_white_noise = mc_white_noise
+
         self._dataset_metadata = None
         self._state_means_flat = None
         self._state_covs_flat = None
         self._mcovs_flat = None
-        self._measurement_model_flat = None
+        self._mc_white_noise_mcov = None
 
     @property
     def num_groups(self) -> int:
         return len(self.state_means)
+
+    @property
+    def num_timesteps(self) -> int:
+        return self.state_means.shape[1]
 
     def set_metadata(self,
                      dataset: Optional['TimeSeriesDataset'] = None,
@@ -101,8 +116,14 @@ class Predictions:
                      type: str = 'predictions',
                      group_colname: Optional[str] = None,
                      time_colname: Optional[str] = None,
-                     conf: Optional[float] = .95,
-                     mc_draws: Optional[int] = None) -> pd.DataFrame:
+                     conf: Optional[float] = .95) -> pd.DataFrame:
+        """
+        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
+        :param type: What type of dataframe to return, either 'predictions' or 'components'.
+        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
+        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
+        :param conf: The confidence level for the confidence intervals, defaults to 0.95.
+        """
         if dataset is None:
             dataset = self.dataset_metadata.copy()
             if dataset.group_names is None:
@@ -124,32 +145,34 @@ class Predictions:
         if conf is not None:
             assert conf >= .50
 
+        type = type.casefold()
         if type.startswith('pred'):
-            if mc_draws is None:
-                mc_draws = 500 if self.measurement_model.is_nonlinear else 0
-            if not mc_draws and self.measurement_model.is_nonlinear:
-                raise RuntimeError("Since there are nonlinearities in the measurement-model, must use `mc_draws`")
+            return_std = False
+            if conf is None:
+                conf = .50
+                return_std = True
+
             df = self._to_dataframe(
                 dataset=dataset,
                 group_colname=group_colname,
                 time_colname=time_colname,
-                conf=conf,
-                mc_draws=mc_draws
+                conf=conf
             )
+            if return_std:
+                df['std'] = df.pop('upper') - df.pop('lower')
             return df
-        else:
-            assert type.startswith('comp'), "Expected `type` to be 'predictions' or 'components'."
-            if mc_draws is None:
-                mc_draws = round(20 / (1 - conf))
-                if mc_draws > 5000:
-                    warn("`mc_draws` is very high due to high `conf`; this may take a long time to compute...")
+        elif type in ('components', 'states', 'observed_states'):
+            if type == 'components':
+                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", DeprecationWarning)
             return self._to_components_dataframe(
                 dataset=dataset,
                 group_colname=group_colname,
                 time_colname=time_colname,
                 conf=conf,
-                mc_draws=mc_draws
+                measured=type in ('observed_states', 'components')
             )
+        else:
+            raise ValueError(f"Expected type to be 'predictions', 'states', or 'observed_states', got '{type}'.")
 
     @torch.inference_mode()
     def _to_components_dataframe(self,
@@ -157,27 +180,46 @@ class Predictions:
                                  group_colname: str,
                                  time_colname: str,
                                  conf: float,
-                                 mc_draws: int) -> pd.DataFrame:
+                                 measured: bool) -> pd.DataFrame:
         alpha = (1 - conf) / 2
         batch_shape = self.state_means.shape[0:2]
 
-        # sample from the state distribution:
-        mvnorm = torch.distributions.MultivariateNormal(
-            loc=self.state_means_flat,
-            covariance_matrix=self.state_covs_flat,
-            validate_args=False
-        )
-        assert mc_draws
-        state_mean_samples = mvnorm.sample((mc_draws,))
+        if self.mc_white_noise is not None:
+            mc_samples = self.mc_white_noise.shape[0]
+            # sample from the state distribution:
+            # note: we dont use `mc_white_noise` here because that the extent of its last dim is
+            # `num_measures + nonlinear_rank`, but here we need `state_rank`.
+            state_mean_samples = torch.distributions.MultivariateNormal(
+                loc=self.state_means_flat,
+                covariance_matrix=self.state_covs_flat,
+                validate_args=False
+            ).sample((mc_samples,))
 
-        # pass each sample to the `get_components` function, organize by process:
-        by_proc = {}
-        for smean_samp in tqdm(state_mean_samples):
-            for process_name, se_name, comp_mean in self.measurement_model_flat.get_components(smean_samp, time=0):
-                key = (process_name, se_name)
-                if key not in by_proc:
-                    by_proc[key] = []
-                by_proc[key].append(comp_mean)
+            # pass each sample to the `get_components` function, organize by process:
+            samples_by_proc = {}
+            for smean_samp in state_mean_samples:
+                for pid, se, comp_mean in self.measurement_model_flat.get_components(smean_samp, measured=measured):
+                    key = (pid, se)
+                    if key not in samples_by_proc:
+                        samples_by_proc[key] = []
+                    samples_by_proc[key].append(comp_mean)
+            # compute CIs:
+            cis_by_proc = {}
+            for key, samples in samples_by_proc.items():
+                stacked = torch.stack(samples, dim=0).view(mc_samples, *batch_shape)
+                lower = torch.quantile(stacked, q=alpha, dim=0)
+                upper = torch.quantile(stacked, q=1 - alpha, dim=0)
+                cis_by_proc[key] = (lower, upper)
+        else:
+            cis_by_proc = {}
+            for q in (alpha, 1 - alpha):
+                multi = -stats.norm.ppf(q)
+                offset = self.state_means_flat + multi * torch.sqrt(self.state_covs_flat.diagonal(dim1=-2, dim2=-1))
+                for pid, se, comp_mean in self.measurement_model_flat.get_components(offset, measured=measured):
+                    key = (pid, se)
+                    if key not in cis_by_proc:
+                        cis_by_proc[key] = []
+                    cis_by_proc[key].append(comp_mean.view(*batch_shape))
 
         from torchcast.utils import TimeSeriesDataset
 
@@ -186,11 +228,11 @@ class Predictions:
             dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
         )
         out = []
-        for (process_name, se_name), comp_means in by_proc.items():
-            comp_means = torch.stack(comp_means, dim=0).view(mc_draws, *batch_shape)
-            mean = torch.mean(comp_means, dim=0)
-            lower = torch.quantile(comp_means, q=alpha, dim=0)
-            upper = torch.quantile(comp_means, q=1 - alpha, dim=0)
+        for pid, se, comp_mean in self.measurement_model_flat.get_components(self.state_means_flat, measured=measured):
+            mean = comp_mean.view(*batch_shape)
+            lower, upper = cis_by_proc[(pid, se)]
+
+            # to dataframe:
             _df = TimeSeriesDataset.tensor_to_dataframe(
                 tensor=torch.stack([mean, lower, upper], -1),
                 times=times,
@@ -199,9 +241,10 @@ class Predictions:
                 time_colname=time_colname,
                 measures=['mean', 'lower', 'upper']
             )
-            _df['process'] = process_name
-            _df['state_element'] = se_name
-            _df['measure'] = self.measurement_model.processes[process_name].measure
+
+            _df['process'] = pid
+            _df['state_element'] = se
+            _df['measure'] = self.measurement_model.processes[pid].measure
             out.append(_df)
 
         if isinstance(dataset, TimeSeriesDataset):
@@ -209,8 +252,8 @@ class Predictions:
                 for m in mgroup:
                     if m not in self.measurement_model.measures:
                         continue
-                    actuals = tens[..., mgroup.index(m)]
-                    preds = self.means[self.measurement_model.measures.index(m)]
+                    actuals = tens[..., [mgroup.index(m)]]
+                    preds = self.means[..., [self.measurement_model.measures.index(m)]]
                     _df = TimeSeriesDataset.tensor_to_dataframe(
                         tensor=preds - actuals,
                         times=times,
@@ -232,25 +275,13 @@ class Predictions:
                       dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
                       group_colname: str,
                       time_colname: str,
-                      conf: float,
-                      mc_draws: int) -> pd.DataFrame:
+                      conf: float) -> pd.DataFrame:
         batch_shape = self.state_means.shape[0:2]
+        alpha = (1 - conf) / 2
 
-        if mc_draws:
-            mmean_samples = self._get_measured_mean_samples(
-                measurement_model=self.measurement_model_flat,
-                state_means=self.state_means_flat,
-                state_covs=self.state_covs_flat,
-                white_noise=mc_draws
-            )
-            mvnorm = torch.distributions.MultivariateNormal(
-                loc=mmean_samples,
-                covariance_matrix=self.measure_covs_flat.unsqueeze(0),
-                validate_args=False
-            )
-            samples = mvnorm.sample().squeeze(0)
+        if self.mc_white_noise is not None:
+            samples = self._get_posterior_predict_samples()
 
-            alpha = (1 - conf) / 2
             by_measure = {}
             for i, measure in enumerate(self.measurement_model.measures):
                 mean = torch.mean(samples[..., i], dim=0)
@@ -262,7 +293,7 @@ class Predictions:
                     upper.view(*batch_shape)
                 )
         else:
-            multi = -stats.norm.ppf((1 - conf) / 2) if conf else .5
+            multi = -stats.norm.ppf(alpha)
             measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
             system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
 
@@ -309,35 +340,47 @@ class Predictions:
             out[-1]['measure'] = measure
         out = pd.concat(out)
 
-        if conf is None:
-            out['std'] = out.pop('upper') - out.pop('lower')
         return out
+
+    @property
+    def mc_white_noise_mcov(self) -> torch.Tensor:
+        if self._mc_white_noise_mcov is None:
+            mc_draws = self.mc_white_noise.shape[0]
+            self._mc_white_noise_mcov = torch.randn(
+                (mc_draws, self.measure_covs.shape[-1]),
+                device=self.measure_covs.device
+            )
+        return self._mc_white_noise_mcov
+
+    def _get_posterior_predict_samples(self) -> torch.Tensor:
+        mmean_samples = self._get_measured_mean_samples(
+            measurement_model=self.measurement_model_flat,
+            state_means=self.state_means_flat,
+            state_covs=self.state_covs_flat,
+        )
+        chol = torch.linalg.cholesky(self.measure_covs_flat)
+        _offsets = chol.unsqueeze(0) @ self.mc_white_noise_mcov.view(-1, 1, chol.shape[-1], 1)
+        samples = mmean_samples + _offsets.squeeze(-1)
+        return samples
 
     def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_shape = self.state_means.shape[0:2]
 
-        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
         if self.measurement_model.is_nonlinear:
             # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=self.measurement_model_flat,
                 state_means=self.state_means_flat,
                 state_covs=self.state_covs_flat,
-                white_noise=self.white_noise
             )
-            mvnorm = torch.distributions.MultivariateNormal(
-                loc=mmean_samples,
-                covariance_matrix=self.measure_covs_flat.unsqueeze(0),
-                validate_args=False
-            )
-            samples = mvnorm.sample().squeeze(0)
-            measured_mean = torch.mean(samples, dim=0)
-            return measured_mean, None
+            measured_mean = torch.mean(mmean_samples, dim=0)
+            return measured_mean.view(*batch_shape, -1), None
         else:
+            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
             system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
             return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
 
-    @cached_property
+    @property
     def means(self) -> torch.Tensor:
         """
         Returns the observed means of the predictions, i.e. the measured means of the state.
@@ -346,7 +389,7 @@ class Predictions:
             self._means, self._covs = self._observe()
         return self._means
 
-    @cached_property
+    @property
     def covs(self) -> Optional[torch.Tensor]:
         if self._means is None:
             self._means, self._covs = self._observe()
@@ -356,50 +399,31 @@ class Predictions:
                 _warn_once['cov'] = True
         return self._covs
 
-    @classmethod
-    def _flatten(cls,
-                 state: tuple[torch.Tensor, torch.Tensor],
-                 measure_cov: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    def _flatten(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        nmeasures = self.measure_covs.shape[-1]
+        state_rank = self.state_means.shape[-1]
+        state_means_flat = self.state_means.view(-1, state_rank)
+        state_covs_flat = self.state_covs.view(-1, state_rank, state_rank)
+        measure_covs_flat = self.measure_covs.view(-1, nmeasures, nmeasures)
+        return state_means_flat, state_covs_flat, measure_covs_flat
 
-        nmeasures = measure_cov.shape[-1]
-        state_rank = state[0].shape[-1]
-        state_means_flat = state[0].view(-1, state_rank)
-        state_covs_flat = state[1].view(-1, state_rank, state_rank)
-        measure_covs_flat = measure_cov.view(-1, nmeasures, nmeasures)
-        return (state_means_flat, state_covs_flat), measure_covs_flat
-
-    @cached_property
+    @property
     def state_means_flat(self):
         if self._state_means_flat is None:
-            (self._state_means_flat, self._state_covs_flat), self._mcovs_flat = self._flatten(
-                state=(self.state_means, self.state_covs),
-                measure_cov=self.measure_covs
-            )
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
         return self._state_means_flat
 
-    @cached_property
+    @property
     def state_covs_flat(self):
         if self._state_covs_flat is None:
-            (self._state_means_flat, self._state_covs_flat), self._mcovs_flat = self._flatten(
-                state=(self.state_means, self.state_covs),
-                measure_cov=self.measure_covs
-            )
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
         return self._state_covs_flat
 
-    @cached_property
+    @property
     def measure_covs_flat(self) -> torch.Tensor:
         if self._mcovs_flat is None:
-            (self._state_means_flat, self._state_covs_flat), self._mcovs_flat = self._flatten(
-                state=(self.state_means, self.state_covs),
-                measure_cov=self.measure_covs
-            )
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
         return self._mcovs_flat
-
-    @cached_property
-    def measurement_model_flat(self) -> 'MeasurementModel':
-        if self._measurement_model_flat is None:
-            self._measurement_model_flat = self.measurement_model.flattened()
-        return self._measurement_model_flat
 
     def log_prob(self, obs: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -457,15 +481,17 @@ class Predictions:
                   state_covs: torch.Tensor,
                   measure_cov: torch.Tensor,
                   measurement_model: 'MeasurementModel',
-                  mc_draws: Union[int, torch.Tensor] = 0) -> torch.Tensor:
+                  **kwargs) -> torch.Tensor:
+        if kwargs:
+            raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
         assert measurement_model.num_timesteps == 1
 
-        if isinstance(mc_draws, torch.Tensor) or mc_draws:
+        if measurement_model.is_nonlinear:
+            mc_samples = self.mc_white_noise.shape[0]
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
                 state_covs=state_covs,
-                white_noise=mc_draws
             )
 
             # evaluate the log-prob of the observations under each sampled measured-mean:
@@ -476,10 +502,8 @@ class Predictions:
             ).log_prob(obs)
             # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
             # this is a numerically stable way to do that:
-            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_draws)
+            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_samples)
         else:
-            if measurement_model.is_nonlinear:
-                raise RuntimeError("Since there are nonlinearities in the measurement-model, must use `mc_draws` > 0.")
             measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
             system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
             return torch.distributions.MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
@@ -487,48 +511,34 @@ class Predictions:
     def _get_measured_mean_samples(self,
                                    measurement_model: 'MeasurementModel',
                                    state_means: torch.Tensor,
-                                   state_covs: torch.Tensor,
-                                   white_noise: Union[int, torch.Tensor]):
+                                   state_covs: torch.Tensor):
         nmeasures = len(measurement_model.measures)
 
-        measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
-
-        # first, create an extended measure-mat
-        extended_measure_mat = measure_mat
-        eprocess2_slice = {}
-        start_ = nmeasures
-        for process in self.measurement_model.nonlinear_processes:
-            if process.measure not in measurement_model.measures:
-                continue  # see note in MeasurementModel._initialize_measure_mats
-            identity_mat = torch.eye(process.rank, dtype=measure_mat.dtype)
-            extended_measure_mat = torch.stack([extended_measure_mat, identity_mat], dim=-2)
-            eprocess2_slice[process.id] = slice(start_, start_ + process.rank)
-            start_ += process.rank
-
-        # now, use the extended measure-mat to reduce dimensionality
-        partial_measured_mean = extended_measure_mat @ state_means  # todo: squeeze?
+        # use the extended measure-mat to reduce dimensionality
+        extended_measure_mat = measurement_model.extended_measure_mat
+        partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
         partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
 
-        # then we sample from that multivariate distribution
+        # then we sample from that multivariate distribution. take care to drop missing measures:
         chol = torch.linalg.cholesky(partial_measured_cov)
-        if not isinstance(white_noise, torch.Tensor):
-            white_noise = torch.randn((white_noise, *state_means.shape[:-1], chol.shape[-1]), device=chol.device)
-        partial_mmean_samples = chol.unsqueeze(0) @ white_noise + partial_measured_mean
+        missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
+        em_idx = [i for i in range(self.measurement_model_flat.extended_measure_mat.shape[-2]) if i not in missing_midx]
+        wn = self.mc_white_noise[:, em_idx]
+        _offsets = chol.unsqueeze(0) @ wn.view(-1, 1, len(em_idx), 1)
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets.squeeze(-1)
 
         # each of these samples represents a draw from a concatenated set of means: (1) the measured-mean of the
         # linear processes with (2) the nonlinear processes' state-means.
         # for each sample, we take those draws from the (nonlinear) state distribution and use them to apply
         # adjustment to the linear measured-mean.
         mmean_samples = []
-        for sampled_pmean in partial_mmean_samples.unbind(0):
+        for sampled_pmean in sampled_pmmeans.unbind(0):
             procs_and_means = [
-                (proc, sampled_pmean[..., eprocess2_slice[proc.id]])
+                (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
                 for proc in self.measurement_model.nonlinear_processes
             ]
             mmean_samples.append(
-                sampled_pmean[..., :nmeasures]
-                +
-                measurement_model.get_measured_mean_adjustment(procs_and_means, time=0)
+                measurement_model.adjust_measured_mean(sampled_pmean[..., 0:nmeasures], procs_and_means, time=0)
             )
         return torch.stack(mmean_samples, dim=0)
 
@@ -739,7 +749,9 @@ class Predictions:
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
             'states': (self.state_means[item], self.state_covs[item]),
-            'measure_covs': self.measure_covs[item]
+            'measure_covs': self.measure_covs[item],
+            # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
+            'mc_white_noise': self.mc_white_noise
         }
         if self.update_means is not None:
             kwargs.update({

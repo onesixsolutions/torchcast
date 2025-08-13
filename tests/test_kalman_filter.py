@@ -331,10 +331,11 @@ class TestKalmanFilter(TestCase):
         self.assertTrue((cov == 0).all())
 
     @parameterized.expand([
-        (torch.float64, 2, False)
+        (torch.float64, 2, False),
+        (torch.float64, 1, False)
     ])
     @torch.no_grad()
-    def test_dtype(self, dtype: torch.dtype, ndim: int = 2, compiled: bool = False):
+    def test_dtype(self, dtype: torch.dtype = torch.float64, ndim: int = 2, compiled: bool = False):
         data = torch.zeros((2, 5, ndim), dtype=dtype)
         kf = KalmanFilter(
             processes=[LocalLevel(id=f'll{i}', measure=str(i)) for i in range(ndim)],

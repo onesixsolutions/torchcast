@@ -10,7 +10,7 @@ from torch import Tensor
 
 from torchcast.exp_smooth.smoothing_matrix import SmoothingMatrix
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor
+from torchcast.internals.utils import update_tensor, get_meshgrids, transpose_last_dims
 from torchcast.process import Process
 from torchcast.state_space import StateSpaceModel
 
@@ -20,12 +20,16 @@ class ExpSmoother(StateSpaceModel):
                  processes: Sequence[Process],
                  measures: Sequence[str],
                  measure_covariance: Optional[Covariance] = None,
-                 smoothing_matrix: Optional[SmoothingMatrix] = None):
+                 smoothing_matrix: Optional[SmoothingMatrix] = None,
+                 measure_funs: Optional[dict[str, str]] = None,
+                 adaptive_measure_var: bool = False):
 
         super().__init__(
             processes=processes,
             measures=measures,
-            measure_covariance=measure_covariance
+            measure_covariance=measure_covariance,
+            measure_funs=measure_funs,
+            adaptive_measure_var=adaptive_measure_var,
         )
         if smoothing_matrix is None:
             smoothing_matrix = SmoothingMatrix.from_measures_and_processes(measures=measures, processes=processes)
@@ -37,9 +41,17 @@ class ExpSmoother(StateSpaceModel):
         ms = self._get_measure_scaling()
         return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=ms.dtype, device=ms.device)
 
-    @property
-    def _update_mat_dims(self) -> dict:
-        return super()._update_mat_dims | {'K': (-2,)}
+    def _mask_mats(self,
+                   groups: torch.Tensor,
+                   val_idx: Optional[torch.Tensor],
+                   **kwargs) -> dict[str, torch.Tensor]:
+        out = super()._mask_mats(groups, val_idx, **kwargs)
+        if val_idx is None:
+            return out
+        m1d, _ = get_meshgrids(groups, val_idx)
+        Kt = transpose_last_dims(kwargs['K'])
+        out['K'] = Kt[m1d]  # K is always a 2D matrix, so we can use m1d
+        return out
 
     def _parse_kwargs(self,
                       num_groups: int,
@@ -70,6 +82,7 @@ class ExpSmoother(StateSpaceModel):
             predict_kwargs['cov1step'] = [cov1step] * num_timesteps
 
         return predict_kwargs, update_kwargs, used_keys
+
     def _update_step(self,
                      input: torch.Tensor,
                      mean: torch.Tensor,

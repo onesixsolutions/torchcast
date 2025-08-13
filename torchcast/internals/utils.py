@@ -1,9 +1,15 @@
 import functools
-from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Collection
+from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Collection, Type
 
 import torch
 
 import numpy as np
+
+
+def get_subclasses(cls: Type) -> Iterable[Type]:
+    for subclass in cls.__subclasses__():
+        yield from get_subclasses(subclass)
+        yield subclass
 
 
 @functools.lru_cache(maxsize=100)
