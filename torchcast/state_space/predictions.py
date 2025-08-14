@@ -11,7 +11,7 @@ import pandas as pd
 
 from scipy import stats
 
-from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, get_meshgrids
+from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, get_meshgrids, ragged_cat
 
 if TYPE_CHECKING:
     from torchcast.utils import TimeSeriesDataset
@@ -252,8 +252,8 @@ class Predictions:
                 for m in mgroup:
                     if m not in self.measurement_model.measures:
                         continue
-                    actuals = tens[..., [mgroup.index(m)]]
-                    preds = self.means[..., [self.measurement_model.measures.index(m)]]
+                    actuals = tens[:, :, [mgroup.index(m)]]
+                    preds = self.means[:, 0:actuals.shape[1], [self.measurement_model.measures.index(m)]]
                     _df = TimeSeriesDataset.tensor_to_dataframe(
                         tensor=preds - actuals,
                         times=times,
@@ -323,13 +323,13 @@ class Predictions:
             dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
         )
         for measure, (mean, lower, upper) in by_measure.items():
-            _to_stack = {'mean': mean, 'lower': lower, 'upper': upper}
+            _to_stack = {'mean': mean.unsqueeze(-1), 'lower': lower.unsqueeze(-1), 'upper': upper.unsqueeze(-1)}
             mactuals = actuals.get(measure, None)
             if mactuals is not None:
-                _to_stack['actual'] = mactuals
+                _to_stack['actual'] = mactuals.unsqueeze(-1)
             out.append(
                 TimeSeriesDataset.tensor_to_dataframe(
-                    tensor=torch.stack(list(_to_stack.values()), -1),
+                    tensor=ragged_cat(list(_to_stack.values()), cat_dim=-1, ragged_dim=1),
                     times=times,
                     group_names=dataset.group_names,
                     group_colname=group_colname,
