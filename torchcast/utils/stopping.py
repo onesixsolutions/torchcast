@@ -80,6 +80,10 @@ class Stopping:
         for nm in monitor_params:
             yield module_parameters[nm]
 
+    @property
+    def epoch(self) -> int:
+        return len(self.values)
+
     @torch.inference_mode()
     def __call__(self, loss: Optional[float]) -> bool:
         self.values.append(self._get_new_values(loss))
