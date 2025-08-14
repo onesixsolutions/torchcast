@@ -381,15 +381,16 @@ class StateSpaceModel(torch.nn.Module):
 
         kwargs = self._prepare_fit_kwargs(y, **kwargs)
 
-        def closure():
-            optimizer.zero_grad()
-            kwargs.update({k: v() for k, v in callable_kwargs.items()})
-            pred = self(y, **kwargs)
-            loss = get_loss(pred, y)
-            loss.backward()
-            prog.update()
-            prog.set_description(f"Epoch {epoch:,}; Loss {loss.item():.4}; Convergence {stopping.convergence}")
-            return loss
+        closure = _OptimizerClosure(
+            ss_model=self,
+            y=y,
+            get_loss=get_loss,
+            prog=prog,
+            callable_kwargs=callable_kwargs,
+            optimizer=optimizer,
+            stopping=stopping,
+            kwargs=kwargs,
+        )
 
         train_loss = float('nan')
         for epoch in range(stopping.max_iter):
@@ -784,3 +785,48 @@ class StateSpaceModel(torch.nn.Module):
             simulate=num_sims,
             **kwargs
         )
+
+
+class _OptimizerClosure:
+    """
+    closure = _OptimizerClosure(
+            ss_model=self,
+            y=y,
+            get_loss=get_loss,
+            prog=prog,
+            callable_kwargs=callable_kwargs,
+            optimizer=optimizer,
+            stopping=stopping,
+            kwargs=kwargs,
+        )
+    """
+    def __init__(self,
+                 ss_model: StateSpaceModel,
+                 y: torch.Tensor,
+                 optimizer: torch.optim.Optimizer,
+                 prog: tqdm,
+                 stopping: 'Stopping',
+                 kwargs: dict,
+                 callable_kwargs: dict[str, callable],
+                 get_loss: callable):
+        self.ss_model = ss_model
+        self.y = y
+        self.optimizer = optimizer
+        self.prog = prog
+        self.stopping = stopping
+        self.kwargs = kwargs
+        self.callable_kwargs = callable_kwargs
+        self.get_loss = get_loss
+
+    @line_profiler.profile
+    def __call__(self):
+        self.optimizer.zero_grad()
+        self.kwargs.update({k: v() for k, v in self.callable_kwargs.items()})
+        pred = self.ss_model(self.y, **self.kwargs)
+        loss = self.get_loss(pred, self.y)
+        loss.backward()
+        self.prog.update()
+        self.prog.set_description(
+            f"Epoch {self.stopping.epoch:,}; Loss {loss.item():.4}; Convergence {self.stopping.convergence}"
+        )
+        return loss
