@@ -100,13 +100,20 @@ class KalmanFilter(StateSpaceModel):
         )
 
         # process-variance:
+        measure_scaling = torch.diag_embed(self._get_measure_scaling().unsqueeze(0))
         pcov_kwargs = {}
         if self.process_covariance.expected_kwargs:
             pcov_kwargs = {k: kwargs[k] for k in self.process_covariance.expected_kwargs}
         used_keys |= set(pcov_kwargs)
-        pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
-        measure_scaling = torch.diag_embed(self._get_measure_scaling().unsqueeze(0).unsqueeze(0))
-        Qs = measure_scaling @ pcov_raw @ measure_scaling
-        predict_kwargs['Q'] = Qs.unbind(1)
+        if pcov_kwargs:
+            measure_scaling = measure_scaling.unsqueeze(0)
+            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
+            Qs = measure_scaling @ pcov_raw @ measure_scaling
+            predict_kwargs['Q'] = Qs.unbind(1)
+        else:
+            # faster if not time-varying
+            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=1)
+            Qs = measure_scaling @ pcov_raw.squeeze(1) @ measure_scaling
+            predict_kwargs['Q'] = [Qs] * num_timesteps
 
         return predict_kwargs, update_kwargs, used_keys

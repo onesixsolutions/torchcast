@@ -5,7 +5,6 @@ from torch.distributions import Binomial
 from typing import Sequence, TYPE_CHECKING, Optional, Union
 
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import get_meshgrids
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.state_space import Predictions
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
@@ -101,20 +100,21 @@ class BinomialFilter(KalmanFilter):
             updates=updates,
             mc_white_noise=mc_white_noise,
             num_obs=num_obs,
-            observed_counts=observed_counts
+            observed_counts=observed_counts,
         )
 
     def _mask_mats(self,
                    groups: torch.Tensor,
-                   val_idx: Optional[torch.Tensor],
+                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
                    binary_idx: Optional[Sequence[int]] = None,
                    **kwargs) -> dict:
-        out = super()._mask_mats(groups, val_idx, **kwargs)
-        if val_idx is None or binary_idx is None:
+        out = super()._mask_mats(groups, masks, **kwargs)
+        if masks is None or binary_idx is None:
             return out
+        val_idx = masks[0]
         out['binary_idx'] = [i for i in binary_idx if i in val_idx]
         _binary_subset_idx = torch.tensor([i1 for i1, i2 in enumerate(binary_idx) if i2 in val_idx], dtype=torch.long)
-        m1d, _ = get_meshgrids(groups, _binary_subset_idx)
+        m1d = torch.meshgrid(groups, _binary_subset_idx, indexing='ij')
         out['num_obs'] = kwargs['num_obs'][m1d]
         return out
 
@@ -271,15 +271,13 @@ class BinomialPredictions(Predictions):
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
                  num_obs: Sequence[torch.Tensor],
                  observed_counts: Optional[bool] = None,
-                 updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-                 mc_white_noise: Optional[torch.Tensor] = None):
+                 **kwargs):
 
         super().__init__(
             measurement_model=measurement_model,
             states=states,
             measure_covs=measure_covs,
-            updates=updates,
-            mc_white_noise=mc_white_noise
+            **kwargs
         )
 
         self.observed_counts = observed_counts
@@ -381,8 +379,8 @@ class BinomialPredictions(Predictions):
         return samples
 
 
-def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop_common: float = 1.):
-    from torchcast.process import LocalLevel
+def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_common: float = 1.):
+    from torchcast.process import LocalLevel, Season
     from torchcast.utils import TimeSeriesDataset
     from scipy.special import expit
     import pandas as pd
@@ -390,8 +388,8 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
     torch.manual_seed(1234)
 
     TOTAL_COUNT = 4
-    measures = ['dim1', 'dim2', 'dim3']
-    binary_measures = ['dim1']
+    measures = ['dim1', 'dim2']
+    binary_measures = []
     latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
     latent_ind = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, len(measures))), dim=1)
     assert 0 <= prop_common <= 1
@@ -424,7 +422,8 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
     )
 
     bf = BinomialFilter(
-        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+                  + [Season(id=f'season_{m}', measure=m, dt_unit='D', period=7, K=2) for m in measures],
         measures=measures,
         binary_measures=binary_measures,
         observed_counts=False
@@ -432,14 +431,20 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
 
     y = dataset.tensors[0]
     bf.fit(y,
-           stopping={'monitor_params': True},
-           num_obs=TOTAL_COUNT,
-           mc_samples=32)
+           stopping={
+               # 'max_iter': 10
+               #    'monitor_params': True
+           },
+           start_offsets=dataset.start_offsets,
+           mc_samples=32
+           )
     _kwargs = {}
-    if TOTAL_COUNT != 1:
-        _kwargs['num_obs'] = TOTAL_COUNT
+    # if TOTAL_COUNT != 1:
+    #     _kwargs['num_obs'] = TOTAL_COUNT
     preds = bf(
-        dataset.tensors[0], **_kwargs,
+        dataset.tensors[0],
+        start_offsets=dataset.start_offsets,
+        **_kwargs,
     )
     df_preds = preds.to_dataframe(dataset)
     if bf.observed_counts:
@@ -458,8 +463,8 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
                 + geom_line(aes(y='latent'), color='purple')
                 + ggtitle(g)
         ).show()
-    # preds._white_noise = torch.zeros((1, len(binary_measures)))
-    # print(preds.log_prob(y).mean())
+    preds._white_noise = torch.zeros((1, len(binary_measures)))
+    print(preds.log_prob(y).mean())
 
 
 if __name__ == '__main__':

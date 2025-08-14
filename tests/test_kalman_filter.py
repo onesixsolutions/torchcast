@@ -28,17 +28,17 @@ class TestKalmanFilter(TestCase):
         data[2, 2, 0] = float('nan')
 
         # test critical helper fun:
-        get_nan_groups2 = torch.jit.script(get_nan_groups)
         nan_groups = {2}
         if ndim > 1:
             nan_groups.add(0)
         for t in range(ntimes):
-            for group_idx, valid_idx in get_nan_groups2(torch.isnan(data[:, t])):
+            for group_idx, masks in get_nan_groups(torch.isnan(data[:, t])):
                 if t == 2:
-                    if valid_idx is None:
+                    if masks is None:
                         self.assertEqual(len(group_idx), data.shape[0] - len(nan_groups))
                         self.assertFalse(bool(set(group_idx.tolist()).intersection(nan_groups)))
                     else:
+                        valid_idx, m1d, m2d = masks
                         self.assertLess(len(valid_idx), ndim)
                         self.assertGreater(len(valid_idx), 0)
                         if len(valid_idx) == 1:
@@ -52,7 +52,7 @@ class TestKalmanFilter(TestCase):
                             self.assertSetEqual(set(valid_idx.tolist()), {1, 2})
                             self.assertSetEqual(set(group_idx.tolist()), {2})
                 else:
-                    self.assertIsNone(valid_idx)
+                    self.assertIsNone(masks)
 
         # test `update`
         # TODO: measure dim vs. state-dim

@@ -161,7 +161,7 @@ class MeasurementModel(DesignModel):
             # apply measure-wide adjustment
             measure_mat[i] = self.measure_funs[measure].adjust_measure_mat(measure_mat[i], measured_mean[i])
 
-        return torch.stack(measure_mat, dim=-1)
+        return torch.stack(measure_mat, dim=-2)
 
     @cached_property
     def measure2idx(self) -> dict[str, int]:

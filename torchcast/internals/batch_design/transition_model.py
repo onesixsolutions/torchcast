@@ -20,23 +20,18 @@ class TransitionModel(DesignModel):
         )
         self.measures = measures
 
-        zeros = torch.zeros(
+        F = torch.zeros(
             (self.num_groups, self.num_timesteps, self.state_rank, self.state_rank),
             device=self.device,
             dtype=self.dtype
         )
-        F = []
         for pid, process in self.processes.items():
             if process.linear_transition:
                 pidx = self.process2slice[pid]
-                # note: as in other parts, assuming autograd makes it more efficient to create clones then sum vs.
-                # repeated masks on the same tensor. should verify that
-                thisF = zeros.clone()
-                thisF[:, :, pidx, pidx] = process.get_transition_matrix()
-                F.append(thisF)
+                F[:, :, pidx, pidx] = process.get_transition_matrix()
             else:
                 raise NotImplementedError
-        self._transition_mats = torch.stack(F, dim=0).sum(0)
+        self._transition_mats = F
 
     @cached_property
     def transition_mats(self) -> Sequence[torch.Tensor]:

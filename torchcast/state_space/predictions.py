@@ -11,7 +11,7 @@ import pandas as pd
 
 from scipy import stats
 
-from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, get_meshgrids, ragged_cat
+from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat
 
 if TYPE_CHECKING:
     from torchcast.utils import TimeSeriesDataset
@@ -425,12 +425,18 @@ class Predictions:
             self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
         return self._mcovs_flat
 
-    def log_prob(self, obs: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def log_prob(self,
+                 obs: torch.Tensor,
+                 weights: Optional[torch.Tensor] = None,
+                 nan_groups_flat: Optional[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]] = None
+                 ) -> torch.Tensor:
         """
         Compute the log-probability of data (e.g. data that was originally fed into the ``StateSpaceModel``).
 
         :param obs: A Tensor that could be used in the ``StateSpaceModel`` forward pass.
         :param weights: If specified, will be used to weight the log-probability of each group X timestep.
+        :param nan_groups_flat: used by StateSpaceModel.fit() for speeding up computations, pre-computing nan-masks at
+         the start of fitting rather than doing so on each call to log_prob().
         :return: A tensor with one element for each group X timestep indicating the log-probability.
         """
         assert len(obs.shape) == 3
@@ -445,20 +451,24 @@ class Predictions:
         state_means_flat = self.state_means.view(-1, state_rank)
         state_covs_flat = self.state_covs.view(-1, state_rank, state_rank)
         measure_covs_flat = self.measure_covs.view(-1, measure_rank, measure_rank)
-        measurement_model_flat = self.measurement_model.flattened()
 
         lp_flat = torch.zeros(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
-        for gt_idx, valid_idx in get_nan_groups(torch.isnan(obs_flat)):
-            if valid_idx is None:
+
+        if nan_groups_flat is None:
+            nan_groups_flat = get_nan_groups(torch.isnan(obs_flat))
+
+        for gt_idx, masks in nan_groups_flat:
+            if masks is None:
+                val_idx = None
                 gt_obs = obs_flat[gt_idx]
                 gt_mcov = measure_covs_flat[gt_idx]
-                gt_mmodel = measurement_model_flat.subset(gt_idx)
+                gt_mmodel = self.measurement_model_flat.subset(gt_idx)
             else:
-                gt_mmodel = measurement_model_flat.subset(gt_idx, measures=valid_idx)
-                mask1d, mask2d = get_meshgrids(gt_idx, valid_idx)
-                gt_mcov = measure_covs_flat[mask2d]
-                gt_obs = obs_flat[mask1d]
-            _kwargs = self._get_log_prob_kwargs(gt_idx, valid_idx)
+                val_idx, m1d, m2d = masks
+                gt_mmodel = self.measurement_model_flat.subset(gt_idx, measures=val_idx)
+                gt_mcov = measure_covs_flat[m2d]
+                gt_obs = obs_flat[m1d]
+            _kwargs = self._get_log_prob_kwargs(gt_idx, val_idx)
             lp_flat[gt_idx] = self._log_prob(
                 obs=gt_obs,
                 state_means=state_means_flat[gt_idx],

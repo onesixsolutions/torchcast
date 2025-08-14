@@ -12,40 +12,6 @@ def get_subclasses(cls: Type) -> Iterable[Type]:
         yield subclass
 
 
-@functools.lru_cache(maxsize=100)
-def get_meshgrids(groups: torch.Tensor,
-                  val_idx: torch.Tensor) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """
-    Returns meshgrids for the given groups and val_idx.
-    """
-    m1d = torch.meshgrid(groups, val_idx, indexing='ij')
-    m2d = torch.meshgrid(groups, val_idx, val_idx, indexing='ij')
-    return m1d, m2d
-
-
-def mask_mats(groups: torch.Tensor,
-              val_idx: Optional[torch.Tensor],
-              mats: Sequence[tuple[str, torch.Tensor, Collection[int]]]) -> dict[str, torch.Tensor]:
-    out = {}
-    if val_idx is None:
-        for nm, mat, _ in mats:
-            out[nm] = mat[groups]
-    else:
-        m1d, m2d = get_meshgrids(groups, val_idx)
-        for nm, mat, dim in mats:
-            dim = set(dim)
-            if dim == {-2}:
-                mat = transpose_last_dims(mat)
-                out[nm] = transpose_last_dims(mat[m1d])
-            elif dim == {-1}:
-                out[nm] = mat[m1d]
-            elif dim == {-2, -1}:
-                out[nm] = mat[m2d]
-            else:
-                raise ValueError(f"Invalid dim ({dim}), must be 0, 1, or 2")
-    return out
-
-
 def normalize_index(index: tuple) -> tuple:
     # Special-case early check for the batched pattern
     if isinstance(index, tuple) and _is_special_batched_pattern(index):
@@ -182,30 +148,41 @@ def transpose_last_dims(x: torch.Tensor) -> torch.Tensor:
     return x.permute(*args)
 
 
-def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]]:
     """
     Iterable of (group_idx, valid_idx) tuples that can be passed to torch.meshgrid. If no valid, then not returned; if
     all valid then (group_idx, None) is returned; can skip call to meshgrid.
     """
     assert len(isnan.shape) == 2
     state_dim = isnan.shape[-1]
-    out: List[Tuple[torch.Tensor, Optional[torch.Tensor]]] = []
+
+    out = []
     if state_dim == 1:
         # shortcut for univariate
         group_idx = (~isnan.squeeze(-1)).nonzero().view(-1)
         out.append((group_idx, None))
         return out
-    for nan_combo in torch.unique(isnan, dim=0):
+
+    nan_combos = torch.unique(isnan, dim=0)
+    if len(nan_combos) == 1 and nan_combos[0].sum() == 0:
+        # shortcut for no nans
+        out.append((torch.arange(isnan.shape[0]), None))
+        return out
+
+    for nan_combo in nan_combos:
         num_nan = nan_combo.sum()
         if num_nan < state_dim:
             c1 = (isnan * nan_combo[None, :]).sum(1) == num_nan
             c2 = (~isnan * ~nan_combo[None, :]).sum(1) == (state_dim - num_nan)
             group_idx = (c1 & c2).nonzero().view(-1)
             if num_nan == 0:
-                valid_idx = None
+                out.append((group_idx, None))
             else:
                 valid_idx = (~nan_combo).nonzero().view(-1)
-            out.append((group_idx, valid_idx))
+                m1d = torch.meshgrid(group_idx, valid_idx, indexing='ij')
+                m2d = torch.meshgrid(group_idx, valid_idx, valid_idx, indexing='ij')
+                masks = (valid_idx, m1d, m2d)
+                out.append((group_idx, masks))
     return out
 
 

@@ -10,7 +10,7 @@ from torch import Tensor
 
 from torchcast.exp_smooth.smoothing_matrix import SmoothingMatrix
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor, get_meshgrids, transpose_last_dims
+from torchcast.internals.utils import update_tensor, transpose_last_dims
 from torchcast.process import Process
 from torchcast.state_space import StateSpaceModel
 
@@ -43,14 +43,14 @@ class ExpSmoother(StateSpaceModel):
 
     def _mask_mats(self,
                    groups: torch.Tensor,
-                   val_idx: Optional[torch.Tensor],
+                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
                    **kwargs) -> dict[str, torch.Tensor]:
-        out = super()._mask_mats(groups, val_idx, **kwargs)
-        if val_idx is None:
+        out = super()._mask_mats(groups, masks, **kwargs)
+        if masks is None:
             return out
-        m1d, _ = get_meshgrids(groups, val_idx)
+        val_id, m1d, m2d = masks
         Kt = transpose_last_dims(kwargs['K'])
-        out['K'] = Kt[m1d]  # K is always a 2D matrix, so we can use m1d
+        out['K'] = transpose_last_dims(Kt[m1d])
         return out
 
     def _parse_kwargs(self,
@@ -70,13 +70,14 @@ class ExpSmoother(StateSpaceModel):
         if self.smoothing_matrix.expected_kwargs:
             smat_kwargs = {k: kwargs[k] for k in self.smoothing_matrix.expected_kwargs}
         used_keys |= set(smat_kwargs)
-        Ks = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=num_timesteps)
-        update_kwargs['K'] = Ks.unbind(1)
-
-        if self.smoothing_matrix.expected_kwargs or self.measure_covariance.expected_kwargs:
+        if smat_kwargs:
+            Ks = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=num_timesteps)
+            update_kwargs['K'] = Ks.unbind(1)
             predict_kwargs['cov1step'] = Ks @ torch.stack(measure_covs, 1) @ Ks.transpose(-1, -2)
         else:
-            K1 = update_kwargs['K'][0]
+            # faster if not time-varying:
+            K1 = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=1).squeeze(1)
+            update_kwargs['K'] = [K1] * num_timesteps
             measure_cov = measure_covs[0]
             cov1step = K1 @ measure_cov @ K1.transpose(-1, -2)
             predict_kwargs['cov1step'] = [cov1step] * num_timesteps
