@@ -70,7 +70,11 @@ class LinearModel(Process):
     def get_measurement_matrix(self, X: torch.Tensor) -> torch.Tensor:
         assert not torch.isnan(X).any()
         assert not torch.isinf(X).any()
-        assert X.shape[-1] == self.rank
+        if X.shape[-1] != self.rank:
+            raise ValueError(
+                f"process '{self.id}' received X that has shape {X.shape}, but expected last dim to "
+                f"match len(predictors) {self.rank}."
+            )
         return X
 
 
