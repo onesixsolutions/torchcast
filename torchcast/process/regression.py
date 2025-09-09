@@ -4,8 +4,8 @@ import torch
 
 from typing import Sequence, Optional, Union, Collection
 
-from .process import Process
-from .utils import ProcessKwarg, StateElement, standardize_decay
+from torchcast.process import Process
+from torchcast.process.utils import ProcessKwarg, StateElement, standardize_decay
 
 
 class LinearModel(Process):
@@ -117,26 +117,28 @@ class SaturatedLinearModel(LinearModel):
         return self.rank - 1
 
     def prepare_measurement_cache(self, X: torch.Tensor) -> dict:
-        # if kwargs:
-        #     warn(f"{self.id} received unexpected kwargs: {kwargs}")
         assert not torch.isnan(X).any()
         assert not torch.isinf(X).any()
-        assert X.shape[-1] == self.num_predictors
+        if X.shape[-1] != self.num_predictors:
+            raise ValueError(
+                f"process '{self.id}' received X that has shape {X.shape}, but expected last dim to "
+                f"match len(predictors) {self.num_predictors}."
+            )
         return {'X': X.unbind(1)}
 
     def get_measured_mean(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
         # TODO: reparameterize
         X = cache['X'][time]
         coefs = mean[:, :self.num_predictors]
-        ceiling = mean[:, self.num_predictors:]
-        cache['yhat'] = X * coefs
-        return cache['yhat'] - torch.log1p(torch.exp(cache['yhat'] - ceiling.unsqueeze(1)))
+        ceiling = mean[:, self.num_predictors]
+        cache['yhat'] = (X * coefs).sum(-1)
+        return cache['yhat'] - torch.log1p(torch.exp(cache['yhat'] - ceiling))
 
     def get_measurement_jacobian(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
         # TODO: reparameterize
         X = cache['X'][time]
-        ceiling = mean[:, self.num_predictors:]
+        ceiling = mean[:, self.num_predictors]
         ceil_derivs = torch.sigmoid((cache['yhat'] - ceiling).clamp(min=-10, max=10))
-        coef_derivs = X * (1 - ceil_derivs)
-        jacobian = torch.stack([coef_derivs, ceil_derivs], dim=-1)
+        coef_derivs = X * (1 - ceil_derivs.unsqueeze(-1))
+        jacobian = torch.cat([coef_derivs, ceil_derivs.unsqueeze(-1)], dim=-1)
         return jacobian

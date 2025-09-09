@@ -430,14 +430,7 @@ def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_
     )
 
     y = dataset.tensors[0]
-    bf.fit(y,
-           stopping={
-               # 'max_iter': 10
-               #    'monitor_params': True
-           },
-           start_offsets=dataset.start_offsets,
-           mc_samples=32
-           )
+    bf.fit(y, start_offsets=dataset.start_offsets, mc_samples=32)
     _kwargs = {}
     # if TOTAL_COUNT != 1:
     #     _kwargs['num_obs'] = TOTAL_COUNT

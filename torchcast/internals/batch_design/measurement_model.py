@@ -63,27 +63,27 @@ class MeasurementModel(DesignModel):
         if self.num_timesteps != 1:
             raise ValueError("Can only get extended measure-mat for flattened measurement-model.")
 
-        self._extended_mmat_slices = {}
-        linear_mm = self._get_linear_measure_mat(0)
-        out = [linear_mm]
-        start_ = len(self.measures)
-        for process in self.nonlinear_processes:
-            if process.measure not in self.measures:
-                continue  # see note in _measure_mats
-            out.append(torch.eye(process.rank, dtype=linear_mm.dtype))
-            self._extended_mmat_slices[process.id] = slice(start_, start_ + process.rank)
-            start_ += process.rank
-        return torch.cat(out, dim=-2)
+        linear_mmat = self._get_linear_measure_mat(0)
+
+        nonlinear_rank = sum(p.rank for p in self.nonlinear_processes)
+        extension = torch.zeros(
+            (self.num_groups, nonlinear_rank, self.state_rank),
+            dtype=self.dtype,
+            device=self.device
+        )
+        if nonlinear_rank:
+            extension[:, :, -nonlinear_rank:] = torch.eye(nonlinear_rank).unsqueeze(0)
+        return torch.cat([linear_mmat, extension], dim=1)
 
     @property
     def extended_mmat_slices(self) -> dict[str, slice]:
         if self._extended_mmat_slices is None:
-            assert self.extended_measure_mat.shape[-1]  # ensure it is computed
+            self._extended_mmat_slices = {}
+            start_ = len(self.measures)
+            for process in self.nonlinear_processes:
+                self._extended_mmat_slices[process.id] = slice(start_, start_ + process.rank)
+                start_ += process.rank
         return self._extended_mmat_slices
-
-    @staticmethod
-    def get_extended_mmat_rank(processes: Iterable['Process'], measures: Sequence[str]) -> int:
-        return len(measures) + sum(p.rank for p in processes if not p.linear_measurement)
 
     def _get_linear_measure_mat(self, time: int) -> torch.Tensor:
         assert time >= 0
@@ -300,7 +300,7 @@ class MeasurementModel(DesignModel):
                 continue  # see note in _measure_mats
             pidx = self.process2slice[pid]
 
-            state_elements = list(process.state_elements.values())
+            state_elements = [se.name for se in process.state_elements.values()]
             proc_mean = mean[..., pidx]
             if measured:
                 if process.linear_measurement:
@@ -312,7 +312,7 @@ class MeasurementModel(DesignModel):
                     state_elements = [s for i, s in enumerate(state_elements) if mask[i]]
                 else:
                     state_elements = ['__combined__']
-                    proc_mean = mmean_adjustments[pid].sum(-1)
-
+                    proc_mean = mmean_adjustments[pid].sum(-1, keepdim=True)
+            assert len(state_elements) == proc_mean.shape[1]
             for se, se_mean in zip(state_elements, proc_mean.T):
-                yield pid, se.name, se_mean
+                yield pid, se, se_mean

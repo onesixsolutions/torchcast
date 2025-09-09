@@ -289,9 +289,8 @@ class StateSpaceModel(torch.nn.Module):
             if mc_samples is None:
                 warn("`mc_samples` not set, using 250 samples", UserWarning)
                 mc_samples = 250
-            emmat_rank = MeasurementModel.get_extended_mmat_rank(self.processes.values(), self.measures)
             prediction_kwargs['mc_white_noise'] = torch.randn(
-                (mc_samples, emmat_rank),
+                (mc_samples, self.state_rank + 1),  # TODO
                 device=meanu.device,
                 dtype=meanu.dtype
             )
@@ -415,7 +414,9 @@ class StateSpaceModel(torch.nn.Module):
     def is_nonlinear(self) -> bool:
         return any(not p.linear_measurement for p in self.processes.values()) or self.measure_funs
 
-    def _prepare_fit_kwargs(self, y: torch.Tensor, **kwargs) -> dict:
+    def _prepare_fit_kwargs(self,
+                            y: torch.Tensor,
+                            **kwargs) -> dict:
         # precompute nan-groups for forward pass
         isnan = torch.isnan(y)
         kwargs['nan_groups'] = [get_nan_groups(isnan_t) for isnan_t in isnan.unbind(1)]
@@ -428,9 +429,8 @@ class StateSpaceModel(torch.nn.Module):
             raise ValueError("Nonlinear state-space models require `mc_samples` to be set.")
         if mc_samples:
             if 'mc_white_noise' not in prediction_kwargs:
-                emmat_rank = MeasurementModel.get_extended_mmat_rank(self.processes.values(), self.measures)
                 prediction_kwargs['mc_white_noise'] = torch.randn(
-                    (mc_samples, emmat_rank),
+                    (mc_samples, self.state_rank + 1),  # TODO
                     device=y.device,
                     dtype=y.dtype
                 )

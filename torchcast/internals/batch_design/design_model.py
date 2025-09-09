@@ -16,7 +16,6 @@ class DesignModel:
         self.num_groups = num_groups
         self.num_timesteps = num_timesteps
         self.processes: dict[str, 'Process'] = processes
-        self._cache_per_process = {}
 
     @property
     def device(self) -> torch.device:

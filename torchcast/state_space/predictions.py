@@ -50,11 +50,18 @@ class Predictions:
                 raise ValueError(
                     "Since the measurement model is nonlinear, the `mc_white_noise` argument must be specified."
                 )
-        elif len(mc_white_noise.shape) != 2 or mc_white_noise.shape[-1] != _expected_mc_lastdim:
+        elif len(mc_white_noise.shape) != 2:
             raise ValueError(
-                f"`mc_white_noise` must be a 2D tensor with shape ({{n_samples}}, {_expected_mc_lastdim}), "
-                f"got {mc_white_noise.shape}."
+                f"`mc_white_noise` must be a 2D tensor, but got shape {mc_white_noise.shape}."
             )
+        elif mc_white_noise.shape[-1] < _expected_mc_lastdim:
+            raise ValueError(
+                f"`mc_white_noise` must have last dimension of size {_expected_mc_lastdim}, "
+                f"but got shape {mc_white_noise.shape}."
+            )
+        elif mc_white_noise.shape[-1] > _expected_mc_lastdim:
+            mc_white_noise = mc_white_noise[..., :_expected_mc_lastdim]
+
         self.mc_white_noise = mc_white_noise
 
         self._dataset_metadata = None
@@ -119,7 +126,7 @@ class Predictions:
                      conf: Optional[float] = .95) -> pd.DataFrame:
         """
         :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
-        :param type: What type of dataframe to return, either 'predictions' or 'components'.
+        :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
         :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
         :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
         :param conf: The confidence level for the confidence intervals, defaults to 0.95.
@@ -529,10 +536,18 @@ class Predictions:
         partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
         partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
 
-        # then we sample from that multivariate distribution. take care to drop missing measures:
-        chol = torch.linalg.cholesky(partial_measured_cov)
+        # then we sample from that multivariate distribution.
+        # some measures might have no linear components, which means we can't take the cholesky for those
+        # todo: add zero_safe_cholesky helper?
+        nonzero = (extended_measure_mat!=0).any(0).any(1).nonzero(as_tuple=True)[0]
+        m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
+        _chol = torch.linalg.cholesky(partial_measured_cov[m2d])
+        chol = torch.zeros_like(partial_measured_cov)
+        chol[m2d] = _chol
+
+        # take care to drop missing measures:
         missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
-        em_idx = [i for i in range(self.measurement_model_flat.extended_measure_mat.shape[-2]) if i not in missing_midx]
+        em_idx = [i for i in range(self.measurement_model_flat.extended_measure_mat.shape[1]) if i not in missing_midx]
         wn = self.mc_white_noise[:, em_idx]
         _offsets = chol.unsqueeze(0) @ wn.view(-1, 1, len(em_idx), 1)
         sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets.squeeze(-1)
