@@ -153,6 +153,7 @@ def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tup
     Iterable of (group_idx, valid_idx) tuples that can be passed to torch.meshgrid. If no valid, then not returned; if
     all valid then (group_idx, None) is returned; can skip call to meshgrid.
     """
+    isnan = isnan.cpu()
     assert len(isnan.shape) == 2
     state_dim = isnan.shape[-1]
 
