@@ -163,7 +163,7 @@ class StateSpaceModel(torch.nn.Module):
         )
 
         # # used by fit() to reduce unneeded computations:
-        # last_measured_per_group = kwargs.pop('last_measured_per_group', None)
+        last_measured_per_group = kwargs.pop('last_measured_per_group', None)
         # if last_measured_per_group is None:
         #     last_measured_per_group = torch.full((num_groups,), out_timesteps, dtype=torch.int, device=meanu.device)
         nan_groups = kwargs.pop('nan_groups', None)
