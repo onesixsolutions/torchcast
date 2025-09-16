@@ -619,7 +619,7 @@ class _DataFrameGroupByDataset(Dataset):
         self.dtype = dtype
         self.device = device
         self.group_dfs = {g: dfg for g, dfg in df.groupby(self.group_colname, sort=False)}
-        self.groups = df[group_colname].unique()
+        self.groups = df[group_colname].dropna().unique()
 
     def __len__(self) -> int:
         return len(self.group_dfs)

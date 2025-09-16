@@ -416,7 +416,7 @@ ds_example2 = TimeSeriesDataset.from_dataframe(
 
 with torch.no_grad():
     pred = season_trainer.module(ds_example2.tensors[1])
-    _df_pred = pd.DataFrame(pred.squeeze(0).numpy()).assign(time=ds_example2.times().squeeze(0))
+    _df_pred = pd.DataFrame(pred.squeeze(0).cpu().numpy()).assign(time=ds_example2.times().squeeze(0))
     
     (_df_pred
          .query("(time.dt.year == 2013) & (time.dt.month == 6) & (time.dt.day < 7)")
@@ -435,7 +435,7 @@ with torch.no_grad():
 with torch.no_grad():
     display(ds_example2
              .to_dataframe()
-             .assign(pred=season_trainer.predict(ds_example2).squeeze())
+             .assign(pred=season_trainer.predict(ds_example2).cpu().squeeze())
              .pipe(plot_2x2, actual_colname='kW_sqrt_c', pred_colname='pred', split_dt=SPLIT_DT))
 
 # Success! We now have different seasonal patterns depending on the time of the day.
@@ -471,17 +471,26 @@ ss_trainer = StateSpaceTrainer(
     dataset_to_kwargs=dataset_to_kwargs,
     optimizer=torch.optim.Adam(kf_nn.parameters(), lr=.05)
 )
-# -
+
+# +
+# for efficiency of training, we split this single group into multiple groups
+df_elec['group2'] = (df_elec['group'] 
+                     + df_elec['time'].dt.year.astype('str') 
+                     + df_elec['time'].dt.quarter.astype('str'))
+# most groups divide nicely into quarters; but some have a very small number of observations 
+# at the tail end; drop those:
+df_elec.loc[df_elec.groupby('group2')['kW'].transform('count') < 300, 'group2'] = float('nan')
 
 dataloader_kf_nn = TimeSeriesDataLoader.from_dataframe(
     df_elec.query("dataset=='train'"),
-    group_colname='group',
+    group_colname='group2',
     time_colname='time',
     dt_unit='h',
     y_colnames=['kW_sqrt_c'],
     X_colnames=get_season_df,
-    batch_size=40
+    batch_size=140
 )
+# -
 
 try:
     _path = os.path.join(BASE_DIR, f"ss_trainer{SEASON_EMBED_NDIM}.pt")
