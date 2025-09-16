@@ -162,14 +162,14 @@ class StateSpaceModel(torch.nn.Module):
             out_timesteps=out_timesteps
         )
 
-        # used by fit() to reduce unneeded computations:
-        last_measured_per_group = kwargs.pop('last_measured_per_group', None)
-        if last_measured_per_group is None:
-            last_measured_per_group = torch.full((num_groups,), out_timesteps, dtype=torch.int, device=meanu.device)
+        # # used by fit() to reduce unneeded computations:
+        # last_measured_per_group = kwargs.pop('last_measured_per_group', None)
+        # if last_measured_per_group is None:
+        #     last_measured_per_group = torch.full((num_groups,), out_timesteps, dtype=torch.int, device=meanu.device)
         nan_groups = kwargs.pop('nan_groups', None)
         if nan_groups is None:
             nan_groups = [None] * out_timesteps
-        # /
+        # # /
 
         # todo: update Covariance class to make this less hacky:
         mcov_kwargs = {}
@@ -211,7 +211,7 @@ class StateSpaceModel(torch.nn.Module):
         mean1s = []
         cov1s = []
         for t in range(out_timesteps):
-            tmask = (t <= last_measured_per_group)
+            tmask = None  # (t <= last_measured_per_group)
             mean1step, transition_mat = transition_model(meanu, time=t, mask=tmask)
             cov1step = self._predict_cov(
                 cov=covu,
@@ -263,7 +263,7 @@ class StateSpaceModel(torch.nn.Module):
                     if tu_h >= out_timesteps:
                         break
                     if h > 1:
-                        tmask = (tu_h <= last_measured_per_group)
+                        tmask = None  # (tu_h <= last_measured_per_group)
                         meanp, F = transition_model(meanp, time=tu_h, mask=tmask)
                         covp = self._predict_cov(
                             cov=covu,
@@ -518,7 +518,7 @@ class StateSpaceModel(torch.nn.Module):
     def _predict_cov(self,
                      cov: torch.Tensor,
                      transition_mat: torch.Tensor,
-                     mask: torch.Tensor,
+                     mask: Optional[torch.Tensor],
                      **kwargs) -> torch.Tensor:
         raise NotImplementedError
 
