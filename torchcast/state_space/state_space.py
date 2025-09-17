@@ -11,6 +11,7 @@ from torchcast.internals.hessian import hessian
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
 from torchcast.state_space.predictions import Predictions
+from torchcast.state_space.adaptive_measure_var import EWMAdaptiveMeasureVar, AdaptiveMeasureVar
 from torchcast.process.regression import Process
 
 if TYPE_CHECKING:
@@ -24,6 +25,8 @@ class StateSpaceModel(torch.nn.Module):
     :param processes: A list of :class:`.Process` modules.
     :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
     :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
+    :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
+    :param adaptive_measure_var: Experimental feature to adaptively scale the measurement covariance over time.
     """
 
     def __init__(self,
@@ -31,7 +34,7 @@ class StateSpaceModel(torch.nn.Module):
                  measures: Sequence[str],
                  measure_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
-                 adaptive_measure_var: bool = False):
+                 adaptive_measure_var: Union[bool, AdaptiveMeasureVar] = False):
         super().__init__()
 
         # measures:
@@ -48,6 +51,8 @@ class StateSpaceModel(torch.nn.Module):
         for m, alias in (measure_funs or {}).items():
             self.measure_funs[m] = MeasureFun.from_alias(alias)
 
+        if adaptive_measure_var is True:
+            adaptive_measure_var = EWMAdaptiveMeasureVar(num_measures=self.measure_covariance.param_rank)
         self.adaptive_measure_var = adaptive_measure_var
 
         # processes:
@@ -175,7 +180,10 @@ class StateSpaceModel(torch.nn.Module):
         mcov_kwargs = {}
         if self.measure_covariance.expected_kwargs:
             mcov_kwargs = {k: kwargs[k] for k in self.measure_covariance.expected_kwargs}
-        measure_covs = self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1)
+        measure_covs = list(self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1))
+
+        if self.adaptive_measure_var:
+            self.adaptive_measure_var.reset()
 
         #
         predict_kwargs, update_kwargs, used_keys = self._parse_kwargs(
@@ -239,14 +247,20 @@ class StateSpaceModel(torch.nn.Module):
                 )
                 if self.adaptive_measure_var and t < len(measure_covs) - 1:
                     measure_covs[t + 1] = self._update_measure_cov(measure_covs[t + 1], measured_mean, inputs[t])
+
             else:
                 meanu, covu = mean1step, cov1step
+
+                if self.adaptive_measure_var and t < len(measure_covs) - 1:
+                    # adaptive-measure-cov module is equipped to handle nans:
+                    fmm = torch.zeros(num_groups, len(self.measures), device=meanu.device)
+                    finp = torch.full_like(fmm, float('nan'))
+                    measure_covs[t + 1] = self._update_measure_cov(measure_covs[t + 1], fmm, finp)
 
             meanus.append(meanu)
             covus.append(covu)
 
         # 2nd loop to get n_step predicts:
-        # idx: Dict[int, int] = {}
         meanps = {}
         covps = {}
         for t1 in range(out_timesteps):
@@ -272,7 +286,6 @@ class StateSpaceModel(torch.nn.Module):
                             mask=tmask
                         )
                     if tu_h not in meanps:
-                        # idx[tu + h] = tu
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp
 
@@ -601,8 +614,20 @@ class StateSpaceModel(torch.nn.Module):
     def _update_measure_cov(self,
                             measure_cov: torch.Tensor,
                             measured_mean: torch.Tensor,
-                            input: torch.Tensor):
-        raise NotImplementedError
+                            input: torch.Tensor) -> torch.Tensor:
+        assert self.adaptive_measure_var
+
+        nan_mask = input.isnan()
+        resid = input.nan_to_num() - measured_mean
+        multi = self.adaptive_measure_var(resid, nan_mask)
+
+        # Handle empty measures (those not in the covariance structure)
+        multi_padded = torch.ones_like(resid)
+        full_idx = [i for i in range(resid.shape[-1]) if i not in self.measure_covariance.empty_idx]
+        multi_padded[..., full_idx] = multi[..., full_idx]
+
+        multi_diag = torch.diag_embed(multi_padded)
+        return multi_diag @ measure_cov @ multi_diag
 
     @staticmethod
     def _mean_update(mean: torch.Tensor, K: torch.Tensor, resid: torch.Tensor) -> torch.Tensor:
