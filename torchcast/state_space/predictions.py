@@ -156,7 +156,7 @@ class Predictions:
         if type.startswith('pred'):
             return_std = False
             if conf is None:
-                conf = .50
+                conf = stats.norm.ppf(2 * stats.norm.cdf(-.5))
                 return_std = True
 
             df = self._to_dataframe(
@@ -539,7 +539,7 @@ class Predictions:
         # then we sample from that multivariate distribution.
         # some measures might have no linear components, which means we can't take the cholesky for those
         # todo: add zero_safe_cholesky helper?
-        nonzero = (extended_measure_mat!=0).any(0).any(1).nonzero(as_tuple=True)[0]
+        nonzero = (extended_measure_mat != 0).any(0).any(1).nonzero(as_tuple=True)[0]
         m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
         _chol = torch.linalg.cholesky(partial_measured_cov[m2d])
         chol = torch.zeros_like(partial_measured_cov)
