@@ -60,5 +60,6 @@ class EWMAdaptiveMeasureVar(AdaptiveMeasureVar):
             self._running = torch.zeros_like(sq_resids)
         new[skip_mask] = self._running[skip_mask]
         new[~skip_mask] = (1 - self.alpha) * self._running[~skip_mask] + self.alpha * sq_resids[~skip_mask]
-        self._running = torch.log(new.clamp(self.eps) ** .5)
-        return torch.exp(self._running * self.weight)
+        self._running = new.clamp(self.eps)
+        log_running_std = torch.log(self._running ** .5)
+        return torch.exp(log_running_std * self.weight)
