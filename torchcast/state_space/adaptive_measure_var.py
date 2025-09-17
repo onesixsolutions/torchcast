@@ -6,6 +6,7 @@ based on prediction residuals.
 """
 import torch
 import torch.nn as nn
+from torch.nn.init import normal_
 from typing import Optional, Sequence
 
 from torchcast.process.utils import Bounded
@@ -36,12 +37,12 @@ class EWMAdaptiveMeasureVar(AdaptiveMeasureVar):
             assert len(bounds) == num_measures
 
         self._alphas = torch.nn.ModuleList()
-        with torch.no_grad():
-            for lower, upper in bounds:
-                self._alphas.append(Bounded(lower, upper))
+        for lower, upper in bounds:
+            self._alphas.append(Bounded(lower, upper))
+            normal_(self._alphas[-1].raw, -3, .1)  # initialize with lower alpha for more smoothing by default
         self._running = None
 
-        self.weight = nn.Parameter(torch.randn(num_measures) * .01 + 1.0)
+        self.weight = nn.Parameter(torch.randn(num_measures).abs() * .01)  # initialize with small positive value
 
         self.eps = eps
 
