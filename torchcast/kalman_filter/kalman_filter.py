@@ -24,7 +24,7 @@ class KalmanFilter(StateSpaceModel):
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
-                 adaptive_measure_var: bool = False):
+                 adaptive_scaling: bool = False):
 
         if initial_covariance is None:
             initial_covariance = Covariance.from_processes(processes, cov_type='initial')
@@ -37,7 +37,7 @@ class KalmanFilter(StateSpaceModel):
             measures=measures,
             measure_covariance=measure_covariance,
             measure_funs=measure_funs,
-            adaptive_measure_var=adaptive_measure_var,
+            adaptive_scaling=adaptive_scaling,
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
@@ -46,6 +46,7 @@ class KalmanFilter(StateSpaceModel):
                      cov: torch.Tensor,
                      transition_mat: torch.Tensor,
                      Q: torch.Tensor,
+                     scaling: Optional[torch.Tensor] = None,
                      mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if mask is None or mask.all():
             mask = slice(None)
@@ -100,20 +101,24 @@ class KalmanFilter(StateSpaceModel):
         )
 
         # process-variance:
-        measure_scaling = torch.diag_embed(self._get_measure_scaling().unsqueeze(0))
         pcov_kwargs = {}
         if self.process_covariance.expected_kwargs:
             pcov_kwargs = {k: kwargs[k] for k in self.process_covariance.expected_kwargs}
         used_keys |= set(pcov_kwargs)
+
+        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+        measure_std = mcov.diagonal(dim1=-2, dim2=-1).sqrt()
+        for idx in self.measure_covariance.empty_idx:
+            measure_std[idx] = torch.ones_like(measure_std[idx])  # empty measures have no variance, so set to 1
+
         if pcov_kwargs:
-            measure_scaling = measure_scaling.unsqueeze(0)
             pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
-            Qs = measure_scaling @ pcov_raw @ measure_scaling
+            Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_std, is_process_cov=True)
             predict_kwargs['Q'] = Qs.unbind(1)
         else:
             # faster if not time-varying
-            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=1)
-            Qs = measure_scaling @ pcov_raw.squeeze(1) @ measure_scaling
+            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=1).squeeze(1)
+            Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_std, is_process_cov=True)
             predict_kwargs['Q'] = [Qs] * num_timesteps
 
         return predict_kwargs, update_kwargs, used_keys

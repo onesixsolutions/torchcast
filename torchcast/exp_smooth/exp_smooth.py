@@ -22,24 +22,23 @@ class ExpSmoother(StateSpaceModel):
                  measure_covariance: Optional[Covariance] = None,
                  smoothing_matrix: Optional[SmoothingMatrix] = None,
                  measure_funs: Optional[dict[str, str]] = None,
-                 adaptive_measure_var: bool = False):
+                 adaptive_scaling: bool = False):
 
         super().__init__(
             processes=processes,
             measures=measures,
             measure_covariance=measure_covariance,
             measure_funs=measure_funs,
-            adaptive_measure_var=adaptive_measure_var,
+            adaptive_scaling=adaptive_scaling,
         )
         if smoothing_matrix is None:
             smoothing_matrix = SmoothingMatrix.from_measures_and_processes(measures=measures, processes=processes)
         self.smoothing_matrix = smoothing_matrix.set_id('smoothing_matrix')
 
     def initial_covariance(self, inputs: dict, num_groups: int, num_times: int, _ignore_input: bool = False) -> Tensor:
-        # initial covariance is always zero. this will be replaced by the 1-step-ahead covariance in the first call to
-        # predict
-        ms = self._get_measure_scaling()
-        return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=ms.dtype, device=ms.device)
+        # initial covariance is always zero. this will be replaced by the 1-step covariance in the first call to predict
+        m = list(self.processes.values())[0].initial_mean  # get a parameter, any parameter, to get device
+        return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=m.dtype, device=m.device)
 
     def _mask_mats(self,
                    groups: torch.Tensor,
@@ -105,9 +104,13 @@ class ExpSmoother(StateSpaceModel):
                      cov: torch.Tensor,
                      transition_mat: torch.Tensor,
                      cov1step: torch.Tensor,
+                     scaling: Optional[torch.Tensor] = None,
                      mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # new_cov will at least be cov1step (see note above in _update_step)
         new_cov = cov1step
+
+        if scaling is not None:
+            raise NotImplementedError
 
         # fastpath: if the call to update returned the zero-dim tensor (see _update above) then we are done
         if len(cov.shape):

@@ -22,7 +22,7 @@ class BinomialFilter(KalmanFilter):
                  measure_covariance: Optional[Covariance] = None,
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
-                 adaptive_measure_var: bool = False):
+                 adaptive_scaling: bool = False):
 
         if binary_measures is None:
             binary_measures = list(measures)
@@ -41,7 +41,7 @@ class BinomialFilter(KalmanFilter):
             process_covariance=process_covariance,
             measure_covariance=measure_covariance,
             initial_covariance=initial_covariance,
-            adaptive_measure_var=adaptive_measure_var,
+            adaptive_scaling=adaptive_scaling,
             measure_funs={m: 'ilogit' for m in binary_measures},
         )
 

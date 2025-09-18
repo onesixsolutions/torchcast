@@ -12,7 +12,7 @@ from typing import Optional, Sequence
 from torchcast.process.utils import Bounded
 
 
-class AdaptiveMeasureVar(nn.Module):
+class AdaptiveScaler(nn.Module):
     def reset(self):
         raise NotImplementedError
 
@@ -20,9 +20,9 @@ class AdaptiveMeasureVar(nn.Module):
         raise NotImplementedError
 
 
-class EWMAdaptiveMeasureVar(AdaptiveMeasureVar):
+class EWMAdaptiveScaler(AdaptiveScaler):
     """
-    Exponentially Weighted Moving Average (EWM) based adaptive measure variance.
+    Exponentially Weighted Moving Average (EWM) based adaptive scaling.
     """
 
     def __init__(self,
