@@ -52,6 +52,8 @@ class KalmanFilter(StateSpaceModel):
             mask = slice(None)
         F = transition_mat[mask]
         Q = Q[mask]
+        scaling = scaling[mask] if scaling is not None else None
+        Q = self._apply_cov_scaling(Q, scaling, is_process_cov=True)
 
         new_cov = update_tensor(cov, new=(F @ cov[mask] @ F.permute(0, 2, 1) + Q), mask=mask)
         return new_cov
