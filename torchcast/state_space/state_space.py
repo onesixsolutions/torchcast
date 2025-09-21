@@ -337,17 +337,14 @@ class StateSpaceModel(torch.nn.Module):
             elif len(scaling.shape) != 2:
                 raise ValueError(f"Expected scaling to be 1d or 2d, got {scaling.shape}")
             # for process cov, need to map from measures to states:
-            pscaling = torch.cat([
+            scaling = torch.cat([
                 scaling[..., [self.measures.index(process.measure)]].repeat(1, process.rank)
                 for process in self.processes.values()
             ], dim=-1)
-            scaling_diag = torch.diag_embed(pscaling)
         else:
-            # for measure-cov this is easy:
+            # for measure-cov nothing extra to do
             assert cov.shape[-1] == len(self.measures)
-            scaling_diag = torch.diag_embed(scaling)
-
-        return scaling_diag @ cov @ scaling_diag
+        return cov * scaling.unsqueeze(-2) * scaling.unsqueeze(-1)
 
     def _get_scaling_multi(self,
                            measured_mean: torch.Tensor,

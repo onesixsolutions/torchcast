@@ -259,8 +259,7 @@ class Covariance(nn.Module):
             if (pred < 0).any():
                 raise RuntimeError(f"{self.id}'s `predict_variance` produced values <0; needs exp/softplus layer.")
             pred = validate_gt_shape(pred, num_groups=num_groups, num_times=num_times, trailing_dim=[self.param_rank])
-            diag_multi = torch.diag_embed(pred)
-            mini_cov = diag_multi @ mini_cov @ diag_multi
+            mini_cov = mini_cov * pred.unsqueeze(-2) * pred.unsqueeze(-1)
 
         mask = self.mask.unsqueeze(0).unsqueeze(0)
 
