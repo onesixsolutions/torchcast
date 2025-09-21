@@ -54,12 +54,13 @@ class EWMAdaptiveScaler(AdaptiveScaler):
         self._running = None
 
     def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
-        sq_resids = residuals ** 2
-        new = torch.zeros_like(sq_resids)
         if self._running is None:
-            self._running = torch.zeros_like(sq_resids)
-        new[skip_mask] = self._running[skip_mask]
-        new[~skip_mask] = (1 - self.alpha) * self._running[~skip_mask] + self.alpha * sq_resids[~skip_mask]
-        self._running = new.clamp(self.eps)
+            self._running = torch.zeros_like(residuals)
+
+        sq_resids = residuals ** 2
+        alpha = torch.zeros_like(sq_resids)
+        alpha[~skip_mask] = self.alpha.expand_as(sq_resids)[~skip_mask]
+        ewma = (1 - alpha) * self._running + alpha * sq_resids
+        self._running = ewma.clamp(self.eps)
         log_running_std = torch.log(self._running ** .5)
-        return torch.exp(log_running_std * self.weight)
+        return torch.exp(torch.clamp(log_running_std * self.weight, max=8))
