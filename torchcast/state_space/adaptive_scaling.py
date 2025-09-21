@@ -4,6 +4,7 @@ Adaptive measure variance modules for StateSpaceModel.
 This module provides implementations for adaptively updating measurement covariance
 based on prediction residuals.
 """
+
 import torch
 import torch.nn as nn
 from torch.nn.init import normal_
@@ -27,39 +28,50 @@ class EWMAdaptiveScaler(AdaptiveScaler):
 
     def __init__(self,
                  num_measures: int,
-                 bounds: Optional[Sequence[tuple[float, float]]] = None,
                  eps: float = 1e-3):
         super().__init__()
 
-        if bounds is None:
-            bounds = [(0.0, 1.0)] * num_measures
-        else:
-            assert len(bounds) == num_measures
+        # initial alpha:
+        self._rhos = torch.nn.ModuleList(
+            [Bounded(0.0, 1.0) for _ in range(num_measures)]
+        )
 
-        self._alphas = torch.nn.ModuleList()
-        for lower, upper in bounds:
-            self._alphas.append(Bounded(lower, upper))
-            normal_(self._alphas[-1].raw, -3, .1)  # initialize with lower alpha for more smoothing by default
-        self._running = None
+        # decay speed:
+        # tau is halflife, so default to halflife of exp(3.5) ~ 33 timesteps
+        self._taus = torch.nn.Parameter(torch.randn(num_measures) * .1 + 3.5)
 
-        self.weight = nn.Parameter(torch.randn(num_measures).abs() * .01)  # initialize with small positive value
+        # coef from log-std to multiplier:
+        # initialize with small positive value
+        self.weight = nn.Parameter(torch.randn(num_measures).abs() * .01)
 
+        # prevent scaling from going to zero:
         self.eps = eps
+
+        self._running = None
+        self._time = None
 
     @property
     def alpha(self) -> torch.Tensor:
-        return torch.stack([alpha() for alpha in self._alphas], -1)
+        alphas = []
+        for i, rho in enumerate(self._rhos):
+            tau = torch.exp(self._taus[i])
+            alpha = tau * rho() / (self._time[:, i] + tau)
+            alphas.append(alpha)
+        return torch.stack(alphas, -1)
 
     def reset(self):
         self._running = None
+        self._time = None
 
     def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
         if self._running is None:
             self._running = torch.zeros_like(residuals)
+            self._time = torch.zeros_like(residuals)
+        self._time += (~skip_mask).int()
 
         sq_resids = residuals ** 2
         alpha = torch.zeros_like(sq_resids)
-        alpha[~skip_mask] = self.alpha.expand_as(sq_resids)[~skip_mask]
+        alpha[~skip_mask] = self.alpha[~skip_mask]
         ewma = (1 - alpha) * self._running + alpha * sq_resids
         self._running = ewma.clamp(self.eps)
         log_running_std = torch.log(self._running ** .5)
