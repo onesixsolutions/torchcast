@@ -4,6 +4,7 @@ Adaptive measure variance modules for StateSpaceModel.
 This module provides implementations for adaptively updating measurement covariance
 based on prediction residuals.
 """
+import warnings
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,16 @@ from torchcast.process.utils import Bounded
 
 
 class AdaptiveScaler(nn.Module):
+    def initialize(self, num_timesteps: int):
+        """
+        If relevant, use num_timesteps to initialize parameters
+        """
+        raise NotImplementedError
+
     def reset(self):
+        """
+        Reset internal state (e.g., running statistics).
+        """
         raise NotImplementedError
 
     def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
@@ -37,8 +47,7 @@ class EWMAdaptiveScaler(AdaptiveScaler):
         )
 
         # decay speed:
-        # tau is halflife, so default to halflife of exp(3.5) ~ 33 timesteps
-        self._taus = torch.nn.Parameter(torch.randn(num_measures) * .1 + 3.5)
+        self._taus = torch.nn.Parameter(torch.randn(num_measures) * .1)
 
         # coef from log-std to multiplier:
         # initialize with small positive value
@@ -49,6 +58,14 @@ class EWMAdaptiveScaler(AdaptiveScaler):
 
         self._running = None
         self._time = None
+        self._called_initialize = None
+
+    @torch.no_grad()
+    def initialize(self, num_timesteps: int):
+        # tau is halflife, by default we'll set halflife to 10% of num_timesteps
+        normal_(self._taus, std=.1)
+        self._taus += torch.log(torch.tensor(.10 * num_timesteps, dtype=self._taus.dtype))
+        self._called_initialize = True
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -62,6 +79,9 @@ class EWMAdaptiveScaler(AdaptiveScaler):
     def reset(self):
         self._running = None
         self._time = None
+        if self._called_initialize is None:
+            warnings.warn("Consider calling adaptive scaler's `initialize()` method before use.")
+            self._called_initialize = False  # only warn once
 
     def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
         if self._running is None:

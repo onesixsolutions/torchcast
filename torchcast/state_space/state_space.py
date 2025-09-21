@@ -411,6 +411,8 @@ class StateSpaceModel(torch.nn.Module):
 
         if set_initial_values:
             self._set_initial_values(y, verbose=verbose > 1, **kwargs)
+            if self.adaptive_scaling:
+                self.adaptive_scaling.initialize(y.shape[1])
 
         _deprecated = {k: kwargs.pop(k) for k in ['tol', 'patience', 'max_iter'] if k in kwargs}
         _dmsg = f"The following are deprecated, use `stopping` arg instead:\n{set(_deprecated)}"
