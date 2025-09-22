@@ -289,7 +289,10 @@ class StateSpaceModel(torch.nn.Module):
                         covps[tu_h] = covp
                         measure_covs[tu_h] = self._apply_cov_scaling(measure_covs[tu_h], scaling)
                     else:
-                        raise NotImplementedError  # TODO: how do we hit this?
+                        # n_step>1 generally should only assign to meanps when tu_h = tu + n_step;
+                        # but the exception is the first n_step timesteps where we do not have the 'forecast-from'
+                        # timepoint in the input
+                        assert every_step
 
         preds = [meanps[t] for t in range(out_timesteps)], [covps[t] for t in range(out_timesteps)]
 
