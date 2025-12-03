@@ -736,13 +736,19 @@ class StateSpaceModel(torch.nn.Module):
                     f"Expected ``init_cov`` to be 3-D with (num_groups, state_dim, state_dim), got {init_cov.shape}"
                 )
 
-        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
-        measure_std = mcov.diagonal(dim1=-2, dim2=-1).sqrt()
-        for idx in self.measure_covariance.empty_idx:
-            measure_std[idx] = torch.ones_like(measure_std[idx])  # empty measures have no variance, so set to 1
-        init_cov = self._apply_cov_scaling(init_cov, scaling=measure_std, is_process_cov=True)
+        measure_scaling = self._get_measure_scaling()
+        init_cov = self._apply_cov_scaling(init_cov, scaling=measure_scaling, is_process_cov=True)
 
         return init_mean, init_cov
+
+    def _get_measure_scaling(self) -> torch.Tensor:
+        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+        # need unbind->modify->stack to avoid modified-inplace error
+        measure_diag = list(mcov.diagonal(dim1=-2, dim2=-1).unbind(0))
+        # replace 0 with 1 in empties:
+        for idx in self.measure_covariance.empty_idx:
+            measure_diag[idx] = torch.as_tensor(1, device=mcov.device, dtype=mcov.dtype)
+        return torch.stack(measure_diag).sqrt()  # careful to only take sqrt *after* removing the zero!
 
     @property
     def state_rank(self) -> int:

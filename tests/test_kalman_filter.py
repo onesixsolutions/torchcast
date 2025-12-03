@@ -196,7 +196,6 @@ class TestKalmanFilter(TestCase):
             ],
             measures=['y']
         )
-        kf._get_measure_scaling = lambda: torch.ones(2)
 
         kf.state_dict()['processes.lm.initial_mean'][:] = torch.tensor([1.5, -0.5])
         kf.state_dict()['measure_covariance.cholesky_log_diag'][0] = np.log(.1 ** .5)
