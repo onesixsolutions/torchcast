@@ -67,7 +67,12 @@ class LinearModel(Process):
             for p in predictors
         ]
 
-    def get_measurement_matrix(self, X: torch.Tensor) -> torch.Tensor:
+    def get_measurement_matrix(self, **kwargs) -> torch.Tensor:
+        X = kwargs.pop(self.model_mat_kwarg_name, None)
+        if X is None:
+            raise TypeError(f"{self.id}.get_measurement_matrix() missing `{self.model_mat_kwarg_name}` argument")
+        if kwargs:
+            raise ValueError(f"{self.id}.get_measurement_matrix() received unexpected kwargs: {set(kwargs)}")
         assert not torch.isnan(X).any()
         assert not torch.isinf(X).any()
         if X.shape[-1] != self.rank:
