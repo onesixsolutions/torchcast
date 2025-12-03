@@ -354,14 +354,14 @@ class StateSpaceModel(torch.nn.Module):
                            input: torch.Tensor) -> Optional[torch.Tensor]:
 
         if self.adaptive_scaling:
-            nan_mask = input.isnan()
-            resid = input.nan_to_num() - measured_mean
+            idx = self.measure_covariance.non_empty_idx
+            nan_mask = input[..., idx].isnan()
+            resid = input[..., idx].nan_to_num() - measured_mean[..., idx]
             multi = self.adaptive_scaling(resid, nan_mask)
 
             # Handle empty measures (those not in the covariance structure)
-            multi_padded = torch.ones_like(resid)
-            full_idx = [i for i in range(resid.shape[-1]) if i not in self.measure_covariance.empty_idx]
-            multi_padded[..., full_idx] = multi[..., full_idx]
+            multi_padded = torch.ones_like(input)
+            multi_padded[..., idx] = multi[..., idx]
             return multi_padded
         else:
             return None

@@ -19,7 +19,7 @@ class TestCovariance(unittest.TestCase):
         self.assertTrue((diff < .0001).all())
 
     def test_empty_idx(self):
-        module = torch.jit.script(Covariance(id='test', rank=3, empty_idx=[0]))
+        module = Covariance(id='test', rank=3, empty_idx=[0])
         cov = module({}, num_groups=1, num_times=1)
         cov = cov.squeeze()
         self.assertTrue((cov[0, :] == 0).all())

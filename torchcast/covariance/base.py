@@ -177,6 +177,10 @@ class Covariance(nn.Module):
             expected_kwargs = [expected_kwargs]
         self.expected_kwargs: Optional[List[str]] = None if expected_kwargs is None else list(expected_kwargs)
 
+    @property
+    def non_empty_idx(self) -> List[int]:
+        return [i for i in range(self.rank) if i not in self.empty_idx]
+
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
         self.cholesky_off_diag: Optional[nn.Parameter] = None
