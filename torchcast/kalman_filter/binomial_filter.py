@@ -112,7 +112,7 @@ class BinomialFilter(KalmanFilter):
         if masks is None or binary_idx is None:
             return out
         val_idx = masks[0]
-        out['binary_idx'] = [i for i in binary_idx if i in val_idx]
+        out['binary_idx'] = torch.isin(val_idx, torch.as_tensor(binary_idx)).nonzero().squeeze(-1)
         _binary_subset_idx = torch.tensor([i1 for i1, i2 in enumerate(binary_idx) if i2 in val_idx], dtype=torch.long)
         m1d = torch.meshgrid(groups, _binary_subset_idx, indexing='ij')
         out['num_obs'] = kwargs['num_obs'][m1d]
@@ -130,7 +130,7 @@ class BinomialFilter(KalmanFilter):
             y = y.clone()
             midx = self.measures.index(measure)
             if not isinstance(num_obs, int):
-                num_obs = num_obs[self.binary_measures.index(measure)]
+                num_obs = num_obs[..., self.binary_measures.index(measure)]
             y[..., midx] = y[..., midx] / num_obs
 
         return super()._get_good_initial_value_from_y(
