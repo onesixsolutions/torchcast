@@ -1,10 +1,22 @@
 from dataclasses import dataclass
 
-from typing import Optional, Union
-from warnings import warn
+from typing import Optional, Union, TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
+
+if TYPE_CHECKING:
+    from torchcast.process import Process
+
+
+def process2slice(processes: dict[str, 'Process']) -> dict[str, 'slice']:
+    start_ = 0
+    process2slice = {}
+    for pid, process in processes.items():
+        end_ = start_ + process.rank
+        process2slice[pid] = slice(start_, end_)
+        start_ = end_
+    return process2slice
 
 
 def standardize_decay(decay: Optional[Union[torch.nn.Module, tuple[float, float]]],

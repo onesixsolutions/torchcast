@@ -1,8 +1,10 @@
 from functools import cached_property
 
-from typing import TYPE_CHECKING, Sequence, Optional, Union, Collection, Iterable
+from typing import TYPE_CHECKING
 
 import torch
+
+from torchcast.process.utils import process2slice
 
 if TYPE_CHECKING:
     from torchcast.process import Process
@@ -51,10 +53,5 @@ class DesignModel:
         """
         Returns a mapping from process id to the slice of the state vector that contains its state elements.
         """
-        start_ = 0
-        process2slice = {}
-        for pid, process in self.processes.items():
-            end_ = start_ + process.rank
-            process2slice[pid] = slice(start_, end_)
-            start_ = end_
-        return process2slice
+        return process2slice(self.processes)
+
