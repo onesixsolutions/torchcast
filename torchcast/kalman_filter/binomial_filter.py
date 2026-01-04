@@ -88,7 +88,6 @@ class BinomialFilter(KalmanFilter):
                               measurement_model: 'MeasurementModel',
                               num_obs: Sequence[torch.Tensor],
                               observed_counts: bool,
-                              mc_white_noise: Optional[torch.Tensor] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
@@ -98,7 +97,7 @@ class BinomialFilter(KalmanFilter):
             states=preds,
             measure_covs=measure_covs,
             updates=updates,
-            mc_white_noise=mc_white_noise,
+            mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
             num_obs=num_obs,
             observed_counts=observed_counts,
         )
@@ -342,7 +341,6 @@ class BinomialPredictions(Predictions):
         if len(binary_idx):
             if num_obs is None:
                 raise RuntimeError("num_obs should be set because there are binary measures")
-            mc_samples = self.mc_white_noise.shape[0]
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model.subset(measures=self.binary_measures),
                 state_means=state_means,
@@ -353,30 +351,11 @@ class BinomialPredictions(Predictions):
             if not self.observed_counts:  # multiply by total_count b/c `obs` are props, but Binomial expects counts:
                 _obs = _obs * num_obs
             mc_log_probs = binom.log_prob(_obs.unsqueeze(0))
-            binary_lp = torch.sum(torch.logsumexp(mc_log_probs, dim=0), -1) - log(mc_samples)
+            binary_lp = torch.sum(torch.logsumexp(mc_log_probs, dim=0), -1) - log(mc_log_probs.shape[0])
         else:
             binary_lp = 0
 
         return gaussian_lp + binary_lp
-
-    def _get_posterior_predict_samples(self) -> torch.Tensor:
-        samples = self._get_measured_mean_samples(
-            measurement_model=self.measurement_model_flat,
-            state_means=self.state_means_flat,
-            state_covs=self.state_covs_flat,
-        )
-
-        gauss_idx = [i for i, m in enumerate(self.measurement_model_flat.measures) if m not in self.binary_measures]
-        if gauss_idx:
-            group_idx = torch.arange(self.measurement_model_flat.num_groups, dtype=torch.long)
-            gauss_idx = torch.as_tensor(gauss_idx, dtype=torch.long)
-            mask2d = torch.meshgrid(group_idx, gauss_idx, gauss_idx, indexing='ij')
-            chol = torch.linalg.cholesky(self.measure_covs_flat[mask2d])
-            _offsets = chol.unsqueeze(0) @ self.mc_white_noise_mcov[..., gauss_idx].view(-1, 1, chol.shape[-1], 1)
-            offsets = torch.zeros_like(samples)
-            offsets[..., gauss_idx] = _offsets.squeeze(-1)
-            samples = samples + offsets
-        return samples
 
 
 def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_common: float = 1.):
@@ -389,7 +368,7 @@ def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_
 
     TOTAL_COUNT = 4
     measures = ['dim1', 'dim2']
-    binary_measures = []
+    binary_measures = ['dim2']
     latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
     latent_ind = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, len(measures))), dim=1)
     assert 0 <= prop_common <= 1
@@ -430,7 +409,7 @@ def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_
     )
 
     y = dataset.tensors[0]
-    bf.fit(y, start_offsets=dataset.start_offsets, mc_samples=32)
+    bf.fit(y, start_offsets=dataset.start_offsets)
     _kwargs = {}
     # if TOTAL_COUNT != 1:
     #     _kwargs['num_obs'] = TOTAL_COUNT
@@ -456,8 +435,8 @@ def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_
                 + geom_line(aes(y='latent'), color='purple')
                 + ggtitle(g)
         ).show()
-    preds._white_noise = torch.zeros((1, len(binary_measures)))
-    print(preds.log_prob(y).mean())
+    # preds._white_noise = torch.zeros((1, len(binary_measures)))
+    # print(preds.log_prob(y).mean())
 
 
 if __name__ == '__main__':

@@ -1,3 +1,5 @@
+from functools import cached_property
+
 from math import log
 
 from dataclasses import dataclass, fields
@@ -16,6 +18,9 @@ from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, r
 if TYPE_CHECKING:
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+_RANDOM_STATE = np.random.RandomState().get_state()
 
 
 class Predictions:
@@ -31,7 +36,7 @@ class Predictions:
                  states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
                  updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-                 mc_white_noise: Optional[torch.Tensor] = None):
+                 mc_white_noise: Optional['FixedWhiteNoise'] = None):
         self.state_means = _maybe_stack(states[0], 1)
         self.state_covs = _maybe_stack(states[1], 1)
         self.measure_covs = _maybe_stack(measure_covs, 1)
@@ -44,23 +49,10 @@ class Predictions:
             self.update_means = _maybe_stack(updates[0], 1)
             self.update_covs = _maybe_stack(updates[1], 1)
 
-        _expected_mc_lastdim = self.measurement_model_flat.extended_measure_mat.shape[-2]
-        if mc_white_noise is None:
-            if self.measurement_model.is_nonlinear:
-                raise ValueError(
-                    "Since the measurement model is nonlinear, the `mc_white_noise` argument must be specified."
-                )
-        elif len(mc_white_noise.shape) != 2:
+        if mc_white_noise is None and self.measurement_model.is_nonlinear:
             raise ValueError(
-                f"`mc_white_noise` must be a 2D tensor, but got shape {mc_white_noise.shape}."
+                "Since the measurement model is nonlinear, the `mc_white_noise` argument must be specified."
             )
-        elif mc_white_noise.shape[-1] < _expected_mc_lastdim:
-            raise ValueError(
-                f"`mc_white_noise` must have last dimension of size {_expected_mc_lastdim}, "
-                f"but got shape {mc_white_noise.shape}."
-            )
-        elif mc_white_noise.shape[-1] > _expected_mc_lastdim:
-            mc_white_noise = mc_white_noise[..., :_expected_mc_lastdim]
 
         self.mc_white_noise = mc_white_noise
 
@@ -68,7 +60,6 @@ class Predictions:
         self._state_means_flat = None
         self._state_covs_flat = None
         self._mcovs_flat = None
-        self._mc_white_noise_mcov = None
 
     @property
     def num_groups(self) -> int:
@@ -192,15 +183,13 @@ class Predictions:
         batch_shape = self.state_means.shape[0:2]
 
         if self.mc_white_noise is not None:
-            mc_samples = self.mc_white_noise.shape[0]
             # sample from the state distribution:
-            # note: we dont use `mc_white_noise` here because that the extent of its last dim is
-            # `num_measures + nonlinear_rank`, but here we need `state_rank`.
+            # todo: use chol @ self.white_noise like in _get_measured_mean_samples
             state_mean_samples = torch.distributions.MultivariateNormal(
                 loc=self.state_means_flat,
                 covariance_matrix=self.state_covs_flat,
                 validate_args=False
-            ).sample((mc_samples,))
+            ).sample((self.mc_white_noise.num_samples,))
 
             # pass each sample to the `get_components` function, organize by process:
             samples_by_proc = {}
@@ -213,7 +202,7 @@ class Predictions:
             # compute CIs:
             cis_by_proc = {}
             for key, samples in samples_by_proc.items():
-                stacked = torch.stack(samples, dim=0).view(mc_samples, *batch_shape)
+                stacked = torch.stack(samples, dim=0).view(self.mc_white_noise.num_samples, *batch_shape)
                 lower = torch.quantile(stacked, q=alpha, dim=0)
                 upper = torch.quantile(stacked, q=1 - alpha, dim=0)
                 cis_by_proc[key] = (lower, upper)
@@ -287,13 +276,34 @@ class Predictions:
         alpha = (1 - conf) / 2
 
         if self.mc_white_noise is not None:
-            samples = self._get_posterior_predict_samples()
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=self.measurement_model_flat,
+                state_means=self.state_means_flat,
+                state_covs=self.state_covs_flat,
+            )
 
+            # _get_measured_mean_samples captures uncertainty in the state, then below we'll add n(0,measure_std) noise
+            # to capture uncertainty from the measure covariance:
+            mstds = self.measure_covs_flat.diagonal(dim1=-2, dim2=-1).sqrt()
+            # mc_white_noise will give the same num_samples*num_dims array for a given num_dims input.
+            # this is primarily used in _get_measured_mean_samples to sample from state uncertainty. but we additionally
+            # need fixed random sampling for measure variance when plotting. this can't be the same fixed random state
+            # as the state uncertainty, since we want state samples and measurement samples to be uncorrelated.
+            rs = np.random.RandomState()
+            rs.set_state(_RANDOM_STATE)
+            measurement_white_noise = torch.as_tensor(
+                rs.randn(self.mc_white_noise.num_samples, len(self.measurement_model.measures)),
+                dtype=self.state_means.dtype,
+                device=self.state_means.device
+            )
+
+            # for each measure, get mean/quantiles:
             by_measure = {}
             for i, measure in enumerate(self.measurement_model.measures):
-                mean = torch.mean(samples[..., i], dim=0)
-                lower = torch.quantile(samples[..., i], q=alpha, dim=0)
-                upper = torch.quantile(samples[..., i], q=1 - alpha, dim=0)
+                samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
+                mean = torch.mean(samples, dim=0)
+                lower = torch.quantile(samples, q=alpha, dim=0)
+                upper = torch.quantile(samples, q=1 - alpha, dim=0)
                 by_measure[measure] = (
                     mean.view(*batch_shape),
                     lower.view(*batch_shape),
@@ -348,27 +358,6 @@ class Predictions:
         out = pd.concat(out)
 
         return out
-
-    @property
-    def mc_white_noise_mcov(self) -> torch.Tensor:
-        if self._mc_white_noise_mcov is None:
-            mc_draws = self.mc_white_noise.shape[0]
-            self._mc_white_noise_mcov = torch.randn(
-                (mc_draws, self.measure_covs.shape[-1]),
-                device=self.measure_covs.device
-            )
-        return self._mc_white_noise_mcov
-
-    def _get_posterior_predict_samples(self) -> torch.Tensor:
-        mmean_samples = self._get_measured_mean_samples(
-            measurement_model=self.measurement_model_flat,
-            state_means=self.state_means_flat,
-            state_covs=self.state_covs_flat,
-        )
-        chol = torch.linalg.cholesky(self.measure_covs_flat)
-        _offsets = chol.unsqueeze(0) @ self.mc_white_noise_mcov.view(-1, 1, chol.shape[-1], 1)
-        samples = mmean_samples + _offsets.squeeze(-1)
-        return samples
 
     def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_shape = self.state_means.shape[0:2]
@@ -504,7 +493,6 @@ class Predictions:
         assert measurement_model.num_timesteps == 1
 
         if measurement_model.is_nonlinear:
-            mc_samples = self.mc_white_noise.shape[0]
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
@@ -519,7 +507,7 @@ class Predictions:
             ).log_prob(obs)
             # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
             # this is a numerically stable way to do that:
-            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_samples)
+            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
         else:
             measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
             system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
@@ -547,8 +535,9 @@ class Predictions:
 
         # take care to drop missing measures:
         missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
-        em_idx = [i for i in range(self.measurement_model_flat.extended_measure_mat.shape[1]) if i not in missing_midx]
-        wn = self.mc_white_noise[:, em_idx]
+        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        em_idx = [i for i in range(em_dim) if i not in missing_midx]
+        wn = self.mc_white_noise(num_dim=em_dim, dtype=_chol.dtype, device=_chol.device)[:, em_idx]
         _offsets = chol.unsqueeze(0) @ wn.view(-1, 1, len(em_idx), 1)
         sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets.squeeze(-1)
 

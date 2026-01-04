@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian
+from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
 from torchcast.state_space.predictions import Predictions
@@ -55,6 +56,8 @@ class StateSpaceModel(torch.nn.Module):
         if adaptive_scaling is True:
             adaptive_scaling = EWMAdaptiveScaler(num_measures=self.measure_covariance.param_rank)
         self.adaptive_scaling = adaptive_scaling
+
+        self._mc_sampling = None
 
         # processes:
         self.dt_unit = None
@@ -302,16 +305,6 @@ class StateSpaceModel(torch.nn.Module):
             updates = None
 
         prediction_kwargs = prediction_kwargs or {}
-        if 'mc_white_noise' not in prediction_kwargs and self.is_nonlinear:
-            mc_samples = kwargs.pop('mc_samples', None)
-            if mc_samples is None:
-                warn("`mc_samples` not set, using 250 samples", UserWarning)
-                mc_samples = 250
-            prediction_kwargs['mc_white_noise'] = torch.randn(
-                (mc_samples, self.state_rank + 1),  # TODO
-                device=meanu.device,
-                dtype=meanu.dtype
-            )
         preds = self._generate_predictions(
             preds=preds,
             updates=updates,
@@ -436,7 +429,18 @@ class StateSpaceModel(torch.nn.Module):
             prog = tqdm()
         callable_kwargs = callable_kwargs or {}
 
-        kwargs = self._prepare_fit_kwargs(y, **kwargs)
+        # precompute nan-groups for forward pass
+        isnan = torch.isnan(y)
+        kwargs['nan_groups'] = [get_nan_groups(isnan_t) for isnan_t in isnan.unbind(1)]
+
+        # see `last_measured_per_group` in forward docstring
+        # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
+        any_measured_bool = ~torch.isnan(y).all(2).cpu()
+        kwargs['last_measured_per_group'] = torch.as_tensor(
+            [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y.shape[0])],
+            dtype=torch.int,
+            device=y.device
+        ) + 1
 
         if get_loss is None:
             # precompute nan-groups instead of doing it on each call to log_prob:
@@ -476,38 +480,25 @@ class StateSpaceModel(torch.nn.Module):
     def is_nonlinear(self) -> bool:
         return any(not p.linear_measurement for p in self.processes.values()) or self.measure_funs
 
-    def _prepare_fit_kwargs(self,
-                            y: torch.Tensor,
-                            **kwargs) -> dict:
-        # precompute nan-groups for forward pass
-        isnan = torch.isnan(y)
-        kwargs['nan_groups'] = [get_nan_groups(isnan_t) for isnan_t in isnan.unbind(1)]
+    @property
+    def mc_sampling(self) -> FixedWhiteNoise:
+        if self._mc_sampling is None:
+            warn(
+                "Model requires monte-carlo sampling; will use 250 samples. You can set to a different value with "
+                "``my_model.mc_sampling = X``"
+            )
+            self.mc_sampling = FixedWhiteNoise(num_samples=250)
+        return self._mc_sampling
 
-        #
-        prediction_kwargs = kwargs.pop('prediction_kwargs', None) or {}
-        # monte-carlo for Predictions.log_prob:
-        mc_samples = kwargs.pop('mc_samples', None)
-        if self.is_nonlinear and not mc_samples:
-            raise ValueError("Nonlinear state-space models require `mc_samples` to be set.")
-        if mc_samples:
-            if 'mc_white_noise' not in prediction_kwargs:
-                prediction_kwargs['mc_white_noise'] = torch.randn(
-                    (mc_samples, self.state_rank + 1),  # TODO
-                    device=y.device,
-                    dtype=y.dtype
-                )
-        kwargs['prediction_kwargs'] = prediction_kwargs
-
-        # see `last_measured_per_group` in forward docstring
-        # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
-        any_measured_bool = ~torch.isnan(y).all(2).cpu()
-        kwargs['last_measured_per_group'] = torch.as_tensor(
-            [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y.shape[0])],
-            dtype=torch.int,
-            device=y.device
-        ) + 1
-
-        return kwargs
+    @mc_sampling.setter
+    def mc_sampling(self, mc_sampling: Union[int, FixedWhiteNoise]):
+        if isinstance(mc_sampling, int):
+            if self._mc_sampling:  # if already set, passing an int just updates the num_samples, doesnt change seed
+                self._mc_sampling.num_samples = mc_sampling
+                mc_sampling = self._mc_sampling
+            else:
+                mc_sampling = FixedWhiteNoise(mc_sampling)
+        self._mc_sampling = mc_sampling
 
     def _generate_predictions(self,
                               preds: tuple[list[torch.Tensor], list[torch.Tensor]],
@@ -515,17 +506,17 @@ class StateSpaceModel(torch.nn.Module):
                               measure_covs: torch.Tensor,
                               measurement_model: 'MeasurementModel',
                               nan_groups: Optional[List[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]]] = None,
-                              mc_white_noise: Optional[torch.Tensor] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
             raise TypeError(f"{type(self).__name__} got unexpected kwargs: {set(kwargs)})")
+
         return Predictions(
             measurement_model=measurement_model,
             states=preds,
             measure_covs=measure_covs,
             updates=updates,
-            mc_white_noise=mc_white_noise,
+            mc_white_noise=self.mc_sampling if self.is_nonlinear else None
         )
 
     def _parse_kwargs(self,
@@ -769,8 +760,6 @@ class StateSpaceModel(torch.nn.Module):
         """
         if not get_loss:
             get_loss = lambda _pred, _y: -_pred.log_prob(_y).sum()
-
-        kwargs = self._prepare_fit_kwargs(y, **kwargs)
 
         pred = self(y, **kwargs)
         loss = get_loss(pred, y)
