@@ -1,5 +1,6 @@
 import datetime
 import itertools
+import pandas as pd
 
 from typing import Sequence, Any, Union, Optional, Tuple, Callable, TYPE_CHECKING
 from warnings import warn
@@ -8,7 +9,7 @@ import numpy as np
 import torch
 
 from torch import Tensor
-from torch.utils.data import TensorDataset, DataLoader, ConcatDataset, Dataset
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 
 from torchcast.internals.utils import ragged_cat, true1d_idx
 
@@ -24,7 +25,7 @@ class TimeSeriesDataset(TensorDataset):
 
     Note that unlike :class:`torch.utils.data.TensorDataset`, indexing a :class:`.TimeSeriesDataset` returns another
     :class:`.TimeSeriesDataset`, not a tuple of tensors. So when using :class:`.TimeSeriesDataset`, use
-    :class:`.TimeSeriesDataLoader` (equivalent to ``DataLoader(collate_fn=TimeSeriesDataset.collate)``).
+    :class:`.TimeSeriesDataLoader`.
     """
     _repr_attrs = ('sizes', 'measures')
 
@@ -260,7 +261,7 @@ class TimeSeriesDataset(TensorDataset):
         if isinstance(item, int):
             item = [item]
         return type(self)(
-            *super(TimeSeriesDataset, self).__getitem__(item),
+            *super().__getitem__(item),
             group_names=self.group_names[item],
             start_times=self.start_times[item],
             measures=self.measures,
@@ -268,49 +269,6 @@ class TimeSeriesDataset(TensorDataset):
         )
 
     # Creation/Transformation ------------------------:
-    @classmethod
-    def make_collate_fn(cls, pad_X: Union[float, str, None] = 'ffill') -> Callable:
-        do_ffill = isinstance(pad_X, str) and pad_X == 'ffill'
-        pad_X = None
-
-        @torch.no_grad()
-        def collate_fn(batch: Sequence['TimeSeriesDataset']) -> 'TimeSeriesDataset':
-            to_concat = {
-                'tensors': [batch[0].tensors],
-                'group_names': [batch[0].group_names],
-                'start_times': [batch[0].start_times]
-            }
-            fixed = {'dt_unit': batch[0].dt_unit, 'measures': batch[0].measures}
-            for i, ts_dataset in enumerate(batch[1:], 1):
-                for attr, appendlist in to_concat.items():
-                    to_concat[attr].append(getattr(ts_dataset, attr))
-                for attr, required_val in fixed.items():
-                    new_val = getattr(ts_dataset, attr)
-                    if new_val != required_val:
-                        raise ValueError(
-                            f"Element {i} has `{attr}` = {new_val}, but for element 0 it's {required_val}."
-                        )
-
-            tensors = []
-            for i, t in enumerate(zip(*to_concat['tensors'])):
-                catted = ragged_cat(t, ragged_dim=1, padding=None if i == 0 else pad_X)
-                if do_ffill and i > 0:  # i==0 is y, not X; but only want to ffill X
-                    any_measured_bool = ~np.isnan(catted.numpy()).all(2)
-                    for g in range(catted.shape[0]):
-                        last_measured_idx = np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0)
-                        catted[g, (last_measured_idx + 1):, :] = catted[g, last_measured_idx, :]
-                tensors.append(catted)
-
-            return cls(
-                *tensors,
-                group_names=np.concatenate(to_concat['group_names']),
-                start_times=np.concatenate(to_concat['start_times']),
-                measures=fixed['measures'],
-                dt_unit=fixed['dt_unit']
-            )
-
-        return collate_fn
-
     def to_dataframe(self,
                      group_colname: str = 'group',
                      time_colname: str = 'time'
@@ -333,6 +291,7 @@ class TimeSeriesDataset(TensorDataset):
                             group_colname: str,
                             time_colname: str,
                             measures: Sequence[str]) -> 'DataFrame':
+        # TODO: this could probably be better
         from pandas import DataFrame, concat
 
         tensor = tensor.cpu().numpy()
@@ -375,7 +334,8 @@ class TimeSeriesDataset(TensorDataset):
                        X_colnames: Optional[Sequence[str]] = None,
                        y_colnames: Optional[Sequence[str]] = None,
                        pad_X: Union[float, str, None] = 'ffill',
-                       **kwargs) -> 'TimeSeriesDataset':
+                       dtype: torch.dtype = torch.float32,
+                       device: Optional[torch.device] = None) -> 'TimeSeriesDataset':
         """
         :param dataframe: A pandas ``DataFrame``
         :param group_colname: Name for the group-column name.
@@ -391,11 +351,8 @@ class TimeSeriesDataset(TensorDataset):
         :param y_colnames: See above.
         :param pad_X: When stacking time-serieses of unequal length, we left-align them and so get trailing missings.
          Setting ``pad_X`` allows you to select the padding value for these. Default 0-padding.
-        :param kwargs: The `dtype` and/or the `device`.
         :return: A :class:`TimeSeriesDataset`.
         """
-        if 'dtype' not in kwargs:
-            kwargs['dtype'] = torch.float32
 
         if X_colnames is not None:
             X_colnames = list(X_colnames)
@@ -457,10 +414,11 @@ class TimeSeriesDataset(TensorDataset):
 
         # second pass organizes into tensor
         time_len = max(time_idx[-1] + 1 for time_idx in time_idxs)
-        tens = torch.empty((len(arrays), time_len, len(measure_colnames)), **kwargs)
-        tens[:] = np.nan
+        tens = torch.empty((len(arrays), time_len, len(measure_colnames)), dtype=dtype)
+        tens[:] = float('nan')
         for i, (array, time_idx) in enumerate(zip(arrays, time_idxs)):
-            tens[i, time_idx, :] = torch.tensor(array, **kwargs)
+            tens[i, time_idx, :] = torch.tensor(array, dtype=dtype)
+        tens = tens.to(device=device)
 
         dataset = cls(
             tens,
@@ -505,9 +463,16 @@ class TimeSeriesDataset(TensorDataset):
          constructing the `times` array? Defaults to the one with the most timesteps.
         :return: A 2D numpy array of datetimes (or integers if dt_unit is None).
         """
-        num_timesteps = self.num_timesteps if which is None else self.tensors[which].shape[1]
-        offsets = np.arange(0, num_timesteps) * (self.dt_unit if self.dt_unit else 1)
-        return self.start_times[:, None] + offsets
+        return self.get_dataset_times(
+            start_times=self.start_times,
+            num_timesteps=self.num_timesteps if which is None else self.tensors[which].shape[1],
+            dt_unit=self.dt_unit
+        )
+
+    @classmethod
+    def get_dataset_times(cls, start_times: np.ndarray, num_timesteps: int, dt_unit: Optional[np.timedelta64]):
+        offsets = np.arange(0, num_timesteps) * (dt_unit if dt_unit else 1)
+        return start_times[:, None] + offsets
 
     def datetimes(self) -> np.ndarray:
         return self.times()
@@ -557,30 +522,26 @@ class TimeSeriesDataset(TensorDataset):
 
 class TimeSeriesDataLoader(DataLoader):
     """
-    This is a convenience wrapper around
-    ``DataLoader(collate_fn=TimeSeriesDataset.make_collate_fn())``. Additionally, it provides a ``from_dataframe()``
-    classmethod so that the data-loader can be created directly from a pandas dataframe. This can be more
-    memory-efficient than the alternative route of first creating a :class:`.TimeSeriesDataset` from a dataframe, and
-    then passing that object to a data-loader.
+    A ``DataLoader`` that  produces ``TimeSeriesDataset``s. Generally should be created with the ``from_dataframe()``
+    classmethod.
     """
 
     def __init__(self,
-                 dataset: 'Dataset',
+                 dataset: '_DataFrameGroupByDataset',
                  batch_size: Optional[int],
-                 pad_X: Union[float, str, None] = 'ffill',
                  **kwargs):
-        """
-        :param dataset: A TimeSeriesDataset
-        :param batch_size: Series per batch to load.
-        :param pad_X: When stacking time-serieses of unequal length, we left-align them and so get trailing nans.
-         Setting ``pad_X`` allows you to select the padding value for these trailing nans. If ``pad_X`` is a float,
-         then it will be used as the padding value. If ``pad_X`` is the string ``'ffill'``, then the trailing nans
-         will be filled with the last non-nan value in the series. If ``pad_X`` is ``None``, then the trailing nans
-         will be left as nans.
-        :param kwargs: Other arguments passed to :class:`torch.utils.data.DataLoader`
-        """
-        kwargs['collate_fn'] = TimeSeriesDataset.make_collate_fn(pad_X)
-        super().__init__(dataset=dataset, batch_size=batch_size, **kwargs)
+        super().__init__(
+            dataset=dataset,
+            batch_size=batch_size,
+            collate_fn=self._collate,
+            **kwargs
+        )
+
+    @staticmethod
+    def _collate(batch: Sequence['TimeSeriesDataset']) -> 'TimeSeriesDataset':
+        if len(batch) == 1:
+            return batch[0]
+        raise NotImplementedError
 
     @classmethod
     def from_dataframe(cls,
@@ -589,9 +550,11 @@ class TimeSeriesDataLoader(DataLoader):
                        time_colname: str,
                        dt_unit: Optional[str],
                        measure_colnames: Optional[Sequence[str]] = None,
-                       X_colnames: Optional[Sequence[str]] = None,
+                       X_colnames: Optional[Union[Sequence[str], Callable]] = None,
                        y_colnames: Optional[Sequence[str]] = None,
                        pad_X: Union[float, str, None] = 'ffill',
+                       dtype: torch.dtype = torch.float32,
+                       device: Optional[torch.device] = None,
                        **kwargs) -> 'TimeSeriesDataLoader':
         """
         :param dataframe: A pandas ``DataFrame``
@@ -602,36 +565,98 @@ class TimeSeriesDataLoader(DataLoader):
          units.
         :param measure_colnames: A list of names of columns that include the actual time-series data in the dataframe.
          Optional if `X_colnames` and `y_colnames` are passed.
-        :param X_colnames: In many settings we have a set of columns corresponding to predictors and a set of columns
-         corresponding to the actual time-series data. The former should be passed as `X_colnames` and the latter as
-         `y_colnames`.
-        :param y_colnames: See above.
+        :param X_colnames: Column-names for predictors; or a function that takes the original dataframe and returns a
+         dataframe with the same number of rows which contains predictors (and only predictors). The latter option is
+         useful so that memory-heavy transforms can be applied just as the batch is yielded, instead of to the whole
+         dataset.
+        :param y_colnames: Alias for ``measure_colnames``; preferred if ``X_colnames`` is used.
         :param pad_X: When stacking time-serieses of unequal length, we left-align them and so get trailing missings.
          Setting ``pad_X`` allows you to select the padding value for these. Default 0-padding.
-        :param kwargs: Other arguments to pass to :func:`TimeSeriesDataset.from_dataframe()`.
+        :param dtype: The dtype for returned tensors.
+        :param device: The device for returned tensors. Note that if you are working with a GPU, it may be more
+         efficient to leave this parameter as-is, then send each batch to the GPU within your training loop.
         :return: An iterable that yields :class:`TimeSeriesDataset`.
         """
-        _kwargs = {}
-        for k in ('device', 'dtype'):
-            if k in kwargs:
-                _kwargs[k] = kwargs.pop(k)
 
-        dataset = ConcatDataset(
-            datasets=[
-                TimeSeriesDataset.from_dataframe(
-                    dataframe=df,
-                    group_colname=group_colname,
-                    time_colname=time_colname,
-                    measure_colnames=measure_colnames,
-                    X_colnames=X_colnames,
-                    y_colnames=y_colnames,
-                    dt_unit=dt_unit,
-                    **_kwargs
-                )
-                for g, df in dataframe.groupby(group_colname)
-            ]
+        return cls(
+            dataset=_DataFrameGroupByDataset(
+                df=dataframe,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                dt_unit=dt_unit,
+                y_colnames=measure_colnames or y_colnames,
+                X_colnames=X_colnames,
+                pad_X=pad_X,
+                device=device,
+                dtype=dtype
+            ),
+            **kwargs
         )
-        return cls(dataset=dataset, pad_X=pad_X, **kwargs)
+
+
+class _DataFrameGroupByDataset(Dataset):
+    """
+    Util class for ``TimeSeriesDataLoader``, to allow lazy (and so memory-efficient) transformations to the data before
+    converting to a ``TimeSeriesDataset``.
+    """
+
+    def __init__(self,
+                 df: pd.DataFrame,
+                 group_colname: str,
+                 time_colname: str,
+                 dt_unit: Optional[str],
+                 y_colnames: Sequence[str],
+                 X_colnames: Optional[Union[Sequence[str], Callable]],
+                 pad_X: Union[float, str, None] = 'ffill',
+                 dtype: torch.dtype = torch.float32,
+                 device: Optional[torch.device] = None):
+        self.group_colname = group_colname
+        self.time_colname = time_colname
+        self.dt_unit = dt_unit
+        self.y_colnames = y_colnames
+        self.X_colnames = X_colnames
+        self.pad_X = pad_X
+        self.dtype = dtype
+        self.device = device
+        self.group_dfs = {g: dfg for g, dfg in df.groupby(self.group_colname, sort=False)}
+        self.groups = df[group_colname].dropna().unique()
+
+    def __len__(self) -> int:
+        return len(self.group_dfs)
+
+    def __getitem__(self, idx) -> TimeSeriesDataset:
+        raise NotImplementedError
+
+    def __getitems__(self, indices: list) -> Sequence[TimeSeriesDataset]:
+        group_names = [self.groups[idx] for idx in indices]
+        df_group = pd.concat([self.group_dfs[group_name] for group_name in group_names]).reset_index(drop=True)
+
+        # extract/create model-matrix:
+        X_colnames = dfX = None
+        if callable(self.X_colnames):
+            dfX = self.X_colnames(df_group)
+            if not dfX.index.equals(df_group.index):
+                raise ValueError("`X_colnames` function must return a dataframe with the same index as the input.")
+        elif self.X_colnames:
+            dfX = df_group[self.X_colnames]
+
+        df = df_group[[self.group_colname, self.time_colname] + list(self.y_colnames)]
+        if dfX is not None:
+            X_colnames = dfX.columns.tolist()
+            df = pd.concat([df, dfX], axis=1)
+
+        # return a batch of size 1 since this is what collate_fn expects, but basically it's already pre-collated
+        return [TimeSeriesDataset.from_dataframe(
+            df,
+            group_colname=self.group_colname,
+            time_colname=self.time_colname,
+            dt_unit=self.dt_unit,
+            y_colnames=self.y_colnames,
+            X_colnames=X_colnames,
+            pad_X=self.pad_X,
+            dtype=self.dtype,
+            device=self.device
+        )]
 
 
 def complete_times(data: 'DataFrame',
@@ -705,5 +730,3 @@ def complete_times(data: 'DataFrame',
              .loc[df_cj[time_colname].between(df_cj['_min'], df_cj['_max']), group_colnames + [time_colname]]
              .reset_index(drop=True))
     return df_cj.merge(data, how='left', on=group_colnames + [time_colname])
-
-

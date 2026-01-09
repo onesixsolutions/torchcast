@@ -28,7 +28,7 @@ class SmoothingMatrix(torch.nn.Module):
         state_rank = 0
         fixed_states = []
         for p in processes:
-            fixed_els = p.fixed_state_elements or []
+            fixed_els = [nm for nm, se in p.state_elements.items() if not se.has_process_variance]
             for i, se in enumerate(p.state_elements):
                 if se in fixed_els:
                     fixed_states.append(state_rank + i)

@@ -10,7 +10,7 @@
 ----------
 """
 
-from .base import Process
+from .process import Process
 from .regression import LinearModel
 from .local import LocalLevel, LocalTrend
 from .season import Season

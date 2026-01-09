@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import Optimizer
 import torch.nn as nn
-from typing import Generator, Union, Type, Sequence, Tuple, Dict, Optional
+from typing import Generator, Union, Type, Sequence, Tuple, Dict, Optional, Callable
 
 from tqdm.auto import tqdm
 
@@ -134,7 +134,7 @@ class SimpleTrainer(BaseTrainer):
 
 class StateSpaceTrainer(BaseTrainer):
     """
-    A trainer for a :``StateSpaceModel``. This is for usage in contexts where the data are too large for
+    A trainer for a :``StateSpaceModel``. This is for contexts in which the data are too large for
     ``StateSpaceModel.fit()`` to be practical. Rather than the base DataLoader, this class takes a
     :class:`torchcast.utils.TimeSeriesDataLoader`.
 
@@ -162,7 +162,7 @@ class StateSpaceTrainer(BaseTrainer):
 
     def __init__(self,
                  module: nn.Module,
-                 dataset_to_kwargs: Optional[Sequence[str]] = None,
+                 dataset_to_kwargs: Optional[Union[Sequence[str], Callable[[TimeSeriesDataset], dict]]] = None,
                  optimizer: Union[Optimizer, Type[Optimizer]] = torch.optim.Adam):
 
         self.dataset_to_kwargs = dataset_to_kwargs
@@ -216,47 +216,40 @@ class StateSpaceTrainer(BaseTrainer):
         return batch.tensors[0].numel()
 
 
-class SeasonalEmbeddingsTrainer(BaseTrainer):
+_warn_once = {}
+
+
+def _default_getX(batch: TimeSeriesDataset) -> torch.Tensor:
+    _, origX, *_other = batch.tensors
+    if len(_other) and not _warn_once.get('warned', False):
+        warnings.warn("Ignoring additional tensors in batch.")
+        _warn_once['warned'] = True
+    return origX
+
+
+class ModelMatEmbeddingsTrainer(BaseTrainer):
     """
-    This trainer is designed to train a :class:`torch.nn.Module` to embed complex seasonal patterns (e.g. cycles on the
-    yearly, weekly, daily level) into a lower-dimensional space. See :doc:`../examples/electricity` for an example.
+    This trainer is designed to train a :class:`torch.nn.Module` to take a model-matrix of predictors and place them in
+    a lower-dimensional space such that a linear regression can effectively predict the target. This is useful in the
+    context of state-space models, since those capture linear relationships.
+
+    :param module: A ``torch.nn.Module`` that takes a model-matrix and returns a lower-dimensional embedding.
+    :param loss_fn: A loss function. Default is :class:`torch.nn.MSELoss`.
+    :param getX: A callable that takes a :class:`torchcast.utils.TimeSeriesDataset` and returns the original
+     model-matrix tensor for passing to ``module``. If left unspecified, will assume the model-matrix is the 2nd
+     tensor in ``batch.tensors``.
     """
 
     def __init__(self,
                  module: nn.Module,
-                 yearly: int,
-                 weekly: int,
-                 daily: int,
-                 other: Sequence[Tuple[np.timedelta64, int]] = (),
                  loss_fn: callable = torch.nn.MSELoss(),
+                 getX: Optional[Callable[[TimeSeriesDataset], torch.Tensor]] = None,
                  **kwargs):
-        # TODO: classmethod `from_dt_unit` that puts in decent defaults for hourly, daily, weekly data?
 
         super().__init__(module=module, **kwargs)
-
-        self.weekly = weekly
-        self.yearly = yearly
-        self.daily = daily
-        self.other = other
         self.loss_fn = loss_fn
-
         self._warned = False
-
-    def times_to_arrays(self, times: np.ndarray) -> Dict[str, torch.Tensor]:
-        out = {}
-        if self.yearly:
-            out['yearly'] = torch.as_tensor(fourier_model_mat(times, K=self.yearly, period='yearly'))
-        if self.weekly:
-            out['weekly'] = torch.as_tensor(fourier_model_mat(times, K=self.weekly, period='weekly'))
-        if self.daily:
-            out['daily'] = torch.as_tensor(fourier_model_mat(times, K=self.daily, period='daily'))
-        for period, k in self.other:
-            out[str(period)] = torch.as_tensor(fourier_model_mat(times, K=k, period=period))
-        return out
-
-    def times_to_model_mat(self, times: np.ndarray) -> torch.Tensor:
-        arrays = list(self.times_to_arrays(times).values())
-        return torch.cat(arrays, -1)
+        self._getX = getX or _default_getX
 
     def get_loss(self, predictions: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         nan_mask = torch.isnan(y)
@@ -264,15 +257,8 @@ class SeasonalEmbeddingsTrainer(BaseTrainer):
 
     def _getXy(self, batch: TimeSeriesDataset) -> Tuple[torch.Tensor, torch.Tensor]:
         batch = batch.to(self._device)
-
-        y, *_other = batch.tensors
-        X = self.times_to_model_mat(batch.times()).to(dtype=y.dtype, device=self._device)
-
-        if len(_other):
-            X = torch.cat([X, _other[0]], -1)
-        if len(_other) > 1 and not self._warned:
-            warnings.warn("Ignoring additional tensors in batch.")
-            self._warned = True
+        y = batch.tensors[0]
+        X = self._getX(batch)
         return X, y
 
     @staticmethod
@@ -282,8 +268,6 @@ class SeasonalEmbeddingsTrainer(BaseTrainer):
         """
         Given tensors y,X in the format expected by ``StateSpaceModel`` -- 3D arrays with groups*times*measures --
         return the solutions to a linear-model for each group.
-
-        See :func:`~torchcast.process.LinearModel.solve_and_predict()`
 
         :param y: A 3d tensor of time-series values.
         :param X: A 3d tensor of predictors.
@@ -362,3 +346,57 @@ class SeasonalEmbeddingsTrainer(BaseTrainer):
         X, y = self._getXy(batch)
         emb = self.module(X)
         return self._solve_and_predict(y=y, X=emb)
+
+
+class SeasonalEmbeddingsTrainer(ModelMatEmbeddingsTrainer):
+    """
+    This trainer teaches a module to embed complex seasonal patterns (e.g. cycles on the yearly, weekly, daily level)
+    into a lower-dimensional space.
+    """
+
+    def __init__(self,
+                 module: nn.Module,
+                 yearly: int,
+                 weekly: int,
+                 daily: int,
+                 other: Sequence[Tuple[np.timedelta64, int]] = (),
+                 loss_fn: callable = torch.nn.MSELoss(),
+                 **kwargs):
+
+        super().__init__(module=module, loss_fn=loss_fn, **kwargs)
+
+        self.weekly = weekly
+        self.yearly = yearly
+        self.daily = daily
+        self.other = other
+
+        self._warned = False
+
+    def times_to_arrays(self, times: np.ndarray) -> Dict[str, torch.Tensor]:
+        out = {}
+        if self.yearly:
+            out['yearly'] = torch.as_tensor(fourier_model_mat(times, K=self.yearly, period='yearly'))
+        if self.weekly:
+            out['weekly'] = torch.as_tensor(fourier_model_mat(times, K=self.weekly, period='weekly'))
+        if self.daily:
+            out['daily'] = torch.as_tensor(fourier_model_mat(times, K=self.daily, period='daily'))
+        for period, k in self.other:
+            out[str(period)] = torch.as_tensor(fourier_model_mat(times, K=k, period=period))
+        return out
+
+    def times_to_model_mat(self, times: np.ndarray) -> torch.Tensor:
+        arrays = list(self.times_to_arrays(times).values())
+        return torch.cat(arrays, -1)
+
+    def _getXy(self, batch: TimeSeriesDataset) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch = batch.to(self._device)
+
+        y, *_other = batch.tensors
+        X = self.times_to_model_mat(batch.times()).to(dtype=y.dtype, device=self._device)
+
+        if len(_other):
+            X = torch.cat([X, _other[0]], -1)
+        if len(_other) > 1 and not self._warned:
+            warnings.warn("Ignoring additional tensors in batch.")
+            self._warned = True
+        return X, y

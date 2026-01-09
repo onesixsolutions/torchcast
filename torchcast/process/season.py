@@ -1,54 +1,17 @@
-import copy
-import itertools
 import math
-from typing import Optional, Tuple, Sequence, Union, Dict
+from typing import Optional, Tuple, Sequence, Union
 from warnings import warn
 
 import numpy as np
 
 import torch
-from torch import jit, nn, Tensor
 
-from torchcast.process.base import Process
-from torchcast.process.utils import SingleOutput, Multi, Bounded, ScriptSequential
-
-
-class _Season:
-    # todo: this mixin is no longer needed, since there is only one Season class
-
-    @staticmethod
-    def _standardize_period(period: Union[str, np.timedelta64], dt_unit_ns: Optional[float]) -> float:
-        if dt_unit_ns is None:
-            if not isinstance(period, (float, int)):
-                raise ValueError(f"period is {type(period)}, but expected float/int since dt_unit is None.")
-        else:
-            if not isinstance(period, (float, int)):
-                if isinstance(period, str):
-                    period = np.timedelta64(1, period)
-                period = period / (dt_unit_ns * np.timedelta64(1, 'ns'))
-        return float(period)
-
-    @staticmethod
-    def _get_dt_unit_ns(dt_unit_str: str) -> int:
-        if isinstance(dt_unit_str, np.timedelta64):
-            dt_unit = dt_unit_str
-        else:
-            dt_unit = np.timedelta64(1, dt_unit_str)
-        dt_unit_ns = dt_unit / np.timedelta64(1, 'ns')
-        assert dt_unit_ns.is_integer()
-        return int(dt_unit_ns)
-
-    @jit.ignore
-    def _standardize_offsets(self, offsets: Sequence) -> np.ndarray:
-        if self.dt_unit_ns is None:
-            return np.asanyarray(offsets) % self.period
-        offsets = np.asanyarray(offsets, dtype='datetime64[ns]')
-        ns_since_epoch = (offsets - np.datetime64(0, 'ns')).view('int64')
-        offsets = ns_since_epoch % (self.period * self.dt_unit_ns) / self.dt_unit_ns  # todo: cancels out?
-        return offsets
+from torchcast.internals.utils import update_tensor
+from torchcast.process.process import Process
+from torchcast.process.utils import Multi, standardize_decay, StateElement, NoInputSequential
 
 
-class Season(_Season, Process):
+class Season(Process):
     """
     Method from `De Livera, A.M., Hyndman, R.J., & Snyder, R. D. (2011)`, specifically the novel approach to modeling
     seasonality that they proposed.
@@ -83,105 +46,114 @@ class Season(_Season, Process):
         if self.period.is_integer() and self.period < K * 2:
             warn(f"K is larger than necessary given a period of {self.period}.")
 
-        if isinstance(decay, bool) and decay:
-            decay = (.98, 1.00)
         if isinstance(decay, tuple) and (decay[0] ** self.period) < .01:
             warn(
                 f"Given the seasonal period, the lower bound on `{id}`'s `decay` ({decay}) may be too low to "
                 f"generate useful gradient information for optimization."
             )
-
-        state_elements, transitions, h_tensor = self._setup(K=K, period=self.period, decay=decay)
+        decay = standardize_decay(decay)
 
         super().__init__(
             id=id,
-            state_elements=state_elements,
-            measure=measure,
-            fixed_state_elements=state_elements if fixed else [],
+            state_elements=self._init_state_elements(K=K, period=self.period, decay=decay, fixed=fixed),
+            measure=measure
         )
-        if not decay:
-            self.f_tensors.update(transitions)
-        else:
-            self.f_modules.update(transitions)
 
-        h_tensor = torch.tensor(h_tensor)
-        self.register_buffer('h_tensor', h_tensor)
-
-    def _build_h_mat(self, inputs: Dict[str, Tensor], num_groups: int, num_times: int) -> Tensor:
-        return self.h_tensor
+    @property
+    def dt_unit(self) -> Optional[np.timedelta64]:
+        if self.dt_unit_ns is None:
+            return None
+        return np.timedelta64(self.dt_unit_ns, 'ns')  # todo: promote
 
     @staticmethod
-    def _setup(K: int,
-               period: float,
-               decay: Optional[Tuple[float, float]]) -> Tuple[Sequence[str], dict, Sequence[float]]:
+    def _standardize_period(period: Union[str, np.timedelta64], dt_unit_ns: Optional[float]) -> float:
+        if dt_unit_ns is None:
+            if not isinstance(period, (float, int)):
+                raise ValueError(f"period is {type(period)}, but expected float/int since dt_unit is None.")
+        else:
+            if not isinstance(period, (float, int)):
+                if isinstance(period, str):
+                    period = np.timedelta64(1, period)
+                period = period / (dt_unit_ns * np.timedelta64(1, 'ns'))
+        return float(period)
 
-        if isinstance(decay, nn.Module):
-            decay = [copy.deepcopy(decay) for _ in range(K * 2)]
-        if isinstance(decay, (list, tuple)):
-            are_modules = [isinstance(m, nn.Module) for m in decay]
-            if any(are_modules):
-                assert all(are_modules), "`decay` is a list with some modules on some other types"
-                assert len(decay) == K * 2, "`decay` is a list of modules, but its length != K*2"
-            else:
-                assert len(decay) == 2, "if `decay` is not list of modules, should be (float,float)"
-                decay = [SingleOutput(transform=Bounded(*decay)) for _ in range(K * 2)]
+    @staticmethod
+    def _get_dt_unit_ns(dt_unit_str: str) -> int:
+        if isinstance(dt_unit_str, np.timedelta64):
+            dt_unit = dt_unit_str
+        else:
+            dt_unit = np.timedelta64(1, dt_unit_str)
+        dt_unit_ns = dt_unit / np.timedelta64(1, 'ns')
+        assert dt_unit_ns.is_integer()
+        return int(dt_unit_ns)
+
+    def _standardize_offsets(self, offsets: np.ndarray) -> np.ndarray:
+        if self.dt_unit_ns is None:
+            return np.asanyarray(offsets) % self.period
+        offsets = np.asanyarray(offsets, dtype='datetime64[ns]')
+        ns_since_epoch = (offsets - np.datetime64(0, 'ns')).view('int64')
+        offsets = ns_since_epoch % (self.period * self.dt_unit_ns) / self.dt_unit_ns  # todo: cancels out?
+        return offsets
+
+    @staticmethod
+    def _init_state_elements(K: int,
+                             period: float,
+                             decay: Union[float, torch.nn.Module],
+                             fixed: bool) -> Sequence[StateElement]:
 
         state_elements = []
-        f_tensors = {}
-        f_modules = {}
-        h_tensor = []
         for j in range(1, K + 1):
-            sj = f"s{j}"
-            state_elements.append(sj)
-            h_tensor.append(1.)
-            s_star_j = f"s*{j}"
-            state_elements.append(s_star_j)
-            h_tensor.append(0.)
+            sj = StateElement(
+                name=f"s{j}",
+                measure_multi=1.0,
+                has_process_variance=not fixed
+            )
+            s_star_j = StateElement(
+                name=f"s*{j}",
+                measure_multi=0.,
+                has_process_variance=not fixed
+            )
 
             lam = torch.tensor(2. * math.pi * j / period)
+            _transitions = {
+                sj: {
+                    sj: torch.cos(lam),
+                    s_star_j: -torch.sin(lam)
+                },
+                s_star_j: {
+                    sj: torch.sin(lam),
+                    s_star_j: torch.cos(lam)
+                }
+            }
+            # todo: previously supported different decays per element, any need for that?
+            for se_from, se_from_transitions in _transitions.items():
+                for se_to, multi in se_from_transitions.items():
+                    if isinstance(decay, torch.nn.Module):
+                        multi = NoInputSequential(decay, Multi(multi))
+                    else:
+                        multi = decay * multi
+                    se_from.set_transition_to(se_to, multi=multi)
+                state_elements.append(se_from)
+        return state_elements
 
-            f_tensors[f'{sj}->{sj}'] = torch.cos(lam)
-            f_tensors[f'{sj}->{s_star_j}'] = -torch.sin(lam)
-            f_tensors[f'{s_star_j}->{sj}'] = torch.sin(lam)
-            f_tensors[f'{s_star_j}->{s_star_j}'] = torch.cos(lam)
-
-            if decay:
-                # more complicated to support decay for TBATS b/c it already uses the transition matrix.
-                # we'd like to keep the sj/starj transitions, just multiply them by the 0-1 decay
-                for from_, to_ in itertools.product([sj, s_star_j], [sj, s_star_j]):
-                    tkey = f'{from_}->{to_}'
-                    which = 2 * (j - 1) + int(from_ == to_)
-                    f_modules[tkey] = ScriptSequential([decay[which], Multi(f_tensors[tkey])])
-
-        if f_modules:
-            assert len(f_modules) == len(f_tensors)
-            return state_elements, f_modules, h_tensor
-        else:
-            return state_elements, f_tensors, h_tensor
-
-    @jit.ignore
-    def offset_initial_state(self, initial_state: Tensor, start_offsets: Optional[Sequence] = None) -> Tensor:
+    def get_initial_mean(self, start_offsets: np.ndarray) -> torch.Tensor:
         if start_offsets is None:
-            if self.dt_unit_ns is None:
-                return initial_state
-            raise RuntimeError(f"Process '{self.id}' has `dt_unit`, so need to pass datetimes for `start_offsets`")
+            raise RuntimeError(f"Process '{self.id}' requires `start_offsets`")
 
         start_offsets = self._standardize_offsets(start_offsets)
         # TODO: this is imprecise for non-integer periods
         start_offsets = start_offsets.round()
         num_groups = len(start_offsets)
 
-        # called from StateSpaceModel._prepare_initial_state which expands as needed
-        assert initial_state.shape[0] == num_groups
-
-        F = self._build_f_mat({}, num_groups=num_groups, num_times=1)[:, 0]
-
-        means = []
-        mean = initial_state.unsqueeze(-1)
-        for i in range(int(self.period) + 1):
-            means.append(mean.squeeze(-1))
-            mean = F @ mean
-
-        groups = [i for i in range(num_groups)]
-        times = [int(start_offsets[i].item()) for i in groups]
-        return torch.stack(means, 1)[(groups, times)]
+        if self.linear_transition:
+            out = []
+            zeros = torch.zeros((num_groups, self.rank), device=self.initial_mean.device)
+            F = self.get_transition_matrix().expand(len(start_offsets), -1, -1)
+            mean = self.initial_mean.expand(len(start_offsets), -1)
+            for i in range(int(self.period) + 1):
+                maski = (start_offsets == i)
+                out.append(update_tensor(zeros, new=mean[maski], mask=maski))
+                mean = (F @ mean.unsqueeze(-1)).squeeze(-1)
+            return torch.stack(out, 0).sum(0)
+        else:
+            raise NotImplementedError

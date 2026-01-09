@@ -1,9 +1,113 @@
 import functools
-from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable
+from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Collection, Type
 
 import torch
 
 import numpy as np
+
+
+def get_subclasses(cls: Type) -> Iterable[Type]:
+    for subclass in cls.__subclasses__():
+        yield from get_subclasses(subclass)
+        yield subclass
+
+
+def normalize_index(index: tuple) -> tuple:
+    # Special-case early check for the batched pattern
+    if isinstance(index, tuple) and _is_special_batched_pattern(index):
+        return index  # Return untouched
+
+    if not isinstance(index, tuple):
+        index = (index,)
+    fancy = False
+    normalized = []
+    for i, ix in enumerate(index):
+        if isinstance(ix, (int, slice)):
+            normalized.append(ix)
+            continue
+
+        arr = _validate_1d_int_array_like(ix)
+        if arr is not None:
+            if fancy:
+                raise NotImplementedError("Only one 'fancy' indexing axis is supported")
+            fancy = True
+            normalized.append(arr.tolist())
+
+        else:
+            raise TypeError(f"Unsupported index type: {type(ix)} at position {i}")
+
+    # Drop trailing slice(None) entries (i.e. [:])
+    while normalized and isinstance(normalized[-1], slice) and normalized[-1] == slice(None):
+        normalized.pop()
+
+    return tuple(normalized)
+
+
+def _is_special_batched_pattern(index: tuple) -> bool:
+    if len(index) != 2:
+        return False
+    i0, i1 = map(np.asarray, index)
+    if not all(arr.dtype.kind in ('i', 'u') for arr in (i0, i1)):
+        return False
+    if i0.ndim >= 1 and i1.ndim >= 1 and i0.shape[0] == i1.shape[0]:
+        return True
+    return False
+
+
+def _validate_1d_int_array_like(obj: Sequence) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(obj)
+        if arr.ndim == 1 and arr.dtype.kind in ('i', 'u'):
+            return arr
+    except Exception:
+        pass
+    return None
+
+
+def compute_index_result_shape(index: tuple, shape: tuple) -> tuple:
+    ndim = len(shape)
+
+    if not isinstance(index, tuple):
+        index = (index,)
+
+    if len(index) > ndim:
+        raise IndexError(f"Too many indices for array: expected {ndim}, got {len(index)}")
+
+    # Special batched case: (batch_idx, per-example idx)
+    if _is_special_batched_pattern(index):
+        batch_idx, elem_idx = map(np.asarray, index)
+        if batch_idx.shape != elem_idx.shape:
+            raise IndexError(f"Batched index shapes must match: got {batch_idx.shape}, {elem_idx.shape}")
+        return batch_idx.shape + shape[2:]  # keep remaining trailing dims
+
+    # Normal case
+    result_shape = []
+    dim = 0
+
+    for ix in index:
+        if dim >= ndim:
+            raise IndexError(f"Too many indices for array: expected {ndim}, got more than {dim}")
+
+        if isinstance(ix, int):
+            if ix < -shape[dim] or ix >= shape[dim]:
+                raise IndexError(f"Index {ix} out of bounds for axis {dim} with size {shape[dim]}")
+            dim += 1
+
+        elif isinstance(ix, slice):
+            start, stop, step = ix.indices(shape[dim])
+            size = max(0, (stop - start + (step - 1)) // step)
+            result_shape.append(size)
+            dim += 1
+
+        elif isinstance(ix, list):
+            for i in ix:
+                if i < -shape[dim] or i >= shape[dim]:
+                    raise IndexError(f"Index {i} out of bounds for axis {dim} with size {shape[dim]}")
+            result_shape.append(len(ix))
+            dim += 1
+
+    result_shape.extend(shape[dim:])
+    return tuple(result_shape)
 
 
 def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[slice, torch.Tensor]]) -> torch.Tensor:
@@ -28,7 +132,7 @@ def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[sl
     :return: If ``mask`` is all True, returns ``new`` (not a copy). Otherwise, returns a new tensor with the same shape
      as ``orig`` where the elements in ``mask`` are replaced with the elements in ``new``.
     """
-    if isinstance(mask, slice) and not mask.start and not mask.stop and not mask.step:
+    if isinstance(mask, slice) and mask == slice(None):
         mask = None
     if mask is None or mask.all():
         return new
@@ -44,58 +148,43 @@ def transpose_last_dims(x: torch.Tensor) -> torch.Tensor:
     return x.permute(*args)
 
 
-def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]]:
     """
     Iterable of (group_idx, valid_idx) tuples that can be passed to torch.meshgrid. If no valid, then not returned; if
     all valid then (group_idx, None) is returned; can skip call to meshgrid.
     """
+    isnan = isnan.cpu()
     assert len(isnan.shape) == 2
     state_dim = isnan.shape[-1]
-    out: List[Tuple[torch.Tensor, Optional[torch.Tensor]]] = []
+
+    out = []
     if state_dim == 1:
         # shortcut for univariate
         group_idx = (~isnan.squeeze(-1)).nonzero().view(-1)
         out.append((group_idx, None))
         return out
-    for nan_combo in torch.unique(isnan, dim=0):
+
+    nan_combos = torch.unique(isnan, dim=0)
+    if len(nan_combos) == 1 and nan_combos[0].sum() == 0:
+        # shortcut for no nans
+        out.append((torch.arange(isnan.shape[0]), None))
+        return out
+
+    for nan_combo in nan_combos:
         num_nan = nan_combo.sum()
         if num_nan < state_dim:
             c1 = (isnan * nan_combo[None, :]).sum(1) == num_nan
             c2 = (~isnan * ~nan_combo[None, :]).sum(1) == (state_dim - num_nan)
             group_idx = (c1 & c2).nonzero().view(-1)
             if num_nan == 0:
-                valid_idx = None
+                out.append((group_idx, None))
             else:
                 valid_idx = (~nan_combo).nonzero().view(-1)
-            out.append((group_idx, valid_idx))
+                m1d = torch.meshgrid(group_idx, valid_idx, indexing='ij')
+                m2d = torch.meshgrid(group_idx, valid_idx, valid_idx, indexing='ij')
+                masks = (valid_idx, m1d, m2d)
+                out.append((group_idx, masks))
     return out
-
-
-def get_owned_kwargs(module, kwargs: dict) -> Iterable[Tuple[str, str, Optional[torch.Tensor]]]:
-    """
-    Get keyword-arguments belonging to a module from a dictionary of kwargs passed to a multi-module container.
-
-    :param module: Any object with an ``id`` and ``expected_kwargs``.
-    :param kwargs: A dictionary of keyword arguments that are shared.
-    :return: An iterable of tuples: ``(used_key, key_name, value)``. The first is used for indicating what was used
-     (so at the end we can warn about unused keys), the second will be passed to the ``module`` later, and the last is
-     the value that will be passed to the module.
-    """
-    if module.expected_kwargs is None:
-        expected_kwargs = []
-    else:
-        expected_kwargs = module.expected_kwargs
-    for k in kwargs:
-        if k in expected_kwargs:
-            yield k, k, kwargs[k]
-        elif k.startswith(f'{module.id}__'):
-            owner, _, subkey = k.partition("__")
-            if subkey in expected_kwargs:
-                yield k, subkey, kwargs[k]
-            else:
-                raise ValueError(
-                    f"Found {k}, but {module.id} wasn't expecting a kwarg named '{subkey}'; expected:{expected_kwargs}"
-                )
 
 
 def validate_gt_shape(

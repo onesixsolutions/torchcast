@@ -96,17 +96,3 @@ def fourier_model_mat(datetimes: Union[np.ndarray, 'Series'],
         out = DataFrame(out, columns=columns, index=orig_index)
 
     return out
-
-
-def fourier_tensor(time: torch.Tensor, seasonal_period: float, K: int) -> torch.Tensor:
-    """
-    Given an N-dimensional tensor, create an N+2 dimensional tensor with the 2nd to last dimension corresponding to the
-    Ks and the last dimension corresponding to sin/cos.
-    """
-    out = torch.empty(time.shape + (K, 2))
-    for idx in range(K):
-        k = idx + 1
-        for sincos in range(2):
-            val = 2. * math.pi * k * time / seasonal_period
-            out[..., idx, sincos] = torch.sin(val) if sincos == 0 else torch.cos(val)
-    return out

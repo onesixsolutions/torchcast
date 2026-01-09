@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        py-version: [ '3.8', '3.9', '3.10' ]
+        py-version: [ '3.9', '3.10', '3.11' ]
 
     steps:
       - uses: actions/checkout@v4
@@ -22,10 +22,10 @@ jobs:
           python-version: ${{ matrix.py-version }}
 
       - name: Install torchcast
-        run: pip install .[tests]
+        run: pip install .[tests] --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Run tests
-        run: python3 -m unittest
+        run: pytest
 
   release:
     needs: test
@@ -74,7 +74,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install awscli
-          pip install ".[docs]"
+          pip install ".[docs]" --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Install pandoc
         uses: pandoc/actions/setup@main
