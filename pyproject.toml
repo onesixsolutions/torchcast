@@ -35,7 +35,7 @@ dev = [
     "black",
 ]
 tests = [
-    "parameterized>=0.7",
+    "pytest>=7.0",
     "filterpy>=1.4",
     "pandas>=1.0"
 ]

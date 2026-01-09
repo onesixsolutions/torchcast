@@ -25,7 +25,7 @@ jobs:
         run: pip install .[tests]
 
       - name: Run tests
-        run: python3 -m unittest
+        run: pytest
 
   release:
     needs: test
