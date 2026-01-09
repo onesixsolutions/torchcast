@@ -1,5 +1,3 @@
-from functools import cached_property
-
 from math import log
 
 from dataclasses import dataclass, fields
