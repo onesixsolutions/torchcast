@@ -20,7 +20,8 @@ dependencies = [
     "numpy>=1.4",
     "scipy>=1.10",
     "tqdm>=4.59",
-    "platformdirs>=4.3"
+    "platformdirs>=4.3",
+    "pandas<3"
 ]
 dynamic = ["version"]
 
@@ -37,7 +38,6 @@ dev = [
 tests = [
     "parameterized>=0.7",
     "filterpy>=1.4",
-    "pandas>=1.0"
 ]
 docs = [
     "jupytext>=1.11",
