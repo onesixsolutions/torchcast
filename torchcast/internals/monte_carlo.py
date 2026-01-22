@@ -1,7 +1,5 @@
 from functools import lru_cache
 
-from copy import deepcopy
-
 from typing import Optional
 
 import numpy as np

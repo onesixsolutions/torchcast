@@ -1,8 +1,11 @@
 """
-Adaptive measure variance modules for StateSpaceModel.
+Adaptive variance modules for StateSpaceModel.
 
-This module provides implementations for adaptively updating measurement covariance
+This module provides implementations for adaptively updating covariance-scaling
 based on prediction residuals.
+
+This is useful when training on multiple time-serieses that differ by orders of magnitude; or if the variance for a
+single time-series is heterogeneous wrt time.
 """
 import warnings
 
