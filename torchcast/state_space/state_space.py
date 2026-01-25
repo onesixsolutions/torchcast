@@ -53,6 +53,9 @@ class StateSpaceModel(torch.nn.Module):
         for m, alias in (measure_funs or {}).items():
             self.measure_funs[m] = MeasureFun.from_alias(alias)
 
+        if not self.measure_covariance.param_rank and adaptive_scaling:
+            warn("Adaptive scaling cannot be applied since there's no measure variance.")
+            adaptive_scaling = False
         if adaptive_scaling is True:
             adaptive_scaling = EWMAdaptiveScaler(num_measures=self.measure_covariance.param_rank)
         self.adaptive_scaling = adaptive_scaling
