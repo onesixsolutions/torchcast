@@ -42,6 +42,7 @@ class Sigmoid(MeasureFun):
         return torch.special.logit(input_mean, eps=1e-7)
 
     def adjust_measure_mat(self, measure_mat: torch.Tensor, measured_mean: torch.Tensor) -> torch.Tensor:
+        measured_mean = measured_mean.clamp(-8, 8)
         numer = torch.exp(-measured_mean)
         denom = (torch.exp(-measured_mean) + 1) ** 2
         return measure_mat * (numer / denom).unsqueeze(-1)
