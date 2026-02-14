@@ -53,10 +53,10 @@ class MeasurementModel(DesignModel):
 
         nl_procs_and_means = list(self._get_nonlinear_processes_and_means(mean))
 
-        measured_mean = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
-        measure_mat = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
+        measured_mean_adj = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
+        measure_mat_adj = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
 
-        return measured_mean, measure_mat
+        return measured_mean_adj, measure_mat_adj
 
     @cached_property
     def extended_measure_mat(self) -> torch.Tensor:
@@ -107,17 +107,17 @@ class MeasurementModel(DesignModel):
             out = out + this_mm
 
         # measure-wide adjustments:
-        out = self._get_measure_wide_adjustments(out)
+        if self.measure_funs:
+            out = self._get_measure_wide_adjustments(out)
         return out
 
     def _get_measure_wide_adjustments(self, measured_mean: torch.Tensor) -> torch.Tensor:
-        if self.measure_funs:
-            measured_mean = list(measured_mean.unbind(-1))
-            for i, measure in enumerate(self.measures):
-                if measure in self.measure_funs:
-                    measured_mean[i] = self.measure_funs[measure](measured_mean[i])
-            measured_mean = torch.stack(measured_mean, dim=-1)
-        return measured_mean  # note: no copy!
+        assert self.measure_funs
+        measured_mean = list(measured_mean.unbind(-1))
+        for i, measure in enumerate(self.measures):
+            if measure in self.measure_funs:
+                measured_mean[i] = self.measure_funs[measure](measured_mean[i])
+        return torch.stack(measured_mean, dim=-1)
 
     def _get_measured_mean_adjustments(self,
                                        nl_processes_and_means: Iterable[tuple['Process', torch.Tensor]],
