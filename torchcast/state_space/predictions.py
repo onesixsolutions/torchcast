@@ -112,13 +112,18 @@ class Predictions:
                      type: str = 'predictions',
                      group_colname: Optional[str] = None,
                      time_colname: Optional[str] = None,
-                     conf: Optional[float] = .95) -> pd.DataFrame:
+                     conf: Optional[float] = .95,
+                     use_map: Optional[bool] = None) -> pd.DataFrame:
         """
         :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
         :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
         :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
         :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
         :param conf: The confidence level for the confidence intervals, defaults to 0.95.
+        :param use_map: If the model requires MCMC, this controls whether the mean uses mcmc to marginalize over the
+         state distribution (``use_map=False``) or whether the MAP is used to apply any non-linearities to the
+         state-mean directly (``use_map=True``). The latter can sometimes exhibit better predictive performance on
+         traditional supervised learning metrics.
         """
         if dataset is None:
             dataset = self.dataset_metadata.copy()
@@ -152,12 +157,15 @@ class Predictions:
                 dataset=dataset,
                 group_colname=group_colname,
                 time_colname=time_colname,
-                conf=conf
+                conf=conf,
+                use_map=use_map
             )
             if return_std:
                 df['std'] = df.pop('upper') - df.pop('lower')
             return df
         elif type in ('components', 'states', 'observed_states'):
+            if use_map:
+                raise NotImplementedError("``use_map=True`` not yet implemented for type!='predictions'")
             if type == 'components':
                 warn("`type='components'` is deprecated, use `type='observed_states'` instead.", DeprecationWarning)
             return self._to_components_dataframe(
@@ -264,65 +272,92 @@ class Predictions:
         out = pd.concat(out)
         return out
 
+    def _get_mc_pred_intervals(self, alpha: float, use_map: bool) -> dict[str, torch.Tensor]:
+        batch_shape = self.state_means.shape[0:2]
+        mmean_samples = self._get_measured_mean_samples(
+            measurement_model=self.measurement_model_flat,
+            state_means=self.state_means_flat,
+            state_covs=self.state_covs_flat,
+        )
+
+        # _get_measured_mean_samples captures uncertainty in the state, then below we'll add n(0,measure_std) noise
+        # to capture uncertainty from the measure covariance:
+        mstds = self.measure_covs_flat.diagonal(dim1=-2, dim2=-1).sqrt()
+        # mc_white_noise will give the same num_samples*num_dims array for a given num_dims input.
+        # this is primarily used in _get_measured_mean_samples to sample from state uncertainty. but we additionally
+        # need fixed random sampling for measure variance when plotting. this can't be the same fixed random state
+        # as the state uncertainty, since we want state samples and measurement samples to be uncorrelated.
+        rs = np.random.RandomState()
+        rs.set_state(_RANDOM_STATE)
+        measurement_white_noise = torch.as_tensor(
+            rs.randn(self.mc_white_noise.num_samples, len(self.measurement_model.measures)),
+            dtype=self.state_means.dtype,
+            device=self.state_means.device
+        )
+
+        # if MAP is requested, monte-carlo only used for intervals
+        measured_mean = None
+        if use_map:
+            measured_mean, _ = self.measurement_model_flat(self.state_means_flat, time=0)
+        elif self.mc_white_noise.num_samples < 1000:
+            warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
+
+        # for each measure, get mean/quantiles:
+        by_measure = {}
+        for i, measure in enumerate(self.measurement_model.measures):
+            samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
+            mean = torch.mean(samples, dim=0) if measured_mean is None else measured_mean[..., i]
+            lower = torch.quantile(samples, q=alpha, dim=0)
+            upper = torch.quantile(samples, q=1 - alpha, dim=0)
+            by_measure[measure] = (
+                mean.view(*batch_shape),
+                lower.view(*batch_shape),
+                upper.view(*batch_shape)
+            )
+        return by_measure
+
+    def _get_pred_intervals(self, alpha: float) -> dict[str, torch.Tensor]:
+        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+        system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+
+        batch_shape = self.state_means.shape[0:2]
+        multi = -stats.norm.ppf(alpha)
+
+        by_measure = {}
+        for i, measure in enumerate(self.measurement_model.measures):
+            mean = measured_mean[..., i]
+            var = system_cov[..., i, i]
+            lower = mean - multi * torch.sqrt(var)
+            upper = mean + multi * torch.sqrt(var)
+            by_measure[measure] = (
+                mean.view(*batch_shape),
+                lower.view(*batch_shape),
+                upper.view(*batch_shape)
+            )
+        return by_measure
+
     @torch.inference_mode()
     def _to_dataframe(self,
                       dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
                       group_colname: str,
                       time_colname: str,
-                      conf: float) -> pd.DataFrame:
-        batch_shape = self.state_means.shape[0:2]
+                      conf: float,
+                      use_map: bool) -> pd.DataFrame:
+
         alpha = (1 - conf) / 2
 
         if self.mc_white_noise is not None:
-            mmean_samples = self._get_measured_mean_samples(
-                measurement_model=self.measurement_model_flat,
-                state_means=self.state_means_flat,
-                state_covs=self.state_covs_flat,
-            )
-
-            # _get_measured_mean_samples captures uncertainty in the state, then below we'll add n(0,measure_std) noise
-            # to capture uncertainty from the measure covariance:
-            mstds = self.measure_covs_flat.diagonal(dim1=-2, dim2=-1).sqrt()
-            # mc_white_noise will give the same num_samples*num_dims array for a given num_dims input.
-            # this is primarily used in _get_measured_mean_samples to sample from state uncertainty. but we additionally
-            # need fixed random sampling for measure variance when plotting. this can't be the same fixed random state
-            # as the state uncertainty, since we want state samples and measurement samples to be uncorrelated.
-            rs = np.random.RandomState()
-            rs.set_state(_RANDOM_STATE)
-            measurement_white_noise = torch.as_tensor(
-                rs.randn(self.mc_white_noise.num_samples, len(self.measurement_model.measures)),
-                dtype=self.state_means.dtype,
-                device=self.state_means.device
-            )
-
-            # for each measure, get mean/quantiles:
-            by_measure = {}
-            for i, measure in enumerate(self.measurement_model.measures):
-                samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
-                mean = torch.mean(samples, dim=0)
-                lower = torch.quantile(samples, q=alpha, dim=0)
-                upper = torch.quantile(samples, q=1 - alpha, dim=0)
-                by_measure[measure] = (
-                    mean.view(*batch_shape),
-                    lower.view(*batch_shape),
-                    upper.view(*batch_shape)
+            if use_map is None:
+                warn(
+                    "Will use MCMC for intervals but MAP for mean; to keep this behavior and suppress this warning, "
+                    "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
                 )
+                use_map = True
+            by_measure = self._get_mc_pred_intervals(alpha, use_map=use_map)
         else:
-            multi = -stats.norm.ppf(alpha)
-            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
-            system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
-
-            by_measure = {}
-            for i, measure in enumerate(self.measurement_model.measures):
-                mean = measured_mean[..., i]
-                var = system_cov[..., i, i]
-                lower = mean - multi * torch.sqrt(var)
-                upper = mean + multi * torch.sqrt(var)
-                by_measure[measure] = (
-                    mean.view(*batch_shape),
-                    lower.view(*batch_shape),
-                    upper.view(*batch_shape)
-                )
+            if use_map:
+                warn("``use_map`` disregarded, no monte-carlo")
+            by_measure = self._get_pred_intervals(alpha)
 
         from torchcast.utils import TimeSeriesDataset
 
@@ -335,7 +370,7 @@ class Predictions:
                     actuals[m] = tens[..., mgroup.index(m)]
         out = []
         times = TimeSeriesDataset.get_dataset_times(
-            dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
+            dataset.start_offsets, num_timesteps=self.state_means.shape[1], dt_unit=dataset.dt_unit
         )
         for measure, (mean, lower, upper) in by_measure.items():
             _to_stack = {'mean': mean.unsqueeze(-1), 'lower': lower.unsqueeze(-1), 'upper': upper.unsqueeze(-1)}
@@ -537,6 +572,7 @@ class Predictions:
         em_idx = [i for i in range(em_dim) if i not in missing_midx]
         wn = self.mc_white_noise(num_dim=em_dim, dtype=_chol.dtype, device=_chol.device)[:, em_idx]
         _offsets = chol.unsqueeze(0) @ wn.view(-1, 1, len(em_idx), 1)
+
         sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets.squeeze(-1)
 
         # each of these samples represents a draw from a concatenated set of means: (1) the measured-mean of the
