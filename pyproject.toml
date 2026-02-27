@@ -25,8 +25,8 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-Repository = "https://github.com/strongio/torchcast"
-"Bug Tracker" = "https://github.com/strongio/torchcast/issues"
+Repository = "https://github.com/onesixsolutions/torchcast"
+"Bug Tracker" = "https://github.com/onesixsolutions/torchcast/issues"
 Documentation = "https://docs.strong.io/torchcast/"
 
 [project.optional-dependencies]
@@ -47,7 +47,7 @@ docs = [
     "ipywidgets>=7.6.3",
     "pandoc>=1.0.2",
     "matplotlib",
-    "strong-sphinx-theme @ git+ssh://git@github.com/strongio/strong-sphinx-theme.git"
+    "strong-sphinx-theme @ git+ssh://git@github.com/onesixsolutions/strong-sphinx-theme.git"
 ]
 
 [tool.setuptools.dynamic]
