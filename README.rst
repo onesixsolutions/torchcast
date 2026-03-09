@@ -18,7 +18,7 @@ Getting Started
 
 .. code-block:: bash
 
-    pip install git+https://github.com/strongio/torchcast.git#egg=torchcast
+    pip install git+https://github.com/onesixsolutions/torchcast.git#egg=torchcast
 
 ``torchcast`` requires Python >= 3.8 and PyTorch >= 1.8.
 
