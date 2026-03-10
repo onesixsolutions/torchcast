@@ -40,10 +40,12 @@ jobs:
         run: |
           pip install --upgrade python-semantic-release
 
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.STRONGIO_MACHINE_PAT }}
+
       - name: Release
         run: |
-          git clone https://${{ secrets.STRONGIO_MACHINE_PAT }}:@github.com/onesixsolutions/torchcast
-          cd torchcast
           semantic-release version --push --changelog --vcs-release --commit
         env:
           GH_TOKEN: ${{ secrets.STRONGIO_MACHINE_PAT }}
