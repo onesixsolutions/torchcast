@@ -1,68 +1,71 @@
+from math import log
+
 from dataclasses import dataclass, fields
-from typing import Tuple, Union, Optional, Dict, Iterator, Sequence, TYPE_CHECKING
+from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING
 from warnings import warn
 
 import torch
-from torch import nn, Tensor
 
 import numpy as np
 import pandas as pd
 
-from functools import cached_property
 from scipy import stats
 
-from torchcast.internals.utils import get_nan_groups, is_near_zero, transpose_last_dims, class_or_instancemethod
+from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat
 
 if TYPE_CHECKING:
-    from torchcast.state_space import StateSpaceModel
     from torchcast.utils import TimeSeriesDataset
+    from torchcast.internals.batch_design import MeasurementModel
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+_RANDOM_STATE = np.random.RandomState().get_state()
 
 
 class Predictions:
     """
     The output of the :class:`.StateSpaceModel` forward pass, containing the underlying state means and covariances, as
-    well as the predicted observations and covariances.
+    well as methods such as ``log_prob()``, ``to_dataframe()``, and ``plot()``.
     """
+    _means = None
+    _covs = None
 
     def __init__(self,
-                 state_means: Union[Sequence[Tensor], Tensor],
-                 state_covs: Union[Sequence[Tensor], Tensor],
-                 R: Union[Sequence[Tensor], Tensor],
-                 H: Union[Sequence[Tensor], Tensor],
-                 model: Union['StateSpaceModel', 'StateSpaceModelMetadata'],
-                 update_means: Optional[Sequence[Tensor]] = None,
-                 update_covs: Optional[Sequence[Tensor]] = None):
+                 measurement_model: 'MeasurementModel',
+                 states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
+                 measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
+                 updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+                 mc_white_noise: Optional['FixedWhiteNoise'] = None):
+        self.state_means = _maybe_stack(states[0], 1)
+        self.state_covs = _maybe_stack(states[1], 1)
+        self.measure_covs = _maybe_stack(measure_covs, 1)
 
-        # predictions state:
-        self._state_means = state_means
-        self._state_covs = state_covs
+        self.measurement_model = measurement_model
+        self.measurement_model_flat = self.measurement_model.flattened()
 
-        # updates state:
-        self._update_means = update_means
-        self._update_covs = update_covs
+        self.update_means = self.update_covs = None
+        if updates is not None:
+            self.update_means = _maybe_stack(updates[0], 1)
+            self.update_covs = _maybe_stack(updates[1], 1)
 
-        # design mats:
-        self._H = H
-        self._R = R
-
-        # some model attributes are needed for `log_prob` method and for names for plotting
-        if not isinstance(model, StateSpaceModelMetadata):
-            all_state_elements = []
-            for pid in model.processes:
-                process = model.processes[pid]
-                for state_element in process.state_elements:
-                    all_state_elements.append((pid, state_element))
-            self._model_attributes = StateSpaceModelMetadata(
-                measures=model.measures,
-                all_state_elements=all_state_elements,
+        if mc_white_noise is None and self.measurement_model.is_nonlinear:
+            raise ValueError(
+                "Since the measurement model is nonlinear, the `mc_white_noise` argument must be specified."
             )
 
-        # for lazily populated properties:
-        self._means = self._covs = None
+        self.mc_white_noise = mc_white_noise
 
-        # metadata
-        self.num_groups, self.num_timesteps, self.state_size = self.state_means.shape
         self._dataset_metadata = None
+        self._state_means_flat = None
+        self._state_covs_flat = None
+        self._mcovs_flat = None
+
+    @property
+    def num_groups(self) -> int:
+        return len(self.state_means)
+
+    @property
+    def num_timesteps(self) -> int:
+        return self.state_means.shape[1]
 
     def set_metadata(self,
                      dataset: Optional['TimeSeriesDataset'] = None,
@@ -103,69 +106,489 @@ class Predictions:
             raise RuntimeError("Metadata not set. Pass the dataset or call `set_metadata()`.")
         return self._dataset_metadata
 
-    @cached_property
-    def R(self) -> torch.Tensor:
-        if not isinstance(self._R, torch.Tensor):
-            self._R = torch.stack(self._R, 1)
-        return self._R
+    @torch.inference_mode()
+    def to_dataframe(self,
+                     dataset: Optional['TimeSeriesDataset'] = None,
+                     type: str = 'predictions',
+                     group_colname: Optional[str] = None,
+                     time_colname: Optional[str] = None,
+                     conf: Optional[float] = .95,
+                     use_map: Optional[bool] = None) -> pd.DataFrame:
+        """
+        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
+        :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
+        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
+        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
+        :param conf: The confidence level for the confidence intervals, defaults to 0.95.
+        :param use_map: If the model requires MCMC, this controls whether the mean uses mcmc to marginalize over the
+         state distribution (``use_map=False``) or whether the MAP is used to apply any non-linearities to the
+         state-mean directly (``use_map=True``). The latter can sometimes exhibit better predictive performance on
+         traditional supervised learning metrics.
+        """
+        if dataset is None:
+            dataset = self.dataset_metadata.copy()
+            if dataset.group_names is None:
+                dataset.group_names = [f"group_{i}" for i in range(self.num_groups)]
+            if dataset.start_offsets.dtype.name.startswith('date') and not dataset.dt_unit:
+                raise ValueError(
+                    "Unable to infer `dt_unit`, please call ``predictions.set_metadata(dt_unit=X)``, or pass `dataset` "
+                    "to ``predictions.to_dataframe()``"
+                )
+            if dataset.dt_unit and not dataset.start_offsets.dtype.name.startswith('date'):
+                raise ValueError(
+                    "Expected `start_offsets` to be a datetime64 array, but got a different dtype. If you don't have "
+                    "dates, then set `dt_unit=None`."
+                )
 
-    @cached_property
-    def H(self) -> torch.Tensor:
-        if not isinstance(self._H, torch.Tensor):
-            self._H = torch.stack(self._H, 1)
-        return self._H
+        group_colname = group_colname or self.dataset_metadata.group_colname
+        time_colname = time_colname or self.dataset_metadata.time_colname
+
+        if conf is not None:
+            assert conf >= .50
+
+        type = type.casefold()
+        if type.startswith('pred'):
+            return_std = False
+            if conf is None:
+                conf = stats.norm.ppf(2 * stats.norm.cdf(-.5))
+                return_std = True
+
+            df = self._to_dataframe(
+                dataset=dataset,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                conf=conf,
+                use_map=use_map
+            )
+            if return_std:
+                df['std'] = df.pop('upper') - df.pop('lower')
+            return df
+        elif type in ('components', 'states', 'observed_states'):
+            if use_map:
+                raise NotImplementedError("``use_map=True`` not yet implemented for type!='predictions'")
+            if type == 'components':
+                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", DeprecationWarning)
+            return self._to_components_dataframe(
+                dataset=dataset,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                conf=conf,
+                measured=type in ('observed_states', 'components')
+            )
+        else:
+            raise ValueError(f"Expected type to be 'predictions', 'states', or 'observed_states', got '{type}'.")
+
+    @torch.inference_mode()
+    def _to_components_dataframe(self,
+                                 dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                                 group_colname: str,
+                                 time_colname: str,
+                                 conf: float,
+                                 measured: bool) -> pd.DataFrame:
+        alpha = (1 - conf) / 2
+        batch_shape = self.state_means.shape[0:2]
+
+        if self.mc_white_noise is not None:
+            # sample from the state distribution:
+            # todo: use chol @ self.white_noise like in _get_measured_mean_samples
+            state_mean_samples = torch.distributions.MultivariateNormal(
+                loc=self.state_means_flat,
+                covariance_matrix=self.state_covs_flat,
+                validate_args=False
+            ).sample((self.mc_white_noise.num_samples,))
+
+            # pass each sample to the `get_components` function, organize by process:
+            samples_by_proc = {}
+            for smean_samp in state_mean_samples:
+                for pid, se, comp_mean in self.measurement_model_flat.get_components(smean_samp, measured=measured):
+                    key = (pid, se)
+                    if key not in samples_by_proc:
+                        samples_by_proc[key] = []
+                    samples_by_proc[key].append(comp_mean)
+            # compute CIs:
+            cis_by_proc = {}
+            for key, samples in samples_by_proc.items():
+                stacked = torch.stack(samples, dim=0).view(self.mc_white_noise.num_samples, *batch_shape)
+                lower = torch.quantile(stacked, q=alpha, dim=0)
+                upper = torch.quantile(stacked, q=1 - alpha, dim=0)
+                cis_by_proc[key] = (lower, upper)
+        else:
+            cis_by_proc = {}
+            for q in (alpha, 1 - alpha):
+                multi = -stats.norm.ppf(q)
+                offset = self.state_means_flat + multi * torch.sqrt(self.state_covs_flat.diagonal(dim1=-2, dim2=-1))
+                for pid, se, comp_mean in self.measurement_model_flat.get_components(offset, measured=measured):
+                    key = (pid, se)
+                    if key not in cis_by_proc:
+                        cis_by_proc[key] = []
+                    cis_by_proc[key].append(comp_mean.view(*batch_shape))
+
+        from torchcast.utils import TimeSeriesDataset
+
+        # for each process, get mean/quantiles:
+        times = TimeSeriesDataset.get_dataset_times(
+            dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
+        )
+        out = []
+        for pid, se, comp_mean in self.measurement_model_flat.get_components(self.state_means_flat, measured=measured):
+            mean = comp_mean.view(*batch_shape)
+            lower, upper = cis_by_proc[(pid, se)]
+
+            # to dataframe:
+            _df = TimeSeriesDataset.tensor_to_dataframe(
+                tensor=torch.stack([mean, lower, upper], -1),
+                times=times,
+                group_names=dataset.group_names,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                measures=['mean', 'lower', 'upper']
+            )
+
+            _df['process'] = pid
+            _df['state_element'] = se
+            _df['measure'] = self.measurement_model.processes[pid].measure
+            out.append(_df)
+
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in self.measurement_model.measures:
+                        continue
+                    actuals = tens[:, :, [mgroup.index(m)]]
+                    preds = self.means[:, 0:actuals.shape[1], [self.measurement_model.measures.index(m)]]
+                    _df = TimeSeriesDataset.tensor_to_dataframe(
+                        tensor=preds - actuals,
+                        times=times,
+                        group_names=dataset.group_names,
+                        group_colname=group_colname,
+                        time_colname=time_colname,
+                        measures=['mean'],
+                    )
+                    _df['measure'] = m
+                    _df['process'] = 'residuals'
+                    _df['state_element'] = 'residuals'
+                    out.append(_df)
+
+        out = pd.concat(out)
+        return out
+
+    def _get_mc_pred_intervals(self, alpha: float, use_map: bool) -> dict[str, torch.Tensor]:
+        batch_shape = self.state_means.shape[0:2]
+        mmean_samples = self._get_measured_mean_samples(
+            measurement_model=self.measurement_model_flat,
+            state_means=self.state_means_flat,
+            state_covs=self.state_covs_flat,
+        )
+
+        # _get_measured_mean_samples captures uncertainty in the state, then below we'll add n(0,measure_std) noise
+        # to capture uncertainty from the measure covariance:
+        mstds = self.measure_covs_flat.diagonal(dim1=-2, dim2=-1).sqrt()
+        # mc_white_noise will give the same num_samples*num_dims array for a given num_dims input.
+        # this is primarily used in _get_measured_mean_samples to sample from state uncertainty. but we additionally
+        # need fixed random sampling for measure variance when plotting. this can't be the same fixed random state
+        # as the state uncertainty, since we want state samples and measurement samples to be uncorrelated.
+        rs = np.random.RandomState()
+        rs.set_state(_RANDOM_STATE)
+        measurement_white_noise = torch.as_tensor(
+            rs.randn(self.mc_white_noise.num_samples, len(self.measurement_model.measures)),
+            dtype=self.state_means.dtype,
+            device=self.state_means.device
+        )
+
+        # if MAP is requested, monte-carlo only used for intervals
+        measured_mean = None
+        if use_map:
+            measured_mean, _ = self.measurement_model_flat(self.state_means_flat, time=0)
+        elif self.mc_white_noise.num_samples < 1000:
+            warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
+
+        # for each measure, get mean/quantiles:
+        by_measure = {}
+        for i, measure in enumerate(self.measurement_model.measures):
+            samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
+            mean = torch.mean(samples, dim=0) if measured_mean is None else measured_mean[..., i]
+            lower = torch.quantile(samples, q=alpha, dim=0)
+            upper = torch.quantile(samples, q=1 - alpha, dim=0)
+            by_measure[measure] = (
+                mean.view(*batch_shape),
+                lower.view(*batch_shape),
+                upper.view(*batch_shape)
+            )
+        return by_measure
+
+    def _get_pred_intervals(self, alpha: float) -> dict[str, torch.Tensor]:
+        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+        system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+
+        batch_shape = self.state_means.shape[0:2]
+        multi = -stats.norm.ppf(alpha)
+
+        by_measure = {}
+        for i, measure in enumerate(self.measurement_model.measures):
+            mean = measured_mean[..., i]
+            var = system_cov[..., i, i]
+            lower = mean - multi * torch.sqrt(var)
+            upper = mean + multi * torch.sqrt(var)
+            by_measure[measure] = (
+                mean.view(*batch_shape),
+                lower.view(*batch_shape),
+                upper.view(*batch_shape)
+            )
+        return by_measure
+
+    @torch.inference_mode()
+    def _to_dataframe(self,
+                      dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                      group_colname: str,
+                      time_colname: str,
+                      conf: float,
+                      use_map: bool) -> pd.DataFrame:
+
+        alpha = (1 - conf) / 2
+
+        if self.mc_white_noise is not None:
+            if use_map is None:
+                warn(
+                    "Will use MCMC for intervals but MAP for mean; to keep this behavior and suppress this warning, "
+                    "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
+                )
+                use_map = True
+            by_measure = self._get_mc_pred_intervals(alpha, use_map=use_map)
+        else:
+            if use_map:
+                warn("``use_map`` disregarded, no monte-carlo")
+            by_measure = self._get_pred_intervals(alpha)
+
+        from torchcast.utils import TimeSeriesDataset
+
+        actuals = {}
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in by_measure:
+                        continue
+                    actuals[m] = tens[..., mgroup.index(m)]
+        out = []
+        times = TimeSeriesDataset.get_dataset_times(
+            dataset.start_offsets, num_timesteps=self.state_means.shape[1], dt_unit=dataset.dt_unit
+        )
+        for measure, (mean, lower, upper) in by_measure.items():
+            _to_stack = {'mean': mean.unsqueeze(-1), 'lower': lower.unsqueeze(-1), 'upper': upper.unsqueeze(-1)}
+            mactuals = actuals.get(measure, None)
+            if mactuals is not None:
+                _to_stack['actual'] = mactuals.unsqueeze(-1)
+            out.append(
+                TimeSeriesDataset.tensor_to_dataframe(
+                    tensor=ragged_cat(list(_to_stack.values()), cat_dim=-1, ragged_dim=1),
+                    times=times,
+                    group_names=dataset.group_names,
+                    group_colname=group_colname,
+                    time_colname=time_colname,
+                    measures=list(_to_stack)
+                )
+            )
+            out[-1]['measure'] = measure
+        out = pd.concat(out)
+
+        return out
+
+    def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_shape = self.state_means.shape[0:2]
+
+        if self.measurement_model.is_nonlinear:
+            # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=self.measurement_model_flat,
+                state_means=self.state_means_flat,
+                state_covs=self.state_covs_flat,
+            )
+            measured_mean = torch.mean(mmean_samples, dim=0)
+            return measured_mean.view(*batch_shape, -1), None
+        else:
+            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+            system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+            return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
 
     @property
-    def measures(self) -> Sequence[str]:
-        return self._model_attributes.measures
+    def means(self) -> torch.Tensor:
+        """
+        Returns the observed means of the predictions, i.e. the measured means of the state.
+        """
+        if self._means is None:
+            self._means, self._covs = self._observe()
+        return self._means
 
-    @cached_property
-    def state_means(self) -> torch.Tensor:
-        if not isinstance(self._state_means, torch.Tensor):
-            self._state_means = torch.stack(self._state_means, 1)
-        if torch.isnan(self._state_means).any():
-            if torch.isnan(self._state_means).all():
-                raise ValueError("`nans` in all groups' `state_means`")
+    @property
+    def covs(self) -> Optional[torch.Tensor]:
+        if self._means is None:
+            self._means, self._covs = self._observe()
+        if self._covs is None:
+            if _warn_once.get('cov', False):
+                warn("The measurement model is nonlinear, so no closed-form covariance is available, returning None.")
+                _warn_once['cov'] = True
+        return self._covs
+
+    def _flatten(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        nmeasures = self.measure_covs.shape[-1]
+        state_rank = self.state_means.shape[-1]
+        state_means_flat = self.state_means.view(-1, state_rank)
+        state_covs_flat = self.state_covs.view(-1, state_rank, state_rank)
+        measure_covs_flat = self.measure_covs.view(-1, nmeasures, nmeasures)
+        return state_means_flat, state_covs_flat, measure_covs_flat
+
+    @property
+    def state_means_flat(self):
+        if self._state_means_flat is None:
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
+        return self._state_means_flat
+
+    @property
+    def state_covs_flat(self):
+        if self._state_covs_flat is None:
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
+        return self._state_covs_flat
+
+    @property
+    def measure_covs_flat(self) -> torch.Tensor:
+        if self._mcovs_flat is None:
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
+        return self._mcovs_flat
+
+    def log_prob(self,
+                 obs: torch.Tensor,
+                 weights: Optional[torch.Tensor] = None,
+                 nan_groups_flat: Optional[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]] = None
+                 ) -> torch.Tensor:
+        """
+        Compute the log-probability of data (e.g. data that was originally fed into the ``StateSpaceModel``).
+
+        :param obs: A Tensor that could be used in the ``StateSpaceModel`` forward pass.
+        :param weights: If specified, will be used to weight the log-probability of each group X timestep.
+        :param nan_groups_flat: used by StateSpaceModel.fit() for speeding up computations, pre-computing nan-masks at
+         the start of fitting rather than doing so on each call to log_prob().
+        :return: A tensor with one element for each group X timestep indicating the log-probability.
+        """
+        assert len(obs.shape) == 3
+        measure_rank = obs.shape[-1]
+        state_rank = self.state_means.shape[-1]
+
+        obs_flat = obs.reshape(-1, measure_rank)
+        if weights is None:
+            weights = torch.ones(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
+        else:
+            weights = weights.view(-1, measure_rank)
+        state_means_flat = self.state_means.view(-1, state_rank)
+        state_covs_flat = self.state_covs.view(-1, state_rank, state_rank)
+        measure_covs_flat = self.measure_covs.view(-1, measure_rank, measure_rank)
+
+        lp_flat = torch.zeros(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
+
+        if nan_groups_flat is None:
+            nan_groups_flat = get_nan_groups(torch.isnan(obs_flat))
+
+        for gt_idx, masks in nan_groups_flat:
+            if masks is None:
+                val_idx = None
+                gt_obs = obs_flat[gt_idx]
+                gt_mcov = measure_covs_flat[gt_idx]
+                gt_mmodel = self.measurement_model_flat.subset(gt_idx)
             else:
-                groups, *_ = zip(*torch.isnan(self._state_means).nonzero().tolist())
-                raise ValueError(f"`nans` in `state_means` for group-indices: {set(groups)}")
-        return self._state_means
-
-    @cached_property
-    def state_covs(self) -> torch.Tensor:
-        if not isinstance(self._state_covs, torch.Tensor):
-            self._state_covs = torch.stack(self._state_covs, 1)
-        if torch.isnan(self._state_covs).any():
-            raise ValueError("`nans` in `state_covs`")
-        return self._state_covs
-
-    @cached_property
-    def update_means(self) -> Optional[torch.Tensor]:
-        if self._update_means is None:
-            raise RuntimeError(
-                "Cannot get ``update_means`` because update mean/cov was not passed when creating this "
-                "``Predictions`` object. This usually means you have to include ``include_updates_in_output=True`` "
-                "when calling ``StateSpaceModel()``."
+                val_idx, m1d, m2d = masks
+                gt_mmodel = self.measurement_model_flat.subset(gt_idx, measures=val_idx)
+                gt_mcov = measure_covs_flat[m2d]
+                gt_obs = obs_flat[m1d]
+            _kwargs = self._get_log_prob_kwargs(gt_idx, val_idx)
+            lp_flat[gt_idx] = self._log_prob(
+                obs=gt_obs,
+                state_means=state_means_flat[gt_idx],
+                state_covs=state_covs_flat[gt_idx],
+                measure_cov=gt_mcov,
+                measurement_model=gt_mmodel,
+                **_kwargs
             )
-        if not isinstance(self._update_means, torch.Tensor):
-            self._update_means = torch.stack(self._update_means, 1)
-        if torch.isnan(self._update_means).any():
-            raise ValueError("`nans` in `state_means`")
-        return self._update_means
 
-    @cached_property
-    def update_covs(self) -> Optional[torch.Tensor]:
-        if self._update_covs is None:
-            raise RuntimeError(
-                "Cannot get ``update_covs`` because update mean/cov was not passed when creating this "
-                "``Predictions`` object. This usually means you have to include ``include_updates_in_output=True`` "
-                "when calling ``StateSpaceModel()``."
+        lp_flat = lp_flat * weights
+
+        return lp_flat.view(obs.shape[0:2])
+
+    def _get_log_prob_kwargs(self, group_idx: torch.Tensor, measure_idx: Optional[torch.Tensor]) -> dict:
+        return {}
+
+    def _log_prob(self,
+                  obs: torch.Tensor,
+                  state_means: torch.Tensor,
+                  state_covs: torch.Tensor,
+                  measure_cov: torch.Tensor,
+                  measurement_model: 'MeasurementModel',
+                  **kwargs) -> torch.Tensor:
+        if kwargs:
+            raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
+        assert measurement_model.num_timesteps == 1
+
+        if measurement_model.is_nonlinear:
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=measurement_model,
+                state_means=state_means,
+                state_covs=state_covs,
             )
-        if not isinstance(self._update_covs, torch.Tensor):
-            self._update_covs = torch.stack(self._update_covs, 1)
-        if torch.isnan(self._update_covs).any():
-            raise ValueError("`nans` in `update_covs`")
-        return self._update_covs
+
+            # evaluate the log-prob of the observations under each sampled measured-mean:
+            mc_log_probs = torch.distributions.MultivariateNormal(
+                loc=mmean_samples,
+                covariance_matrix=measure_cov.unsqueeze(0),
+                validate_args=False
+            ).log_prob(obs)
+            # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
+            # this is a numerically stable way to do that:
+            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
+        else:
+            measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
+            system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
+            return torch.distributions.MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
+
+    def _get_measured_mean_samples(self,
+                                   measurement_model: 'MeasurementModel',
+                                   state_means: torch.Tensor,
+                                   state_covs: torch.Tensor):
+        nmeasures = len(measurement_model.measures)
+
+        # use the extended measure-mat to reduce dimensionality
+        extended_measure_mat = measurement_model.extended_measure_mat
+        partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
+        partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
+
+        # then we sample from that multivariate distribution.
+        # some measures might have no linear components, which means we can't take the cholesky for those
+        # todo: add zero_safe_cholesky helper?
+        nonzero = (extended_measure_mat != 0).any(0).any(1).cpu().nonzero(as_tuple=True)[0]
+        m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
+        _chol = torch.linalg.cholesky(partial_measured_cov[m2d])
+        chol = torch.zeros_like(partial_measured_cov)
+        chol[m2d] = _chol
+
+        # take care to drop missing measures:
+        missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
+        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        em_idx = [i for i in range(em_dim) if i not in missing_midx]
+        wn = self.mc_white_noise(num_dim=em_dim, dtype=_chol.dtype, device=_chol.device)[:, em_idx]
+        _offsets = chol.unsqueeze(0) @ wn.view(-1, 1, len(em_idx), 1)
+
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets.squeeze(-1)
+
+        # each of these samples represents a draw from a concatenated set of means: (1) the measured-mean of the
+        # linear processes with (2) the nonlinear processes' state-means.
+        # for each sample, we take those draws from the (nonlinear) state distribution and use them to apply
+        # adjustment to the linear measured-mean.
+        mmean_samples = []
+        for sampled_pmean in sampled_pmmeans.unbind(0):
+            procs_and_means = [
+                (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
+                for proc in self.measurement_model.nonlinear_processes
+            ]
+            mmean_samples.append(
+                measurement_model.adjust_measured_mean(sampled_pmean[..., 0:nmeasures], procs_and_means, time=0)
+            )
+        return torch.stack(mmean_samples, dim=0)
 
     def with_new_start_times(self,
                              start_times: Union[np.ndarray, np.datetime64],
@@ -185,7 +608,7 @@ class Predictions:
     def get_state_at_times(self,
                            times: Union[np.ndarray, np.datetime64],
                            type_: str = 'update',
-                           **kwargs) -> Tuple[Tensor, Tensor]:
+                           **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         For each group, get the state (tuple of (mean, cov)) for a timepoint. This is often useful since predictions
         are right-aligned and padded, so that the final prediction for each group is arbitrarily padded and does not
@@ -248,249 +671,6 @@ class Predictions:
 
         return times
 
-    @classmethod
-    def observe(cls, state_means: Tensor, state_covs: Tensor, R: Tensor, H: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Convert latent states into observed predictions (and their uncertainty).
-
-        :param state_means: The latent state means
-        :param state_covs: The latent state covs.
-        :param R: The measure-covariance matrices.
-        :param H: The measurement matrix.
-        :return: A tuple of `means`, `covs`.
-        """
-        means = H.matmul(state_means.unsqueeze(-1)).squeeze(-1)
-        Ht = transpose_last_dims(H)
-        covs = H.matmul(state_covs).matmul(Ht) + R
-        return means, covs
-
-    @property
-    def means(self) -> Tensor:
-        if self._means is None:
-            # TODO: in ExpSmooth, _state_covs, _R, and _H will often not be time-varying. if we could generate them s.t.
-            #  we could perform a fast check of this (self._R[0] is self._R[1]) then could speed up slowest step:
-            #  `H.matmul(state_covs).matmul(Ht) + R`
-            self._means, self._covs = self.observe(self.state_means, self.state_covs, self.R, self.H)
-        return self._means
-
-    @property
-    def covs(self) -> Tensor:
-        if self._covs is None:
-            self._means, self._covs = self.observe(self.state_means, self.state_covs, self.R, self.H)
-        return self._covs
-
-    def log_prob(self, obs: Tensor, weights: Optional[Tensor] = None) -> Tensor:
-        """
-        Compute the log-probability of data (e.g. data that was originally fed into the ``StateSpaceModel``).
-
-        :param obs: A Tensor that could be used in the ``StateSpaceModel`` forward pass.
-        :param weights: If specified, will be used to weight the log-probability of each group X timestep.
-        :return: A tensor with one element for each group X timestep indicating the log-probability.
-        """
-        assert len(obs.shape) == 3
-        assert obs.shape[-1] == self.means.shape[-1]
-        n_measure_dim = obs.shape[-1]
-        n_state_dim = self.state_means.shape[-1]
-
-        obs_flat = obs.reshape(-1, n_measure_dim)
-        if weights is None:
-            weights = torch.ones(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
-        else:
-            weights = weights.reshape(-1, n_measure_dim)
-        state_means_flat = self.state_means.view(-1, n_state_dim)
-        state_covs_flat = self.state_covs.view(-1, n_state_dim, n_state_dim)
-        H_flat = self.H.view(-1, n_measure_dim, n_state_dim)
-        R_flat = self.R.view(-1, n_measure_dim, n_measure_dim)
-
-        lp_flat = torch.zeros(obs_flat.shape[0], dtype=self.state_means.dtype, device=self.state_means.device)
-        for gt_idx, valid_idx in get_nan_groups(torch.isnan(obs_flat)):
-            if valid_idx is None:
-                gt_obs = obs_flat[gt_idx]
-                gt_R = R_flat[gt_idx]
-                gt_H = H_flat[gt_idx]
-            else:
-                mask1d = torch.meshgrid(gt_idx, valid_idx, indexing='ij')
-                mask2d = torch.meshgrid(gt_idx, valid_idx, valid_idx, indexing='ij')
-                gt_R = R_flat[mask2d]
-                gt_H = H_flat[mask1d]
-                gt_obs = obs_flat[mask1d]
-            _kwargs = self._get_log_prob_kwargs(gt_idx, valid_idx)
-            lp_flat[gt_idx] = self._log_prob(
-                obs=gt_obs,
-                state_means=state_means_flat[gt_idx],
-                state_covs=state_covs_flat[gt_idx],
-                R=gt_R,
-                H=gt_H,
-                **_kwargs
-            )
-
-        lp_flat = lp_flat * weights
-
-        return lp_flat.view(obs.shape[0:2])
-
-    def _get_log_prob_kwargs(self, groups: Tensor, valid_idx: Tensor) -> dict:
-        return {}
-
-    def _log_prob(self,
-                  obs: Tensor,
-                  state_means: Tensor,
-                  state_covs: Tensor,
-                  R: Tensor,
-                  H: Tensor,
-                  **kwargs) -> Tensor:
-        means, covs = self.observe(state_means, state_covs, R, H)
-        return torch.distributions.MultivariateNormal(means, covs, validate_args=False).log_prob(obs)
-
-    def to_dataframe(self,
-                     dataset: Optional['TimeSeriesDataset'] = None,
-                     type: str = 'predictions',
-                     group_colname: Optional[str] = None,
-                     time_colname: Optional[str] = None,
-                     conf: Optional[float] = .95,
-                     **kwargs) -> pd.DataFrame:
-        """
-        :param dataset: The dataset which generated the predictions. If not supplied, will use the metadata set at
-         prediction time, but the group-names will be replaced by dummy group names, and the output will not include
-         actuals.
-        :param type: Either 'predictions' or 'components'.
-        :param group_colname: Column-name for 'group'
-        :param time_colname: Column-name for 'time'
-        :param conf: If set, specifies the confidence level for the 'lower' and 'upper' columns in the output. Default
-         of 0.95 means these are 0.025 and 0.975. If ``None``, then will just include 'std' column instead.
-        :return: A pandas DataFrame with 'group', 'time', 'measure', 'mean', 'lower', 'upper'. For ``type='components'``
-         additionally includes: 'process' and 'state_element'.
-        """
-        from torchcast.utils import TimeSeriesDataset
-
-        multi = kwargs.pop('multi', False)
-        if multi is not False:
-            msg = "`multi` is deprecated, please use `conf` instead."
-            if multi is None:  # old way of specifying "just return std", for backwards-compatibility
-                warn(msg, DeprecationWarning)
-                conf = None
-            else:
-                raise TypeError(msg)
-        if kwargs:
-            raise TypeError(f"Unexpected keyword arguments: {set(kwargs)}")
-
-        named_tensors = {}
-        if dataset is None:
-            dataset = self.dataset_metadata.copy()
-            if dataset.group_names is None:
-                dataset.group_names = [f"group_{i}" for i in range(self.num_groups)]
-            if dataset.start_offsets.dtype.name.startswith('date') and not dataset.dt_unit:
-                raise ValueError(
-                    "Unable to infer `dt_unit`, please call ``predictions.set_metadata(dt_unit=X)``, or pass `dataset` "
-                    "to ``predictions.to_dataframe()``"
-                )
-            if dataset.dt_unit and not dataset.start_offsets.dtype.name.startswith('date'):
-                raise ValueError(
-                    "Expected `start_offsets` to be a datetime64 array, but got a different dtype. If you don't have "
-                    "dates, then set `dt_unit=None`."
-                )
-        else:
-            for measure_group, tensor in zip(dataset.measures, dataset.tensors):
-                for i, measure in enumerate(measure_group):
-                    if measure in self.measures:
-                        named_tensors[measure] = tensor[..., [i]]
-            missing = set(self.measures) - set(dataset.all_measures)
-            if missing:
-                raise ValueError(
-                    f"Some measures in the design aren't in the dataset.\n"
-                    f"Design: {missing}\nDataset: {dataset.all_measures}"
-                )
-
-        group_colname = group_colname or self.dataset_metadata.group_colname
-        time_colname = time_colname or self.dataset_metadata.time_colname
-
-        def _tensor_to_df(tens, measures):
-            offsets = np.arange(0, tens.shape[1]) * (dataset.dt_unit if dataset.dt_unit else 1)
-            times = dataset.start_offsets[:, None] + offsets
-
-            return TimeSeriesDataset.tensor_to_dataframe(
-                tensor=tens,
-                times=times,
-                group_names=dataset.group_names,
-                group_colname=group_colname,
-                time_colname=time_colname,
-                measures=measures
-            )
-
-        assert group_colname not in {'mean', 'lower', 'upper', 'std'}
-        assert time_colname not in {'mean', 'lower', 'upper', 'std'}
-
-        out = []
-        if type.startswith('pred'):
-
-            stds = torch.diagonal(self.covs, dim1=-1, dim2=-2).sqrt()
-            for i, measure in enumerate(self.measures):
-                # predicted:
-                df = _tensor_to_df(torch.stack([self.means[..., i], stds[..., i]], 2), measures=['mean', 'std'])
-                if conf is not None:
-                    df['lower'], df['upper'] = conf2bounds(df['mean'], df.pop('std'), conf=conf)
-
-                # actual:
-                orig_tensor = named_tensors.get(measure, None)
-                if orig_tensor is not None and not torch.isnan(orig_tensor).all():
-                    df_actual = _tensor_to_df(orig_tensor, measures=['actual'])
-                    df = df.merge(df_actual, on=[group_colname, time_colname], how='left')
-
-                out.append(df.assign(measure=measure))
-
-        elif type.startswith('comp'):
-            for (measure, process, state_element), (m, std) in self._components().items():
-                df = _tensor_to_df(torch.stack([m, std], 2), measures=['mean', 'std'])
-                if conf is not None:
-                    df['lower'], df['upper'] = conf2bounds(df['mean'], df.pop('std'), conf=conf)
-                df['process'], df['state_element'], df['measure'] = process, state_element, measure
-                out.append(df)
-
-            # residuals:
-            for i, measure in enumerate(self.measures):
-                orig_tensor = named_tensors.get(measure, None)
-                if orig_tensor is None:
-                    continue
-                predictions = self.means[..., [i]]
-                if orig_tensor.shape[1] < predictions.shape[1]:
-                    orig_aligned = predictions.data.clone()
-                    orig_aligned[:] = float('nan')
-                    orig_aligned[:, 0:orig_tensor.shape[1], :] = orig_tensor
-                else:
-                    orig_aligned = orig_tensor[:, 0:predictions.shape[1], :]
-
-                df = _tensor_to_df(predictions - orig_aligned, ['mean'])
-                df['process'], df['state_element'], df['measure'] = 'residuals', 'residuals', measure
-                out.append(df)
-
-        else:
-            raise ValueError("Expected `type` to be 'predictions' or 'components'.")
-
-        out = pd.concat(out).reset_index(drop=True)
-        _out_cols = [group_colname, time_colname, 'measure', 'mean']
-        if conf is None:
-            _out_cols.append('std')
-        else:
-            _out_cols.extend(['lower', 'upper'])
-        if type.startswith('comp'):
-            _out_cols = _out_cols[0:3] + ['process', 'state_element'] + _out_cols[3:]
-        if 'actual' in out.columns:
-            _out_cols.append('actual')
-        return out[_out_cols]
-
-    @torch.no_grad()
-    def _components(self) -> Dict[Tuple[str, str, str], Tuple[Tensor, Tensor]]:
-        out = {}
-        for midx, measure in enumerate(self.measures):
-            H = self.H[..., midx, :]
-            means = H * self.state_means
-            stds = H * torch.diagonal(self.state_covs, dim1=-2, dim2=-1).sqrt()
-
-            for se_idx, (process, state_element) in enumerate(self._model_attributes.all_state_elements):
-                if not is_near_zero(means[:, :, se_idx]).all():
-                    out[(measure, process, state_element)] = (means[:, :, se_idx], stds[:, :, se_idx])
-
-        return out
-
     @class_or_instancemethod
     def plot(cls,
              df: Optional[Union[pd.DataFrame, 'TimeSeriesDataset']] = None,
@@ -543,7 +723,7 @@ class Predictions:
 
         df = df.copy()
         if 'upper' not in df.columns and 'std' in df.columns:
-            df['lower'], df['upper'] = conf2bounds(df['mean'], df.pop('std'), conf=.95)
+            raise RuntimeError("Please convert your 'std' column into lower/upper columns.")
         if df[group_colname].nunique() > max_num_groups:
             subset_groups = df[group_colname].drop_duplicates().sample(max_num_groups).tolist()
             if len(subset_groups) < df[group_colname].nunique():
@@ -597,7 +777,7 @@ class Predictions:
 
         return plot + theme_bw() + theme(**kwargs)
 
-    def __iter__(self) -> Iterator[Tensor]:
+    def __iter__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # so that we can do ``mean, cov = predictions``
         yield self.means
         yield self.covs
@@ -606,28 +786,26 @@ class Predictions:
         # for numpy.asarray
         return self.means.detach().numpy()
 
-    def __getitem__(self, item: Tuple) -> 'Predictions':
+    def __getitem__(self, item) -> 'Predictions':
         kwargs = self._getitem_helper(item)
         cls = type(self)
-        return cls(**kwargs, model=self._model_attributes)
+        return cls(**kwargs)
 
     def _getitem_helper(self, item: tuple) -> dict:
+        if not isinstance(item, tuple):
+            item = (item,)
         kwargs = {
-            'state_means': self.state_means[item],
-            'state_covs': self.state_covs[item],
-            'H': self.H[item],
-            'R': self.R[item]
+            'measurement_model': self.measurement_model.subset(*item),
+            'states': (self.state_means[item], self.state_covs[item]),
+            'measure_covs': self.measure_covs[item],
+            # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
+            'mc_white_noise': self.mc_white_noise
         }
-        if self._update_means is not None:
-            kwargs.update({'update_means': self.update_means[item], 'update_covs': self.update_covs[item]})
+        if self.update_means is not None:
+            kwargs.update({
+                'updates': (self.update_means[item], self.update_covs[item])
+            })
 
-        for k in list(kwargs):
-            expected_shape = getattr(self, k).shape
-            v = kwargs[k]
-            if len(v.shape) != len(expected_shape):
-                raise TypeError(f"Expected {k} to have ndims {len(expected_shape)}, but got {len(v.shape)}")
-            if v.shape[2:] != expected_shape[2:]:
-                raise TypeError(f"Cannot index into non-batch dims of {type(self).__name__}")
         return kwargs
 
 
@@ -664,9 +842,10 @@ class DatasetMetadata:
         )
 
 
-def conf2bounds(mean, std, conf) -> tuple:
-    assert conf >= .50
-    multi = -stats.norm.ppf((1 - conf) / 2)
-    lower = mean - multi * std
-    upper = mean + multi * std
-    return lower, upper
+def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.stack(x, dim=dim)
+
+
+_warn_once = {}

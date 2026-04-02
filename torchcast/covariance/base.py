@@ -10,7 +10,7 @@ from torch import Tensor, nn, jit
 from torchcast.process.utils import Identity
 from torchcast.covariance.util import num_off_diag, mini_cov_mask
 from torchcast.internals.utils import is_near_zero, validate_gt_shape
-from torchcast.process.base import Process
+from torchcast.process.process import Process
 
 
 class Covariance(nn.Module):
@@ -67,9 +67,7 @@ class Covariance(nn.Module):
         state_rank = 0
         no_cov_idx = []
         for p in processes:
-            no_cov_elements = []
-            if cov_type == 'process':
-                no_cov_elements = p.fixed_state_elements or []
+            no_cov_elements = [nm for nm, se in p.state_elements.items() if not getattr(se, f'has_{cov_type}_variance')]
             for i, se in enumerate(p.state_elements):
                 if se in no_cov_elements:
                     no_cov_idx.append(state_rank + i)
@@ -179,6 +177,10 @@ class Covariance(nn.Module):
             expected_kwargs = [expected_kwargs]
         self.expected_kwargs: Optional[List[str]] = None if expected_kwargs is None else list(expected_kwargs)
 
+    @property
+    def non_empty_idx(self) -> List[int]:
+        return [i for i in range(self.rank) if i not in self.empty_idx]
+
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
         self.cholesky_off_diag: Optional[nn.Parameter] = None
@@ -261,8 +263,7 @@ class Covariance(nn.Module):
             if (pred < 0).any():
                 raise RuntimeError(f"{self.id}'s `predict_variance` produced values <0; needs exp/softplus layer.")
             pred = validate_gt_shape(pred, num_groups=num_groups, num_times=num_times, trailing_dim=[self.param_rank])
-            diag_multi = torch.diag_embed(pred)
-            mini_cov = diag_multi @ mini_cov @ diag_multi
+            mini_cov = mini_cov * pred.unsqueeze(-2) * pred.unsqueeze(-1)
 
         mask = self.mask.unsqueeze(0).unsqueeze(0)
 

@@ -3,66 +3,120 @@ The :class:`.ExpSmoother` is a :class:`torch.nn.Module` which generates forecast
 
 This class inherits most of its methods from :class:`torchcast.state_space.StateSpaceModel`.
 """
-from typing import Sequence, Optional, Tuple, List, Dict, Iterable
+from typing import Sequence, Optional
 
 import torch
 from torch import Tensor
 
 from torchcast.exp_smooth.smoothing_matrix import SmoothingMatrix
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor
+from torchcast.internals.utils import update_tensor, transpose_last_dims
 from torchcast.process import Process
-from torchcast.state_space import StateSpaceModel, Predictions
-from torchcast.state_space.ss_step import StateSpaceStep
+from torchcast.state_space import StateSpaceModel
 
 
-class ExpSmoothStep(StateSpaceStep):
+class ExpSmoother(StateSpaceModel):
+    def __init__(self,
+                 processes: Sequence[Process],
+                 measures: Sequence[str],
+                 measure_covariance: Optional[Covariance] = None,
+                 smoothing_matrix: Optional[SmoothingMatrix] = None,
+                 measure_funs: Optional[dict[str, str]] = None,
+                 adaptive_scaling: bool = False):
+
+        super().__init__(
+            processes=processes,
+            measures=measures,
+            measure_covariance=measure_covariance,
+            measure_funs=measure_funs,
+            adaptive_scaling=adaptive_scaling,
+        )
+        if smoothing_matrix is None:
+            smoothing_matrix = SmoothingMatrix.from_measures_and_processes(measures=measures, processes=processes)
+        self.smoothing_matrix = smoothing_matrix.set_id('smoothing_matrix')
+
+    def initial_covariance(self, inputs: dict, num_groups: int, num_times: int, _ignore_input: bool = False) -> Tensor:
+        # initial covariance is always zero. this will be replaced by the 1-step covariance in the first call to predict
+        m = list(self.processes.values())[0].initial_mean  # get a parameter, any parameter, to get device
+        return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=m.dtype, device=m.device)
 
     def _mask_mats(self,
-                   groups: Tensor,
-                   val_idx: Optional[Tensor],
-                   input: Tensor,
-                   kwargs: Dict[str, Tensor],
-                   kwargs_dims: Optional[Dict[str, int]] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
-        assert kwargs_dims is None
-        kwargs_dims = {'H': 1, 'R': 2, 'K': 1}
-        return super()._mask_mats(
-            groups=groups,
-            val_idx=val_idx,
-            input=input,
-            kwargs=kwargs,
-            kwargs_dims=kwargs_dims
+                   groups: torch.Tensor,
+                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                   **kwargs) -> dict[str, torch.Tensor]:
+        out = super()._mask_mats(groups, masks, **kwargs)
+        if masks is None:
+            return out
+        val_id, m1d, m2d = masks
+        Kt = transpose_last_dims(kwargs['K'])
+        out['K'] = transpose_last_dims(Kt[m1d])
+        return out
+
+    def _parse_kwargs(self,
+                      num_groups: int,
+                      num_timesteps: int,
+                      measure_covs: Sequence[torch.Tensor],
+                      **kwargs) -> tuple[dict[str, Sequence], dict[str, Sequence], set]:
+        predict_kwargs, update_kwargs, used_keys = super()._parse_kwargs(
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+            measure_covs=measure_covs,
+            **kwargs
         )
 
-    def _update(self,
-                input: Tensor,
-                mean: Tensor,
-                cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        measured_mean = (kwargs['H'] @ mean.unsqueeze(-1)).squeeze(-1)
+        # process-variance:
+        smat_kwargs = {}
+        if self.smoothing_matrix.expected_kwargs:
+            smat_kwargs = {k: kwargs[k] for k in self.smoothing_matrix.expected_kwargs}
+        used_keys |= set(smat_kwargs)
+        if smat_kwargs:
+            Ks = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=num_timesteps)
+            update_kwargs['K'] = Ks.unbind(1)
+            predict_kwargs['cov1step'] = Ks @ torch.stack(measure_covs, 1) @ Ks.transpose(-1, -2)
+        else:
+            # faster if not time-varying:
+            K1 = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=1).squeeze(1)
+            update_kwargs['K'] = [K1] * num_timesteps
+            measure_cov = measure_covs[0]
+            cov1step = K1 @ measure_cov @ K1.transpose(-1, -2)
+            predict_kwargs['cov1step'] = [cov1step] * num_timesteps
+
+        return predict_kwargs, update_kwargs, used_keys
+
+    def _update_step(self,
+                     input: torch.Tensor,
+                     mean: torch.Tensor,
+                     cov: torch.Tensor,
+                     measured_mean: torch.Tensor,
+                     measure_mat: torch.Tensor,
+                     measure_cov: torch.Tensor,
+                     K: torch.Tensor,
+                     **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        if kwargs:
+            raise TypeError(f"`{type(self).__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
         resid = input - measured_mean
-        new_mean = mean + (kwargs['K'] @ resid.unsqueeze(-1)).squeeze(-1)
-        # _update doesn't waste compute creating new_cov; then in predict below, cov will be replaced by cov1step
+        new_mean = self._mean_update(mean=mean, K=K, resid=resid)
+        # this method doesn't waste compute creating new_cov; then in predict below, cov will be replaced by cov1step
         new_cov = torch.tensor(0.0, dtype=mean.dtype, device=mean.device)
         return new_mean, new_cov
 
-    def predict(self,
-                mean: Tensor,
-                cov: Tensor,
-                mask: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
-        if mask.all():
-            mask = slice(None)
+    def _predict_cov(self,
+                     cov: torch.Tensor,
+                     transition_mat: torch.Tensor,
+                     cov1step: torch.Tensor,
+                     scaling: Optional[torch.Tensor] = None,
+                     mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # new_cov will at least be cov1step (see note above in _update_step)
+        new_cov = cov1step
 
-        F = kwargs['F'][mask]
-
-        new_mean = update_tensor(mean, new=(F @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
-
-        # new_cov will at least be cov1step (see note above in _update)
-        new_cov = kwargs['cov1step']
+        if scaling is not None:
+            raise NotImplementedError
 
         # fastpath: if the call to update returned the zero-dim tensor (see _update above) then we are done
         if len(cov.shape):
+            if mask is None or mask.all():
+                mask = slice(None)
+            F = transition_mat[mask]
             # we'll hit this under two conditions:
             # - this is a >1 step ahead forecast, so we didn't just call update(), but instead of a real cov from a
             #   previous call to predict (and that cov will be at least `cov1step`)
@@ -77,98 +131,4 @@ class ExpSmoothStep(StateSpaceStep):
                 new=new_cov[mask] + F @ cov[mask] @ F.permute(0, 2, 1),
                 mask=mask
             )
-
-        return new_mean, new_cov
-
-
-class ExpSmoother(StateSpaceModel):
-    """
-    Uses exponential smoothing to generate forecasts.
-
-    :param processes: A list of :class:`.Process` modules.
-    :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
-    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
-    """
-    ss_step_cls = ExpSmoothStep
-
-    def __init__(self,
-                 processes: Sequence[Process],
-                 measures: Optional[Sequence[str]] = None,
-                 measure_covariance: Optional[Covariance] = None,
-                 smoothing_matrix: Optional[SmoothingMatrix] = None):
-
-        if measure_covariance is None:
-            measure_covariance = Covariance.from_measures(measures)
-
-        super().__init__(
-            processes=processes,
-            measures=measures,
-            measure_covariance=measure_covariance,
-        )
-
-        if smoothing_matrix is None:
-            smoothing_matrix = SmoothingMatrix.from_measures_and_processes(measures=measures, processes=processes)
-        self.smoothing_matrix = smoothing_matrix.set_id('smoothing_matrix')
-
-    @torch.jit.ignore
-    def initial_covariance(self, inputs: dict, num_groups: int, num_times: int, _ignore_input: bool = False) -> Tensor:
-        # initial covariance is always zero. this will be replaced by the 1-step-ahead covariance in the first call to
-        # predict
-        ms = self._get_measure_scaling()
-        return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=ms.dtype, device=ms.device)
-
-    @torch.jit.ignore
-    def design_modules(self) -> Iterable[Tuple[str, torch.nn.Module]]:
-        # torchscript doesn't support super, see: https://github.com/pytorch/pytorch/issues/42885
-        for pid in self.processes:
-            yield pid, self.processes[pid]
-        yield 'measure_covariance', self.measure_covariance
-        yield 'smoothing_matrix', self.smoothing_matrix
-
-    def _build_design_mats(self,
-                           kwargs_per_process: Dict[str, Dict[str, Tensor]],
-                           num_groups: int,
-                           out_timesteps: int) -> Tuple[Dict[str, List[Tensor]], Dict[str, List[Tensor]]]:
-        assert out_timesteps
-
-        Fs, Hs = self._build_transition_and_measure_mats(kwargs_per_process, num_groups, out_timesteps)
-
-        # measure-variance:
-        mcov_input = kwargs_per_process.get('measure_covariance', {})
-        Rs = self.measure_covariance(mcov_input,
-                                     num_groups=num_groups,
-                                     num_times=out_timesteps)
-
-        sm_input = kwargs_per_process.get('smoothing_matrix', {})
-        Ks = self.smoothing_matrix(sm_input,
-                                   num_groups=num_groups,
-                                   num_times=out_timesteps)
-
-        # pre-compute 1-step-ahead variance
-        cov1steps: Optional[List[Tensor]] = None
-        if len(mcov_input) > 0 or len(sm_input) > 0:
-            cov1steps = (Ks @ Rs @ Ks.transpose(-1, -2)).unbind(1)
-
-        # unbind
-        Rs = Rs.unbind(1)
-        Ks = Ks.unbind(1)
-        if cov1steps is None:
-            # if not time-varying, the this is cheaper
-            # note: will unnecessarily do the less cheap version with inputs that are groupwise but not timewise
-            cov1step = Ks[0] @ Rs[0] @ Ks[0].transpose(-1, -2)
-            cov1steps = [cov1step] * out_timesteps
-
-        predict_kwargs = {'F': Fs, 'cov1step': cov1steps}
-        update_kwargs = {'H': Hs, 'K': Ks, 'R': Rs}
-        return predict_kwargs, update_kwargs
-
-    def _generate_predictions(self,
-                              preds: Tuple[List[Tensor], List[Tensor]],
-                              updates: Optional[Tuple[List[Tensor], List[Tensor]]] = None,
-                              **kwargs) -> 'Predictions':
-        del kwargs['K']
-        return super()._generate_predictions(
-            preds=preds,
-            updates=updates,
-            **kwargs
-        )
+        return new_cov
