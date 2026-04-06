@@ -129,7 +129,7 @@ pred.plot(df_pred.query("group=='Changping'"), split_dt=SPLIT_DT, time_colname='
 
 # %%
 pred.plot(
-    pred.to_dataframe(dataset_all, type='components').query("group=='Changping'"), split_dt=SPLIT_DT,
+    pred.to_dataframe(dataset_all, type='observed_states').query("group=='Changping'"), split_dt=SPLIT_DT,
     time_colname='time', group_colname='group'
 )
 

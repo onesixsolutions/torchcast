@@ -1,213 +1,65 @@
-from typing import Tuple, Optional, Sequence, List, TYPE_CHECKING, Union, Dict
-
-import numpy as np
-import pandas as pd
-
-from scipy.special import expit, logit
+from math import log
 
 import torch
-from torch import Tensor
 from torch.distributions import Binomial
+from typing import Sequence, TYPE_CHECKING, Optional, Union
 
 from torchcast.covariance import Covariance
-from torchcast.covariance.util import mini_cov_mask
-from torchcast.internals.utils import identity, class_or_instancemethod
 from torchcast.kalman_filter import KalmanFilter
-from torchcast.kalman_filter.ekf import EKFStep, EKFPredictions
-from torchcast.process import Process
-from torchcast.state_space.predictions import conf2bounds
+from torchcast.state_space import Predictions
+from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
-    from pandas import DataFrame
-
-
-class BinomialStep(EKFStep):
-    def __init__(self, binary_idx: Optional[Sequence[int]] = None, observed_counts: Optional[bool] = None):
-        super().__init__()
-        self.binary_idx = binary_idx
-        self.observed_counts = observed_counts
-
-    def _update(self,
-                input: Tensor,
-                mean: Tensor,
-                cov: Tensor,
-                kwargs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor]:
-
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
-        if binary_idx is None:
-            binary_idx = list(range(input.shape[-1]))
-        if (input[:, binary_idx] < 0).any():
-            raise ValueError("BinomialFilter does not support negative inputs.")
-
-        if self.observed_counts is None:
-            if 'num_obs' in kwargs and (kwargs['num_obs'] != 1).any():
-                raise ValueError(
-                    "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
-                    "or proportions (observed_counts=False)."
-                )
-        elif self.observed_counts:
-            if 'num_obs' not in kwargs:
-                raise ValueError("num_obs should be passed because observed_counts=True")
-            input = input.clone()
-            input[:, binary_idx] = input[:, binary_idx] / kwargs['num_obs']
-            if (input[:, binary_idx] > 1).any():
-                raise ValueError("Some inputs are > num_obs")
-
-        return super()._update(
-            input=input,
-            mean=mean,
-            cov=cov,
-            kwargs=kwargs
-        )
-
-    def _mask_mats(self,
-                   groups: Tensor,
-                   val_idx: Optional[Tensor],
-                   input: Tensor,
-                   kwargs: Dict[str, Tensor],
-                   kwargs_dims: Optional[Dict[str, int]] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
-        masked_input, new_kwargs = super()._mask_mats(
-            groups=groups,
-            val_idx=val_idx,
-            input=input,
-            kwargs=kwargs
-        )
-
-        if self.binary_idx is not None and val_idx is not None:
-            new_kwargs['binary_idx'] = torch.as_tensor(
-                [new_idx for new_idx, og_idx in enumerate(val_idx) if og_idx in self.binary_idx],
-                dtype=torch.int,
-                device=input.device
-            )
-        if 'num_obs' in kwargs:
-            new_kwargs['num_obs'] = kwargs['num_obs'][groups]
-            if val_idx is not None:
-                _keep_idx = [i for i, bidx in enumerate(self.binary_idx) if bidx in val_idx]
-                new_kwargs['num_obs'] = new_kwargs['num_obs'][:, _keep_idx]
-
-        return masked_input, new_kwargs
-
-    def _adjust_h(self, mean: Tensor, H: Tensor, kwargs: Dict[str, Tensor]) -> Tensor:
-        """
-        >>> import sympy
-        >>> from sympy import exp, Matrix
-        >>>
-        >>>  def full_like(x, value):
-        >>>     nrow, ncol = x.shape
-        >>>     return sympy.Matrix([[value]*ncol]*nrow)
-        >>>
-        >>> def ones_like(x):
-        >>>     return full_like(x, 1)
-        >>>
-        >>> def sigmoid(x):
-        >>>     return (ones_like(x) + exp(-x)) ** -1
-        >>>
-        >>> sympy.init_printing(use_latex='mathjax')
-        >>>
-        >>> x1, x2, x3 = sympy.symbols("x, x', y")
-        >>>
-        >>> H = sympy.Matrix([[1, 0, 1]])
-        >>>
-        >>> state = sympy.Matrix([x1, x2, x3])
-        >>> mmean_orig = H @ state
-        >>> measured_mean = sigmoid(mmean_orig)
-        >>>
-        >>> J = measured_mean.jacobian(state)
-        >>>
-        >>> def jacob(h_dot_state):
-        >>>     numer = exp(-h_dot_state)
-        >>>     denom = (exp(-h_dot_state) + ones_like(h_dot_state)) ** 2
-        >>>     return numer * denom ** -1  # sympy being weird, numer/denom doesn't work
-        >>>
-        >>> sympy.matrices.dense.matrix_multiply_elementwise(
-        >>>     full_like(H, jacob(mmean_orig)),
-        >>>     H
-        >>> )
-        """
-        # this assert should not fail, b/c all processes only support a single measure
-        assert not ((H != 0).sum(-2) > 1).any(), "BinomialFilter does not support the provided measurement-matrix"
-        all_idx = list(range(H.shape[-1]))
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
-        if binary_idx is None:
-            binary_idx = all_idx
-        h_dot_state = (H @ mean.unsqueeze(-1)).squeeze(-1)
-        adjustment = torch.ones_like(h_dot_state)
-        binary_h_dot_state = h_dot_state[..., binary_idx].clamp(-10, 10)
-        numer = torch.exp(-binary_h_dot_state)
-        denom = (torch.exp(-binary_h_dot_state) + 1) ** 2
-        adjustment[..., binary_idx] = numer / denom
-        return H * adjustment.unsqueeze(-1)
-
-    def _adjust_r(self, measured_mean: Tensor, R: Optional[Tensor], kwargs: dict[str, Tensor]) -> Tensor:
-        all_idx = list(range(R.shape[-1]))
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
-        if binary_idx is None:
-            binary_idx = all_idx
-        gaussian_idx = [idx for idx in all_idx if idx not in binary_idx]
-
-        # binomial variance:
-        newR = torch.zeros_like(R)
-        binary_measured_mean = measured_mean[..., binary_idx]
-        # mean of binomial target is n*p, variance is n*p*(1-p)
-        # mean of target that is `binom_target / n` is p, variance is p*(1-p)/n (scaling a RV by N  scales var by N**2)
-        num_obs = kwargs.get('num_obs', 1)
-        newR[..., binary_idx, binary_idx] = (
-                binary_measured_mean * (1 - binary_measured_mean) / num_obs
-        )
-
-        if gaussian_idx:
-            # for gaussian measures, would be much more readable code if we just looped over the gaussian dims
-            # and modified newR in-place. but now that newR has grad, don't want to modify in-place.
-            # so we use masking trick
-            gaussian_idx = torch.as_tensor(gaussian_idx)
-            gaussian_cidx = torch.meshgrid(torch.arange(newR.shape[0]), gaussian_idx, gaussian_idx, indexing='ij')
-            expand_mask = mini_cov_mask(rank=len(all_idx), empty_idx=binary_idx, device=R.device)  # todo: cache?
-            gaussianR = expand_mask @ R[gaussian_cidx] @ expand_mask.transpose(-1, -2)
-            newR = newR + gaussianR
-
-        return newR
-
-    def _adjust_measurement(self, x: Tensor, kwargs: dict[str, Tensor]) -> Tensor:
-        all_idx = list(range(x.shape[-1]))
-        binary_idx = kwargs.get('binary_idx', self.binary_idx)
-        if binary_idx is None:
-            binary_idx = all_idx
-        gaussian_idx = [idx for idx in all_idx if idx not in binary_idx]
-
-        # again some awkwardness due to avoiding in-place on tensors with grad
-        binary_out = torch.zeros_like(x)
-        binary_out[..., binary_idx] = torch.sigmoid(x[..., binary_idx].clamp(-8, 8))
-        gaussian_out = torch.zeros_like(x)
-        gaussian_out[..., gaussian_idx] = x[..., gaussian_idx]
-        return binary_out + gaussian_out
+    from torchcast.process import Process
 
 
 class BinomialFilter(KalmanFilter):
-    ss_step_cls = BinomialStep
-
     def __init__(self,
-                 processes: Sequence[Process],
-                 measures: Optional[Sequence[str]] = None,
+                 processes: Sequence['Process'],
+                 measures: Optional[Sequence[str]],
                  binary_measures: Optional[Sequence[str]] = None,
-                 process_covariance: Optional[Covariance] = None,
-                 measure_covariance: Optional[Union[Covariance, dict]] = None,
-                 initial_covariance: Optional[Covariance] = None,
                  observed_counts: Optional[bool] = None,
-                 **kwargs):
+                 measure_covariance: Optional[Covariance] = None,
+                 process_covariance: Optional[Covariance] = None,
+                 initial_covariance: Optional[Covariance] = None,
+                 adaptive_scaling: bool = False):
 
+        if binary_measures is None:
+            binary_measures = list(measures)
+
+        measure_covariance = self._validate_measure_cov(
+            measures=measures,
+            binary_measures=binary_measures,
+            measure_covariance=measure_covariance
+        )
+        self.observed_counts = observed_counts
+        self.binary_measures = binary_measures
+
+        super().__init__(
+            processes=processes,
+            measures=measures,
+            process_covariance=process_covariance,
+            measure_covariance=measure_covariance,
+            initial_covariance=initial_covariance,
+            adaptive_scaling=adaptive_scaling,
+            measure_funs={m: 'ilogit' for m in binary_measures},
+        )
+
+    @classmethod
+    def _validate_measure_cov(cls,
+                              measures: Sequence[str],
+                              binary_measures: Sequence[str],
+                              measure_covariance: Optional[Covariance]) -> Covariance:
         if isinstance(measures, str):
             raise ValueError(f"`measures` should be a list of strings not a string.")
         if isinstance(binary_measures, str):
             raise ValueError(f"`binary_measures` should be a list of strings not a string.")
 
-        if binary_measures is None:
-            binary_measures = list(measures)
         unexpected = set(binary_measures) - set(measures)
         if unexpected:
             raise RuntimeError(f"Some `binary_measures` not in `measures`: {unexpected}")
-        self.binary_measures = measures if binary_measures is None else binary_measures
 
-        mcov_empty_idx = [i for i, m in enumerate(measures) if m in self.binary_measures]
+        mcov_empty_idx = [i for i, m in enumerate(measures) if m in binary_measures]
         if measure_covariance is None:
             measure_covariance = {}
         if isinstance(measure_covariance, dict):
@@ -221,273 +73,302 @@ class BinomialFilter(KalmanFilter):
                     f"Expected ``empty_idx`` to correspond to binary measures (i.e. {mcov_empty_idx}) but they did not "
                     f"(i.e. got {measure_covariance.empty_idx}). To resolve this, you could instead supply for the "
                     f"`measure_covariance` argument the keyword arguments for initializing a ``Covariance`` object "
-                    f"(rather than passing the ``Covariance`` itself), then {type(self).__name__} will figure out the "
+                    f"(rather than passing the ``Covariance`` itself), then {cls.__name__} will figure out the "
                     f"empty-idx for you."
                 )
         else:
             measure_covariance = Covariance(**measure_covariance)
 
-        self.observed_counts = observed_counts
+        return measure_covariance
+
+    def _generate_predictions(self,
+                              preds: tuple[list[torch.Tensor], list[torch.Tensor]],
+                              updates: Optional[tuple[list[torch.Tensor], list[torch.Tensor]]],
+                              measure_covs: torch.Tensor,
+                              measurement_model: 'MeasurementModel',
+                              num_obs: Sequence[torch.Tensor],
+                              observed_counts: bool,
+                              **kwargs
+                              ) -> 'Predictions':
+        if kwargs:
+            raise TypeError(f"{type(self).__name__} got unexpected kwargs: {set(kwargs)})")
+        return BinomialPredictions(
+            measurement_model=measurement_model,
+            states=preds,
+            measure_covs=measure_covs,
+            updates=updates,
+            mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
+            num_obs=num_obs,
+            observed_counts=observed_counts,
+        )
+
+    def _mask_mats(self,
+                   groups: torch.Tensor,
+                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                   binary_idx: Optional[Sequence[int]] = None,
+                   **kwargs) -> dict:
+        out = super()._mask_mats(groups, masks, **kwargs)
+        if masks is None or binary_idx is None:
+            return out
+        val_idx = masks[0]
+        out['binary_idx'] = torch.isin(val_idx, torch.as_tensor(binary_idx)).nonzero().squeeze(-1)
+        _binary_subset_idx = torch.tensor([i1 for i1, i2 in enumerate(binary_idx) if i2 in val_idx], dtype=torch.long)
+        m1d = torch.meshgrid(groups, _binary_subset_idx, indexing='ij')
+        out['num_obs'] = kwargs['num_obs'][m1d]
+        return out
+
+    @torch.no_grad()
+    def _get_good_initial_value_from_y(self,
+                                       y: torch.Tensor,
+                                       measure: str,
+                                       num_obs: Optional[torch.Tensor] = None,
+                                       **kwargs) -> torch.Tensor:
+        if measure in self.binary_measures and self.observed_counts:
+            if num_obs is None:
+                raise ValueError("num_obs should be passed because observed_counts=True")
+            y = y.clone()
+            midx = self.measures.index(measure)
+            if not isinstance(num_obs, int):
+                num_obs = num_obs[..., self.binary_measures.index(measure)]
+            y[..., midx] = y[..., midx] / num_obs
+
+        return super()._get_good_initial_value_from_y(
+            y=y,
+            measure=measure,
+            **kwargs
+        )
+
+    def _parse_kwargs(self,
+                      num_groups: int,
+                      num_timesteps: int,
+                      measure_covs: Sequence[torch.Tensor],
+                      **kwargs) -> tuple[dict[str, Sequence], dict[str, Sequence], set]:
+        predict_kwargs, update_kwargs, used_keys = super()._parse_kwargs(
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+            measure_covs=measure_covs,
+            **kwargs
+        )
+        if 'num_obs' in kwargs:
+            num_obs = kwargs.pop('num_obs')
+            if isinstance(num_obs, int):
+                _nobs = [torch.ones(num_groups, len(self.binary_measures), device=measure_covs[0].device) * num_obs]
+                update_kwargs['num_obs'] = _nobs * num_timesteps
+            else:
+                update_kwargs['num_obs'] = num_obs.unbind(1)
+            used_keys.add('num_obs')
+        return predict_kwargs, update_kwargs, used_keys
+
+    def _update_step_with_nans(self,
+                               input: torch.Tensor,
+                               mean: torch.Tensor,
+                               cov: torch.Tensor,
+                               measured_mean: torch.Tensor,
+                               measure_mat: torch.Tensor,
+                               measure_cov: torch.Tensor,
+                               **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        return super()._update_step_with_nans(
+            input=input,
+            mean=mean,
+            cov=cov,
+            measured_mean=measured_mean,
+            measure_mat=measure_mat,
+            measure_cov=measure_cov,
+            binary_idx=[i for i, m in enumerate(self.measures) if m in self.binary_measures],
+            **kwargs
+        )
+
+    def _update_step(self,
+                     input: torch.Tensor,
+                     mean: torch.Tensor,
+                     cov: torch.Tensor,
+                     measured_mean: torch.Tensor,
+                     measure_mat: torch.Tensor,
+                     measure_cov: torch.Tensor,
+                     num_obs: Optional[torch.Tensor],
+                     binary_idx: Sequence[int],
+                     **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+
+        # validate input:
+        if (input[:, binary_idx] < 0).any():
+            raise ValueError("BinomialFilter does not support negative inputs.")
+
+        # validate num_obs, use to normalize input if observed_counts=True:
+        if self.observed_counts is None:
+            if num_obs is not None and (num_obs != 1).any():
+                raise ValueError(
+                    "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
+                    "or proportions (observed_counts=False)."
+                )
+        elif self.observed_counts:
+            if num_obs is None:
+                raise ValueError("num_obs should be passed because observed_counts=True")
+            input = input.clone()
+            input[:, binary_idx] = input[:, binary_idx] / num_obs
+            if (input[:, binary_idx] > 1).any():
+                raise ValueError("Some inputs are > num_obs")
+
+        # adjust measure-cov based on binomial identity relationship:
+        bin_measure_cov = torch.zeros_like(measure_cov)
+        binary_measured_mean = measured_mean[..., binary_idx]
+        # mean of binomial target is n*p, variance is n*p*(1-p)
+        # mean of target that is `binom_target / n` is p, variance is p*(1-p)/n (scaling a RV by N scales var by N**2)
+        bin_measure_cov[..., binary_idx, binary_idx] = (
+                binary_measured_mean * (1 - binary_measured_mean) / num_obs
+        )
+        measure_cov = measure_cov + bin_measure_cov
+
+        return super()._update_step(
+            input=input,
+            mean=mean,
+            cov=cov,
+            measured_mean=measured_mean,
+            measure_mat=measure_mat,
+            measure_cov=measure_cov,
+            **kwargs
+        )
+
+    @torch.jit.ignore()
+    def forward(self,
+                y: Optional[torch.Tensor] = None,
+                n_step: Union[int, float] = 1,
+                start_offsets: Optional[Sequence] = None,
+                out_timesteps: Optional[Union[int, float]] = None,
+                initial_state: Union[tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+                every_step: bool = True,
+                include_updates_in_output: bool = False,
+                simulate: Optional[int] = None,
+                last_measured_per_group: Optional[torch.Tensor] = None,
+                prediction_kwargs: Optional[dict] = None,
+                **kwargs) -> 'Predictions':
+
+        prediction_kwargs = prediction_kwargs or {}
+        prediction_kwargs['observed_counts'] = self.observed_counts
+        if 'num_obs' not in kwargs:
+            kwargs['num_obs'] = 1
+        prediction_kwargs['num_obs'] = kwargs['num_obs']
+
+        return super().forward(
+            y=y,
+            n_step=n_step,
+            start_offsets=start_offsets,
+            out_timesteps=out_timesteps,
+            initial_state=initial_state,
+            every_step=every_step,
+            include_updates_in_output=include_updates_in_output,
+            simulate=simulate,
+            last_measured_per_group=last_measured_per_group,
+            prediction_kwargs=prediction_kwargs,
+            **kwargs
+        )
+
+
+class BinomialPredictions(Predictions):
+    def __init__(self,
+                 measurement_model: 'MeasurementModel',
+                 states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
+                 measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
+                 num_obs: Sequence[torch.Tensor],
+                 observed_counts: Optional[bool] = None,
+                 **kwargs):
 
         super().__init__(
-            processes=processes,
-            measures=measures,
-            process_covariance=process_covariance,
-            measure_covariance=measure_covariance,
-            initial_covariance=initial_covariance,
+            measurement_model=measurement_model,
+            states=states,
+            measure_covs=measure_covs,
             **kwargs
         )
 
-    def _get_ss_step_kwargs(self) -> dict:
-        return {
-            'binary_idx': [idx for idx, m in enumerate(self.measures) if m in self.binary_measures],
-            'observed_counts': self.observed_counts
-        }
-
-    def _get_measure_scaling(self) -> Tensor:
-        # TODO: less code duplication?
-        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
-        measure_var = mcov.diagonal(dim1=-2, dim2=-1)
-        multi = torch.zeros(mcov.shape[0:-2] + (self.state_rank,), dtype=mcov.dtype, device=mcov.device)
-        for pid, process in self.processes.items():
-            pidx = self.process_to_slice[pid]
-            if process.measure in self.binary_measures:
-                multi[..., slice(*pidx)] = 1.0
-            else:
-                multi[..., slice(*pidx)] = measure_var[..., self.measure_to_idx[process.measure]].sqrt().unsqueeze(-1)
-        assert (multi > 0).all()
-        return multi
-
-    @torch.jit.ignore
-    def _generate_predictions(self,
-                              preds: Tuple[List[Tensor], List[Tensor]],
-                              updates: Optional[Tuple[List[Tensor], List[Tensor]]] = None,
-                              **kwargs) -> 'BinomialPredictions':
-        if updates is not None:
-            kwargs.update(update_means=updates[0], update_covs=updates[1])
-        preds = BinomialPredictions(
-            *preds,
-            R=kwargs.pop('R'),
-            H=kwargs.pop('H'),
-            model=self,
-            binary_measures=self.binary_measures,
-            observed_counts=self.observed_counts,
-            **kwargs
-        )
-        return preds
-
-    @torch.jit.ignore()
-    def set_initial_values(self,
-                           y: Tensor,
-                           ilinks: Optional[dict[str, callable]] = None,
-                           verbose: bool = True,
-                           num_obs: Optional[Tensor] = None,
-                           **kwargs):
-        y = y.clone()
-        if self.observed_counts:
-            if num_obs is None:
-                raise RuntimeError("num_obs should be passed because observed_counts=True")
-            binary_idx = [i for i, m in enumerate(self.measures) if m in self.binary_measures]
-            y[..., binary_idx] /= num_obs
-        ilinks = {m: (logit if m in self.binary_measures else identity) for m in self.measures}
-        return super().set_initial_values(y=y, ilinks=ilinks, verbose=verbose)
-
-    @torch.jit.ignore()
-    def _parse_design_kwargs(self, input: Optional[Tensor], out_timesteps: int, **kwargs) -> Dict[str, dict]:
-        num_obs = kwargs.pop('num_obs', None)
-        kwargs_per_process = super()._parse_design_kwargs(input=input, out_timesteps=out_timesteps, **kwargs)
-        if num_obs is None:
-            if self.observed_counts:
-                raise RuntimeError("num_obs should be passed because observed_counts=True")
-            kwargs_per_process['num_obs'] = 1
-        else:
-            kwargs_per_process['num_obs'] = num_obs
-        return kwargs_per_process
-
-    def _build_design_mats(self,
-                           kwargs_per_process: Dict[str, Dict[str, Tensor]],
-                           num_groups: int,
-                           out_timesteps: int) -> Tuple[Dict[str, List[Tensor]], Dict[str, List[Tensor]]]:
-        num_obs = kwargs_per_process.pop('num_obs', None)
-        predict_kwargs, update_kwargs = super()._build_design_mats(
-            kwargs_per_process=kwargs_per_process,
-            num_groups=num_groups,
-            out_timesteps=out_timesteps
-        )
-        if isinstance(num_obs, int):
-            device = next(iter(self.parameters())).device
-            _nobs = [torch.ones(num_groups, len(self.binary_measures), device=device) * num_obs]
-            update_kwargs['num_obs'] = _nobs * out_timesteps
-        elif num_obs is not None:
-            update_kwargs['num_obs'] = num_obs.unbind(1)
-        return predict_kwargs, update_kwargs
-
-    def fit(self,
-            *args,
-            mc_samples: int,
-            **kwargs):
-        """
-        :param mc_samples: Number of samples to draw for MC approximation to binomial likelihood.
-        :param kwargs: Additional keyword arguments, see `func:torchcast.kalman_filter.KalmanFilter.fit`.
-        """
-        device = next(iter(self.parameters())).device
-        kwargs['prediction_kwargs'] = kwargs.get('prediction_kwargs', {})
-        if mc_samples:
-            wn = torch.randn((mc_samples, len(self.binary_measures)), device=device)
-        else:
-            wn = torch.zeros((1, len(self.binary_measures)), device=device)
-        kwargs['prediction_kwargs']['white_noise'] = wn
-        return super().fit(*args, **kwargs)
-
-
-class BinomialPredictions(EKFPredictions):
-
-    def __init__(self,
-                 *args,
-                 binary_measures: Sequence[str],
-                 observed_counts: Optional[bool] = None,
-                 num_obs: List[Tensor],
-                 white_noise: Optional[Tensor] = None,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_obs = num_obs if isinstance(num_obs, torch.Tensor) else torch.stack(num_obs, 1)
-        self.binary_measures = binary_measures
         self.observed_counts = observed_counts
-        self._white_noise = white_noise
+        self.binary_measures = [m for m, f in measurement_model.measure_funs.items() if isinstance(f, Sigmoid)]
+        if isinstance(num_obs, int):
+            num_obs = torch.full(
+                (self.num_groups, self.num_timesteps, len(self.binary_measures)),
+                fill_value=num_obs,
+                device=measurement_model.device
+            )
+        self.num_obs = num_obs if isinstance(num_obs, torch.Tensor) else torch.stack(num_obs, 1)
 
-    @property
-    def white_noise(self) -> Tensor:
-        if self._white_noise is None:
-            # todo: explain more
-            raise RuntimeError("Cannot access `white_noise` attribute because it was not passed at init.")
-        return self._white_noise
+    def _getitem_helper(self, item: tuple) -> dict:
+        out = super()._getitem_helper(item)
+        out['observed_counts'] = self.observed_counts
+        out['num_obs'] = self.num_obs[item]
+        return out
 
-    def _get_log_prob_kwargs(self, groups: Tensor, valid_idx: Tensor) -> dict:
-        white_noise = self.white_noise
+    def _get_log_prob_kwargs(self, groups: torch.Tensor, valid_idx: Optional[torch.Tensor]) -> dict:
+        out = super()._get_log_prob_kwargs(groups, valid_idx)
 
-        num_obs = None
         if self.binary_measures:
             num_obs = self.num_obs.view(-1, len(self.binary_measures))[groups]
-
-        if valid_idx is not None:
-            valid_measures = [m for i, m in enumerate(self.measures) if i in valid_idx]
-            valid_binary_idx = [i for i, m in enumerate(self.binary_measures) if m in valid_measures]
-            if num_obs is not None:
+            if valid_idx is not None:
+                _valid_measures = [m for i, m in enumerate(self.measurement_model.measures) if i in valid_idx]
+                valid_binary_idx = [i for i, m in enumerate(self.binary_measures) if m in _valid_measures]
                 num_obs = num_obs[:, valid_binary_idx]
-            white_noise = white_noise[:, valid_binary_idx]
-        out = {
-            'measures': [m for i, m in enumerate(self.measures) if valid_idx is None or i in valid_idx],
-            'white_noise': white_noise
-        }
-        if num_obs is not None:
             out['num_obs'] = num_obs
 
         return out
 
-    # noinspection PyMethodOverriding
     def _log_prob(self,
-                  obs: Tensor,
-                  state_means: Tensor,
-                  state_covs: Tensor,
-                  R: Tensor,
-                  H: Tensor,
-                  white_noise: Tensor,
-                  measures: Sequence[str],
-                  num_obs: Optional[Tensor] = None,
-                  **kwargs) -> Tensor:
-        means, covs = self.observe(state_means, state_covs, R, H)
-        group_idx = torch.arange(covs.shape[0], dtype=torch.int)
-        binary_idx = torch.as_tensor([i for i, m in enumerate(measures) if m in self.binary_measures], dtype=torch.int)
-        gauss_idx = torch.as_tensor([i for i in range(covs.shape[-1]) if i not in binary_idx], dtype=torch.int)
-        if len(gauss_idx):
-            gauss_cidx = torch.meshgrid(group_idx, gauss_idx, gauss_idx, indexing='ij')
-            gauss = torch.distributions.MultivariateNormal(means[..., gauss_idx], covs[gauss_cidx], validate_args=False)
-            gauss_lp = gauss.log_prob(obs[..., gauss_idx])
+                  obs: torch.Tensor,
+                  state_means: torch.Tensor,
+                  state_covs: torch.Tensor,
+                  measure_cov: torch.Tensor,
+                  measurement_model: 'MeasurementModel',
+                  num_obs: Optional[torch.Tensor] = None,
+                  **kwargs) -> torch.Tensor:
+        if kwargs:
+            raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
+
+        binary_idx = [i for i, m in enumerate(measurement_model.measures) if m in self.binary_measures]
+        gauss_idx = [i for i, m in enumerate(measurement_model.measures) if m not in self.binary_measures]
+        gaussian_measures = [m for m in measurement_model.measures if m not in self.binary_measures]
+        group_idx = torch.arange(obs.shape[0], dtype=torch.long)
+
+        if gauss_idx:
+            gauss_idx = torch.as_tensor(gauss_idx, dtype=torch.long)
+            mask2d = torch.meshgrid(group_idx, gauss_idx, gauss_idx, indexing='ij')
+            gaussian_lp = super()._log_prob(
+                obs=obs[..., gauss_idx],
+                state_means=state_means,
+                state_covs=state_covs,
+                measure_cov=measure_cov[mask2d],
+                measurement_model=measurement_model.subset(measures=gaussian_measures),
+                **kwargs
+            )
         else:
-            gauss_lp = 0
+            gaussian_lp = 0
 
         if len(binary_idx):
             if num_obs is None:
-                raise RuntimeError("num_obs should be set because there are binary-measures")
-            binary_cidx = torch.meshgrid(group_idx, binary_idx, binary_idx, indexing='ij')
-            chol = torch.linalg.cholesky(covs[binary_cidx])
-            corr_white_noise = chol.unsqueeze(0) @ white_noise.view(-1, 1, len(binary_idx), 1)
-            mc_samples = corr_white_noise.squeeze(-1) + means[..., binary_idx].unsqueeze(0)
-            binom = Binomial(total_count=num_obs.unsqueeze(0), logits=mc_samples, validate_args=False)
+                raise RuntimeError("num_obs should be set because there are binary measures")
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=measurement_model.subset(measures=self.binary_measures),
+                state_means=state_means,
+                state_covs=state_covs,
+            )
+            binom = Binomial(total_count=num_obs.unsqueeze(0), probs=mmean_samples, validate_args=False)
             _obs = obs[..., binary_idx]
             if not self.observed_counts:  # multiply by total_count b/c `obs` are props, but Binomial expects counts:
-                _obs = _obs * binom.total_count
-            # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
-            # this is a numerically stable way to do that:
-            mc_log_probs = binom.log_prob(_obs)
-            mc_marginal = torch.logsumexp(mc_log_probs, dim=0) - np.log(mc_samples.shape[0])
-            binary_lp = mc_marginal.sum(-1)
+                _obs = _obs * num_obs
+            mc_log_probs = binom.log_prob(_obs.unsqueeze(0))
+            binary_lp = torch.sum(torch.logsumexp(mc_log_probs, dim=0), -1) - log(mc_log_probs.shape[0])
         else:
             binary_lp = 0
 
-        return gauss_lp + binary_lp
-
-    @class_or_instancemethod
-    def _adjust_measured_mean(cls,
-                              x: Union[Tensor, np.ndarray, pd.Series],
-                              measure: str,
-                              std: Optional[Union[Tensor, np.ndarray, pd.Series]] = None,
-                              conf: float = .95) -> Union[Tensor, pd.DataFrame]:
-        if isinstance(cls, type):
-            raise RuntimeError(f"Cannot call this method as a classmethod for {cls.__name__}, only instance method.")
-
-        x_index = None
-        if hasattr(x, 'to_numpy'):
-            x_index = x.index if hasattr(x, 'index') else None
-            x = x.to_numpy()
-
-        if std is None:
-            x = torch.as_tensor(x)
-            if measure in cls.binary_measures:
-                return torch.sigmoid(x)
-            return x
-
-        with torch.no_grad():
-            if hasattr(std, 'to_numpy'):
-                std = std.to_numpy()
-
-            # todo: this is only state-uncertainty, should we also include measurement-uncertainty: p*(1-p)?
-            lower, upper = conf2bounds(x, std, conf=conf)
-            out = pd.DataFrame({'lower': lower, 'upper': upper}, index=None if x_index is None else x_index)
-
-            if measure in cls.binary_measures:
-                # if len(x.shape) > 1:
-                #     raise NotImplementedError("TODO")
-                # grid = np.linspace(0, 1, 100, endpoint=False) + 0.5 / 100
-                # points = stats.norm(x[:, None], std[:, None]).ppf(grid[None, :])
-                # out['mean'] = expit(points).mean(1)
-                out['mean'] = expit(x)
-                out['lower'] = expit(out['lower'])
-                out['upper'] = expit(out['upper'])
-            else:
-                out['mean'] = x
-
-            return out
-
-    def _getitem_helper(self, item: tuple) -> dict:
-        kwargs = super()._getitem_helper(item)
-        kwargs['num_obs'] = self.num_obs[item]
-        kwargs['white_noise'] = self._white_noise
-        kwargs['binary_measures'] = self.binary_measures
-        kwargs['observed_counts'] = self.observed_counts
-        return kwargs
+        return gaussian_lp + binary_lp
 
 
-def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop_common: float = 1.):
-    from torchcast.process import LocalLevel
+def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_common: float = 1.):
+    from torchcast.process import LocalLevel, Season
     from torchcast.utils import TimeSeriesDataset
+    from scipy.special import expit
     import pandas as pd
     from plotnine import geom_line, aes, ggtitle
     torch.manual_seed(1234)
 
-    total_count = 20
+    TOTAL_COUNT = 4
     measures = ['dim1', 'dim2']
-    binary_measures = ['dim1']
+    binary_measures = ['dim2']
     latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
     latent_ind = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, len(measures))), dim=1)
     assert 0 <= prop_common <= 1
@@ -501,8 +382,8 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
     y = []
     for i, m in enumerate(measures):
         if m in binary_measures:
-            y.append(torch.distributions.Binomial(logits=latent[..., i], total_count=total_count).sample())
-            # y[-1] /= total_count
+            y.append(torch.distributions.Binomial(logits=latent[..., i], total_count=TOTAL_COUNT).sample())
+            y[-1] /= TOTAL_COUNT
             y[-1][:, int(num_timesteps * .7):] = float('nan')
         else:
             y.append(torch.distributions.Normal(loc=latent[..., i], scale=.5).sample())
@@ -520,27 +401,32 @@ def main(num_groups: int = 100, num_timesteps: int = 100, bias: float = -1, prop
     )
 
     bf = BinomialFilter(
-        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+                  + [Season(id=f'season_{m}', measure=m, dt_unit='D', period=7, K=2) for m in measures],
         measures=measures,
         binary_measures=binary_measures,
-        observed_counts=True
+        observed_counts=False
     )
 
     y = dataset.tensors[0]
-    bf.fit(y,
-           num_obs=total_count,
-           mc_samples=64)
+    bf.fit(y, start_offsets=dataset.start_offsets)
+    _kwargs = {}
+    # if TOTAL_COUNT != 1:
+    #     _kwargs['num_obs'] = TOTAL_COUNT
     preds = bf(
-        dataset.tensors[0], num_obs=total_count
+        dataset.tensors[0],
+        start_offsets=dataset.start_offsets,
+        **_kwargs,
     )
     df_preds = preds.to_dataframe(dataset)
-    df_preds.loc[df_preds['measure'].isin(binary_measures), ['mean', 'lower', 'upper']] *= total_count
+    if bf.observed_counts:
+        df_preds.loc[df_preds['measure'].isin(binary_measures), ['mean', 'lower', 'upper']] *= TOTAL_COUNT
     df_latent = (dataset.to_dataframe()
                  .drop(columns=measures)
                  .melt(id_vars=['group', 'time'], var_name='measure', value_name='latent')
                  .assign(measure=lambda _df: _df['measure'].str.replace('latent', 'dim')))
     _is_binary = df_latent['measure'].isin(binary_measures)
-    df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent']) * total_count
+    df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent'])
 
     df_plot = df_preds.merge(df_latent, how='left', on=['group', 'time', 'measure'])
     for g, _df in df_plot.query("group.isin(group.drop_duplicates().sample(5))").groupby('group'):

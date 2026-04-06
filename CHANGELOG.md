@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## v1.1.0 (2026-04-06)
+
+### Refactor of `Process` API and internals
+
+Rewrite of the `Process` class and its subclasses to improve maintainability and support extended-kalman-filter 
+processes. Note the external API behavior is fully backwards-compatible, but models created in an earlier version of 
+torchcast cannot be loaded into this newer version (and vice versa) due to renaming/reorganization of the 
+`state_dict`.
+
+### Updates to Utils: Data-Loading and Trainer
+
+- The ``TimeSeriesDataLoader`` class has been updated to support batchwise transformations. Its ``from_dataframe()`` method now optionally accepts a function for `X_colnames`, which should take a dataframe for a batch and return the model-matrix for that batch (i.e. a dataframe of predictors). This is useful for memory-intensive transformations, since they can be applied just-in-time to single batch of the data instead of being applied to the entire dataframe before sending it to the dataloader. See the electricity example in the documentation for an example of usage.
+- The ``SeasonalEmbeddingsTrainer`` (used in the electricity example) has been deprecated in favor of the more general ``ModelMatEmbeddingsTrainer``, which embeds any high-dimensional model-matrix into a lower dimensional space. See the electricity example in the documentation for an example of usage.
+
+### Experimental
+
+- State-space models (like ``KalmanFilter``) now support an ``adaptive_scaling`` argument. If set to ``True``, then the model will use a learned exponential moving average model to dynamically adjust the model's variance.
+
+### Other
+
+- Python 3.9 or greater is now required.
+- Pandas is currently pinned to <3, as support for 3.* has not yet been tested.
+- The ``to_dataframe()`` method of ``Predictions`` supports 'predictions',  'states', or 'observed_states'. The last of these replaces ``type='components'``, which is now deprecated.
+
 ## v0.6.0 (2025-04-25)
 
 ### Updated default `fit()` behavior

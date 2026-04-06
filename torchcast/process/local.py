@@ -1,11 +1,8 @@
-from typing import Tuple, Optional, Union, Dict
-
 import torch
+from typing import Optional, Union
 
-from torch import nn, Tensor
-
-from .base import Process
-from .utils import SingleOutput, Bounded
+from .process import Process
+from .utils import StateElement, standardize_decay
 
 
 class LocalLevel(Process):
@@ -23,27 +20,20 @@ class LocalLevel(Process):
     def __init__(self,
                  id: str,
                  measure: Optional[str] = None,
-                 decay: Optional[Union[torch.nn.Module, Tuple[float, float]]] = None):
-
-        se = 'position'
-
-        super(LocalLevel, self).__init__(
+                 decay: Optional[Union[torch.nn.Module, tuple[float, float], float]] = None):
+        super().__init__(
             id=id,
-            measure=measure,
-            state_elements=[se],
+            state_elements=[StateElement(name='level', measure_multi=1.0, has_process_variance=True)],
+            measure=measure
         )
 
-        if decay:
-            if isinstance(decay, bool):
-                decay = (0.95, 1.00)
-            if isinstance(decay, tuple):
-                decay = SingleOutput(transform=Bounded(*decay))
-            self.f_modules[f'{se}->{se}'] = decay
-        else:
-            self.f_tensors[f'{se}->{se}'] = torch.ones(1)
+        decay = standardize_decay(decay)
+        self._has_decay = not isinstance(decay, float) or decay < 1.0
+        self.state_elements['level'].set_transition_to(self.state_elements['level'], multi=decay)
 
-    def _build_h_mat(self, inputs: Dict[str, torch.Tensor], num_groups: int, num_times: int) -> Tensor:
-        return torch.tensor([1.], device=self.device, dtype=self.dtype)
+    @property
+    def intercept_state_element(self) -> Optional[str]:
+        return None if self._has_decay else 'level'
 
 
 class LocalTrend(Process):
@@ -55,39 +45,28 @@ class LocalTrend(Process):
      to allow the trend to decay somewhere between .95 (moderate decay) and 1.00 (no decay), with the exact value
      being a learned parameter.
     :param decay_position: See `decay` in :class:`LocalLevel`. Default is no decay.
-    :param velocity_multi: Default 0.1. A multiplier on the velocity, so that
-     ``next_position = position + velocity_multi * velocity``. A value of << 1.0 can be helpful since the
-     trend has such a large effect on the prediction, so that large values can lead to exploding predictions.
     """
+    _velocity_multi = 0.1  # trend has large effect on the prediction -- large values can lead to exploding predictions
 
     def __init__(self,
                  id: str,
                  measure: Optional[str] = None,
-                 decay_velocity: Optional[Union[torch.nn.Module, Tuple[float, float]]] = (.95, 1.00),
-                 decay_position: Optional[Union[torch.nn.Module, Tuple[float, float]]] = None,
-                 velocity_multi: float = 0.1):
+                 decay_velocity: Optional[Union[torch.nn.Module, tuple[float, float]]] = (0.95, 1.00),
+                 decay_position: Optional[Union[torch.nn.Module, tuple[float, float]]] = None):
+        # observed, transitions to itself (but with possible decay):
+        position = StateElement(name='position', measure_multi=1.0, has_process_variance=True)
+        decay_position = standardize_decay(decay_position)
+        self._has_position_decay = not isinstance(decay_position, float) or decay_position < 1.0
+        position.set_transition_to(position, multi=decay_position)
 
-        super(LocalTrend, self).__init__(
-            id=id,
-            measure=measure,
-            state_elements=['position', 'velocity'],
-        )
+        # unobserved, transitions not only to itself but into position:
+        velocity = StateElement(name='velocity', measure_multi=0.0, has_process_variance=True)
+        decay_velocity = standardize_decay(decay_velocity)
+        velocity.set_transition_to(velocity, multi=decay_velocity)
+        velocity.set_transition_to(position, multi=self._velocity_multi)
 
-        if decay_position is None:
-            self.f_tensors['position->position'] = torch.ones(1)
-        else:
-            if isinstance(decay_position, tuple):
-                decay_position = SingleOutput(transform=Bounded(*decay_position))
-            self.f_modules['position->position'] = decay_position
-        if decay_velocity is None:
-            self.f_tensors['velocity->velocity'] = torch.ones(1)
-        else:
-            if isinstance(decay_velocity, tuple):
-                decay_velocity = SingleOutput(transform=Bounded(*decay_velocity))
-            self.f_modules['velocity->velocity'] = decay_velocity
+        super().__init__(id=id, state_elements=[position, velocity], measure=measure)
 
-        assert velocity_multi <= 1.
-        self.f_tensors['velocity->position'] = torch.ones(1) * velocity_multi
-
-    def _build_h_mat(self, inputs: Dict[str, torch.Tensor], num_groups: int, num_times: int) -> Tensor:
-        return torch.tensor([1., 0.], device=self.device, dtype=self.dtype)
+    @property
+    def intercept_state_element(self) -> Optional[str]:
+        return None if self._has_position_decay else 'position'
