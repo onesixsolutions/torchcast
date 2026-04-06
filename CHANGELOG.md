@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## v0.7.0 (2026-04-03)
+## v1.1.0 (2026-04-06)
 
 ### Refactor of `Process` API and internals
 
