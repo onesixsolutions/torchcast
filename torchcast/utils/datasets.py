@@ -36,7 +36,7 @@ def load_air_quality_data(dt_unit: str) -> 'DataFrame':
     except FileNotFoundError:
         print('loading from gh...')
         read_csv(
-            f'https://raw.githubusercontent.com/strongio/torchcast/c675f04bb244a73155fbd98c110590bd735808bc/docs/examples/aq_{dt_unit}.csv',
+            f'https://raw.githubusercontent.com/onesixsolutions/torchcast/c675f04bb244a73155fbd98c110590bd735808bc/docs/examples/aq_{dt_unit}.csv',
             parse_dates=['date' if dt_unit == 'daily' else 'week']
         ).to_csv(cache_path / f'aq-{dt_unit}.csv', index=False)
     return load_air_quality_data(dt_unit)
