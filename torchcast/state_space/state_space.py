@@ -381,7 +381,7 @@ class StateSpaceModel(torch.nn.Module):
         :param optimizer: The optimizer to use. Can also pass a function which takes the parameters and returns an
          optimizer instance. Default is :class:`torch.optim.LBFGS` with ``(line_search_fn='strong_wolfe', max_iter=1)``.
         :param stopping: Controls stopping/convergence rules; should be a :class:`torchcast.utils.Stopping` instance, or
-         a dict of keyword-args to one. Example: ``stopping={'abstol' : .001, 'monitor' : 'params'}``
+         a dict of keyword-args to one. Example: ``stopping={'abstol' : .001, 'monitor_params' : True}``
         :param verbose: If True (default) will print the loss and epoch.
         :param callbacks: A list of functions that will be called at the end of each epoch, which take the current
          epoch's loss value.
