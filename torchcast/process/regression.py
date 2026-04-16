@@ -107,7 +107,7 @@ class SaturatedLinearModel(LinearModel):
     def _init_state_elements(self,
                              predictors: Sequence[str],
                              fixed: Sequence[str]) -> Sequence[StateElement]:
-        assert 'ceiling' not in predictors, f"`ceiling` is a reserved name for {type(self).__name__}"
+        assert '_ceiling' not in predictors, f"`_ceiling` is a reserved name for {type(self).__name__}"
         coefs = [
             StateElement(name=p, measure_multi=None, has_process_variance=p not in fixed)
             for p in predictors
@@ -137,7 +137,7 @@ class SaturatedLinearModel(LinearModel):
         coefs = mean[:, :self.num_predictors]
         ceiling = mean[:, self.num_predictors]
         cache['yhat'] = (X * coefs).sum(-1)
-        return cache['yhat'] - torch.log1p(torch.exp(cache['yhat'] - ceiling))
+        return cache['yhat'] - torch.nn.functional.softplus(cache['yhat'] - ceiling)
 
     def get_measurement_jacobian(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
         # TODO: reparameterize
