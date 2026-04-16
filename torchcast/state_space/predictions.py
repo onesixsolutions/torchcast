@@ -368,6 +368,12 @@ class Predictions:
                     if m not in by_measure:
                         continue
                     actuals[m] = tens[..., mgroup.index(m)]
+            missing = set(by_measure) - set(dataset.all_measures)
+            if missing:
+                warn(
+                    f"The following measures in your model are not present in your dataset, please double-check that "
+                    f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
+                )
         out = []
         times = TimeSeriesDataset.get_dataset_times(
             dataset.start_offsets, num_timesteps=self.state_means.shape[1], dt_unit=dataset.dt_unit
