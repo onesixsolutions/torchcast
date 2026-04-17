@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## v1.1.1 (2026-04-17)
+
+### Bug fix: LBFGS default optimizer regression with PyTorch >= 2.10
+
+The default LBFGS optimizer now explicitly sets `max_eval=25`. This restores correct training behavior after [pytorch/pytorch#161488](https://github.com/pytorch/pytorch/pull/161488) (shipped in PyTorch 2.10) fixed a bug where `max_eval` was silently ignored by the strong Wolfe line search. Prior to that fix, `max_eval` defaulted to `2` (from `max_iter * 1.25 + 1` with `max_iter=1`), which was effectively ignored — the line search ran freely. After the fix, the cap was correctly enforced, causing the optimizer to converge after only a handful of epochs with a poor loss.
+
 ## v1.1.0 (2026-04-06)
 
 ### Refactor of `Process` API and internals

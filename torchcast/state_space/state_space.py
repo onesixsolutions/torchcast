@@ -379,9 +379,10 @@ class StateSpaceModel(torch.nn.Module):
 
         :param y: A tensor containing the batch of time-series(es), see :func:`StateSpaceModel.forward()`.
         :param optimizer: The optimizer to use. Can also pass a function which takes the parameters and returns an
-         optimizer instance. Default is :class:`torch.optim.LBFGS` with ``(line_search_fn='strong_wolfe', max_iter=1)``.
+         optimizer instance. Default is :class:`torch.optim.LBFGS` with
+         ``(line_search_fn='strong_wolfe', max_iter=1, max_eval=25)``.
         :param stopping: Controls stopping/convergence rules; should be a :class:`torchcast.utils.Stopping` instance, or
-         a dict of keyword-args to one. Example: ``stopping={'abstol' : .001, 'monitor' : 'params'}``
+         a dict of keyword-args to one. Example: ``stopping={'abstol' : .001, 'monitor_params' : True}``
         :param verbose: If True (default) will print the loss and epoch.
         :param callbacks: A list of functions that will be called at the end of each epoch, which take the current
          epoch's loss value.
@@ -402,9 +403,12 @@ class StateSpaceModel(torch.nn.Module):
             optimizer = optimizer([p for p in self.parameters() if p.requires_grad])
         elif optimizer is None:
             optimizer = torch.optim.LBFGS(
+                # only pass params that require grad:
                 [p for p in self.parameters() if p.requires_grad],
-                # https://discuss.pytorch.org/t/unclear-purpose-of-max-iter-kwarg-in-the-lbfgs-optimizer/65695/4
+                # see https://discuss.pytorch.org/t/unclear-purpose-of-max-iter-kwarg-in-the-lbfgs-optimizer/65695/4
                 max_iter=1,
+                # see https://github.com/pytorch/pytorch/pull/161488
+                max_eval=25,
                 line_search_fn='strong_wolfe'
             )
 
