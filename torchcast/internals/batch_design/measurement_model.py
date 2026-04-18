@@ -40,7 +40,7 @@ class MeasurementModel(DesignModel):
     def is_nonlinear(self) -> bool:
         return bool(self.nonlinear_processes) or self.measure_funs
 
-    @property
+    @cached_property
     def nonlinear_processes(self) -> list['Process']:
         return [p for p in self.processes.values() if not p.linear_measurement]
 
@@ -53,10 +53,11 @@ class MeasurementModel(DesignModel):
 
         nl_procs_and_means = list(self._get_nonlinear_processes_and_means(mean))
 
-        measured_mean_adj = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
-        measure_mat_adj = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
+        if self.is_nonlinear:
+            measured_mean = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
+            measure_mat = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
 
-        return measured_mean_adj, measure_mat_adj
+        return measured_mean, measure_mat
 
     @cached_property
     def extended_measure_mat(self) -> torch.Tensor:
