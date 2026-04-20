@@ -106,3 +106,6 @@ docs/_html/*
 *.csv
 *.pt
 *.gz
+
+# VS Code / Cursor multi-root workspace
+torchcast.code-workspace
