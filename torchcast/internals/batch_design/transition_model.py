@@ -20,8 +20,11 @@ class TransitionModel(DesignModel):
         )
         self.measures = measures
 
+        is_time_varying = False # could be supported in the future
+        n_times = self.num_timesteps if is_time_varying else 1
+
         F = torch.zeros(
-            (self.num_groups, self.num_timesteps, self.state_rank, self.state_rank),
+            (self.num_groups, n_times, self.state_rank, self.state_rank),
             device=self.device,
             dtype=self.dtype
         )
@@ -31,11 +34,13 @@ class TransitionModel(DesignModel):
                 F[:, :, pidx, pidx] = process.get_transition_matrix()
             else:
                 raise NotImplementedError
-        self._transition_mats = F
 
-    @cached_property
-    def transition_mats(self) -> Sequence[torch.Tensor]:
-        return self._transition_mats.to(device=self.device, dtype=self.dtype).unbind(1)
+        if is_time_varying:
+            self.transition_mats = F.unbind(1)
+        else:
+            # much faster for backward-step:
+            F0 = F.squeeze(1)
+            self.transition_mats = [F0] * self.num_timesteps
 
     def __call__(self,
                  mean: torch.Tensor,

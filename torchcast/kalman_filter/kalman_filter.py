@@ -110,6 +110,7 @@ class KalmanFilter(StateSpaceModel):
 
         measure_scaling = self._get_measure_scaling()
 
+        # todo: instead of branching here, clean up Covariance.forward():
         if pcov_kwargs:
             pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
             Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_scaling, is_process_cov=True)
