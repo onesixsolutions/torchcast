@@ -870,12 +870,29 @@ class _OptimizerClosure:
         self.kwargs = kwargs
         self.callable_kwargs = callable_kwargs
         self.get_loss = get_loss
+        self._bad_count = 0
+        self._max_bad_count = self.optimizer.param_groups[0].get('max_eval', 10)
 
     def __call__(self):
         self.optimizer.zero_grad()
         self.kwargs.update({k: v() for k, v in self.callable_kwargs.items()})
         pred = self.ss_model(self.y, **self.kwargs)
-        loss = self.get_loss(pred, self.y)
+
+        try:
+            loss = self.get_loss(pred, self.y)
+        except torch.linalg.LinAlgError:
+            # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
+            # by back-tracking and trying a different (hopefully more stable) parameter proposal.
+            # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
+            self._bad_count += 1
+            if self._bad_count > self._max_bad_count:
+                raise RuntimeError(
+                    "Optimizer cannot find a region of param-space where all covs are valid. "
+                    "Try again, potentially with a lower learning-rate."
+                )
+            return torch.tensor(float('inf'))
+        self._bad_count = 0
+
         loss.backward()
         self.prog.update()
         self.prog.set_description(

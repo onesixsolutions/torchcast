@@ -1,5 +1,4 @@
 import torch
-from torch.linalg import LinAlgError
 
 
 def get_outlier_multi(resid: torch.Tensor,
