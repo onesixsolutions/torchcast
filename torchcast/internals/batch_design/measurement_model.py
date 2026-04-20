@@ -197,8 +197,10 @@ class MeasurementModel(DesignModel):
 
     @cached_property
     def _measure_mats(self) -> Sequence[torch.Tensor]:
+        is_time_varying = any(p.measurement_kwargs for p in self.processes.values())
+        n_times = self.num_timesteps if is_time_varying else 1
         H = torch.zeros(
-            (self.num_groups, self.num_timesteps, len(self.measures), self.state_rank),
+            (self.num_groups, n_times, len(self.measures), self.state_rank),
             device=self.device,
             dtype=self.dtype
         )
@@ -213,10 +215,15 @@ class MeasurementModel(DesignModel):
             if len(value.shape) == 1:
                 value = value.unsqueeze(0).unsqueeze(0)
             elif len(value.shape) != 3:
+                assert not is_time_varying
                 raise ValueError(f"for process {pid}, measurement matrix expected to be a vector or have shape"
                                  f"(num_groups, num_times, rank). Instead got {value.shape}. ")
-            # todo is all this masking inefficient?
             H[:, :, midx, pidx] = value
+
+        if not is_time_varying:
+            # much faster for backward-step
+            H0 = H.squeeze(1)
+            return [H0] * self.num_timesteps
 
         return H.unbind(1)
 

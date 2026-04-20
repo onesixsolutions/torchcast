@@ -69,6 +69,7 @@ class ExpSmoother(StateSpaceModel):
         if self.smoothing_matrix.expected_kwargs:
             smat_kwargs = {k: kwargs[k] for k in self.smoothing_matrix.expected_kwargs}
         used_keys |= set(smat_kwargs)
+        # todo: instead of branching here, clean up Covariance.forward():
         if smat_kwargs:
             Ks = self.smoothing_matrix(smat_kwargs, num_groups=num_groups, num_times=num_timesteps)
             update_kwargs['K'] = Ks.unbind(1)
