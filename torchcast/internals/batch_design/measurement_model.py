@@ -73,7 +73,9 @@ class MeasurementModel(DesignModel):
             device=self.device
         )
         if nonlinear_rank:
-            extension[:, :, -nonlinear_rank:] = torch.eye(nonlinear_rank).unsqueeze(0)
+            extension[:, :, -nonlinear_rank:] = torch.eye(
+                nonlinear_rank, dtype=self.dtype, device=self.device
+            ).unsqueeze(0)
         return torch.cat([linear_mmat, extension], dim=1)
 
     @property

@@ -566,8 +566,10 @@ class Predictions:
         # then we sample from that multivariate distribution.
         # some measures might have no linear components, which means we can't take the cholesky for those
         # todo: add zero_safe_cholesky helper?
-        nonzero = (extended_measure_mat != 0).any(0).any(1).cpu().nonzero(as_tuple=True)[0]
-        m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
+        dev = partial_measured_cov.device
+        nonzero = (extended_measure_mat != 0).any(0).any(1).nonzero(as_tuple=True)[0]
+        group_idx = torch.arange(measurement_model.num_groups, device=dev, dtype=nonzero.dtype)
+        m2d = torch.meshgrid(group_idx, nonzero, nonzero, indexing='ij')
         _chol = torch.linalg.cholesky(partial_measured_cov[m2d])
         chol = torch.zeros_like(partial_measured_cov)
         chol[m2d] = _chol

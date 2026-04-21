@@ -262,3 +262,33 @@ def test_training3(compile: bool = False):
         pred = kf(dataset.tensors[0], start_offsets=dataset.start_datetimes)
     df_pred = pred.to_dataframe(dataset)
     assert np.mean((df_pred['actual'] - df_pred['mean']) ** 2) < .05
+
+
+def _mps_available() -> bool:
+    return getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available()
+
+
+@pytest.mark.skipif(not _mps_available(), reason='MPS not available')
+def test_kalman_forward_log_prob_mps():
+    torch.manual_seed(0)
+    y = torch.randn(2, 12, 1, device='mps')
+    kf = KalmanFilter(processes=[LocalTrend(id='t', measure='0')], measures=['0'])
+    kf.to(y.device)
+    pred = kf(y)
+    lp = pred.log_prob(y).mean()
+    assert torch.isfinite(lp), lp
+
+
+@pytest.mark.skipif(not _mps_available(), reason='MPS not available')
+def test_kalman_fit_mps_input_uses_cpu_and_model_can_infer_on_mps():
+    """fit() moves MPS y to CPU internally; trained weights can be used on MPS for forward."""
+    torch.manual_seed(0)
+    y = torch.randn(2, 12, 1, device='mps')
+    kf = KalmanFilter(processes=[LocalTrend(id='t', measure='0')], measures=['0'])
+    opt = torch.optim.Adam([p for p in kf.parameters() if p.requires_grad], lr=0.2)
+    with pytest.warns(UserWarning, match='MPS'):
+        kf.fit(y, optimizer=opt, stopping={'max_iter': 5}, verbose=0)
+    assert next(kf.parameters()).device.type == 'cpu'
+    kf.to(y.device)
+    pred = kf(y)
+    assert torch.isfinite(pred.log_prob(y).mean())

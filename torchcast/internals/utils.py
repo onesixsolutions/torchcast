@@ -55,6 +55,11 @@ def _is_special_batched_pattern(index: tuple) -> bool:
 
 
 def _validate_1d_int_array_like(obj: Sequence) -> Optional[np.ndarray]:
+    if isinstance(obj, torch.Tensor):
+        if obj.ndim == 1 and obj.dtype in (
+                torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8, torch.bool):
+            return obj.detach().cpu().numpy()
+        return None
     try:
         arr = np.asarray(obj)
         if arr.ndim == 1 and arr.dtype.kind in ('i', 'u'):
@@ -153,33 +158,34 @@ def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tup
     Iterable of (group_idx, valid_idx) tuples that can be passed to torch.meshgrid. If no valid, then not returned; if
     all valid then (group_idx, None) is returned; can skip call to meshgrid.
     """
-    isnan = isnan.cpu()
-    assert len(isnan.shape) == 2
-    state_dim = isnan.shape[-1]
+    target_device = isnan.device
+    isnan_cpu = isnan.cpu()
+    assert len(isnan_cpu.shape) == 2
+    state_dim = isnan_cpu.shape[-1]
 
     out = []
     if state_dim == 1:
         # shortcut for univariate
-        group_idx = (~isnan.squeeze(-1)).nonzero().view(-1)
+        group_idx = (~isnan_cpu.squeeze(-1)).nonzero().view(-1).to(target_device)
         out.append((group_idx, None))
         return out
 
-    nan_combos = torch.unique(isnan, dim=0)
+    nan_combos = torch.unique(isnan_cpu, dim=0)
     if len(nan_combos) == 1 and nan_combos[0].sum() == 0:
         # shortcut for no nans
-        out.append((torch.arange(isnan.shape[0]), None))
+        out.append((torch.arange(isnan_cpu.shape[0], device=target_device), None))
         return out
 
     for nan_combo in nan_combos:
         num_nan = nan_combo.sum()
         if num_nan < state_dim:
-            c1 = (isnan * nan_combo[None, :]).sum(1) == num_nan
-            c2 = (~isnan * ~nan_combo[None, :]).sum(1) == (state_dim - num_nan)
-            group_idx = (c1 & c2).nonzero().view(-1)
+            c1 = (isnan_cpu * nan_combo[None, :]).sum(1) == num_nan
+            c2 = (~isnan_cpu * ~nan_combo[None, :]).sum(1) == (state_dim - num_nan)
+            group_idx = (c1 & c2).nonzero().view(-1).to(target_device)
             if num_nan == 0:
                 out.append((group_idx, None))
             else:
-                valid_idx = (~nan_combo).nonzero().view(-1)
+                valid_idx = (~nan_combo).nonzero().view(-1).to(target_device)
                 m1d = torch.meshgrid(group_idx, valid_idx, indexing='ij')
                 m2d = torch.meshgrid(group_idx, valid_idx, valid_idx, indexing='ij')
                 masks = (valid_idx, m1d, m2d)

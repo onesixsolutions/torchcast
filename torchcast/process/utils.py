@@ -50,7 +50,7 @@ class FixedValue(torch.nn.Module):
 
     def __init__(self, value: float):
         super().__init__()
-        self.value = torch.as_tensor(value)
+        self.register_buffer('value', torch.as_tensor(value), persistent=True)
 
     def forward(self) -> torch.Tensor:
         return self.value
@@ -131,7 +131,7 @@ class Multi(nn.Module):
 
     def __init__(self, value: torch.Tensor):
         super().__init__()
-        self.value = value
+        self.register_buffer('value', value, persistent=True)
 
     def forward(self, input: Tensor) -> Tensor:
         return input * self.value

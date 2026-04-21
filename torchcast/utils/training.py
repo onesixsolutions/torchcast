@@ -24,6 +24,14 @@ from torchcast.utils import TimeSeriesDataset
 from torchcast.utils.features import fourier_model_mat
 
 
+def default_accelerator_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
 class BaseTrainer:
     _device = None
 
@@ -35,7 +43,7 @@ class BaseTrainer:
             optimizer = optimizer([p for p in module.parameters() if p.requires_grad])
         self.optimizer = optimizer
 
-        self.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.to(default_accelerator_device())
 
         self.epoch = 0
 

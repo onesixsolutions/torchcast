@@ -371,6 +371,7 @@ class StateSpaceModel(torch.nn.Module):
             get_loss: Optional[callable] = None,
             callable_kwargs: Optional[dict[str, callable]] = None,
             set_initial_values: bool = True,
+            device: Optional[Union[torch.device, str]] = None,
             **kwargs):
         """
         A high-level interface for fitting a state-space model when all the training data fits in memory. If your data
@@ -378,6 +379,12 @@ class StateSpaceModel(torch.nn.Module):
         lightning.
 
         :param y: A tensor containing the batch of time-series(es), see :func:`StateSpaceModel.forward()`.
+        :param device: If set, moves ``y`` and this module to this device before fitting. If ``None`` (default), the
+         module is moved to ``y.device`` so that parameters and data match (required for MPS/CUDA training).
+         **Apple MPS:** backward through the Kalman filter (``torch.linalg.solve``, etc.) is still unreliable on MPS
+         in current PyTorch; if ``y`` (or ``device``) is MPS, this method automatically moves ``y`` and the module to
+         **CPU for optimization only** and leaves the fitted module on CPU afterward. Use ``model.to('mps')`` before
+         ``forward`` if you want inference on MPS.
         :param optimizer: The optimizer to use. Can also pass a function which takes the parameters and returns an
          optimizer instance. Default is :class:`torch.optim.LBFGS` with
          ``(line_search_fn='strong_wolfe', max_iter=1, max_eval=25)``.
@@ -398,6 +405,27 @@ class StateSpaceModel(torch.nn.Module):
          arguments.
         :return: This ``StateSpaceModel`` instance.
         """
+
+        if not torch.is_floating_point(y):
+            raise ValueError(f"Expected y to be a float tensor, got {y.dtype}")
+
+        if device is not None:
+            target = torch.device(device) if isinstance(device, str) else device
+            y = y.to(target)
+            self.to(target)
+        else:
+            self.to(y.device)
+
+        if y.device.type == 'mps':
+            warn(
+                "Fitting on Apple MPS often raises torch.AcceleratorError during backward (Kalman / linalg). "
+                "Using CPU for this ``fit()``; the module stays on CPU when ``fit`` returns. "
+                "Call ``model.to('mps')`` before ``forward`` if you want MPS inference.",
+                UserWarning,
+                stacklevel=2,
+            )
+            y = y.cpu()
+            self.to(torch.device('cpu'))
 
         if callable(optimizer):
             optimizer = optimizer([p for p in self.parameters() if p.requires_grad])
