@@ -94,6 +94,48 @@ class TimeSeriesDataset(TensorDataset):
             kwargs.append("{}={!r}".format(k, v))
         return "{}({})".format(type(self).__name__, ", ".join(kwargs))
 
+    @torch.no_grad()
+    def standardize(self,
+                    dataset: Optional['TimeSeriesDataset'] = None,
+                    which: Sequence[int] = (1,)) -> 'TimeSeriesDataset':
+        """
+        Take a TimeSeriesDataset and standardize its tensors. If no dataset is passed, a copy of this one is returned;
+        if a dataset *is* passed, the mean/std from this dataset is used (and again, a copy of the input is returned).
+
+        :param dataset: A TimeSeriesDataset whose tensors will be standardized (centered and scaled by mean).
+        :param which: Which tensors to standardize (ints with 0-indexing). Defaults to (1,) (i.e. just the 2nd tensor).
+        :return: If no dataset was passed a copy of this dataset with standardized tensors. If a dataset was passed a
+         copy of that, standardized using the mean/std of *this* dataset.
+
+        >>> ds_train, ds_val = ds.train_val_split()
+        >>> ds_train_std = ds_train.standardize()
+        >>> ds_val_std = ds_train.standardize(dataset=ds_val)  # use train mean/std to avoid leakage
+        """
+
+        if isinstance(which, int):
+            which = (which,)
+        if not which:
+            which = range(len(self.tensors))
+        which = list(which)
+
+        if dataset is None:
+            dataset = self
+        else:
+            for i in which:
+                assert dataset.measures[i] == self.measures[i], "dataset-measures must match"
+
+        tensors = [x.clone() for x in dataset.tensors]
+        for i in which:
+            # get mean/std from self:
+            m = self.tensors[i].nanmean([0, 1], keepdims=True)
+            s = np.nanstd(self.tensors[i].numpy(), axis=(0, 1), keepdims=True, ddof=1)
+
+            # standardize cloned:
+            tensors[i] -= m
+            tensors[i] /= s
+
+        return dataset.with_new_tensors(*tensors)
+
     @property
     def sizes(self) -> Sequence:
         return [t.size() for t in self.tensors]

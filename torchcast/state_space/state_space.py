@@ -792,8 +792,8 @@ class StateSpaceModel(torch.nn.Module):
             except (RuntimeError, ValueError) as e:
                 warn(
                     f"Unable to get valid covariance from optimized parameters (see error below)."
-                    f"If you haven't already, fit the model with ``monitor_params=True`` (see the ``stopping`` argument"
-                    f" of ``fit()``)."
+                    f"If you haven't already tried, scale your data, and fit the model with ``monitor_params=True`` "
+                    f"(see the ``stopping`` argument of ``fit()``)."
                     f"\n{str(e)}"
                 )
                 fake_cov = torch.diag(torch.diag(hess).pow(-1).clip(min=1E-5))
