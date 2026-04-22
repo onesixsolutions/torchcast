@@ -133,15 +133,6 @@ class StateSpaceModel(torch.nn.Module):
          :func:`Predictions.to_dataframe()` methods.
         """
 
-        if y is None:
-            if out_timesteps is None:
-                raise RuntimeError("If no y is passed, must specify `out_timesteps`")
-        else:
-            if not torch.is_floating_point(y):
-                raise ValueError(f"Expected y to be a float tensor, got {y.dtype}")
-            if torch.isinf(y).any():
-                raise ValueError("y contains infinite values.")
-
         initial_state = self._prepare_initial_state(
             initial_state,
             start_offsets=start_offsets,
@@ -157,15 +148,7 @@ class StateSpaceModel(torch.nn.Module):
                 for k, v in kwargs.items()
             }
 
-        if isinstance(n_step, float):
-            if not n_step.is_integer():
-                raise ValueError("`n_step` must be an int.")
-            n_step = int(n_step)
-        if isinstance(out_timesteps, float):
-            if not out_timesteps.is_integer():
-                raise ValueError("`out_timesteps` must be an int.")
-            out_timesteps = int(out_timesteps)
-
+        n_step = int(n_step)
         assert n_step > 0
 
         meanu, covu, inputs, num_groups, out_timesteps = self._standardize_input(
@@ -559,6 +542,10 @@ class StateSpaceModel(torch.nn.Module):
             if covu.shape[0] == 1:
                 covu = repeat(covu, times=num_groups, dim=0)
         else:
+            if not torch.is_floating_point(input):
+                raise ValueError(f"Expected input to be a float tensor, got {input.dtype}")
+            if torch.isinf(input).any():
+                raise ValueError("input contains infinite values.")
             if len(input.shape) != 3:
                 raise ValueError(f"Expected len(input.shape) == 3 (group,time,measure)")
             if input.shape[-1] != len(self.measures):
