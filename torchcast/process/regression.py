@@ -32,6 +32,7 @@ class LinearModel(Process):
                  fixed: Union[bool, Collection[str]] = True,
                  decay: Optional[tuple[float, float]] = None,
                  model_mat_kwarg_name: str = 'X'):
+
         if isinstance(fixed, str):
             raise ValueError(f"`fixed` should be a collection of strings not a single string.")
         elif hasattr(fixed, '__contains__'):
@@ -40,6 +41,8 @@ class LinearModel(Process):
                 raise ValueError(f"fixed={fixed} contains elements not in predictors={predictors}: {unexpected}")
         else:
             fixed = list(predictors) if fixed else []
+
+        self.predictors = predictors
 
         super().__init__(
             id=id,
@@ -90,10 +93,13 @@ class SaturatedLinearModel(LinearModel):
                  id: str,
                  predictors: Sequence[str],
                  measure: Optional[str] = None,
+                 ceiling_init_value: Optional[float] = None,
                  fixed: Union[bool, Collection[str]] = True,
                  fix_ceiling: bool = True,
                  decay: Optional[tuple[float, float]] = None,
-                 model_mat_kwarg_name: str = 'X'):
+                 model_mat_kwarg_name: str = 'X',
+                 anchor: float = 0.0,
+                 eps: float = .01):
         self.fix_ceiling = fix_ceiling
         super().__init__(
             id=id,
@@ -103,6 +109,19 @@ class SaturatedLinearModel(LinearModel):
             decay=decay,
             model_mat_kwarg_name=model_mat_kwarg_name
         )
+
+        # ceiling initial value:
+        if ceiling_init_value is None:
+            ceiling_init_value = 1.0 + torch.randn(1).item() / 10
+        with torch.no_grad():
+            assert list(self.state_elements)[-1] == '_ceiling'
+            self.initial_mean[-1] = ceiling_init_value
+
+        # yhat value below which y~=yhat (regardless of ceiling value)
+        self.anchor = anchor
+        # how close is close enough for y~=yhat?
+        assert eps > 0
+        self.eps = eps
 
     def _init_state_elements(self,
                              predictors: Sequence[str],
@@ -119,9 +138,14 @@ class SaturatedLinearModel(LinearModel):
 
     @property
     def num_predictors(self) -> int:
-        return self.rank - 1
+        return len(self.predictors)
 
-    def prepare_measurement_cache(self, X: torch.Tensor) -> dict:
+    def prepare_measurement_cache(self, **kwargs) -> dict:
+        X = kwargs.pop(self.model_mat_kwarg_name, None)
+        if X is None:
+            raise TypeError(f"{self.id}.prepare_measurement_cache() missing `{self.model_mat_kwarg_name}` argument")
+        if kwargs:
+            raise ValueError(f"{self.id}.prepare_measurement_cache() received unexpected kwargs: {set(kwargs)}")
         assert not torch.isnan(X).any()
         assert not torch.isinf(X).any()
         if X.shape[-1] != self.num_predictors:
@@ -129,21 +153,27 @@ class SaturatedLinearModel(LinearModel):
                 f"process '{self.id}' received X that has shape {X.shape}, but expected last dim to "
                 f"match len(predictors) {self.num_predictors}."
             )
-        return {'X': X.unbind(1)}
+        return {
+            'X': X.unbind(1),
+            's' : [None] * X.shape[1],
+            'yhat' : [None] * X.shape[1]
+        }
 
     def get_measured_mean(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
-        # TODO: reparameterize
         X = cache['X'][time]
         coefs = mean[:, :self.num_predictors]
         ceiling = mean[:, self.num_predictors]
-        cache['yhat'] = (X * coefs).sum(-1)
-        return cache['yhat'] - torch.nn.functional.softplus(cache['yhat'] - ceiling)
+        yhat = cache['yhat'][time] = (X * coefs).sum(-1)
+        log_eps = torch.log(torch.as_tensor(self.eps))
+        s = cache['s'][time] = -log_eps / (ceiling - self.anchor).clamp(min=1e-5)
+        return yhat - (1. / s) * torch.nn.functional.softplus(s * (yhat - ceiling))
 
     def get_measurement_jacobian(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
-        # TODO: reparameterize
         X = cache['X'][time]
         ceiling = mean[:, self.num_predictors]
-        ceil_derivs = torch.sigmoid((cache['yhat'] - ceiling).clamp(min=-10, max=10))
-        coef_derivs = X * (1 - ceil_derivs.unsqueeze(-1))
-        jacobian = torch.cat([coef_derivs, ceil_derivs.unsqueeze(-1)], dim=-1)
-        return jacobian
+
+        sig = (cache['s'][time] * (cache['yhat'][time] - ceiling)).clamp(min=-8, max=8)
+        ceil_derivs = torch.sigmoid(sig)
+
+        coef_derivs = (1 - ceil_derivs).unsqueeze(-1) * X
+        return torch.cat([coef_derivs, ceil_derivs.unsqueeze(-1)], dim=-1)
