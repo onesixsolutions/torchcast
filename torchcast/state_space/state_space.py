@@ -863,9 +863,9 @@ class _OptimizerClosure:
     def __call__(self):
         self.optimizer.zero_grad()
         self.kwargs.update({k: v() for k, v in self.callable_kwargs.items()})
-        pred = self.ss_model(self.y, **self.kwargs)
 
         try:
+            pred = self.ss_model(self.y, **self.kwargs)
             loss = self.get_loss(pred, self.y)
         except torch.linalg.LinAlgError:
             # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
