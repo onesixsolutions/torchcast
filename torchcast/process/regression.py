@@ -87,6 +87,38 @@ class LinearModel(Process):
 
 
 class SaturatedLinearModel(LinearModel):
+    """
+    Similar to :class:`.LinearModel`, except an additional ceiling state-element allows for saturating effects. That is,
+     if ``yhat = X @ state`` and in a normal linear model ``measured_mean = y_hat``, the saturated linear model still
+    has ``measured_mean = y_hat`` when far from the ceiling, but has ``measured_mean = ceiling`` when close.
+
+    The measurement-function this process uses is:
+
+    ```
+    measured_mean = yhat - (1. / s) * softplus(s * (yhat - ceiling))
+    ```
+
+    With yhat defined above and ``s`` being a sharpness parameter. Part of this sharpness parameter is set by the user
+    (see below), but this part is scaled to the inverse of the ceiling height, so that, as the ceiling lowers, sharpness
+     increases. This allows the ``yhat -> measured_mean`` relationship to be consistent when yhat is far from the
+    ceiling (i.e., the ceiling won't impact where yhat crosses the origin).
+
+    :param id: Unique identifier for the process
+    :param predictors: A sequence of strings with predictor-names.
+    :param measure: The name of the measure for this process.
+    :param fixed: By default, the regression-coefficients are assumed to be fixed: we are initially
+     uncertain about their value at the start of each series, but we gradually grow more confident. See LinearModel.
+    :param fix_ceiling: Like ``fixed``, but for the ceiling state-element.
+    :param sharpness: In the ceiling formula above, ``s`` controls the sharpness of the curve: how quickly it curves
+     towards the ceiling. This is relative to the ceiling height, so that ``s = sharpness / (ceiling - anchor)``. You
+     can either pass ``sharpness`` here directly (default 2) or you can pass a ``torch.nn.Parameter``, in which case
+     this will be interpreted as log-sharpness and learned.
+    :param decay: See :class:`.LinearModel`
+    :param model_mat_kwarg_name: See :class:`.LinearModel`
+    :param anchor: If we start with yhat near the ceiling and reduce it, ``anchor`` is the yhat value at which yhat
+     converges to ``measured_mean``. Typically you want to leave this at zero, but that implicitly assumes your
+     predictors are centered.
+    """
     linear_measurement = False
 
     def __init__(self,
@@ -96,10 +128,10 @@ class SaturatedLinearModel(LinearModel):
                  ceiling_init_value: Optional[float] = None,
                  fixed: Union[bool, Collection[str]] = True,
                  fix_ceiling: bool = True,
+                 sharpness: Union[float, torch.nn.Parameter] = 2,
                  decay: Optional[tuple[float, float]] = None,
                  model_mat_kwarg_name: str = 'X',
-                 anchor: float = 0.0,
-                 eps: float = .01):
+                 anchor: float = 0.0):
         self.fix_ceiling = fix_ceiling
         super().__init__(
             id=id,
@@ -119,9 +151,16 @@ class SaturatedLinearModel(LinearModel):
 
         # yhat value below which y~=yhat (regardless of ceiling value)
         self.anchor = anchor
-        # how close is close enough for y~=yhat?
-        assert eps > 0
-        self.eps = eps
+
+        # sharpness when one unit above anchor
+        if isinstance(sharpness, torch.nn.Parameter):
+            self.log_sharpness = sharpness
+        else:
+            self.log_sharpness = torch.log(torch.as_tensor(sharpness))
+
+    @property
+    def sharpness(self) -> torch.Tensor:
+        return self.log_sharpness.exp()
 
     def _init_state_elements(self,
                              predictors: Sequence[str],
@@ -155,8 +194,8 @@ class SaturatedLinearModel(LinearModel):
             )
         return {
             'X': X.unbind(1),
-            's' : [None] * X.shape[1],
-            'yhat' : [None] * X.shape[1]
+            's': [None] * X.shape[1],
+            'yhat': [None] * X.shape[1]
         }
 
     def get_measured_mean(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
@@ -164,8 +203,7 @@ class SaturatedLinearModel(LinearModel):
         coefs = mean[:, :self.num_predictors]
         ceiling = mean[:, self.num_predictors]
         yhat = cache['yhat'][time] = (X * coefs).sum(-1)
-        log_eps = torch.log(torch.as_tensor(self.eps))
-        s = cache['s'][time] = -log_eps / (ceiling - self.anchor).clamp(min=1e-5)
+        s = cache['s'][time] = self.sharpness / (ceiling - self.anchor).clamp(min=1e-5)
         return yhat - (1. / s) * torch.nn.functional.softplus(s * (yhat - ceiling))
 
     def get_measurement_jacobian(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
