@@ -115,6 +115,8 @@ class SaturatedLinearModel(LinearModel):
      this will be interpreted as log-sharpness and learned.
     :param decay: See :class:`.LinearModel`
     :param model_mat_kwarg_name: See :class:`.LinearModel`
+    :param ceiling_init_value: The initial value for the ceiling prior. Defaults to 1 +/- jitter. If your measure is
+     very much not centered and/or scaled, optimization could be improved by putting an informative guess here.
     :param anchor: If we start with yhat near the ceiling and reduce it, ``anchor`` is the yhat value at which yhat
      converges to ``measured_mean``. Typically you want to leave this at zero, but that implicitly assumes your
      predictors are centered.
@@ -125,12 +127,12 @@ class SaturatedLinearModel(LinearModel):
                  id: str,
                  predictors: Sequence[str],
                  measure: Optional[str] = None,
-                 ceiling_init_value: Optional[float] = None,
                  fixed: Union[bool, Collection[str]] = True,
                  fix_ceiling: bool = True,
                  sharpness: Union[float, torch.nn.Parameter] = 2,
                  decay: Optional[tuple[float, float]] = None,
                  model_mat_kwarg_name: str = 'X',
+                 ceiling_init_value: Optional[float] = None,
                  anchor: float = 0.0):
         self.fix_ceiling = fix_ceiling
         super().__init__(
