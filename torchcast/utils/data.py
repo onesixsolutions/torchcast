@@ -571,19 +571,58 @@ class TimeSeriesDataLoader(DataLoader):
     def __init__(self,
                  dataset: '_DataFrameGroupByDataset',
                  batch_size: Optional[int],
+                 dt_unit: Optional[str],
+                 pad_X: Union[float, str, None] = 'ffill',
+                 dtype: torch.dtype = torch.float32,
+                 device: Optional[torch.device] = None,
                  **kwargs):
+
+        self.X_colnames = dataset.X_colnames
+        self.y_colnames = dataset.y_colnames
+        self.group_colname = dataset.group_colname
+        self.time_colname = dataset.time_colname
+        self.dt_unit = dt_unit
+        self.pad_X = pad_X
+        self.dtype = dtype
+        self.device = device
+
+        if kwargs.pop('collate_fn', None) is not None:
+            raise TypeError(
+                f"{type(self).__name__} does not support custom `collate_fn`, please subclass and "
+                f"override ``_collate_fn()``"
+            )
+
         super().__init__(
             dataset=dataset,
             batch_size=batch_size,
-            collate_fn=self._collate,
+            collate_fn=self._collate_fn,
             **kwargs
         )
 
-    @staticmethod
-    def _collate(batch: Sequence['TimeSeriesDataset']) -> 'TimeSeriesDataset':
-        if len(batch) == 1:
-            return batch[0]
-        raise NotImplementedError
+    def _collate_fn(self, batch: Sequence[pd.DataFrame]) -> 'TimeSeriesDataset':
+        df_group = pd.concat(batch).reset_index(drop=True)
+        X_colnames = dfX = None
+        if callable(self.X_colnames):
+            dfX = self.X_colnames(df_group)
+            if not dfX.index.equals(df_group.index):
+                raise ValueError("`X_colnames` function must return a dataframe with the same index as the input.")
+        elif self.X_colnames:
+            dfX = df_group[self.X_colnames]
+        df = df_group[[self.group_colname, self.time_colname] + list(self.y_colnames)]
+        if dfX is not None:
+            X_colnames = dfX.columns.tolist()
+            df = pd.concat([df, dfX], axis=1)
+        return TimeSeriesDataset.from_dataframe(
+            df,
+            group_colname=self.group_colname,
+            time_colname=self.time_colname,
+            dt_unit=self.dt_unit,
+            y_colnames=self.y_colnames,
+            X_colnames=X_colnames,
+            pad_X=self.pad_X,
+            dtype=self.dtype,
+            device=self.device
+        )
 
     @classmethod
     def from_dataframe(cls,
@@ -625,41 +664,32 @@ class TimeSeriesDataLoader(DataLoader):
                 df=dataframe,
                 group_colname=group_colname,
                 time_colname=time_colname,
-                dt_unit=dt_unit,
                 y_colnames=measure_colnames or y_colnames,
-                X_colnames=X_colnames,
-                pad_X=pad_X,
-                device=device,
-                dtype=dtype
+                X_colnames=X_colnames
             ),
+            dt_unit=dt_unit,
+            pad_X=pad_X,
+            dtype=dtype,
+            device=device,
             **kwargs
         )
 
 
 class _DataFrameGroupByDataset(Dataset):
     """
-    Util class for ``TimeSeriesDataLoader``, to allow lazy (and so memory-efficient) transformations to the data before
-    converting to a ``TimeSeriesDataset``.
+    Util class for ``TimeSeriesDataLoader``.
     """
 
     def __init__(self,
                  df: pd.DataFrame,
                  group_colname: str,
                  time_colname: str,
-                 dt_unit: Optional[str],
                  y_colnames: Sequence[str],
-                 X_colnames: Optional[Union[Sequence[str], Callable]],
-                 pad_X: Union[float, str, None] = 'ffill',
-                 dtype: torch.dtype = torch.float32,
-                 device: Optional[torch.device] = None):
+                 X_colnames: Optional[Union[Sequence[str], Callable]]):
         self.group_colname = group_colname
         self.time_colname = time_colname
-        self.dt_unit = dt_unit
         self.y_colnames = y_colnames
         self.X_colnames = X_colnames
-        self.pad_X = pad_X
-        self.dtype = dtype
-        self.device = device
         self.group_dfs = {g: dfg for g, dfg in df.groupby(self.group_colname, sort=False)}
         self.groups = df[group_colname].dropna().unique()
 
@@ -669,36 +699,9 @@ class _DataFrameGroupByDataset(Dataset):
     def __getitem__(self, idx) -> TimeSeriesDataset:
         raise NotImplementedError
 
-    def __getitems__(self, indices: list) -> Sequence[TimeSeriesDataset]:
+    def __getitems__(self, indices: list) -> Sequence[pd.DataFrame]:
         group_names = [self.groups[idx] for idx in indices]
-        df_group = pd.concat([self.group_dfs[group_name] for group_name in group_names]).reset_index(drop=True)
-
-        # extract/create model-matrix:
-        X_colnames = dfX = None
-        if callable(self.X_colnames):
-            dfX = self.X_colnames(df_group)
-            if not dfX.index.equals(df_group.index):
-                raise ValueError("`X_colnames` function must return a dataframe with the same index as the input.")
-        elif self.X_colnames:
-            dfX = df_group[self.X_colnames]
-
-        df = df_group[[self.group_colname, self.time_colname] + list(self.y_colnames)]
-        if dfX is not None:
-            X_colnames = dfX.columns.tolist()
-            df = pd.concat([df, dfX], axis=1)
-
-        # return a batch of size 1 since this is what collate_fn expects, but basically it's already pre-collated
-        return [TimeSeriesDataset.from_dataframe(
-            df,
-            group_colname=self.group_colname,
-            time_colname=self.time_colname,
-            dt_unit=self.dt_unit,
-            y_colnames=self.y_colnames,
-            X_colnames=X_colnames,
-            pad_X=self.pad_X,
-            dtype=self.dtype,
-            device=self.device
-        )]
+        return [self.group_dfs[group_name] for group_name in group_names]
 
 
 def complete_times(data: 'DataFrame',
