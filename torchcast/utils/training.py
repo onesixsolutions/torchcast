@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import Optimizer
 import torch.nn as nn
-from typing import Generator, Union, Type, Sequence, Tuple, Dict, Optional, Callable
+from typing import Generator, Union, Type, Sequence, Tuple, Dict, Optional, Callable, Any
 
 from tqdm.auto import tqdm
 
@@ -44,10 +44,10 @@ class BaseTrainer:
         self._device = device
         return self
 
-    def _get_closure(self, batch: any, forward_kwargs: dict) -> callable:
+    def _get_closure(self, batch: Any, forward_kwargs: dict) -> Callable:
         raise NotImplementedError
 
-    def _get_batch_numel(self, batch: any) -> int:
+    def _get_batch_numel(self, batch: Any) -> int:
         raise NotImplementedError
 
     def __call__(self,
@@ -106,11 +106,11 @@ class SimpleTrainer(BaseTrainer):
     def __init__(self,
                  module: nn.Module,
                  optimizer: Union[Optimizer, Type[Optimizer]] = torch.optim.Adam,
-                 loss_fn: callable = torch.nn.MSELoss()):
+                 loss_fn: Callable = torch.nn.MSELoss()):
         self.loss_fn = loss_fn
         super().__init__(module=module, optimizer=optimizer)
 
-    def _get_closure(self, batch: Dataset, forward_kwargs: dict) -> callable:
+    def _get_closure(self, batch: Dataset, forward_kwargs: dict) -> Callable:
         inputs, targets, *_other = batch
         if len(_other) and not self._warned:
             warnings.warn("Ignoring additional tensors in batch.")
@@ -196,7 +196,7 @@ class StateSpaceTrainer(BaseTrainer):
                 kwargs[k] = t
         return y, kwargs
 
-    def _get_closure(self, batch: TimeSeriesDataset, forward_kwargs: dict) -> callable:
+    def _get_closure(self, batch: TimeSeriesDataset, forward_kwargs: dict) -> Callable:
 
         def closure():
             # we call _batch_to_args from inside the closure in case `dataset_to_kwargs` is callable & involves grad.
@@ -212,7 +212,7 @@ class StateSpaceTrainer(BaseTrainer):
 
         return closure
 
-    def _get_batch_numel(self, batch: any) -> int:
+    def _get_batch_numel(self, batch: Any) -> int:
         return batch.tensors[0].numel()
 
 
@@ -242,7 +242,7 @@ class ModelMatEmbeddingsTrainer(BaseTrainer):
 
     def __init__(self,
                  module: nn.Module,
-                 loss_fn: callable = torch.nn.MSELoss(),
+                 loss_fn: Callable = torch.nn.MSELoss(),
                  getX: Optional[Callable[[TimeSeriesDataset], torch.Tensor]] = None,
                  **kwargs):
 
@@ -322,7 +322,7 @@ class ModelMatEmbeddingsTrainer(BaseTrainer):
         coefs = cls._l2_solve(y=y, X=X, prior_precision=prior_precision)
         return (coefs.transpose(-1, -2) * X).sum(-1).unsqueeze(-1)
 
-    def _get_closure(self, batch: TimeSeriesDataset, forward_kwargs: dict) -> callable:
+    def _get_closure(self, batch: TimeSeriesDataset, forward_kwargs: dict) -> Callable:
         X, y = self._getXy(batch)
 
         def closure():
@@ -335,7 +335,7 @@ class ModelMatEmbeddingsTrainer(BaseTrainer):
 
         return closure
 
-    def _get_batch_numel(self, batch: any) -> int:
+    def _get_batch_numel(self, batch: Any) -> int:
         return batch.tensors[0].numel()
 
     def predict(self, batch: TimeSeriesDataset) -> torch.Tensor:
@@ -360,7 +360,7 @@ class SeasonalEmbeddingsTrainer(ModelMatEmbeddingsTrainer):
                  weekly: int,
                  daily: int,
                  other: Sequence[Tuple[np.timedelta64, int]] = (),
-                 loss_fn: callable = torch.nn.MSELoss(),
+                 loss_fn: Callable = torch.nn.MSELoss(),
                  **kwargs):
 
         super().__init__(module=module, loss_fn=loss_fn, **kwargs)

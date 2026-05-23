@@ -29,11 +29,19 @@ class Stopping:
             raise ValueError("At least one of `monitor_loss` or `monitor_params` must be True")
         self.monitor_loss = monitor_loss
         self.monitor_params = monitor_params
-        self.module = module
         self.abstol = abstol
-        self.values = []
         self.patience = patience
         self.max_iter = max_iter
+
+        self.module = None
+        self.values = None
+        self._patience_counter = None
+        self.last_change = None
+        self.reset(module)
+
+    def reset(self, module: Optional[torch.nn.Module] = None):
+        self.module = module
+        self.values = []
         self._patience_counter = 0
         self.last_change = float('nan')
 
