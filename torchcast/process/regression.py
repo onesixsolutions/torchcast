@@ -4,6 +4,8 @@ import torch
 
 from typing import Sequence, Optional, Union, Collection
 
+from torch.nn.functional import softplus
+
 from torchcast.process import Process
 from torchcast.process.utils import ProcessKwarg, StateElement, standardize_decay
 
@@ -109,10 +111,6 @@ class SaturatedLinearModel(LinearModel):
     :param fixed: By default, the regression-coefficients are assumed to be fixed: we are initially
      uncertain about their value at the start of each series, but we gradually grow more confident. See LinearModel.
     :param fix_ceiling: Like ``fixed``, but for the ceiling state-element.
-    :param sharpness: In the ceiling formula above, ``s`` controls the sharpness of the curve: how quickly it curves
-     towards the ceiling. This is relative to the ceiling height, so that ``s = sharpness / (ceiling - anchor)``. You
-     can either pass ``sharpness`` here directly (default 2) or you can pass a ``torch.nn.Parameter``, in which case
-     this will be interpreted as log-sharpness and learned.
     :param decay: See :class:`.LinearModel`
     :param model_mat_kwarg_name: See :class:`.LinearModel`
     :param ceiling_init_value: The initial value for the ceiling prior. Defaults to 1 +/- jitter. If your measure is
@@ -122,6 +120,7 @@ class SaturatedLinearModel(LinearModel):
      predictors are centered.
     """
     linear_measurement = False
+    base_sharpness = 6.0
 
     def __init__(self,
                  id: str,
@@ -129,7 +128,6 @@ class SaturatedLinearModel(LinearModel):
                  measure: Optional[str] = None,
                  fixed: Union[bool, Collection[str]] = True,
                  fix_ceiling: bool = True,
-                 sharpness: Union[float, torch.nn.Parameter] = 2,
                  decay: Optional[tuple[float, float]] = None,
                  model_mat_kwarg_name: str = 'X',
                  ceiling_init_value: Optional[float] = None,
@@ -153,16 +151,6 @@ class SaturatedLinearModel(LinearModel):
 
         # yhat value below which y~=yhat (regardless of ceiling value)
         self.anchor = anchor
-
-        # sharpness when one unit above anchor
-        if isinstance(sharpness, torch.nn.Parameter):
-            self.log_sharpness = sharpness
-        else:
-            self.log_sharpness = torch.log(torch.as_tensor(sharpness))
-
-    @property
-    def sharpness(self) -> torch.Tensor:
-        return self.log_sharpness.exp()
 
     def _init_state_elements(self,
                              predictors: Sequence[str],
@@ -205,15 +193,57 @@ class SaturatedLinearModel(LinearModel):
         coefs = mean[:, :self.num_predictors]
         ceiling = mean[:, self.num_predictors]
         yhat = cache['yhat'][time] = (X * coefs).sum(-1)
-        s = cache['s'][time] = self.sharpness / (ceiling - self.anchor).clamp(min=1e-5)
-        return yhat - (1. / s) * torch.nn.functional.softplus(s * (yhat - ceiling))
+        return _sat_measured_mean(yhat, ceiling=ceiling, sharpness=self.base_sharpness, anchor=self.anchor)
 
     def get_measurement_jacobian(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
-        X = cache['X'][time]
-        ceiling = mean[:, self.num_predictors]
+        return _sat_jacobian(
+            X=cache['X'][time],
+            yhat=cache['yhat'][time],
+            ceiling=mean[:, self.num_predictors],
+            sharpness=self.base_sharpness,
+            anchor=self.anchor
+        )
 
-        sig = (cache['s'][time] * (cache['yhat'][time] - ceiling)).clamp(min=-8, max=8)
-        ceil_derivs = torch.sigmoid(sig)
 
-        coef_derivs = (1 - ceil_derivs).unsqueeze(-1) * X
-        return torch.cat([coef_derivs, ceil_derivs.unsqueeze(-1)], dim=-1)
+def _sat_measured_mean(yhat: torch.Tensor,
+                       ceiling: torch.Tensor,
+                       sharpness: float,
+                       anchor: float) -> torch.Tensor:
+    d = (ceiling - anchor).clamp(min=1e-6)
+    s = sharpness / d
+    nl_mask = s * (ceiling - yhat) <= (4.6 - torch.log(s))
+    adjustment = torch.zeros_like(yhat)
+    adjustment[nl_mask] = softplus(s[nl_mask] * (yhat[nl_mask] - ceiling[nl_mask])) / s[nl_mask]
+    return yhat - adjustment
+
+
+def _sat_jacobian(X: torch.Tensor,
+                  yhat: torch.Tensor,
+                  ceiling: torch.Tensor,
+                  sharpness: float,
+                  anchor: float) -> torch.Tensor:
+    d = ceiling - anchor
+    ac_mask = d > 1e-6  # mask indicating ceiling is above anchor (below that `s` doesnt work)
+    d = d.clamp(min=1e-6)
+    s = sharpness / d
+
+    u = yhat - ceiling
+    su = (s * u).clamp(min=-20, max=20)
+    sigma = torch.sigmoid(su)
+    sp = softplus(su)
+
+    nl_mask = s * (ceiling - yhat) <= (4.6 - torch.log(s))  # mask indicating we're in nonlinear regime
+
+    # ceil derivs:
+    _mask = nl_mask & ac_mask
+    path2 = torch.zeros_like(sigma)
+    path2[_mask] = -sp[_mask] / (s[_mask] * d[_mask]) + (u[_mask] / d[_mask]) * sigma[_mask]
+    ceil_derivs = torch.zeros_like(sigma)
+    ceil_derivs[nl_mask] = (sigma[nl_mask] + path2[nl_mask].clamp(min=-1., max=1.)).clamp(min=0.)
+
+    # coef derivs:
+    coef_deriv_multi = torch.ones_like(sigma)
+    coef_deriv_multi[nl_mask] = (1. - sigma[nl_mask])
+    coef_derivs = X * coef_deriv_multi.unsqueeze(-1)
+
+    return torch.cat([coef_derivs, ceil_derivs.unsqueeze(-1)], dim=-1)
