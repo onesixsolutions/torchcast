@@ -100,10 +100,9 @@ class SaturatedLinearModel(LinearModel):
     measured_mean = yhat - (1. / s) * softplus(s * (yhat - ceiling))
     ```
 
-    With yhat defined above and ``s`` being a sharpness parameter. Part of this sharpness parameter is set by the user
-    (see below), but this part is scaled to the inverse of the ceiling height, so that, as the ceiling lowers, sharpness
-     increases. This allows the ``yhat -> measured_mean`` relationship to be consistent when yhat is far from the
-    ceiling (i.e., the ceiling won't impact where yhat crosses the origin).
+    With yhat defined above and ``s`` being a sharpness parameter which is scaled to the inverse of the ceiling height,
+    so that, as the ceiling lowers, sharpness increases. This allows the ``yhat -> measured_mean`` relationship to be
+    consistent when yhat is far from the ceiling (i.e., the ceiling won't impact where yhat crosses the origin).
 
     :param id: Unique identifier for the process
     :param predictors: A sequence of strings with predictor-names.
@@ -116,7 +115,7 @@ class SaturatedLinearModel(LinearModel):
     :param ceiling_init_value: The initial value for the ceiling prior. Defaults to 1 +/- jitter. If your measure is
      very much not centered and/or scaled, optimization could be improved by putting an informative guess here.
     :param anchor: If we start with yhat near the ceiling and reduce it, ``anchor`` is the yhat value at which yhat
-     converges to ``measured_mean``. Typically you want to leave this at zero, but that implicitly assumes your
+     converges to ``measured_mean``. Typically, you want to leave this at zero, but that implicitly assumes your
      predictors are centered.
     """
     linear_measurement = False
@@ -193,7 +192,12 @@ class SaturatedLinearModel(LinearModel):
         coefs = mean[:, :self.num_predictors]
         ceiling = mean[:, self.num_predictors]
         yhat = cache['yhat'][time] = (X * coefs).sum(-1)
-        return _sat_measured_mean(yhat, ceiling=ceiling, sharpness=self.base_sharpness, anchor=self.anchor)
+        return _sat_measured_mean(
+            yhat,
+            ceiling=ceiling,
+            sharpness=self.base_sharpness,
+            anchor=self.anchor,
+        )
 
     def get_measurement_jacobian(self, mean: torch.Tensor, time: int, cache: dict) -> torch.Tensor:
         return _sat_jacobian(
@@ -201,7 +205,7 @@ class SaturatedLinearModel(LinearModel):
             yhat=cache['yhat'][time],
             ceiling=mean[:, self.num_predictors],
             sharpness=self.base_sharpness,
-            anchor=self.anchor
+            anchor=self.anchor,
         )
 
 
@@ -211,9 +215,25 @@ def _sat_measured_mean(yhat: torch.Tensor,
                        anchor: float) -> torch.Tensor:
     d = (ceiling - anchor).clamp(min=1e-6)
     s = sharpness / d
-    nl_mask = s * (ceiling - yhat) <= (4.6 - torch.log(s))
+    nl_mask = yhat > ceiling / sharpness
     adjustment = torch.zeros_like(yhat)
     adjustment[nl_mask] = softplus(s[nl_mask] * (yhat[nl_mask] - ceiling[nl_mask])) / s[nl_mask]
+    # quick note on `nl_mask`:
+    # the idea with this saturation approach is that when yhat << ceiling, the problem should reduce to linear
+    # (`adjustment` asymptotes to 0), and when yhat >> ceiling, then the output is just the ceiling (i.e. the
+    # ``adjustment = yhat + ceiling``, so ``yhat - adjustment`` just equals ceiling).
+    # the problem is that the adjustment doesn't quite asymptote towards zero when yhat << ceiling. specifically if
+    # yhat is reasonable but ceiling is growing, the adjustment instead asymptotes towards
+    # ``(ceiling / sharpness) * exp(-sharpness)``. this means, counter-intuitively, that in this regime, larger ceiling
+    # values actually push *down* our output relative to yhat (instead of bringing it upwards). this is as confusing
+    # for us as it is for the optimizer.
+    # to help with this, we want to ignore the adjustment around where this counter-intuitive behavior starts. where is
+    # that? for a pair of ceilings, it starts at the yhat where their two ``adjustment`` curves cross, (i.e. where
+    # ceil_larger switches from having higher outputs to having lower outputs than ceil_smaller's outputs). This is
+    # ``ceil_larger*ceil_smaller * log(ceil_smaller/ceil_larger) / (sharpness * (ceil_smaller - ceil_larger))``. If we
+    # then use taylor expansions to understand the limiting behavior as the two ceilings get closer together, we
+    # get a fairly principled cutoff for when we should start ignoring the adjustment, which is how ``nl_mask`` is
+    # defined above.
     return yhat - adjustment
 
 
@@ -230,14 +250,13 @@ def _sat_jacobian(X: torch.Tensor,
     u = yhat - ceiling
     su = (s * u).clamp(min=-20, max=20)
     sigma = torch.sigmoid(su)
-    sp = softplus(su)
 
-    nl_mask = s * (ceiling - yhat) <= (4.6 - torch.log(s))  # mask indicating we're in nonlinear regime
+    nl_mask = yhat > ceiling / sharpness  # mask indicating we're in nonlinear regime (see _sat_measured_mean)
 
     # ceil derivs:
     _mask = nl_mask & ac_mask
     path2 = torch.zeros_like(sigma)
-    path2[_mask] = -sp[_mask] / (s[_mask] * d[_mask]) + (u[_mask] / d[_mask]) * sigma[_mask]
+    path2[_mask] = -softplus(su[_mask]) / (s[_mask] * d[_mask]) + (u[_mask] / d[_mask]) * sigma[_mask]
     ceil_derivs = torch.zeros_like(sigma)
     ceil_derivs[nl_mask] = (sigma[nl_mask] + path2[nl_mask].clamp(min=-1., max=1.)).clamp(min=0.)
 
