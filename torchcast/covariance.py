@@ -1,14 +1,12 @@
 import math
 
-from typing import List, Optional, Sequence, Dict, Union
+from typing import List, Optional, Sequence, Dict, Union, Collection
 from warnings import warn
 
 import torch
-
 from torch import Tensor, nn, jit
 
 from torchcast.process.utils import Identity
-from torchcast.covariance.util import num_off_diag, mini_cov_mask
 from torchcast.internals.utils import is_near_zero, validate_gt_shape
 from torchcast.process.process import Process
 
@@ -268,3 +266,24 @@ class Covariance(nn.Module):
         mask = self.mask.unsqueeze(0).unsqueeze(0)
 
         return mask @ mini_cov @ mask.transpose(-1, -2)
+
+
+def num_off_diag(rank: int) -> int:
+    return int(rank * (rank - 1) / 2)
+
+
+def cov2corr(cov: Tensor) -> Tensor:
+    std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
+    # TODO: cov / std_.unsqueeze(-1) / std_.unsqueeze(-2)
+    return cov / (std_.unsqueeze(-1) @ std_.unsqueeze(-2))
+
+
+def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
+    param_rank = rank - len(empty_idx)
+    mask = torch.zeros((rank, param_rank), **kwargs)
+    c = 0
+    for r in range(rank):
+        if r not in empty_idx:
+            mask[r, c] = 1.
+            c += 1
+    return mask
