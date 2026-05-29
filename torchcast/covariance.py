@@ -10,6 +10,10 @@ from torchcast.process.utils import Identity
 from torchcast.internals.utils import is_near_zero, validate_gt_shape
 from torchcast.process.process import Process
 
+DEFAULT_MCOV_MULTI = 1.0
+DEFAULT_PCOV_MULTI = 0.1  # less than measure-cov by default
+DEFAULT_ICOV_MULTI = 0.5  # somewhere in between
+
 
 class Covariance(nn.Module):
     """
@@ -71,11 +75,10 @@ class Covariance(nn.Module):
                     no_cov_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
 
-        if cov_type == 'process':
-            # by default, assume process cov is less than measure cov:
-            if 'init_diag_multi' not in kwargs:
-                kwargs['init_diag_multi'] = .05
-        elif cov_type != 'initial':
+        if 'init_diag_multi' not in kwargs:
+            kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
+
+        if cov_type not in {'initial', 'process'} :
             raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
 
         if predict_variance is True:
@@ -116,7 +119,7 @@ class Covariance(nn.Module):
         if 'method' not in kwargs and len(measures) > 5:
             kwargs['method'] = 'low_rank'
         if 'init_diag_multi' not in kwargs:
-            kwargs['init_diag_multi'] = 1.0
+            kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
 
         if predict_variance is True:
             predict_variance = Identity()
@@ -127,17 +130,19 @@ class Covariance(nn.Module):
 
     def __init__(self,
                  rank: int,
+                 init_diag_multi: float,
                  method: str = 'log_cholesky',
                  empty_idx: List[int] = (),
                  predict_variance: Optional[nn.Module] = None,
                  expected_kwargs: Optional[Sequence[str]] = None,
-                 id: Optional[str] = None,
-                 init_diag_multi: float = 0.1):
+                 id: Optional[str] = None):
         """
         You should rarely call this directly. Instead, call :func:`Covariance.from_measures` and
         :func:`Covariance.from_processes`.
 
         :param rank: The number of elements along the diagonal.
+        :param init_diag_multi: A float that will be applied as a multiplier to the initial values along the diagonal.
+         This can be useful to provide intelligent starting-values to speed up optimization.
         :param method: The parameterization for the covariance. The default, "log_cholesky", parameterizes the
          covariance using the cholesky factorization (which is itself split into two tensors: the log-transformed
          diagonal elements and the off-diagonal). The other currently supported option is "low_rank", which
@@ -150,8 +155,6 @@ class Covariance(nn.Module):
          at ``forward()``.
         :param id: Identifier for this covariance. Typically left ``None`` and set when passed to the
          :class:`.StateSpaceModel`.
-        :param init_diag_multi: A float that will be applied as a multiplier to the initial values along the diagonal.
-         This can be useful to provide intelligent starting-values to speed up optimization.
         """
 
         super().__init__()

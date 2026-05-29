@@ -4,7 +4,7 @@ import torch
 from torch.distributions import Binomial
 from typing import Sequence, TYPE_CHECKING, Optional, Union
 
-from torchcast.covariance import Covariance
+from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.state_space import Predictions
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
@@ -70,7 +70,7 @@ class BinomialFilter(KalmanFilter):
 
         mcov_empty_idx = [i for i, m in enumerate(measures) if m in binary_measures]
         if measure_covariance is None:
-            measure_covariance = {}
+            measure_covariance = {'init_diag_multi': DEFAULT_MCOV_MULTI}
         if isinstance(measure_covariance, dict):
             measure_covariance['id'] = 'measure_covariance'
             measure_covariance['rank'] = len(measures)
@@ -469,7 +469,6 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
     y = dataset.tensors[0]
     bf.fit(y, start_offsets=dataset.start_offsets,
            stopping={'monitor_params': True},
-           #callbacks=[lambda _: print(bf.post_correction_module.state_dict())]
            )
     _kwargs = {}
     if TOTAL_COUNT != 1:
