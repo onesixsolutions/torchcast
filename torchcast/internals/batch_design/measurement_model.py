@@ -9,6 +9,7 @@ import torch
 
 from torchcast.internals.utils import normalize_index, compute_index_result_shape
 
+
 if TYPE_CHECKING:
     from torchcast.process import Process
 
@@ -38,7 +39,7 @@ class MeasurementModel(DesignModel):
 
     @property
     def is_nonlinear(self) -> bool:
-        return bool(self.nonlinear_processes) or self.measure_funs
+        return bool(self.nonlinear_processes) or bool(self.measure_funs)
 
     @cached_property
     def nonlinear_processes(self) -> list['Process']:
@@ -66,15 +67,17 @@ class MeasurementModel(DesignModel):
 
         linear_mmat = self._get_linear_measure_mat(0)
 
-        nonlinear_rank = sum(p.rank for p in self.nonlinear_processes)
-        extension = torch.zeros(
-            (self.num_groups, nonlinear_rank, self.state_rank),
-            dtype=self.dtype,
-            device=self.device
-        )
-        if nonlinear_rank:
-            extension[:, :, -nonlinear_rank:] = torch.eye(nonlinear_rank).unsqueeze(0)
-        return torch.cat([linear_mmat, extension], dim=1)
+        extension = []
+        for proc in self.nonlinear_processes:
+            slc = self.process2slice[proc.id]
+            for i in range(slc.start, slc.stop):
+                x = torch.zeros(self.state_rank, device=linear_mmat.device, dtype=linear_mmat.dtype)
+                x[i] = 1.0
+                extension.append(x)
+        if extension:
+            extension = torch.stack(extension).unsqueeze(0).expand(linear_mmat.shape[0], -1, -1)
+            return torch.cat([linear_mmat, extension], dim=1)
+        return linear_mmat
 
     @property
     def extended_mmat_slices(self) -> dict[str, slice]:
