@@ -297,11 +297,13 @@ def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
 # backwards compat shim
 class _DeprecatedBase(types.ModuleType):
     def __getattr__(self, name):
-        warn(
-            f"`torchcast.covariance.base.{name}` is deprecated, import from `torchcast.covariance.{name}`",
-            DeprecationWarning,
-            stacklevel=2
-        )
+        if name != '__file__':
+            warn(
+                f"`torchcast.covariance.base.{name}` is deprecated, instead just import from "
+                f"`torchcast.covariance.{name}`.",
+                DeprecationWarning,
+                stacklevel=2
+            )
         return globals()[name]
 
 
