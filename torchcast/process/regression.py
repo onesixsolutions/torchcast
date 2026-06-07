@@ -90,15 +90,15 @@ class LinearModel(Process):
 
 class SaturatedLinearModel(LinearModel):
     """
-    Similar to :class:`.LinearModel`, except an additional ceiling state-element allows for saturating effects. That is,
-     if ``yhat = X @ state`` and in a normal linear model ``measured_mean = y_hat``, the saturated linear model still
-    has ``measured_mean = y_hat`` when far from the ceiling, but has ``measured_mean = ceiling`` when close.
+    Similar to :class:`.LinearModel`, except an additional ceiling state-element allows for saturating effects. That
+    is, if ``yhat = X @ state`` and in a normal linear model ``measured_mean = y_hat``, the saturated linear model
+    still has ``measured_mean = y_hat`` when far from the ceiling, but has ``measured_mean = ceiling`` when close.
 
     The measurement-function this process uses is:
 
-    ```
-    measured_mean = yhat - (1. / s) * softplus(s * (yhat - ceiling))
-    ```
+    .. code-block:: text
+
+        measured_mean = yhat - (1. / s) * softplus(s * (yhat - ceiling))
 
     With yhat defined above and ``s`` being a sharpness parameter which is scaled to the inverse of the ceiling height,
     so that, as the ceiling lowers, sharpness increases. This allows the ``yhat -> measured_mean`` relationship to be

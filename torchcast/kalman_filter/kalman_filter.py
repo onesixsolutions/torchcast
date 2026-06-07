@@ -1,6 +1,6 @@
 """
 The :class:`.KalmanFilter` is a :class:`torch.nn.Module` which generates forecasts using the full kalman-filtering
-algorithm.
+algorithm (or optionally extended-kalman filtering, if any measure-funs or nonlinear processes are used).
 
 This class inherits most of its methods from :class:`torchcast.state_space.StateSpaceModel`.
 """
@@ -17,6 +17,16 @@ import torch
 
 
 class KalmanFilter(StateSpaceModel):
+    """
+    :param processes: A list of :class:`.Process` modules.
+    :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
+    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
+    :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
+    :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
+    :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
+    :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
+     is useful if different groups have very different magnitudes.
+    """
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Sequence[str],

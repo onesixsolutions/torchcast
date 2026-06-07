@@ -134,8 +134,8 @@ class SimpleTrainer(BaseTrainer):
 
 class StateSpaceTrainer(BaseTrainer):
     """
-    A trainer for a :``StateSpaceModel``. This is for contexts in which the data are too large for
-    ``StateSpaceModel.fit()`` to be practical. Rather than the base DataLoader, this class takes a
+    A trainer for a :class:`torchcast.state_space.StateSpaceModel`. This is for contexts in which the data are too
+    large for ``StateSpaceModel.fit()`` to be practical. Rather than the base DataLoader, this class takes a
     :class:`torchcast.utils.TimeSeriesDataLoader`.
 
     Usage:

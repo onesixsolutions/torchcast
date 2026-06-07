@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## v1.2.0 (2026-06-08)
+
+### New Features
+
+**EKF**
+
+The KalmanFilter's support for extended-kalman-filtering, introduced silently in [v1.1.0](https://github.com/onesixsolutions/torchcast/releases/tag/v1.1.0), is now public, focusing on two newly documented features:
+
+- `SaturatedLinearModel` process is now documented and exported from the `torchcast.process` top-level namespace.
+- `BinomialFilter` is now documented and exported from ``torchcast.kalman_filter``.
+
+**`TimeSeriesDataset and DataLoader`**
+
+- Adds `standardize()` method to `TimeSeriesDataset` that centers and scales one or more tensors in a dataset. 
+- `TimeSeriesDataLoader` has been refactored to improve support for subclasses, which can override ``_collate_fn`` to determine how each group's DataFrame gets collated and then transformed into a `TimeSeriesDataset`.
+
+### Deprecations / Breaking Changes
+
+- **Covariance module restructured**: The `torchcast/covariance` module directory has been consolidated into a single `torchcast/covariance.py` module. Existing imports from `torchcast.covariance.base` (typically in pickled models) will continue to work via a backwards-compatibility shim but will emit a `DeprecationWarning`.
+
 ## v1.1.1 (2026-04-17)
 
 ### Bug fix: LBFGS default optimizer regression with PyTorch >= 2.10

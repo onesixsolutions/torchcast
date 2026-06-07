@@ -1,3 +1,8 @@
+"""
+The :class:`.BinomialFilter` is a :class:`.KalmanFilter` with (1) one or more sigmoid measurement-functions
+and (2) with a log_prob that use binomial likelihood (using monte-carlo approximation).
+"""
+
 from math import log
 
 import torch
@@ -14,13 +19,27 @@ if TYPE_CHECKING:
 
 
 class BinomialFilter(KalmanFilter):
+    """
+    :param processes: A list of :class:`.Process` modules.
+    :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
+    :param binary_measures: A subset of ``measures`` with binary (binomial) outcomes.
+    :param observed_counts: If True, then ``y`` is interpreted as counts; if False then as probabilities 0-1.
+    :param do_post_hoc_correction: Default True. Apply correction to the binary residuals during the update step, to
+     compensate for the linearization error introduced by the EKF approximation. The exact correction is learned: a
+     learned baseline correction level is modulated by a learned increase/decrease according to `num_obs`.
+    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
+    :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
+    :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
+    :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
+     is useful if different groups have very different magnitudes.
+    """
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Optional[Sequence[str]],
                  binary_measures: Optional[Sequence[str]] = None,
                  observed_counts: Optional[bool] = None,
                  do_post_hoc_correction: bool = True,
-                 measure_covariance: Optional[Covariance] = None,
+                 measure_covariance: Optional[Union[Covariance, dict]] = None,
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
                  adaptive_scaling: bool = False):
