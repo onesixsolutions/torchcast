@@ -1,4 +1,6 @@
 import math
+import sys
+import types
 
 from typing import List, Optional, Sequence, Dict, Union, Collection
 from warnings import warn
@@ -78,7 +80,7 @@ class Covariance(nn.Module):
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
 
-        if cov_type not in {'initial', 'process'} :
+        if cov_type not in {'initial', 'process'}:
             raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
 
         if predict_variance is True:
@@ -290,3 +292,18 @@ def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
             mask[r, c] = 1.
             c += 1
     return mask
+
+
+# backwards compat shim
+class _DeprecatedBase(types.ModuleType):
+    def __getattr__(self, name):
+        warn(
+            f"`torchcast.covariance.base.{name}` is deprecated, import from `torchcast.covariance.{name}`",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        return globals()[name]
+
+
+_base = _DeprecatedBase('covariance.base')
+sys.modules['torchcast.covariance.base'] = _base
