@@ -33,6 +33,7 @@ class BinomialFilter(KalmanFilter):
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
     """
+
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Optional[Sequence[str]],
@@ -256,11 +257,12 @@ class BinomialFilter(KalmanFilter):
             resid = torch.zeros_like(input)
             resid[..., binary_idx] = self._binomial_post_hoc_correction(
                 raw_resid[..., binary_idx],
-                measured_mean[..., binary_idx],
+                binary_measured_mean,
                 num_obs
             )
             other_idx = [x for x in range(measured_mean.shape[-1]) if x not in binary_idx]
-            resid[..., other_idx] = raw_resid[..., other_idx]
+            if other_idx:
+                resid[..., other_idx] = raw_resid[..., other_idx]
             measured_mean = input - resid
 
         return super()._update_step(
@@ -507,15 +509,15 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
     _is_binary = df_latent['measure'].isin(binary_measures)
     df_latent.loc[_is_binary, 'latent'] = expit(df_latent.loc[_is_binary, 'latent'])
 
-    # df_plot = df_preds.merge(df_latent, how='left', on=['group', 'time', 'measure'])
-    # for g, _df in df_plot.query("group.isin(group.drop_duplicates().sample(5))").groupby('group'):
-    #     (
-    #             preds.plot(_df)
-    #             + geom_line(aes(y='latent'), color='purple')
-    #             + ggtitle(g)
-    #     ).show()
+    df_plot = df_preds.merge(df_latent, how='left', on=['group', 'time', 'measure'])
+    for g, _df in df_plot.query("group.isin(group.drop_duplicates().sample(5))").groupby('group'):
+        (
+                preds.plot(_df)
+                + geom_line(aes(y='latent'), color='purple')
+                + ggtitle(g)
+        ).show()
     # preds._white_noise = torch.zeros((1, len(binary_measures)))
-    print(preds.log_prob(y).mean())
+    # print(preds.log_prob(y).mean())
     # with correction tensor(-1.3281, grad_fn=<MeanBackward0>)
 
 
