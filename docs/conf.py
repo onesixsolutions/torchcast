@@ -68,6 +68,8 @@ html_css_files = [
 ]
 
 #
+autodoc_inherit_docstrings = False
+
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3/', None),
     'PyTorch': ('https://pytorch.org/docs/stable/', None),

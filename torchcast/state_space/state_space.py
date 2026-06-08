@@ -133,15 +133,6 @@ class StateSpaceModel(torch.nn.Module):
          :func:`Predictions.to_dataframe()` methods.
         """
 
-        if y is None:
-            if out_timesteps is None:
-                raise RuntimeError("If no y is passed, must specify `out_timesteps`")
-        else:
-            if not torch.is_floating_point(y):
-                raise ValueError(f"Expected y to be a float tensor, got {y.dtype}")
-            if torch.isinf(y).any():
-                raise ValueError("y contains infinite values.")
-
         initial_state = self._prepare_initial_state(
             initial_state,
             start_offsets=start_offsets,
@@ -157,15 +148,7 @@ class StateSpaceModel(torch.nn.Module):
                 for k, v in kwargs.items()
             }
 
-        if isinstance(n_step, float):
-            if not n_step.is_integer():
-                raise ValueError("`n_step` must be an int.")
-            n_step = int(n_step)
-        if isinstance(out_timesteps, float):
-            if not out_timesteps.is_integer():
-                raise ValueError("`out_timesteps` must be an int.")
-            out_timesteps = int(out_timesteps)
-
+        n_step = int(n_step)
         assert n_step > 0
 
         meanu, covu, inputs, num_groups, out_timesteps = self._standardize_input(
@@ -559,6 +542,10 @@ class StateSpaceModel(torch.nn.Module):
             if covu.shape[0] == 1:
                 covu = repeat(covu, times=num_groups, dim=0)
         else:
+            if not torch.is_floating_point(input):
+                raise ValueError(f"Expected input to be a float tensor, got {input.dtype}")
+            if torch.isinf(input).any():
+                raise ValueError("input contains infinite values.")
             if len(input.shape) != 3:
                 raise ValueError(f"Expected len(input.shape) == 3 (group,time,measure)")
             if input.shape[-1] != len(self.measures):
@@ -792,8 +779,8 @@ class StateSpaceModel(torch.nn.Module):
             except (RuntimeError, ValueError) as e:
                 warn(
                     f"Unable to get valid covariance from optimized parameters (see error below)."
-                    f"If you haven't already, fit the model with ``monitor_params=True`` (see the ``stopping`` argument"
-                    f" of ``fit()``)."
+                    f"If you haven't already tried, scale your data, and fit the model with ``monitor_params=True`` "
+                    f"(see the ``stopping`` argument of ``fit()``)."
                     f"\n{str(e)}"
                 )
                 fake_cov = torch.diag(torch.diag(hess).pow(-1).clip(min=1E-5))
@@ -870,12 +857,29 @@ class _OptimizerClosure:
         self.kwargs = kwargs
         self.callable_kwargs = callable_kwargs
         self.get_loss = get_loss
+        self._bad_count = 0
+        self._max_bad_count = self.optimizer.param_groups[0].get('max_eval', 10)
 
     def __call__(self):
         self.optimizer.zero_grad()
         self.kwargs.update({k: v() for k, v in self.callable_kwargs.items()})
-        pred = self.ss_model(self.y, **self.kwargs)
-        loss = self.get_loss(pred, self.y)
+
+        try:
+            pred = self.ss_model(self.y, **self.kwargs)
+            loss = self.get_loss(pred, self.y)
+        except torch.linalg.LinAlgError:
+            # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
+            # by back-tracking and trying a different (hopefully more stable) parameter proposal.
+            # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
+            self._bad_count += 1
+            if self._bad_count > self._max_bad_count:
+                raise RuntimeError(
+                    "Optimizer cannot find a region of param-space where all covs are valid. "
+                    "Try again, potentially with a lower learning-rate."
+                )
+            return torch.tensor(float('inf'))
+        self._bad_count = 0
+
         loss.backward()
         self.prog.update()
         self.prog.set_description(

@@ -4,7 +4,7 @@ from torchcast.covariance import Covariance
 
 @torch.no_grad()
 def test_from_log_cholesky():
-    module = Covariance(id='test', rank=3)
+    module = Covariance(id='test', rank=3, init_diag_multi=0.1)
 
     module.state_dict()['cholesky_log_diag'][:] = torch.arange(1., 3.1)
     module.state_dict()['cholesky_off_diag'][:] = torch.arange(1., 3.1)
@@ -18,7 +18,7 @@ def test_from_log_cholesky():
 
 @torch.no_grad()
 def test_empty_idx():
-    module = Covariance(id='test', rank=3, empty_idx=[0])
+    module = Covariance(id='test', rank=3, empty_idx=[0], init_diag_multi=0.1)
     cov = module({}, num_groups=1, num_times=1)
     cov = cov.squeeze()
     assert (cov[0, :] == 0).all()

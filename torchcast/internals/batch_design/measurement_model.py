@@ -9,6 +9,7 @@ import torch
 
 from torchcast.internals.utils import normalize_index, compute_index_result_shape
 
+
 if TYPE_CHECKING:
     from torchcast.process import Process
 
@@ -38,9 +39,9 @@ class MeasurementModel(DesignModel):
 
     @property
     def is_nonlinear(self) -> bool:
-        return bool(self.nonlinear_processes) or self.measure_funs
+        return bool(self.nonlinear_processes) or bool(self.measure_funs)
 
-    @property
+    @cached_property
     def nonlinear_processes(self) -> list['Process']:
         return [p for p in self.processes.values() if not p.linear_measurement]
 
@@ -53,10 +54,11 @@ class MeasurementModel(DesignModel):
 
         nl_procs_and_means = list(self._get_nonlinear_processes_and_means(mean))
 
-        measured_mean_adj = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
-        measure_mat_adj = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
+        if self.is_nonlinear:
+            measured_mean = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
+            measure_mat = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
 
-        return measured_mean_adj, measure_mat_adj
+        return measured_mean, measure_mat
 
     @cached_property
     def extended_measure_mat(self) -> torch.Tensor:
@@ -65,15 +67,17 @@ class MeasurementModel(DesignModel):
 
         linear_mmat = self._get_linear_measure_mat(0)
 
-        nonlinear_rank = sum(p.rank for p in self.nonlinear_processes)
-        extension = torch.zeros(
-            (self.num_groups, nonlinear_rank, self.state_rank),
-            dtype=self.dtype,
-            device=self.device
-        )
-        if nonlinear_rank:
-            extension[:, :, -nonlinear_rank:] = torch.eye(nonlinear_rank).unsqueeze(0)
-        return torch.cat([linear_mmat, extension], dim=1)
+        extension = []
+        for proc in self.nonlinear_processes:
+            slc = self.process2slice[proc.id]
+            for i in range(slc.start, slc.stop):
+                x = torch.zeros(self.state_rank, device=linear_mmat.device, dtype=linear_mmat.dtype)
+                x[i] = 1.0
+                extension.append(x)
+        if extension:
+            extension = torch.stack(extension).unsqueeze(0).expand(linear_mmat.shape[0], -1, -1)
+            return torch.cat([linear_mmat, extension], dim=1)
+        return linear_mmat
 
     @property
     def extended_mmat_slices(self) -> dict[str, slice]:
@@ -196,8 +200,10 @@ class MeasurementModel(DesignModel):
 
     @cached_property
     def _measure_mats(self) -> Sequence[torch.Tensor]:
+        is_time_varying = any(p.measurement_kwargs for p in self.processes.values())
+        n_times = self.num_timesteps if is_time_varying else 1
         H = torch.zeros(
-            (self.num_groups, self.num_timesteps, len(self.measures), self.state_rank),
+            (self.num_groups, n_times, len(self.measures), self.state_rank),
             device=self.device,
             dtype=self.dtype
         )
@@ -212,10 +218,15 @@ class MeasurementModel(DesignModel):
             if len(value.shape) == 1:
                 value = value.unsqueeze(0).unsqueeze(0)
             elif len(value.shape) != 3:
+                assert not is_time_varying
                 raise ValueError(f"for process {pid}, measurement matrix expected to be a vector or have shape"
                                  f"(num_groups, num_times, rank). Instead got {value.shape}. ")
-            # todo is all this masking inefficient?
             H[:, :, midx, pidx] = value
+
+        if not is_time_varying:
+            # much faster for backward-step
+            H0 = H.squeeze(1)
+            return [H0] * self.num_timesteps
 
         return H.unbind(1)
 

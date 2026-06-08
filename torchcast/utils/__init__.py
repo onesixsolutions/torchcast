@@ -9,11 +9,10 @@ This module includes:
 * Simple trainer classes for PyTorch models, with specialized subclasses for torchcast's model-classes, as well as a
   special class for training neural networks to embed complex seasonal patterns into lower dimensional embeddings.
 * A 'Stopping' class for controlling convergence/stopping for the `fit()` method in state-space models.
----
 """
 
 from .features import add_season_features
 from .data import TimeSeriesDataset, TimeSeriesDataLoader, complete_times
 from .baseline import make_baseline
-from .training import SimpleTrainer, StateSpaceTrainer, SeasonalEmbeddingsTrainer
+from .training import SimpleTrainer, StateSpaceTrainer, ModelMatEmbeddingsTrainer, SeasonalEmbeddingsTrainer
 from .stopping import Stopping

@@ -1,16 +1,20 @@
 import math
+import sys
+import types
 
-from typing import List, Optional, Sequence, Dict, Union
+from typing import List, Optional, Sequence, Dict, Union, Collection
 from warnings import warn
 
 import torch
-
 from torch import Tensor, nn, jit
 
 from torchcast.process.utils import Identity
-from torchcast.covariance.util import num_off_diag, mini_cov_mask
 from torchcast.internals.utils import is_near_zero, validate_gt_shape
 from torchcast.process.process import Process
+
+DEFAULT_MCOV_MULTI = 1.0
+DEFAULT_PCOV_MULTI = 0.1  # less than measure-cov by default
+DEFAULT_ICOV_MULTI = 0.5  # somewhere in between
 
 
 class Covariance(nn.Module):
@@ -73,11 +77,10 @@ class Covariance(nn.Module):
                     no_cov_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
 
-        if cov_type == 'process':
-            # by default, assume process cov is less than measure cov:
-            if 'init_diag_multi' not in kwargs:
-                kwargs['init_diag_multi'] = .05
-        elif cov_type != 'initial':
+        if 'init_diag_multi' not in kwargs:
+            kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
+
+        if cov_type not in {'initial', 'process'}:
             raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
 
         if predict_variance is True:
@@ -118,7 +121,7 @@ class Covariance(nn.Module):
         if 'method' not in kwargs and len(measures) > 5:
             kwargs['method'] = 'low_rank'
         if 'init_diag_multi' not in kwargs:
-            kwargs['init_diag_multi'] = 1.0
+            kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
 
         if predict_variance is True:
             predict_variance = Identity()
@@ -129,17 +132,19 @@ class Covariance(nn.Module):
 
     def __init__(self,
                  rank: int,
+                 init_diag_multi: float,
                  method: str = 'log_cholesky',
                  empty_idx: List[int] = (),
                  predict_variance: Optional[nn.Module] = None,
                  expected_kwargs: Optional[Sequence[str]] = None,
-                 id: Optional[str] = None,
-                 init_diag_multi: float = 0.1):
+                 id: Optional[str] = None):
         """
         You should rarely call this directly. Instead, call :func:`Covariance.from_measures` and
         :func:`Covariance.from_processes`.
 
         :param rank: The number of elements along the diagonal.
+        :param init_diag_multi: A float that will be applied as a multiplier to the initial values along the diagonal.
+         This can be useful to provide intelligent starting-values to speed up optimization.
         :param method: The parameterization for the covariance. The default, "log_cholesky", parameterizes the
          covariance using the cholesky factorization (which is itself split into two tensors: the log-transformed
          diagonal elements and the off-diagonal). The other currently supported option is "low_rank", which
@@ -152,8 +157,6 @@ class Covariance(nn.Module):
          at ``forward()``.
         :param id: Identifier for this covariance. Typically left ``None`` and set when passed to the
          :class:`.StateSpaceModel`.
-        :param init_diag_multi: A float that will be applied as a multiplier to the initial values along the diagonal.
-         This can be useful to provide intelligent starting-values to speed up optimization.
         """
 
         super().__init__()
@@ -268,3 +271,41 @@ class Covariance(nn.Module):
         mask = self.mask.unsqueeze(0).unsqueeze(0)
 
         return mask @ mini_cov @ mask.transpose(-1, -2)
+
+
+def num_off_diag(rank: int) -> int:
+    return int(rank * (rank - 1) / 2)
+
+
+def cov2corr(cov: Tensor) -> Tensor:
+    std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
+    # TODO: cov / std_.unsqueeze(-1) / std_.unsqueeze(-2)
+    return cov / (std_.unsqueeze(-1) @ std_.unsqueeze(-2))
+
+
+def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
+    param_rank = rank - len(empty_idx)
+    mask = torch.zeros((rank, param_rank), **kwargs)
+    c = 0
+    for r in range(rank):
+        if r not in empty_idx:
+            mask[r, c] = 1.
+            c += 1
+    return mask
+
+
+# backwards compat shim
+class _DeprecatedBase(types.ModuleType):
+    def __getattr__(self, name):
+        if name != '__file__':
+            warn(
+                f"`torchcast.covariance.base.{name}` is deprecated, instead just import from "
+                f"`torchcast.covariance.{name}`.",
+                DeprecationWarning,
+                stacklevel=2
+            )
+        return globals()[name]
+
+
+_base = _DeprecatedBase('covariance.base')
+sys.modules['torchcast.covariance.base'] = _base

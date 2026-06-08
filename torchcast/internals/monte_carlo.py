@@ -15,6 +15,9 @@ class FixedWhiteNoise:
         self._num_samples = num_samples
         self.reset(random_state)
 
+    def __repr__(self) -> str:
+        return "FixedWhiteNoise(num_samples={})".format(self.num_samples)
+
     @property
     def num_samples(self) -> int:
         return self._num_samples

@@ -6,7 +6,6 @@ import numpy as np
 
 import torch
 
-from torchcast.internals.utils import update_tensor
 from torchcast.process.process import Process
 from torchcast.process.utils import Multi, standardize_decay, StateElement, NoInputSequential
 
@@ -145,15 +144,38 @@ class Season(Process):
         start_offsets = start_offsets.round()
         num_groups = len(start_offsets)
 
-        if self.linear_transition:
-            out = []
-            zeros = torch.zeros((num_groups, self.rank), device=self.initial_mean.device)
-            F = self.get_transition_matrix().expand(len(start_offsets), -1, -1)
-            mean = self.initial_mean.expand(len(start_offsets), -1)
-            for i in range(int(self.period) + 1):
-                maski = (start_offsets == i)
-                out.append(update_tensor(zeros, new=mean[maski], mask=maski))
-                mean = (F @ mean.unsqueeze(-1)).squeeze(-1)
-            return torch.stack(out, 0).sum(0)
-        else:
+        if not self.linear_transition:
             raise NotImplementedError
+
+        # Each 2x2 block of F for harmonic j is: decay * [[cos(lam_j), -sin(lam_j)],
+        #                                                   [sin(lam_j),  cos(lam_j)]]
+        # so F^i has blocks: decay^i * R(i * lam_j).
+        # This lets us compute F^i @ initial_mean directly via trig instead of stepping
+        # through i matrix multiplications (the old approach was O(period) per forward pass).
+        F = self.get_transition_matrix()  # (rank, rank)
+        K = self.rank // 2
+        even = torch.arange(0, self.rank, 2, device=F.device)  # indices of s_j components
+        F_cos = F[even, even]          # decay * cos(lam_j), shape (K,)
+        F_sin = F[even + 1, even]      # decay * sin(lam_j), shape (K,)
+        lam = torch.atan2(F_sin, F_cos)                      # rotation angle per harmonic, (K,)
+        decay = torch.sqrt(F_cos ** 2 + F_sin ** 2)          # magnitude per harmonic, (K,)
+
+        offsets = torch.as_tensor(
+            start_offsets, dtype=self.initial_mean.dtype, device=self.initial_mean.device
+        )  # (num_groups,)
+
+        angles = offsets[:, None] * lam[None, :]             # (num_groups, K)
+        decay_factors = decay[None, :] ** offsets[:, None]   # (num_groups, K)
+
+        mean0 = self.initial_mean.view(K, 2)  # (K, 2): [[s1, s*1], [s2, s*2], ...]
+        s0 = mean0[:, 0]       # (K,)
+        s_star0 = mean0[:, 1]  # (K,)
+
+        cos_a = torch.cos(angles)  # (num_groups, K)
+        sin_a = torch.sin(angles)  # (num_groups, K)
+
+        new_s = (s0 * cos_a - s_star0 * sin_a) * decay_factors       # (num_groups, K)
+        new_s_star = (s0 * sin_a + s_star0 * cos_a) * decay_factors  # (num_groups, K)
+
+        # Interleave back to [s1, s*1, s2, s*2, ...] layout
+        return torch.stack([new_s, new_s_star], dim=-1).reshape(num_groups, self.rank)

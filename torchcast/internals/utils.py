@@ -1,5 +1,5 @@
 import functools
-from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Collection, Type
+from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Type
 
 import torch
 

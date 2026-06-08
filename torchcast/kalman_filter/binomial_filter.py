@@ -1,10 +1,15 @@
+"""
+The :class:`.BinomialFilter` is a :class:`.KalmanFilter` with (1) one or more sigmoid measurement-functions
+and (2) with a log_prob that use binomial likelihood (using monte-carlo approximation).
+"""
+
 from math import log
 
 import torch
 from torch.distributions import Binomial
 from typing import Sequence, TYPE_CHECKING, Optional, Union
 
-from torchcast.covariance import Covariance
+from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.state_space import Predictions
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
@@ -14,12 +19,28 @@ if TYPE_CHECKING:
 
 
 class BinomialFilter(KalmanFilter):
+    """
+    :param processes: A list of :class:`.Process` modules.
+    :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
+    :param binary_measures: A subset of ``measures`` with binary (binomial) outcomes.
+    :param observed_counts: If True, then ``y`` is interpreted as counts; if False then as probabilities 0-1.
+    :param do_post_hoc_correction: Default True. Apply correction to the binary residuals during the update step, to
+     compensate for the linearization error introduced by the EKF approximation. The exact correction is learned: a
+     learned baseline correction level is modulated by a learned increase/decrease according to `num_obs`.
+    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
+    :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
+    :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
+    :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
+     is useful if different groups have very different magnitudes.
+    """
+
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Optional[Sequence[str]],
                  binary_measures: Optional[Sequence[str]] = None,
                  observed_counts: Optional[bool] = None,
-                 measure_covariance: Optional[Covariance] = None,
+                 do_post_hoc_correction: bool = True,
+                 measure_covariance: Optional[Union[Covariance, dict]] = None,
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
                  adaptive_scaling: bool = False):
@@ -45,6 +66,14 @@ class BinomialFilter(KalmanFilter):
             measure_funs={m: 'ilogit' for m in binary_measures},
         )
 
+        if do_post_hoc_correction:
+            self.post_correction_module = torch.nn.Linear(1, 1, bias=True)
+            with torch.no_grad():
+                self.post_correction_module.bias.normal_(mean=-.5, std=.1)
+                self.post_correction_module.weight.normal_(std=.1)
+        else:
+            self.post_correction_module = None
+
     @classmethod
     def _validate_measure_cov(cls,
                               measures: Sequence[str],
@@ -61,7 +90,7 @@ class BinomialFilter(KalmanFilter):
 
         mcov_empty_idx = [i for i, m in enumerate(measures) if m in binary_measures]
         if measure_covariance is None:
-            measure_covariance = {}
+            measure_covariance = {'init_diag_multi': DEFAULT_MCOV_MULTI}
         if isinstance(measure_covariance, dict):
             measure_covariance['id'] = 'measure_covariance'
             measure_covariance['rank'] = len(measures)
@@ -195,7 +224,9 @@ class BinomialFilter(KalmanFilter):
 
         # validate num_obs, use to normalize input if observed_counts=True:
         if self.observed_counts is None:
-            if num_obs is not None and (num_obs != 1).any():
+            if num_obs is None:
+                num_obs = 1
+            elif (num_obs != 1).any():
                 raise ValueError(
                     "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
                     "or proportions (observed_counts=False)."
@@ -218,6 +249,22 @@ class BinomialFilter(KalmanFilter):
         )
         measure_cov = measure_cov + bin_measure_cov
 
+        if self.do_post_hoc_correction:
+            # super takes input and mean, not resid.
+            # we want to multiply the resid, so we'll just do that then apply that adjustment to the measured-mean:
+            raw_resid = input - measured_mean
+
+            resid = torch.zeros_like(input)
+            resid[..., binary_idx] = self._binomial_post_hoc_correction(
+                raw_resid[..., binary_idx],
+                binary_measured_mean,
+                num_obs
+            )
+            other_idx = [x for x in range(measured_mean.shape[-1]) if x not in binary_idx]
+            if other_idx:
+                resid[..., other_idx] = raw_resid[..., other_idx]
+            measured_mean = input - resid
+
         return super()._update_step(
             input=input,
             mean=mean,
@@ -227,6 +274,36 @@ class BinomialFilter(KalmanFilter):
             measure_cov=measure_cov,
             **kwargs
         )
+
+    @property
+    def do_post_hoc_correction(self) -> bool:
+        return getattr(self, 'post_correction_module', None) is not None
+
+    def _binomial_post_hoc_correction(self,
+                                      resid: torch.Tensor,
+                                      measured_mean: torch.Tensor,
+                                      num_obs: torch.Tensor) -> torch.Tensor:
+        measured_mean = torch.clamp(measured_mean, min=1e-6, max=1 - 1e-6)
+        Hx = torch.log(measured_mean / (1 - measured_mean))
+
+        # only applies when residual is heading us towards extremes (so neg resid if logit < 0, pos resid if > 0)
+        consistent = torch.sign(resid) == torch.sign(Hx)
+
+        # sharpness is learned empirically:
+        sharpness = torch.exp(self.post_correction_module(torch.log(num_obs[consistent]).unsqueeze(-1))).squeeze(-1)
+
+        # multi is 1 if ~consistent, or its set by normalized derivative of sigmoid
+        multi = torch.ones_like(resid)
+        deriv_at_Hx = self._sigmoid_deriv(Hx[consistent], s=sharpness)
+        deriv_at_zero = self._sigmoid_deriv(torch.as_tensor(0.), s=sharpness)
+        multi[consistent] = (deriv_at_zero / deriv_at_Hx)
+
+        return resid * multi
+
+    @staticmethod
+    def _sigmoid_deriv(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        exp_neg = torch.exp(-s * x)
+        return s * exp_neg / (exp_neg + 1) ** 2
 
     @torch.jit.ignore()
     def forward(self,
@@ -358,7 +435,7 @@ class BinomialPredictions(Predictions):
         return gaussian_lp + binary_lp
 
 
-def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_common: float = 1.):
+def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_common: float = 0.5):
     from torchcast.process import LocalLevel, Season
     from torchcast.utils import TimeSeriesDataset
     from scipy.special import expit
@@ -402,17 +479,21 @@ def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_
 
     bf = BinomialFilter(
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures]
-                  + [Season(id=f'season_{m}', measure=m, dt_unit='D', period=7, K=2) for m in measures],
+        #          + [Season(id=f'season_{m}', measure=m, dt_unit='D', period=7, K=2) for m in measures]
+        ,
         measures=measures,
         binary_measures=binary_measures,
-        observed_counts=False
+        observed_counts=False,
+        do_post_hoc_correction=False
     )
 
     y = dataset.tensors[0]
-    bf.fit(y, start_offsets=dataset.start_offsets)
+    bf.fit(y, start_offsets=dataset.start_offsets,
+           stopping={'monitor_params': True},
+           )
     _kwargs = {}
-    # if TOTAL_COUNT != 1:
-    #     _kwargs['num_obs'] = TOTAL_COUNT
+    if TOTAL_COUNT != 1:
+        _kwargs['num_obs'] = TOTAL_COUNT
     preds = bf(
         dataset.tensors[0],
         start_offsets=dataset.start_offsets,
@@ -437,6 +518,7 @@ def main(num_groups: int = 50, num_timesteps: int = 365, bias: float = -1, prop_
         ).show()
     # preds._white_noise = torch.zeros((1, len(binary_measures)))
     # print(preds.log_prob(y).mean())
+    # with correction tensor(-1.3281, grad_fn=<MeanBackward0>)
 
 
 if __name__ == '__main__':
