@@ -219,55 +219,57 @@ class BinomialFilter(KalmanFilter):
                      measure_cov: torch.Tensor,
                      num_obs: Optional[torch.Tensor],
                      binary_idx: Sequence[int],
-                     **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+                     recursive_call: bool = False,
+                     **kwargs) -> 'StateTuple':
 
-        # validate input:
-        if (input[:, binary_idx] < 0).any():
-            raise ValueError("BinomialFilter does not support negative inputs.")
+        if not recursive_call:  # todo: is there a better way to have this computed only once?
+            # validate input:
+            if (input[:, binary_idx] < 0).any():
+                raise ValueError("BinomialFilter does not support negative inputs.")
 
-        # validate num_obs, use to normalize input if observed_counts=True:
-        if self.observed_counts is None:
-            if num_obs is None:
-                num_obs = 1
-            elif (num_obs != 1).any():
-                raise ValueError(
-                    "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
-                    "or proportions (observed_counts=False)."
-                )
-        elif self.observed_counts:
-            if num_obs is None:
-                raise ValueError("num_obs should be passed because observed_counts=True")
-            input = input.clone()
-            input[:, binary_idx] = input[:, binary_idx] / num_obs
+            # validate num_obs, use to normalize input if observed_counts=True:
+            if self.observed_counts is None:
+                if num_obs is None:
+                    num_obs = 1
+                elif (num_obs != 1).any():
+                    raise ValueError(
+                        "If `num_obs` is supplied, must specify whether observed values are counts "
+                        "(observed_counts=True) or proportions (observed_counts=False)."
+                    )
+            elif self.observed_counts:
+                if num_obs is None:
+                    raise ValueError("num_obs should be passed because observed_counts=True")
+                input = input.clone()
+                input[:, binary_idx] = input[:, binary_idx] / num_obs
 
-        if (input[:, binary_idx] > 1).any():
-            raise ValueError("Some inputs are > num_obs")
+            if (input[:, binary_idx] > 1).any():
+                raise ValueError("Some inputs are > num_obs")
 
-        # adjust measure-cov based on binomial identity relationship:
-        bin_measure_cov = torch.zeros_like(measure_cov)
-        binary_measured_mean = measured_mean[..., binary_idx]
-        # mean of binomial target is n*p, variance is n*p*(1-p)
-        # mean of target that is `binom_target / n` is p, variance is p*(1-p)/n (scaling a RV by N scales var by N**2)
-        bin_measure_cov[..., binary_idx, binary_idx] = (
-                binary_measured_mean * (1 - binary_measured_mean) / num_obs
-        )
-        measure_cov = measure_cov + bin_measure_cov
-
-        if self.do_post_hoc_correction:
-            # super takes input and mean, not resid.
-            # we want to multiply the resid, so we'll just do that then apply that adjustment to the measured-mean:
-            raw_resid = input - measured_mean
-
-            resid = torch.zeros_like(input)
-            resid[..., binary_idx] = self._binomial_post_hoc_correction(
-                raw_resid[..., binary_idx],
-                binary_measured_mean,
-                num_obs
+            # adjust measure-cov based on binomial identity relationship:
+            bin_measure_cov = torch.zeros_like(measure_cov)
+            binary_measured_mean = measured_mean[..., binary_idx]
+            # mean of binomial target is n*p, variance is n*p*(1-p)
+            # mean of target that is `binom_target / n` is p, var is p*(1-p)/n (scaling a RV by N scales var by N**2)
+            bin_measure_cov[..., binary_idx, binary_idx] = (
+                    binary_measured_mean * (1 - binary_measured_mean) / num_obs
             )
-            other_idx = [x for x in range(measured_mean.shape[-1]) if x not in binary_idx]
-            if other_idx:
-                resid[..., other_idx] = raw_resid[..., other_idx]
-            measured_mean = input - resid
+            measure_cov = measure_cov + bin_measure_cov
+
+            if self.do_post_hoc_correction:
+                # super takes input and mean, not resid.
+                # we want to multiply the resid, so we'll just do that then apply that adjustment to the measured-mean:
+                raw_resid = input - measured_mean
+
+                resid = torch.zeros_like(input)
+                resid[..., binary_idx] = self._binomial_post_hoc_correction(
+                    raw_resid[..., binary_idx],
+                    binary_measured_mean,
+                    num_obs
+                )
+                other_idx = [x for x in range(measured_mean.shape[-1]) if x not in binary_idx]
+                if other_idx:
+                    resid[..., other_idx] = raw_resid[..., other_idx]
+                measured_mean = input - resid
 
         return super()._update_step(
             input=input,

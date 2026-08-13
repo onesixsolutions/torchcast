@@ -6,6 +6,11 @@ import torch
 import numpy as np
 
 
+@functools.lru_cache()
+def subset_mask(subset: Sequence[str], superset: Sequence[str]) -> torch.Tensor:
+    return torch.tensor([int(x in subset) for x in superset])
+
+
 def get_subclasses(cls: Type) -> Iterable[Type]:
     for subclass in cls.__subclasses__():
         yield from get_subclasses(subclass)
