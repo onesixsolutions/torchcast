@@ -218,6 +218,20 @@ class RegimeModel(torch.nn.Module):
             mapping.append(effective.index(eff))
         return effective, torch.as_tensor(mapping, dtype=torch.long)
 
+    def standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
+        """
+        :param regime_probs: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
+        :param measures: The measures to return probabilities for.
+        :return: A ``(num_groups, len(measures))`` tensor with the probability that each measure is in its standard
+         regime (always 1 for measures without mixture components).
+        """
+        mask = torch.ones((self.num_combos, len(measures)), dtype=regime_probs.dtype, device=regime_probs.device)
+        for j, measure in enumerate(measures):
+            if measure in self.mixture_measures:
+                k = self.mixture_measures.index(measure)
+                mask[:, j] = torch.as_tensor([float(combo[k] is None) for combo in self.combos])
+        return regime_probs @ mask
+
     def validate_measures(self, measure_funs: dict, processes: Sequence) -> None:
         """
         Mixture measures must have a linear-Gaussian measurement model (no measure-function, no nonlinear processes).

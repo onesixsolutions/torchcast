@@ -276,7 +276,7 @@ class StateSpaceModel(torch.nn.Module):
                 )
                 meanu, covu = state
                 regime_post = state.regime_probs
-                scaling1step = self._get_scaling_multi(measured_mean, inputs[t])
+                scaling1step = self._get_scaling_multi(measured_mean, inputs[t], regime_probs=regime_post)
             else:
                 meanu, covu = mean1step, cov1step
 
@@ -378,13 +378,22 @@ class StateSpaceModel(torch.nn.Module):
 
     def _get_scaling_multi(self,
                            measured_mean: torch.Tensor,
-                           input: torch.Tensor) -> Optional[torch.Tensor]:
-
+                           input: torch.Tensor,
+                           regime_probs: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """
+        :param regime_probs: If the model has mixture components, the ``(num_groups, num_combos)`` posterior
+         regime-probabilities from the update-step. Residuals are then weighted by the probability that each measure
+         is in its standard regime, so that residuals explained by a mixture component don't inflate the scaling.
+        """
         if self.adaptive_scaling:
             idx = self.measure_covariance.non_empty_idx
             nan_mask = input[..., idx].isnan()
             resid = input[..., idx].nan_to_num() - measured_mean[..., idx]
-            multi = self.adaptive_scaling(resid, nan_mask)
+            if self.regime_model is None or regime_probs is None:
+                multi = self.adaptive_scaling(resid, nan_mask)
+            else:
+                weights = self.regime_model.standard_probs(regime_probs, [self.measures[i] for i in idx])
+                multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
 
             # Handle empty measures (those not in the covariance structure)
             multi_padded = torch.ones_like(input)

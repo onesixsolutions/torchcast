@@ -381,3 +381,98 @@ def test_initial_state_continuation():
     kf_plain = _make_kf(['y1', 'y2'], [])
     with pytest.raises(ValueError, match="no mixture components"):
         kf_plain(y[:, split:], initial_state=state)
+
+
+def test_standard_probs():
+    components = [
+        MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1'),
+        MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c1'),
+        MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c2'),
+    ]
+    rm = RegimeModel(components, measures=['a', 'b', 'c'])
+    regime_probs = torch.softmax(torch.randn(4, rm.num_combos), -1)
+    probs = rm.standard_probs(regime_probs, ['a', 'b', 'c'])
+    for j, m in enumerate(['a', 'b', 'c']):
+        if m == 'b':
+            assert torch.allclose(probs[:, j], torch.ones(4))
+            continue
+        k = rm.mixture_measures.index(m)
+        standard = torch.tensor([combo[k] is None for combo in rm.combos])
+        assert torch.allclose(probs[:, j], regime_probs[:, standard].sum(-1))
+    # at base-probs, matches the base-rate:
+    assert torch.allclose(rm.standard_probs(rm.base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
+
+
+@torch.no_grad()
+def test_ewma_scaler_weights():
+    from torchcast.state_space.adaptive_scaling import EWMAdaptiveScaler
+
+    torch.manual_seed(1)
+    resids = [torch.randn(3, 2) for _ in range(5)]
+    skip = torch.zeros(3, 2, dtype=torch.bool)
+
+    def run(weights):
+        torch.manual_seed(2)
+        scaler = EWMAdaptiveScaler(num_measures=2)
+        scaler.initialize(20)
+        scaler.reset()
+        return [scaler(r, skip, weights=weights) for r in resids], scaler
+
+    unweighted, s0 = run(None)
+    ones, s1 = run(torch.ones(3, 2))
+    assert all(torch.allclose(a, b) for a, b in zip(unweighted, ones))
+
+    # zero weight on the last residual == skipping it:
+    torch.manual_seed(1)
+    scaler = EWMAdaptiveScaler(num_measures=2)
+    scaler.initialize(20)
+    scaler.reset()
+    for i, r in enumerate(resids):
+        w = torch.ones(3, 2)
+        w[0, 1] = 0. if i == 4 else 1.
+        scaler(r, skip, weights=w)
+    torch.manual_seed(1)
+    scaler_skip = EWMAdaptiveScaler(num_measures=2)
+    scaler_skip.initialize(20)
+    scaler_skip.reset()
+    for i, r in enumerate(resids):
+        sk = skip.clone()
+        sk[0, 1] = i == 4
+        scaler_skip(r, sk)
+    assert torch.allclose(scaler._running, scaler_skip._running)
+    assert torch.allclose(scaler._time, scaler_skip._time.float())
+
+
+@torch.no_grad()
+def test_adaptive_scaling_ignores_explained_outliers():
+    """
+    A low outlier that's explained by the mixture component shouldn't inflate the adaptive scaling (whereas without the
+    mixture, it does): for the scaling, it should be (almost) as if the observation were missing.
+    """
+    def make(with_mixture: bool):
+        torch.manual_seed(0)
+        kf = KalmanFilter(
+            processes=[LocalLevel(id='level')],
+            measures=['y'],
+            adaptive_scaling=True,
+            mixture_components=[MixtureComponent('y', mean_init=-6., prob_init=.05, id='low')] if with_mixture else None
+        )
+        kf.adaptive_scaling.initialize(30)
+        kf.adaptive_scaling.weight.fill_(1.)
+        if with_mixture:
+            kf.regime_model.components[0]._log_std.fill_(-1.)
+        return kf
+
+    torch.manual_seed(1)
+    y = torch.randn(4, 30, 1) * .3
+    y_outlier, y_missing = y.clone(), y.clone()
+    y_outlier[:, 15] = -6.
+    y_missing[:, 15] = float('nan')
+    for with_mixture in (False, True):
+        kf = make(with_mixture)
+        # measure-variance at t=16 reflects the scaling after observing t=15:
+        ratio = kf(y_outlier).measure_covs[:, 16, 0, 0] / kf(y_missing).measure_covs[:, 16, 0, 0]
+        if with_mixture:
+            assert torch.allclose(ratio, torch.ones_like(ratio), atol=.01)
+        else:
+            assert (ratio > 2).all()
