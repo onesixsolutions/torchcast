@@ -441,7 +441,9 @@ class Predictions:
 
         probs, means, vars_ = [], [], []
         for component in components:
-            in_regime = torch.as_tensor([combo[k] is component for combo in rm.combos], device=self.regime_priors.device)
+            in_regime = torch.as_tensor(
+                [combo[k] is component for combo in rm.combos], device=self.regime_priors.device
+            )
             probs.append(self.regime_priors[..., in_regime].sum(-1))
             means.append(standard_mean if component is None else component.mean.expand(*batch_shape))
             vars_.append(standard_var if component is None else component.var.expand(*batch_shape))

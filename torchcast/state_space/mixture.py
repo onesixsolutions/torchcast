@@ -130,7 +130,7 @@ class StickyTransition(RegimeTransition):
 
 class RegimeModel(torch.nn.Module):
     """
-    Owns the :class:`MixtureComponent`s for a model and the fixed table of regime-combos.
+    Owns the :class:`MixtureComponent` objects for a model and the fixed table of regime-combos.
 
     A combo is a tuple with one entry per mixture measure (in the order of ``self.mixture_measures``): either ``None``
     (the standard regime) or one of that measure's components. Measures without components are always in the standard
@@ -152,7 +152,9 @@ class RegimeModel(torch.nn.Module):
         by_measure = {}
         for component in components:
             if component.measure not in measures:
-                raise ValueError(f"MixtureComponent '{component.id}' has measure '{component.measure}' not in `measures`")
+                raise ValueError(
+                    f"MixtureComponent '{component.id}' has measure '{component.measure}' not in `measures`"
+                )
             by_measure.setdefault(component.measure, []).append(component)
         for measure, comps in by_measure.items():
             ids = [c.id for c in comps]

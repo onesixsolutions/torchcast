@@ -7,6 +7,7 @@ API
    state_space
    kalman_filter
    binomial_filter
+   mixture
    exp_smooth
    processes
    covariance

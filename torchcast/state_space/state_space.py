@@ -32,8 +32,8 @@ class StateSpaceModel(torch.nn.Module):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
-    :param mixture_components: Experimental. A list of :class:`.MixtureComponent`s: alternative regimes for one or more
-     measures, which explain an observation without updating the state.
+    :param mixture_components: Experimental. A list of :class:`.MixtureComponent` objects: alternative regimes for one
+     or more measures, which explain an observation without updating the state.
     :param regime_transition: Experimental. A :class:`.RegimeTransition` controlling how regime-probabilities evolve
      over time; defaults to :class:`.StickyTransition`. Only used if ``mixture_components`` are passed.
     """

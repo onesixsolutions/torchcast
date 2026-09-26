@@ -1,5 +1,41 @@
 # CHANGELOG
 
+## Unreleased
+
+### New feature: mixture components (experimental)
+
+A measure can now have one or more alternative *regimes* -- e.g. for outliers that shouldn't update the state or
+inflate the variance. See the new [mixture components example](https://docs.strong.io/torchcast/examples/mixture_components.html).
+
+- `KalmanFilter(mixture_components=[MixtureComponent(...), ...])`: each `MixtureComponent` has a learned mean,
+  variance, and base-rate. An observation explained by a component is scored against it, rather than updating the
+  state. Components are supported on any linear-gaussian measure, including the non-binary measures of a
+  `BinomialFilter`.
+- Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
+  a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
+  mixture when that's zero). A custom transition can be passed via `regime_transition=`.
+- `univariate_mixture_prob=True` computes the per-timestep regime-probabilities from the mixture measures' likelihood
+  only (an approximation, but cheaper, and avoids e.g. a binary measure's gaussian approximation influencing them).
+- `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
+- Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
+  regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing.
+  `Predictions.get_regime_combos()` gives the joint version. `means`/`covs` are the mixture's exact moments, and
+  `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
+- With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
+
+### Other changes
+
+- `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
+  tuple it replaces (unpacking, `len()`, indexing), and also carries the regime-probabilities of models with mixture
+  components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks
+  `isinstance(..., tuple)` will need updating.)
+- `AdaptiveScaler.forward()` takes an optional `weights` argument. It's only passed for models with mixture
+  components, so custom subclasses only need to accept it to be used with mixtures.
+- For subclasses of `KalmanFilter`: the update-step is now split into `_prepare_update()` (a hook to adjust
+  inputs, called once per step), `_kalman_update()`, and `_mixture_update()`. Subclasses that previously overrode
+  `_update_step()` to adjust its inputs (as `BinomialFilter` did) should override `_prepare_update()` instead.
+- Adds `benchmarks/profile_simple_model.py`, for checking performance against other git refs.
+
 ## v1.2.0 (2026-06-08)
 
 ### New Features
