@@ -23,6 +23,13 @@ measurement std-devs are ~10), which in turn distorted the predicted means via t
 `num_groups` was affected for the same reason. The error is negligible when measurement std-devs are close to 1 (e.g.
 standardized data). Now only the default initial covariance (when no covariance is passed) is scaled.
 
+### Other bug fixes
+
+- Adaptive scaling (`adaptive_scaling=True`) raised an `IndexError` when a measure without a measure-variance (e.g. a
+  binary measure in `BinomialFilter`) was listed before one with a measure-variance.
+- `Predictions.covs` for nonlinear models now warns (once) that no closed-form covariance is available; previously the
+  warning never fired.
+
 ## v1.1.2 (2026-06-08)
 
 ### New Features
