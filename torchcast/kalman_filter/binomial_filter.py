@@ -131,6 +131,7 @@ class BinomialFilter(KalmanFilter):
                               num_obs: Sequence[torch.Tensor],
                               observed_counts: bool,
                               regime_priors: Optional[Sequence[torch.Tensor]] = None,
+                              update_regime_probs: Optional[Sequence[torch.Tensor]] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
@@ -145,6 +146,7 @@ class BinomialFilter(KalmanFilter):
             observed_counts=observed_counts,
             regime_model=self.regime_model,
             regime_priors=regime_priors,
+            update_regime_probs=update_regime_probs,
         )
 
     def _mask_mats(self,

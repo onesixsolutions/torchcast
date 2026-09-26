@@ -177,7 +177,7 @@ class KalmanFilter(StateSpaceModel):
         :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
         :param regime_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo. Defaults
          to the regime-model's base-probs.
-        :return: The collapsed state, with ``regime_post`` set to the ``(num_groups, num_combos)`` posterior.
+        :return: The collapsed state, with ``regime_probs`` set to the ``(num_groups, num_combos)`` posterior.
         """
         num_groups = input.shape[0]
         if regime_prior is None:
@@ -201,7 +201,7 @@ class KalmanFilter(StateSpaceModel):
         )
         if len(effective) == 1:
             # no mixture measures observed, so observations are uninformative about the regime:
-            standard.regime_post = log_prior.exp()
+            standard.regime_probs = log_prior.exp()
             return standard
 
         # which measures contribute to the responsibilities:
@@ -257,7 +257,7 @@ class KalmanFilter(StateSpaceModel):
         weights = weights.index_add(1, mapping.to(input.device), regime_post)
 
         new_state = self._mix_updates(states, weights)
-        new_state.regime_post = regime_post
+        new_state.regime_probs = regime_post
         return new_state
 
     @staticmethod

@@ -16,6 +16,7 @@ from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, r
 
 if TYPE_CHECKING:
     from .mixture import RegimeModel
+    from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise
@@ -38,7 +39,8 @@ class Predictions:
                  updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
                  mc_white_noise: Optional['FixedWhiteNoise'] = None,
                  regime_model: Optional['RegimeModel'] = None,
-                 regime_priors: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None):
+                 regime_priors: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None,
+                 update_regime_probs: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None):
         self.state_means = _maybe_stack(states[0], 1)
         self.state_covs = _maybe_stack(states[1], 1)
         self.measure_covs = _maybe_stack(measure_covs, 1)
@@ -68,6 +70,8 @@ class Predictions:
         self.regime_priors = None if regime_priors is None else _maybe_stack(regime_priors, 1)
         if self.regime_model is not None and self.regime_priors is None:
             raise ValueError("If `regime_model` is passed, must also pass `regime_priors`.")
+        # (num_groups, num_timesteps, num_combos) posterior regime-probabilities, if `updates` were passed:
+        self.update_regime_probs = None if update_regime_probs is None else _maybe_stack(update_regime_probs, 1)
 
     @property
     def num_groups(self) -> int:
@@ -696,7 +700,7 @@ class Predictions:
     def get_state_at_times(self,
                            times: Union[np.ndarray, np.datetime64],
                            type_: str = 'update',
-                           **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+                           **kwargs) -> 'StateTuple':
         """
         For each group, get the state (tuple of (mean, cov)) for a timepoint. This is often useful since predictions
         are right-aligned and padded, so that the final prediction for each group is arbitrarily padded and does not
@@ -708,14 +712,21 @@ class Predictions:
         :param type_: What type of state? Since this method is typically used for getting an `initial_state` for
          another call to :func:`StateSpaceModel.forward()`, this should generally be 'update' (the default); other
          option is 'prediction'.
-        :return: A tuple of state-means and state-covs, appropriate for forecasting by passing as `initial_state`
-         for :func:`StateSpaceModel.forward()`.
+        :return: A :class:`.StateTuple`, appropriate for forecasting by passing as `initial_state` for
+         :func:`StateSpaceModel.forward()`. This behaves like a tuple of ``(state_means, state_covs)``; if the model has
+         mixture components, it also carries the ``regime_probs`` at those times.
         """
+        from .state import StateTuple
+
         preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
         if type_.startswith('pred'):
-            return preds.state_means.squeeze(1), preds.state_covs.squeeze(1)
+            regime_probs = None if preds.regime_priors is None else preds.regime_priors.squeeze(1)
+            return StateTuple(preds.state_means.squeeze(1), preds.state_covs.squeeze(1), regime_probs=regime_probs)
         elif type_.startswith('update'):
-            return preds.update_means.squeeze(1), preds.update_covs.squeeze(1)
+            if preds.update_means is None:
+                raise RuntimeError("No updates available; call the model with ``include_updates_in_output=True``.")
+            regime_probs = None if preds.update_regime_probs is None else preds.update_regime_probs.squeeze(1)
+            return StateTuple(preds.update_means.squeeze(1), preds.update_covs.squeeze(1), regime_probs=regime_probs)
         else:
             raise ValueError("Unrecognized `type_`, expected 'prediction' or 'update'.")
 
@@ -895,6 +906,8 @@ class Predictions:
             kwargs.update({
                 'updates': (self.update_means[item], self.update_covs[item])
             })
+        if self.update_regime_probs is not None:
+            kwargs['update_regime_probs'] = self.update_regime_probs[item]
 
         return kwargs
 

@@ -185,7 +185,7 @@ def test_update_step_univariate():
         expected_mean = w_n * mean_n + w_w * mean
         expected_cov = w_n * (cov_n + (mean_n - expected_mean) ** 2) + w_w * (cov + (mean - expected_mean) ** 2)
 
-        assert torch.allclose(state.regime_post[:, 1], w_w.view(1), atol=1e-6)
+        assert torch.allclose(state.regime_probs[:, 1], w_w.view(1), atol=1e-6)
         assert torch.allclose(state.mean, expected_mean.view(1, 1), atol=1e-6)
         assert torch.allclose(state.cov, expected_cov.view(1, 1, 1), atol=1e-6)
 
@@ -210,7 +210,7 @@ def test_update_step_unobserved_mixture_measure():
     assert torch.allclose(state.mean, expected_mean)
     assert torch.allclose(state.cov, expected_cov)
     # the regime is unobserved, so the posterior is the prior:
-    assert torch.allclose(state.regime_post, kf.regime_model.base_probs().expand(4, -1))
+    assert torch.allclose(state.regime_probs, kf.regime_model.base_probs().expand(4, -1))
 
 
 @torch.no_grad()
@@ -346,3 +346,38 @@ def test_n_step_regime_priors(n_step: int, every_step: bool):
         assert torch.allclose(pred_n.regime_priors[:, t], pred_1.regime_priors[:, t], atol=1e-6)
     # so the log-prob matches too:
     assert torch.allclose(pred_n.log_prob(y)[:, -1], kf(y_nan, n_step=1).log_prob(y)[:, -1], atol=1e-5)
+
+
+@torch.no_grad()
+def test_initial_state_continuation():
+    kf = _make_kf(['y1', 'y2'], ['y1'])
+    kf.regime_model.transition._stay_logit.fill_(1.)
+    y = _make_y(num_measures=2)
+    y[:, 11, 0] = -4.  # an outlier right before the split, so the regime-probs at the split are informative
+    split = 12
+
+    full = kf(y)
+    state = kf(y[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
+    assert state.regime_probs.shape == (y.shape[0], kf.regime_model.num_combos)
+    cont = kf(y[:, split:], initial_state=state)
+    assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-5)
+    assert torch.allclose(cont.state_covs, full.state_covs[:, split:], atol=1e-5)
+    assert torch.allclose(cont.regime_priors, full.regime_priors[:, split:], atol=1e-6)
+    assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
+
+    # a plain (mean, cov) tuple restarts regime-probs from the transition's initial distribution:
+    cont_tuple = kf(y[:, split:], initial_state=tuple(state))
+    assert torch.allclose(cont_tuple.regime_priors[:, 0], kf.regime_model.base_probs().expand(y.shape[0], -1))
+
+    # 'prediction'-type states also carry regime-probs:
+    pred_state = full.get_state_at_times(split, type_='prediction')
+    assert torch.allclose(pred_state.regime_probs, full.regime_priors[:, split])
+
+    # simulate from the state:
+    sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
+    assert sim.regime_priors.shape == (2 * y.shape[0], 5, kf.regime_model.num_combos)
+
+    # a model without mixture components rejects regime-probs:
+    kf_plain = _make_kf(['y1', 'y2'], [])
+    with pytest.raises(ValueError, match="no mixture components"):
+        kf_plain(y[:, split:], initial_state=state)
