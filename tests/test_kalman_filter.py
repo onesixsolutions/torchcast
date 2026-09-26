@@ -394,3 +394,32 @@ def test_dtype(dtype: torch.dtype, ndim: int, compiled: bool):
     assert pred.means.dtype == dtype
     loss = pred.log_prob(data)
     assert loss.dtype == dtype
+
+
+@pytest.mark.parametrize("measure_log_std", [0., 2.])
+@torch.no_grad()
+def test_initial_state_continuation(measure_log_std: float):
+    """
+    Filtering the first part of a series, then forecasting from ``get_state_at_times()`` on the rest, should match a
+    single pass over the whole series.
+    """
+    torch.manual_seed(0)
+    measures = ['y1', 'y2']
+    kf = KalmanFilter(processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in measures], measures=measures)
+    kf.measure_covariance.cholesky_log_diag.fill_(measure_log_std)
+    y = torch.randn((3, 20, len(measures))).cumsum(1) * 10
+    split = 12
+
+    full = kf(y)
+    first = kf(y[:, :split], include_updates_in_output=True)
+    state = first.get_state_at_times(split - 1)
+    # backwards-compatible with the (mean, cov) tuple that used to be returned:
+    mean, cov = state
+    assert len(state) == 2 and state[0] is mean and state[1] is cov
+
+    cont = kf(y[:, split:], initial_state=state)
+    assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-4)
+    assert torch.allclose(cont.state_covs, full.state_covs[:, split:], rtol=1e-4, atol=1e-4)
+    # passing a plain tuple is equivalent:
+    cont_tuple = kf(y[:, split:], initial_state=(mean, cov))
+    assert torch.allclose(cont_tuple.state_covs, cont.state_covs)
