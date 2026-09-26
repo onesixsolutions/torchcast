@@ -388,7 +388,7 @@ class StateSpaceModel(torch.nn.Module):
 
             # Handle empty measures (those not in the covariance structure)
             multi_padded = torch.ones_like(input)
-            multi_padded[..., idx] = multi[..., idx]
+            multi_padded[..., idx] = multi
             return multi_padded
         else:
             return None

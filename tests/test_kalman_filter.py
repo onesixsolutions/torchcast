@@ -423,3 +423,46 @@ def test_initial_state_continuation(measure_log_std: float):
     # passing a plain tuple is equivalent:
     cont_tuple = kf(y[:, split:], initial_state=(mean, cov))
     assert torch.allclose(cont_tuple.state_covs, cont.state_covs)
+
+
+@torch.no_grad()
+def test_adaptive_scaling_with_empty_measure_cov():
+    """
+    With adaptive scaling, measures without a measure-variance (e.g. binary measures in the BinomialFilter) should get
+    no scaling, and the ordering of measures shouldn't matter.
+    """
+    from torchcast.kalman_filter import BinomialFilter
+
+    def make(measures):
+        torch.manual_seed(0)
+        return BinomialFilter(
+            processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+            measures=measures,
+            binary_measures=['visit'],
+            adaptive_scaling=True
+        )
+
+    torch.manual_seed(1)
+    y = torch.stack([(torch.rand(3, 15) > .5).float(), torch.randn(3, 15).cumsum(1) * 3], -1)  # visit, spend
+    bf1 = make(['visit', 'spend'])
+    bf1.adaptive_scaling.initialize(y.shape[1])
+    # make an equivalent model with the measures (and so the state-elements) in the opposite order.
+    # copy parameters by name (not buffers, which encode which measure is binary); state-covariances are position-based,
+    # so make them diagonal and flip:
+    bf2 = make(['spend', 'visit'])
+    params2 = dict(bf2.named_parameters())
+    for name, param in bf1.named_parameters():
+        params2[name].copy_(param)
+    for bf in (bf1, bf2):
+        for cov in (bf.initial_covariance, bf.process_covariance):
+            cov.cholesky_off_diag.zero_()
+    for cov1, cov2 in [(bf1.initial_covariance, bf2.initial_covariance),
+                       (bf1.process_covariance, bf2.process_covariance)]:
+        cov2.cholesky_log_diag.copy_(cov1.cholesky_log_diag.flip(0))
+
+    pred1 = bf1(y)
+    pred2 = bf2(y.flip(-1))
+    assert torch.allclose(pred1.state_means, pred2.state_means.flip(-1), atol=1e-5)
+    assert torch.allclose(pred1.measure_covs, pred2.measure_covs.flip(-1).flip(-2), atol=1e-5)
+    # scaling was actually applied to the gaussian measure:
+    assert not torch.allclose(pred1.measure_covs[:, 1:, 1, 1], pred1.measure_covs[:, :1, 1, 1].expand(-1, 14))
