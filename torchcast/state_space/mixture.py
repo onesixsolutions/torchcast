@@ -10,6 +10,7 @@ combination of regimes across the mixture measures (the standard regime, or one 
 probabilities are tracked jointly over this table.
 """
 import itertools
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import torch
@@ -244,3 +245,48 @@ class RegimeModel(torch.nn.Module):
                 raise ValueError(
                     f"Mixture components are not supported for '{measure}', which has nonlinear processes: {nonlinear}"
                 )
+
+
+@dataclass
+class MixtureOfNormals:
+    """
+    A batch of univariate mixtures of normals: the predictive distribution of a single measure with mixture components.
+    The last dimension of each tensor indexes the mixture's components; the first is the standard regime.
+
+    For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
+    then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.
+
+    :param labels: A name for each component (``'standard'``, then the :class:`MixtureComponent` ids).
+    :param probs: The probability of each component.
+    :param means: The mean of each component.
+    :param vars: The variance of each component.
+    """
+    labels: list
+    probs: torch.Tensor
+    means: torch.Tensor
+    vars: torch.Tensor
+
+    def mean(self) -> torch.Tensor:
+        return (self.probs * self.means).sum(-1)
+
+    def var(self) -> torch.Tensor:
+        return (self.probs * (self.vars + self.means ** 2)).sum(-1) - self.mean() ** 2
+
+    def cdf(self, value: torch.Tensor) -> torch.Tensor:
+        z = (value.unsqueeze(-1) - self.means) / self.vars.sqrt()
+        return (self.probs * torch.special.ndtr(z)).sum(-1)
+
+    def quantile(self, q: float, num_iter: int = 60) -> torch.Tensor:
+        """
+        The ``q``-th quantile, found by bisection on the cdf.
+        """
+        assert 0 < q < 1
+        sd = self.vars.sqrt()
+        lower = (self.means - 10 * sd).min(-1).values
+        upper = (self.means + 10 * sd).max(-1).values
+        for _ in range(num_iter):
+            mid = (lower + upper) / 2
+            below = self.cdf(mid) < q
+            lower = torch.where(below, mid, lower)
+            upper = torch.where(below, upper, mid)
+        return (lower + upper) / 2

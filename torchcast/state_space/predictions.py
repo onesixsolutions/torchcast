@@ -15,7 +15,7 @@ from torch.distributions import MultivariateNormal
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
-    from .mixture import RegimeModel
+    from .mixture import RegimeModel, MixtureOfNormals
     from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
@@ -332,18 +332,12 @@ class Predictions:
                 lower.view(*batch_shape),
                 upper.view(*batch_shape)
             )
+        # mixture measures are linear-gaussian (within each regime), so use their closed-form mixture:
+        by_measure.update(self._get_mixture_intervals(alpha))
         return by_measure
 
     def _get_pred_intervals(self, alpha: float) -> dict[str, torch.Tensor]:
-        if self.regime_model is not None:
-            # todo: how do we reduce touchpoints for "mixture components impact the measured mean"?
-            #   right now, need it here, in observe, maybe some other places...
-            #   could be solved by having mixture components be part of MeasurementModel, but we don't
-            #   actually want them to mixed in with measured_mean as part of `__call__` in StateSpaceModel...
-            #   so probably just a method?
-            raise NotImplementedError("TODO")
-        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
-        system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+        measured_mean, system_cov = self._measured_moments_flat()
 
         batch_shape = self.state_means.shape[0:2]
         multi = -stats.norm.ppf(alpha)
@@ -359,7 +353,104 @@ class Predictions:
                 lower.view(*batch_shape),
                 upper.view(*batch_shape)
             )
+        by_measure.update(self._get_mixture_intervals(alpha))
         return by_measure
+
+    def _get_mixture_intervals(self, alpha: float) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if self.regime_model is None:
+            return {}
+        out = {}
+        for measure in self.regime_model.mixture_measures:
+            mixture = self.get_mixture(measure)
+            out[measure] = (mixture.mean(), mixture.quantile(alpha), mixture.quantile(1 - alpha))
+        return out
+
+    def _measured_moments_flat(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        :return: The (flattened) measured-mean and system-covariance of the (linearized) measurement model -- i.e.,
+         for models with mixture components, of the standard regime.
+        """
+        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+        system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+        return measured_mean, system_cov
+
+    def get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        For models with mixture components: the predictive distribution as a mixture over regime-combos (see
+        :class:`.RegimeModel`). Within each combo the prediction is multivariate normal: measures in the standard
+        regime have the usual (state-dependent) mean and covariance; measures in a mixture-component's regime have
+        that component's mean and variance, and are uncorrelated with the other measures.
+
+        Note that for measures with a measure-function (e.g. binary measures), the standard-regime moments are from
+        the linearized measurement-model, so are approximate.
+
+        :return: A tuple of (1) a label for each combo: a tuple with the regime of each mixture measure ('standard' or
+         the component id), (2) a ``(num_groups, num_timesteps, num_combos)`` tensor of combo probabilities, (3) a
+         ``(num_groups, num_timesteps, num_combos, num_measures)`` tensor of means, and (4) a ``(num_groups,
+         num_timesteps, num_combos, num_measures, num_measures)`` tensor of covariances.
+        """
+        if self.regime_model is None:
+            raise RuntimeError("This model has no mixture components.")
+        rm = self.regime_model
+        measures = list(self.measurement_model.measures)
+        measured_mean, system_cov = self._measured_moments_flat()
+        means, covs = [], []
+        for combo in rm.combos:
+            mean = measured_mean.clone()
+            cov = system_cov.clone()
+            for measure, component in zip(rm.mixture_measures, combo):
+                if component is None:
+                    continue
+                j = measures.index(measure)
+                mean[:, j] = component.mean
+                cov[:, j, :] = 0
+                cov[:, :, j] = 0
+                cov[:, j, j] = component.var
+            means.append(mean)
+            covs.append(cov)
+        batch_shape = self.state_means.shape[0:2]
+        labels = [tuple('standard' if c is None else c.id for c in combo) for combo in rm.combos]
+        return (
+            labels,
+            self.regime_priors,
+            torch.stack(means, 1).view(*batch_shape, rm.num_combos, len(measures)),
+            torch.stack(covs, 1).view(*batch_shape, rm.num_combos, len(measures), len(measures)),
+        )
+
+    def get_mixture(self, measure: str) -> 'MixtureOfNormals':
+        """
+        For a measure with mixture components, the predictive distribution as a (univariate) mixture of normals: the
+        standard regime, then each of the measure's components.
+
+        :param measure: The name of the measure.
+        :return: A :class:`.MixtureOfNormals` whose tensors have shape ``(num_groups, num_timesteps, num_components)``.
+        """
+        from .mixture import MixtureOfNormals
+
+        if self.regime_model is None or measure not in self.regime_model.mixture_measures:
+            raise ValueError(f"'{measure}' has no mixture components.")
+        rm = self.regime_model
+        j = list(self.measurement_model.measures).index(measure)
+        k = rm.mixture_measures.index(measure)
+        components = [None] + [c for c in rm.components if c.measure == measure]
+
+        measured_mean, system_cov = self._measured_moments_flat()
+        batch_shape = self.state_means.shape[0:2]
+        standard_mean = measured_mean[:, j].view(*batch_shape)
+        standard_var = system_cov[:, j, j].view(*batch_shape)
+
+        probs, means, vars_ = [], [], []
+        for component in components:
+            in_regime = torch.as_tensor([combo[k] is component for combo in rm.combos], device=self.regime_priors.device)
+            probs.append(self.regime_priors[..., in_regime].sum(-1))
+            means.append(standard_mean if component is None else component.mean.expand(*batch_shape))
+            vars_.append(standard_var if component is None else component.var.expand(*batch_shape))
+        return MixtureOfNormals(
+            labels=['standard' if c is None else c.id for c in components],
+            probs=torch.stack(probs, -1),
+            means=torch.stack(means, -1),
+            vars=torch.stack(vars_, -1),
+        )
 
     @torch.inference_mode()
     def _to_dataframe(self,
@@ -433,21 +524,32 @@ class Predictions:
                 state_means=self.state_means_flat,
                 state_covs=self.state_covs_flat,
             )
-            measured_mean = torch.mean(mmean_samples, dim=0)
+            measured_mean = torch.mean(mmean_samples, dim=0).view(*batch_shape, -1)
             if self.regime_model is not None:
-                raise NotImplementedError("TODO")
-            return measured_mean.view(*batch_shape, -1), None
+                # mixture measures are linear-gaussian within each regime, so use the closed-form mixture-mean:
+                measured_mean = measured_mean.clone()
+                for measure in self.regime_model.mixture_measures:
+                    j = list(self.measurement_model.measures).index(measure)
+                    measured_mean[..., j] = self.get_mixture(measure).mean()
+            return measured_mean, None
+        elif self.regime_model is not None:
+            # the exact mean and covariance of the mixture over regime-combos:
+            _, probs, means, covs = self.get_regime_combos()
+            mean = (probs.unsqueeze(-1) * means).sum(-2)
+            second_moment = (probs[..., None, None] * (covs + means.unsqueeze(-1) * means.unsqueeze(-2))).sum(-3)
+            return mean, second_moment - mean.unsqueeze(-1) * mean.unsqueeze(-2)
         else:
-            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
-            system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
-            if self.regime_model is not None:
-                raise NotImplementedError("TODO")
+            measured_mean, system_cov = self._measured_moments_flat()
             return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
 
     @property
     def means(self) -> torch.Tensor:
         """
         Returns the observed means of the predictions, i.e. the measured means of the state.
+
+        For models with mixture components, ``means`` and ``covs`` are the exact mean and covariance of the mixture
+        over regimes -- but the predictive distribution is not gaussian, so e.g. don't use them to construct intervals,
+        or to back-transform a transformed measure. Use :func:`get_mixture` (or :func:`get_regime_combos`) instead.
         """
         if self._means is None:
             self._means, self._covs = self._observe()

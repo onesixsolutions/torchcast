@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pytest
 import torch
 from torch.distributions import MultivariateNormal, Normal
@@ -476,3 +477,112 @@ def test_adaptive_scaling_ignores_explained_outliers():
             assert torch.allclose(ratio, torch.ones_like(ratio), atol=.01)
         else:
             assert (ratio > 2).all()
+
+
+def test_mixture_of_normals():
+    from scipy import stats
+    from torchcast.state_space.mixture import MixtureOfNormals
+
+    # a single component is just a normal:
+    single = MixtureOfNormals(['standard'], torch.ones(3, 1), torch.tensor([[0.], [1.], [-2.]]), torch.full((3, 1), 4.))
+    for q in (.025, .5, .9):
+        expected = torch.as_tensor(stats.norm.ppf(q, loc=[0., 1., -2.], scale=2.), dtype=torch.float32)
+        assert torch.allclose(single.quantile(q), expected, atol=1e-4)
+
+    # a skewed mixture:
+    mix = MixtureOfNormals(
+        ['standard', 'low'],
+        probs=torch.tensor([[.9, .1]]),
+        means=torch.tensor([[5., -5.]]),
+        vars=torch.tensor([[.25, 1.]])
+    )
+    assert torch.allclose(mix.mean(), torch.tensor([4.]))
+    assert torch.allclose(mix.var(), torch.tensor([.9 * (.25 + 25) + .1 * (1 + 25) - 16]))
+    for q in (.05, .1, .5, .95):
+        assert torch.allclose(mix.cdf(mix.quantile(q)), torch.tensor([q]), atol=1e-5)
+    # the 5% quantile is in the low component, but the 50% is in the standard one:
+    assert mix.quantile(.05) < -3 and mix.quantile(.5) > 4
+
+
+@torch.no_grad()
+def test_prediction_outputs():
+    measures = ['y1', 'y2']
+    kf = _make_kf(measures, ['y1'])
+    y = _make_y(num_measures=2)
+    y[0, 3:6, 0] = float('nan')
+    pred = kf(y)
+    G, T = y.shape[:2]
+
+    # per-measure mixture:
+    mix = pred.get_mixture('y1')
+    assert mix.labels == ['standard', 'y1_low']
+    assert mix.probs.shape == (G, T, 2)
+    assert torch.allclose(mix.probs.sum(-1), torch.ones(G, T))
+    with pytest.raises(ValueError, match="no mixture components"):
+        pred.get_mixture('y2')
+
+    # means/covs are the moments of the joint mixture; their marginals match the per-measure mixture:
+    means, covs = pred
+    assert torch.allclose(means[..., 0], mix.mean(), atol=1e-5)
+    assert torch.allclose(covs[..., 0, 0], mix.var(), atol=1e-4)
+    # 'y2' has no components, so its moments are the standard-regime ones:
+    measured_mean, system_cov = pred._measured_moments_flat()
+    assert torch.allclose(means[..., 1], measured_mean[:, 1].view(G, T), atol=1e-5)
+    assert torch.allclose(covs[..., 1, 1], system_cov[:, 1, 1].view(G, T), atol=1e-5)
+
+    # cross-covariance vs. sampling from the mixture, for one group/time:
+    labels, probs, combo_means, combo_covs = pred.get_regime_combos()
+    assert labels == [('standard',), ('y1_low',)]
+    g, t = 1, 8
+    torch.manual_seed(0)
+    n = 400_000
+    which = torch.multinomial(probs[g, t], n, replacement=True)
+    samples = MultivariateNormal(combo_means[g, t], combo_covs[g, t]).sample((n,))[torch.arange(n), which]
+    assert torch.allclose(samples.T.cov(), covs[g, t], atol=.02, rtol=.02)
+
+    # dataframe: exact mixture quantiles for y1, gaussian for y2
+    df = pred.to_dataframe(type='predictions', conf=.9)
+    df_y1 = df.query("measure == 'y1'").sort_values(['group', 'time'])
+    assert torch.allclose(torch.as_tensor(df_y1['lower'].values, dtype=torch.float32), mix.quantile(.05).reshape(-1),
+                          atol=1e-4)
+    assert (df['lower'] < df['mean']).all() and (df['mean'] < df['upper']).all()
+
+
+@torch.no_grad()
+def test_negligible_mixture_outputs_match_kf():
+    kf_mix = _make_kf(['y1', 'y2'], ['y1'])
+    kf_mix.regime_model.components[0].logit.fill_(-30.)
+    kf = _make_kf(['y1', 'y2'], [])
+    kf.load_state_dict({k: v for k, v in kf_mix.state_dict().items() if not k.startswith('regime_model.')})
+    y = _make_y(num_measures=2)
+    pred_mix, pred = kf_mix(y), kf(y)
+    assert torch.allclose(pred_mix.means, pred.means, atol=1e-5)
+    assert torch.allclose(pred_mix.covs, pred.covs, atol=1e-5)
+    df_mix, df = pred_mix.to_dataframe(), pred.to_dataframe()
+    for col in ('mean', 'lower', 'upper'):
+        assert np.allclose(df_mix[col].values, df[col].values, atol=1e-3)
+
+
+@torch.no_grad()
+def test_binomial_prediction_outputs():
+    torch.manual_seed(1)
+    num_groups, num_times = 4, 20
+    visit = (torch.rand(num_groups, num_times) > .4).float()
+    spend = torch.randn(num_groups, num_times).cumsum(1) * .2 + 3.
+    spend[visit == 0] = float('nan')
+    y = torch.stack([visit, spend], -1)
+    measures = ['visit', 'spend']
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+        measures=measures,
+        binary_measures=['visit'],
+        mixture_components=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+    )
+    bf.mc_sampling = 200
+    pred = bf(y)
+    means = pred.means
+    assert torch.allclose(means[..., 1], pred.get_mixture('spend').mean(), atol=1e-5)
+    assert ((means[..., 0] > 0) & (means[..., 0] < 1)).all()
+    df = pred.to_dataframe(use_map=True)
+    assert set(df['measure']) == {'visit', 'spend'}
+    assert np.isfinite(df[['mean', 'lower', 'upper']].values).all()
