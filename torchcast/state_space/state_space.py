@@ -267,7 +267,7 @@ class StateSpaceModel(torch.nn.Module):
                         tmask = (tu_h <= last_measured_per_group)
                         meanp, F = transition_model(meanp, time=tu_h, mask=tmask)
                         covp = self._predict_cov(
-                            cov=covu,
+                            cov=covp,
                             transition_mat=F,
                             **{k: v[tu_h] for k, v in predict_kwargs.items()},
                             scaling=scaling,

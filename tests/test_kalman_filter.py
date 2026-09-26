@@ -10,6 +10,7 @@ from torchcast.internals.batch_design import TransitionModel, MeasurementModel
 from torchcast.internals.utils import get_nan_groups
 
 from torchcast.kalman_filter import KalmanFilter
+from torchcast.exp_smooth import ExpSmoother
 
 import numpy as np
 from filterpy.kalman import KalmanFilter as filterpy_KalmanFilter
@@ -231,6 +232,48 @@ def test_equations_preds(n_step: int = 1):
             assert (resid ** 2).mean() > 1.
         else:
             assert (resid ** 2).mean() < .02
+
+
+@pytest.mark.parametrize(
+    "klass,n_step,every_step",
+    list(itertools.product([KalmanFilter, ExpSmoother], [2, 3, 5], [True, False]))
+)
+@torch.no_grad()
+def test_n_step_matches_nan_forecast(klass: type, n_step: int, every_step: bool):
+    """
+    An h-step-ahead prediction for time t is a forecast from the update at t - h. So it should exactly match the
+    1-step-ahead prediction for time t when the observations between t - h and t are missing.
+
+    With every_step=True, h=n_step (except for the first n_step timesteps, which forecast from the initial state). With
+    every_step=False, the horizon cycles through 1...n_step.
+    """
+    torch.manual_seed(123)
+    measures = ['y1', 'y2']
+    model = klass(
+        processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in measures],
+        measures=measures
+    )
+    if isinstance(model, ExpSmoother):
+        # default init gives K~0 (so covs~0), which would make this test trivially pass
+        model.smoothing_matrix.init_bias = 0
+    num_times = 12
+    y = torch.randn((3, num_times, len(measures))).cumsum(1)
+    pred_n = model(y, n_step=n_step, every_step=every_step)
+    assert (pred_n.state_covs.diagonal(dim1=-2, dim2=-1) > .01).any()
+
+    for t in range(num_times):
+        h = min(t + 1, n_step) if every_step else (t % n_step) + 1
+        y_nan = y.clone()
+        y_nan[:, (t - h + 1):t] = float('nan')
+        pred_1 = model(y_nan, n_step=1)
+        assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
+        assert torch.allclose(pred_n.state_covs[:, t], pred_1.state_covs[:, t], atol=1e-5)
+
+    # a prediction should never depend on observations after it:
+    y_later = y.clone()
+    y_later[:, -1] = float('nan')
+    pred_later = model(y_later, n_step=n_step, every_step=every_step)
+    assert torch.allclose(pred_n.state_covs[:, :-1], pred_later.state_covs[:, :-1], atol=1e-5)
 
 
 def test_keyword_dispatch():

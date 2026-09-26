@@ -1,6 +1,20 @@
 # CHANGELOG
 
-## v1.2.0 (2026-06-08)
+## v1.1.3 (2026-09-26)
+
+### Bug fix: covariance of `n_step > 1` predictions
+
+For `n_step > 1` (with either `every_step` setting), the state-covariance of each h-step-ahead prediction (for h > 1)
+was propagated from the wrong covariance: the final filtered update of the whole series, rather than the (h-1)-step
+prediction. This affected the prediction intervals and `log_prob()` of any model called with `n_step > 1` (and
+therefore models trained on multi-step losses); predicted means were unaffected. `n_step=1` predictions, including
+those for timesteps with missing values or beyond the end of the data, were not affected.
+
+- `KalmanFilter`: multi-step covariances were computed from an unrelated timestep's update, so they depended on the
+  missingness pattern at the end of the series rather than growing correctly with the forecast horizon.
+- `ExpSmoother`: multi-step covariances did not grow with the forecast horizon (they stayed at the 1-step covariance).
+
+## v1.1.2 (2026-06-08)
 
 ### New Features
 
