@@ -466,3 +466,21 @@ def test_adaptive_scaling_with_empty_measure_cov():
     assert torch.allclose(pred1.measure_covs, pred2.measure_covs.flip(-1).flip(-2), atol=1e-5)
     # scaling was actually applied to the gaussian measure:
     assert not torch.allclose(pred1.measure_covs[:, 1:, 1, 1], pred1.measure_covs[:, :1, 1, 1].expand(-1, 14))
+
+
+@torch.no_grad()
+def test_nonlinear_covs_warns_once():
+    import warnings
+    from torchcast.kalman_filter import BinomialFilter
+    from torchcast.state_space import predictions
+
+    torch.manual_seed(0)
+    bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['visit'])
+    bf.mc_sampling = 10
+    pred = bf((torch.rand(2, 5, 1) > .5).float())
+    predictions._warn_once.pop('cov', None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        assert pred.covs is None
+        assert pred.covs is None
+    assert len([w for w in caught if 'no closed-form covariance' in str(w.message)]) == 1
