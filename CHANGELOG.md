@@ -14,6 +14,15 @@ those for timesteps with missing values or beyond the end of the data, were not 
   missingness pattern at the end of the series rather than growing correctly with the forecast horizon.
 - `ExpSmoother`: multi-step covariances did not grow with the forecast horizon (they stayed at the 1-step covariance).
 
+### Bug fix: covariance when forecasting from `initial_state`
+
+A covariance passed via `forward(initial_state=...)` -- typically from `Predictions.get_state_at_times()` -- was
+incorrectly re-scaled by the measurement standard-deviations (which are already baked into it). So continuing a
+forecast from a saved state started with an inflated covariance (by roughly the measurement variance: e.g. ~100x if
+measurement std-devs are ~10), which in turn distorted the predicted means via the kalman gain. `simulate()` with
+`num_groups` was affected for the same reason. The error is negligible when measurement std-devs are close to 1 (e.g.
+standardized data). Now only the default initial covariance (when no covariance is passed) is scaled.
+
 ## v1.1.2 (2026-06-08)
 
 ### New Features
