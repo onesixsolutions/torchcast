@@ -342,4 +342,7 @@ def test_n_step_regime_priors(n_step: int, every_step: bool):
         y_nan[:, (t - h + 1):t] = float('nan')
         pred_1 = kf(y_nan, n_step=1)
         assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
+        assert torch.allclose(pred_n.state_covs[:, t], pred_1.state_covs[:, t], atol=1e-5)
         assert torch.allclose(pred_n.regime_priors[:, t], pred_1.regime_priors[:, t], atol=1e-6)
+    # so the log-prob matches too:
+    assert torch.allclose(pred_n.log_prob(y)[:, -1], kf(y_nan, n_step=1).log_prob(y)[:, -1], atol=1e-5)
