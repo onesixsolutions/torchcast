@@ -113,6 +113,14 @@ def test_custom_transition():
     assert isinstance(kf.regime_model.transition, MyTransition)
 
 
+class StaticTransition(RegimeTransition):
+    def initial(self, base_probs, num_groups):
+        return base_probs.expand(num_groups, -1)
+
+    def forward(self, posterior, base_probs):
+        return base_probs.expand(posterior.shape[0], -1)
+
+
 def test_parameters_registered_and_get_grads():
     kf = _make_kf(['y1', 'y2'], ['y1'])
     names = {n for n, _ in kf.named_parameters()}
@@ -126,6 +134,7 @@ def test_parameters_registered_and_get_grads():
     component = kf.regime_model.components[0]
     for param in (component.mean, component._log_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
+    assert (kf.regime_model.transition._stay_logit.grad.abs() > 0).all()
 
 
 @pytest.mark.parametrize("measures,mixture_measures", [
@@ -214,7 +223,6 @@ def test_log_prob_brute_force():
     lp = pred.log_prob(y)
 
     rm = kf.regime_model
-    base_probs = rm.base_probs()
     H = torch.eye(2)
     R = kf.measure_covariance({}, num_groups=1, num_times=1)[0, 0]
     for g, t in [(0, 0), (1, 4), (2, 9), (0, 5)]:
@@ -223,7 +231,7 @@ def test_log_prob_brute_force():
         m = pred.state_means[g, t] @ H.T
         S = H @ pred.state_covs[g, t] @ H.T + R
         total = 0.
-        for combo, prob in zip(rm.combos, base_probs):
+        for combo, prob in zip(rm.combos, pred.regime_priors[g, t]):
             normal = [i for i in observed if combo[i] is None]
             lik = 1.
             if normal:
@@ -269,3 +277,69 @@ def test_binomial_filter_with_mixture(univariate_mixture_prob: bool):
     # end-to-end training:
     bf.zero_grad()
     bf.fit(y, stopping={'max_iter': 3}, verbose=0)
+
+
+@torch.no_grad()
+def test_no_stickiness_is_static():
+    measures = ['y1', 'y2']
+    kf_static = _make_kf(measures, measures, regime_transition=StaticTransition(num_combos=4))
+    kf_sticky = _make_kf(measures, measures)
+    kf_sticky.load_state_dict(
+        {k: v for k, v in kf_static.state_dict().items() if 'transition' not in k}, strict=False
+    )
+    kf_sticky.regime_model.transition._stay_logit.fill_(-30.)
+    y = _make_y(num_measures=2)
+    y[0, 3:6, 0] = float('nan')
+    pred_static, pred_sticky = kf_static(y), kf_sticky(y)
+    base_probs = kf_static.regime_model.base_probs()
+    assert torch.allclose(pred_static.regime_priors, base_probs.expand_as(pred_static.regime_priors))
+    assert torch.allclose(pred_sticky.regime_priors, pred_static.regime_priors, atol=1e-6)
+    assert torch.allclose(pred_sticky.state_means, pred_static.state_means, atol=1e-5)
+    assert torch.allclose(pred_sticky.log_prob(y), pred_static.log_prob(y), atol=1e-5)
+
+
+@torch.no_grad()
+def test_regime_priors_through_time():
+    kf = _make_kf(['y'], ['y'])
+    transition = kf.regime_model.transition
+    transition._stay_logit.fill_(2.)  # stay ~ .88
+    base_probs = kf.regime_model.base_probs()
+
+    y = torch.zeros((2, 10, 1))
+    y[0, 4] = -4.  # an outlier (at the component's mean) for group 0 only
+    y[:, 7] = float('nan')
+    pred = kf(y)
+    priors = pred.regime_priors
+    assert torch.allclose(priors[:, 0], base_probs.expand(2, -1))
+    # after the outlier, group 0 is more likely to be in the 'low' regime -- both vs. the base-rate and vs. group 1:
+    assert priors[0, 5, 1] > .5 > base_probs[1]
+    assert priors[0, 5, 1] > priors[1, 5, 1]
+    # ...and this decays back towards the base-rate as normal observations come in:
+    assert priors[0, 6, 1] < priors[0, 5, 1]
+    # when the observation is missing, the prior just evolves via the transition:
+    assert torch.allclose(priors[:, 8], transition(priors[:, 7], base_probs), atol=1e-6)
+    # forecasting past the data:
+    pred_fcast = kf(y, out_timesteps=13)
+    assert torch.allclose(pred_fcast.regime_priors[:, 11], transition(pred_fcast.regime_priors[:, 10], base_probs))
+    # slicing keeps priors aligned:
+    assert torch.allclose(pred[:, 4:6].regime_priors, priors[:, 4:6])
+
+
+@pytest.mark.parametrize("n_step,every_step", [(2, True), (3, True), (3, False)])
+@torch.no_grad()
+def test_n_step_regime_priors(n_step: int, every_step: bool):
+    """
+    As in ``test_n_step_matches_nan_forecast``: an h-step prediction for t should match a 1-step prediction with the
+    observations between t - h and t missing.
+    """
+    kf = _make_kf(['y1', 'y2'], ['y1'])
+    kf.regime_model.transition._stay_logit.fill_(1.)
+    y = _make_y(num_measures=2)
+    pred_n = kf(y, n_step=n_step, every_step=every_step)
+    for t in range(y.shape[1]):
+        h = min(t + 1, n_step) if every_step else (t % n_step) + 1
+        y_nan = y.clone()
+        y_nan[:, (t - h + 1):t] = float('nan')
+        pred_1 = kf(y_nan, n_step=1)
+        assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
+        assert torch.allclose(pred_n.regime_priors[:, t], pred_1.regime_priors[:, t], atol=1e-6)

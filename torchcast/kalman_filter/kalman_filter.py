@@ -93,6 +93,7 @@ class KalmanFilter(StateSpaceModel):
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
                      val_idx: Optional[torch.Tensor] = None,
+                     regime_prior: Optional[torch.Tensor] = None,
                      **kwargs) -> 'StateTuple':
         input, measured_mean, measure_cov = self._prepare_update(
             input=input,
@@ -117,6 +118,7 @@ class KalmanFilter(StateSpaceModel):
             measure_mat=measure_mat,
             measure_cov=measure_cov,
             measures=self.measures if val_idx is None else [self.measures[i] for i in val_idx.tolist()],
+            regime_prior=regime_prior,
         )
 
     def _prepare_update(self,
@@ -181,7 +183,7 @@ class KalmanFilter(StateSpaceModel):
         if regime_prior is None:
             log_prior = self.regime_model.log_base_probs().expand(num_groups, -1)
         else:
-            log_prior = regime_prior.log()
+            log_prior = regime_prior.clamp_min(1e-30).log()
 
         effective, mapping = self.regime_model.effective_combos(measures)
 

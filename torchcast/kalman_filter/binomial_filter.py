@@ -130,6 +130,7 @@ class BinomialFilter(KalmanFilter):
                               measurement_model: 'MeasurementModel',
                               num_obs: Sequence[torch.Tensor],
                               observed_counts: bool,
+                              regime_priors: Optional[Sequence[torch.Tensor]] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
@@ -143,6 +144,7 @@ class BinomialFilter(KalmanFilter):
             num_obs=num_obs,
             observed_counts=observed_counts,
             regime_model=self.regime_model,
+            regime_priors=regime_priors,
         )
 
     def _mask_mats(self,
@@ -443,6 +445,7 @@ class BinomialPredictions(Predictions):
                   measure_cov: torch.Tensor,
                   measurement_model: 'MeasurementModel',
                   num_obs: Optional[torch.Tensor] = None,
+                  regime_log_prior: Optional[torch.Tensor] = None,
                   **kwargs) -> torch.Tensor:
         if kwargs:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
@@ -462,7 +465,7 @@ class BinomialPredictions(Predictions):
                 state_covs=state_covs,
                 measure_cov=measure_cov[mask2d],
                 measurement_model=measurement_model.subset(measures=gaussian_measures),
-                **kwargs
+                regime_log_prior=regime_log_prior,
             )
         else:
             gaussian_lp = 0

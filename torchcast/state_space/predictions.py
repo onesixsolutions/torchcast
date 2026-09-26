@@ -37,7 +37,8 @@ class Predictions:
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
                  updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
                  mc_white_noise: Optional['FixedWhiteNoise'] = None,
-                 regime_model: Optional['RegimeModel'] = None):
+                 regime_model: Optional['RegimeModel'] = None,
+                 regime_priors: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None):
         self.state_means = _maybe_stack(states[0], 1)
         self.state_covs = _maybe_stack(states[1], 1)
         self.measure_covs = _maybe_stack(measure_covs, 1)
@@ -63,6 +64,10 @@ class Predictions:
         self._mcovs_flat = None
 
         self.regime_model = regime_model
+        # (num_groups, num_timesteps, num_combos) prior regime-probabilities for each prediction:
+        self.regime_priors = None if regime_priors is None else _maybe_stack(regime_priors, 1)
+        if self.regime_model is not None and self.regime_priors is None:
+            raise ValueError("If `regime_model` is passed, must also pass `regime_priors`.")
 
     @property
     def num_groups(self) -> int:
@@ -539,7 +544,15 @@ class Predictions:
         return lp_flat.view(obs.shape[0:2])
 
     def _get_log_prob_kwargs(self, group_idx: torch.Tensor, measure_idx: Optional[torch.Tensor]) -> dict:
-        return {}
+        """
+        :param group_idx: Indices into the flattened (group*time) predictions.
+        :param measure_idx: The observed measures, or None if all are observed.
+        """
+        out = {}
+        if self.regime_priors is not None:
+            regime_priors_flat = self.regime_priors.reshape(-1, self.regime_priors.shape[-1])
+            out['regime_log_prior'] = regime_priors_flat[group_idx].clamp_min(1e-30).log()
+        return out
 
     def _log_prob(self,
                   obs: torch.Tensor,
@@ -547,6 +560,7 @@ class Predictions:
                   state_covs: torch.Tensor,
                   measure_cov: torch.Tensor,
                   measurement_model: 'MeasurementModel',
+                  regime_log_prior: Optional[torch.Tensor] = None,
                   **kwargs) -> torch.Tensor:
         if kwargs:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
@@ -580,7 +594,7 @@ class Predictions:
         if not has_mixture:
             return MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
         return self._mixture_log_prob(obs=obs, measured_mean=measured_mean, system_cov=system_cov,
-                                      measures=measurement_model.measures)
+                                      measures=measurement_model.measures, log_prior=regime_log_prior)
 
     def _mixture_log_prob(self,
                           obs: torch.Tensor,
@@ -875,6 +889,7 @@ class Predictions:
             # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
             'mc_white_noise': self.mc_white_noise,
             'regime_model': self.regime_model,
+            'regime_priors': None if self.regime_priors is None else self.regime_priors[item],
         }
         if self.update_means is not None:
             kwargs.update({
