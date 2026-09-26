@@ -10,12 +10,12 @@ import numpy as np
 import pandas as pd
 
 from scipy import stats
-from torch.distributions import MultivariateNormal, Normal
+from torch.distributions import MultivariateNormal
 
-from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat
-from .mixture import MixtureComponent
+from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
+    from .mixture import RegimeModel
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise
@@ -37,7 +37,7 @@ class Predictions:
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
                  updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
                  mc_white_noise: Optional['FixedWhiteNoise'] = None,
-                 mixture_components: Optional[Sequence[MixtureComponent]] = None):
+                 regime_model: Optional['RegimeModel'] = None):
         self.state_means = _maybe_stack(states[0], 1)
         self.state_covs = _maybe_stack(states[1], 1)
         self.measure_covs = _maybe_stack(measure_covs, 1)
@@ -62,7 +62,7 @@ class Predictions:
         self._state_covs_flat = None
         self._mcovs_flat = None
 
-        self.mixture_components = mixture_components
+        self.regime_model = regime_model
 
     @property
     def num_groups(self) -> int:
@@ -326,7 +326,7 @@ class Predictions:
         return by_measure
 
     def _get_pred_intervals(self, alpha: float) -> dict[str, torch.Tensor]:
-        if self.mixture_components:
+        if self.regime_model is not None:
             # todo: how do we reduce touchpoints for "mixture components impact the measured mean"?
             #   right now, need it here, in observe, maybe some other places...
             #   could be solved by having mixture components be part of MeasurementModel, but we don't
@@ -425,13 +425,13 @@ class Predictions:
                 state_covs=self.state_covs_flat,
             )
             measured_mean = torch.mean(mmean_samples, dim=0)
-            if self.mixture_components:
+            if self.regime_model is not None:
                 raise NotImplementedError("TODO")
             return measured_mean.view(*batch_shape, -1), None
         else:
             measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
             system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
-            if self.mixture_components:
+            if self.regime_model is not None:
                 raise NotImplementedError("TODO")
             return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
 
@@ -552,7 +552,13 @@ class Predictions:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
         assert measurement_model.num_timesteps == 1
 
+        has_mixture = self.regime_model is not None and any(
+            m in measurement_model.measures for m in self.regime_model.mixture_measures
+        )
+
         if measurement_model.is_nonlinear:
+            if has_mixture:
+                raise NotImplementedError("`log_prob` not yet supported with mixture components + nonlinear measures.")
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
@@ -567,62 +573,52 @@ class Predictions:
             ).log_prob(obs)
             # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
             # this is a numerically stable way to do that:
-            log_lik1 = torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
-        else:
-            measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
-            system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
-            log_lik1 = MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
+            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
 
-        if len(self.mixture_components):
-            prior_probs = []
-            log_liks = []
-            for rs, prob in MixtureComponent.traverse(self.mixture_components, measurement_model.measures):
-                # for each measure, we are either in the standard regime or one of the mixtures
-                # mask of which measures are standard:
-                norm_mask = torch.tensor([mi.is_null for mi in rs], dtype=torch.bool)
+        measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
+        system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
+        if not has_mixture:
+            return MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
+        return self._mixture_log_prob(obs=obs, measured_mean=measured_mean, system_cov=system_cov,
+                                      measures=measurement_model.measures)
 
-                # the probability associated with this specific combination of dimensions being 'weird':
-                prior_probs.append(prob)
+    def _mixture_log_prob(self,
+                          obs: torch.Tensor,
+                          measured_mean: torch.Tensor,
+                          system_cov: torch.Tensor,
+                          measures: Sequence[str],
+                          log_prior: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        The marginal log-likelihood under the mixture: ``logsumexp_c(log_prior_c + log_lik_c)``. All regime-combos share
+        the same predicted state, so each combo's likelihood just uses a sub-block of ``system_cov`` for the measures
+        in the standard regime, plus each non-standard measure's component likelihood.
 
-                # all standard:
-                if all(norm_mask):
-                    log_liks.append(log_lik1)
-                    continue
-                norm_idx = norm_mask.nonzero(as_tuple=True)[0]
+        :param log_prior: A ``(batch, num_combos)`` tensor of log prior regime-probabilities. Defaults to the
+         regime-model's base-probs.
+        """
+        num_rows = obs.shape[0]
+        if log_prior is None:
+            log_prior = self.regime_model.log_base_probs().expand(num_rows, -1)
 
-                # some measures are weird, but assumed to be uncorrelated with the rest, so just compute each weird
-                # lp, the remaining multivariate lp, and sum together (i.e. product of independent probs):
-                mix_ll = []
-                for i, m in enumerate(rs):
-                    if m.is_null:
-                        continue
-                    mix_ll.append(
-                        Normal(loc=m.mean, scale=m.var ** .5, validate_args=False).log_prob(obs[..., i])
-                    )
-                if len(norm_idx):
-                    raise NotImplementedError("TODO: prevent infinite recursion")
-                    norm_ll = self._log_prob(
-                        obs=obs[..., norm_idx],
-                        state_means=state_means,
-                        state_covs=state_covs,
-                        measure_cov=measure_cov[..., norm_idx.unsqueeze(-1), norm_idx.unsqueeze(0)],
-                        measurement_model=measurement_model.subset(
-                            measures=[measurement_model.measures[i] for i in norm_idx]
-                        ),
-                    )
-                    mix_ll.append(norm_ll)
-                log_liks.append(torch.stack(mix_ll, dim=0).sum(dim=0))
-
-            if len(log_liks) == 1:
-                # speedup: all mixture measures are dropped in this _log_prob call (nan obs)
-                # so no need to do the extra stacking etc below:
-                return log_lik1
-
-            log_liks_stacked = torch.stack(log_liks, dim=0)  # (num_combos, batch)
-            log_priors_stacked = torch.stack([torch.log(p.clamp_min(1e-12)) for p in prior_probs], dim=0)
-            return torch.logsumexp(log_liks_stacked + log_priors_stacked, dim=0)
-        else:
-            return log_lik1
+        effective, mapping = self.regime_model.effective_combos(measures)
+        resid = obs - measured_mean
+        out = []
+        for e, eff in enumerate(effective):
+            weird_idx = [i for i, _ in eff]
+            normal_idx = [i for i in range(len(measures)) if i not in weird_idx]
+            log_lik = torch.zeros(num_rows, dtype=obs.dtype, device=obs.device)
+            if normal_idx:
+                idx = torch.as_tensor(normal_idx, dtype=torch.long, device=obs.device)
+                log_lik = log_lik + mvnorm_log_prob(resid[:, idx], system_cov[:, idx.unsqueeze(-1), idx.unsqueeze(0)])
+            for i, component in eff:
+                log_lik = log_lik + mvnorm_log_prob(
+                    (obs[:, i] - component.mean).unsqueeze(-1),
+                    component.var.expand(num_rows, 1, 1)
+                )
+            # combos that are indistinguishable given `measures` pool their prior probability:
+            log_prior_e = torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
+            out.append(log_prior_e + log_lik)
+        return torch.logsumexp(torch.stack(out, -1), -1)
 
     def _get_measured_mean_samples(self,
                                    measurement_model: 'MeasurementModel',
@@ -877,7 +873,8 @@ class Predictions:
             'states': (self.state_means[item], self.state_covs[item]),
             'measure_covs': self.measure_covs[item],
             # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
-            'mc_white_noise': self.mc_white_noise
+            'mc_white_noise': self.mc_white_noise,
+            'regime_model': self.regime_model,
         }
         if self.update_means is not None:
             kwargs.update({

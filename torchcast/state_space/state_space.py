@@ -1,6 +1,4 @@
-import itertools
-from functools import cached_property
-from typing import List, Optional, Sequence, Union, TYPE_CHECKING, Callable, Iterator, Literal
+from typing import List, Optional, Sequence, Union, TYPE_CHECKING, Callable, Iterator
 from warnings import warn
 
 import numpy as np
@@ -15,12 +13,34 @@ from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
 
-from .mixture import MixtureComponent
+from .mixture import MixtureComponent, RegimeModel, RegimeTransition
 from .predictions import Predictions
 from .adaptive_scaling import EWMAdaptiveScaler, AdaptiveScaler
 
 if TYPE_CHECKING:
     from torchcast.utils.stopping import Stopping
+
+
+class StateTuple:
+    """
+    The output of ``_update_step()``. Iterates as ``(mean, cov)``; optionally carries the residual and system-covariance
+    of the update, and the posterior regime-probabilities (if the model has mixture components).
+    """
+
+    def __init__(self,
+                 mean: torch.Tensor,
+                 cov: torch.Tensor,
+                 resid: Optional[torch.Tensor] = None,
+                 system_cov: Optional[torch.Tensor] = None,
+                 regime_post: Optional[torch.Tensor] = None):
+        self.mean = mean
+        self.cov = cov
+        self.resid = resid
+        self.system_cov = system_cov
+        self.regime_post = regime_post
+
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        return iter([self.mean, self.cov])
 
 
 class StateSpaceModel(torch.nn.Module):
@@ -33,6 +53,10 @@ class StateSpaceModel(torch.nn.Module):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
+    :param mixture_components: Experimental. A list of :class:`.MixtureComponent`s: alternative regimes for one or more
+     measures, which explain an observation without updating the state.
+    :param regime_transition: Experimental. A :class:`.RegimeTransition` controlling how regime-probabilities evolve
+     over time; defaults to :class:`.StickyTransition`. Only used if ``mixture_components`` are passed.
     """
 
     def __init__(self,
@@ -41,7 +65,8 @@ class StateSpaceModel(torch.nn.Module):
                  measure_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: Union[bool, AdaptiveScaler] = False,
-                 mixture_components: Optional[Sequence[MixtureComponent]] = None):
+                 mixture_components: Optional[Sequence[MixtureComponent]] = None,
+                 regime_transition: Optional[RegimeTransition] = None):
         super().__init__()
 
         # measures:
@@ -91,7 +116,12 @@ class StateSpaceModel(torch.nn.Module):
                 else:
                     self.dt_unit = process.dt_unit
 
-        self.mixture_components = mixture_components or []
+        self.regime_model: Optional[RegimeModel] = None
+        if mixture_components:
+            self.regime_model = RegimeModel(mixture_components, measures=measures, transition=regime_transition)
+            self.regime_model.validate_measures(self.measure_funs, list(self.processes.values()))
+        elif regime_transition is not None:
+            raise ValueError("`regime_transition` was passed, but there are no `mixture_components`.")
 
     def forward(self,
                 y: Optional[torch.Tensor] = None,
@@ -513,7 +543,7 @@ class StateSpaceModel(torch.nn.Module):
             measure_covs=measure_covs,
             updates=updates,
             mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
-            mixture_components=self.mixture_components
+            regime_model=self.regime_model
         )
 
     def _parse_kwargs(self,
@@ -887,64 +917,6 @@ class LossFun:
         if self.reduce == 'sum':
             return torch.sum(neg_log_prob)
         raise ValueError(f"Unrecognized `reduce` {self.reduce}")
-
-
-import math
-from functools import cached_property
-from typing import Iterator, Optional, Sequence, Union
-
-import torch
-
-
-class StateTuple:
-    def __init__(self,
-                 mean: torch.Tensor,
-                 cov: torch.Tensor,
-                 resid: Optional[torch.Tensor] = None,
-                 system_cov: Optional[torch.Tensor] = None):
-        self.mean = mean
-        self.cov = cov
-        self.resid = resid
-        self.system_cov = system_cov
-
-    def __iter__(self) -> Iterator[torch.Tensor]:
-        return iter([self.mean, self.cov])
-
-    def subset_measure(self, idx: Union[int, Sequence[int]]) -> 'StateTuple':
-        """
-        Returns a new StateTuple with `resid`/`system_cov` subset to the given measurement-dim
-        index (or indices). `mean`/`cov` (state-space) pass through unchanged.
-        """
-        if self.resid is None or self.system_cov is None:
-            raise RuntimeError("subset_measure requires `resid` and `system_cov` to be set.")
-
-        idx_t = torch.as_tensor([idx] if isinstance(idx, int) else idx,
-                                 device=self.resid.device, dtype=torch.long)
-
-        resid_sub = self.resid.index_select(1, idx_t)
-        system_cov_sub = self.system_cov.index_select(1, idx_t).index_select(2, idx_t)
-
-        return StateTuple(mean=self.mean, cov=self.cov, resid=resid_sub, system_cov=system_cov_sub)
-
-    @cached_property
-    def log_prob(self) -> torch.Tensor:
-        if self.resid is None or self.system_cov is None:
-            raise RuntimeError("`log_prob` requires `resid` and `system_cov` to be set.")
-
-        resid = self.resid.squeeze(-1) if self.resid.dim() == 3 else self.resid
-        d = resid.shape[-1]
-
-        if d == 1:
-            var = self.system_cov[..., 0, 0]
-            r = resid[..., 0]
-            return -0.5 * (torch.log(2 * math.pi * var) + r ** 2 / var)
-
-        system_cov_sym = 0.5 * (self.system_cov + self.system_cov.transpose(-2, -1))
-        L = torch.linalg.cholesky(system_cov_sym)
-        sol = torch.cholesky_solve(resid.unsqueeze(-1), L)
-        quad = (resid.unsqueeze(-2) @ sol).squeeze(-1).squeeze(-1)
-        logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
-        return -0.5 * (d * math.log(2 * math.pi) + logdet + quad)
 
 
 class _OptimizerClosure:

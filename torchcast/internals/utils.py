@@ -1,4 +1,5 @@
 import functools
+import math
 from typing import Union, Any, Tuple, Sequence, List, Optional, Iterable, Type
 
 import torch
@@ -9,6 +10,24 @@ import numpy as np
 @functools.lru_cache()
 def subset_mask(subset: Sequence[str], superset: Sequence[str]) -> torch.Tensor:
     return torch.tensor([int(x in subset) for x in superset])
+
+
+def mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
+    """
+    Log-density of a zero-mean multivariate normal, with a fast path for the univariate case.
+
+    :param resid: A ``(batch, d)`` tensor (observations minus means).
+    :param cov: A ``(batch, d, d)`` tensor.
+    :return: A ``(batch,)`` tensor.
+    """
+    d = resid.shape[-1]
+    if d == 1:
+        var = cov[..., 0, 0]
+        return -0.5 * (torch.log(2 * math.pi * var) + resid[..., 0] ** 2 / var)
+    L = torch.linalg.cholesky(0.5 * (cov + cov.transpose(-2, -1)))
+    z = torch.linalg.solve_triangular(L, resid.unsqueeze(-1), upper=False).squeeze(-1)
+    logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+    return -0.5 * (d * math.log(2 * math.pi) + logdet + (z ** 2).sum(-1))
 
 
 def get_subclasses(cls: Type) -> Iterable[Type]:
