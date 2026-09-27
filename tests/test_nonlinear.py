@@ -1,6 +1,7 @@
 """
 Tests for the nonlinear (EKF / monte-carlo) code paths: measure-functions (sigmoid), nonlinear processes
-(SaturatedLinearModel), and the BinomialFilter. Where possible, results are compared to an independent ground-truth
+(SaturatedLinearModel), and the BinomialFilter. (The EKF jacobian -- vs. autograd -- is tested in
+test_kalman_filter.py.) Where possible, results are compared to an independent ground-truth
 (autograd jacobians; gauss-hermite quadrature of exact marginal likelihoods). Monte-carlo noise is pinned with seeded
 `FixedWhiteNoise`, so these tests are deterministic.
 """
@@ -63,49 +64,6 @@ def test_saturated_measured_mean_formula():
     assert torch.allclose(far_above, yhat - 50, atol=1e-2)
     # and never exceed min(yhat, ceiling) by much / never exceed yhat:
     assert (measured <= yhat + 1e-6).all()
-
-
-_SIGMOID_JACOBIAN_BUG = pytest.mark.xfail(
-    strict=True,
-    reason="Known bug: `MeasurementModel.__call__` passes the *post*-sigmoid measured mean to "
-           "`Sigmoid.adjust_measure_mat`, so the jacobian is sigmoid'(sigmoid(z)) rather than sigmoid'(z). Fixing it "
-           "changes predictions of all BinomialFilter / sigmoid models, so it's pending a decision on rollout."
-)
-
-
-@pytest.mark.parametrize("config", [
-    pytest.param('sigmoid', marks=_SIGMOID_JACOBIAN_BUG),
-    'saturated',
-    pytest.param('saturated+sigmoid', marks=_SIGMOID_JACOBIAN_BUG),
-])
-def test_ekf_jacobian_matches_autograd(config: str):
-    """
-    The EKF linearization: the measurement-matrix returned by the MeasurementModel should be the jacobian of the
-    measured-mean wrt the state.
-    """
-    torch.manual_seed(0)
-    processes = [LocalLevel(id='level')]
-    kwargs = {}
-    if 'saturated' in config:
-        processes.append(SaturatedLinearModel(id='slm', predictors=['a', 'b']))
-        kwargs['X'] = torch.randn(4, 3, 2)
-    measure_funs = {'y': 'sigmoid'} if 'sigmoid' in config else None
-    kf = KalmanFilter(processes=processes, measures=['y'], measure_funs=measure_funs)
-    kf.mc_sampling = _white_noise(10)
-    with torch.no_grad():
-        pred = kf(torch.rand(4, 3, 1), **kwargs)
-    mm = pred.measurement_model
-    means = pred.state_means[:, 1].clone()  # (groups, state), at time=1
-
-    _, measure_mat = mm(means, time=1)
-    for g in range(means.shape[0]):
-        def fun(state):
-            full = means.clone()
-            full[g] = state
-            return mm(full, time=1)[0][g]
-
-        jac = torch.autograd.functional.jacobian(fun, means[g].clone())
-        assert torch.allclose(measure_mat[g], jac, atol=1e-5), (g, measure_mat[g], jac)
 
 
 @torch.no_grad()
