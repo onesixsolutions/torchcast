@@ -196,3 +196,42 @@ def test_derived_binomial_spend():
     assert np.isfinite(df_ws[['mean', 'lower', 'upper']].values).all()
     # with a meaningful chance of no visit, the lower bound is zero:
     assert (df_ws['lower'] == 0).any()
+
+
+_MEMORY_SCRIPT = """
+import resource, sys, torch
+from torchcast.kalman_filter import KalmanFilter
+from torchcast.process import LocalTrend, Season
+
+def peak_mb():
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / 2 ** 20 if sys.platform == 'darwin' else rss / 2 ** 10  # bytes on macOS, KB on linux
+
+torch.manual_seed(0)
+measure_funs = {'y': 'sigmoid'} if sys.argv[1] == 'nonlinear' else None
+kf = KalmanFilter(
+    processes=[LocalTrend(id='trend'), Season(id='season', period=7, dt_unit=None, K=8, fixed=True)],
+    measures=['y'],
+    measure_funs=measure_funs,
+)
+kf.mc_sampling = 10
+with torch.no_grad():
+    pred = kf(torch.rand(20, 100, 1) * .5 + .25, start_offsets=[0] * 20)  # 2000 rows, state-rank 18
+    before = peak_mb()
+    pred.sample(500)
+print(peak_mb() - before)
+"""
+
+
+@pytest.mark.parametrize("model", ['linear', 'nonlinear'])
+def test_sample_memory(model: str):
+    """
+    Regression test: sampling shouldn't materialize (num_samples, num_rows, state_rank, state_rank) tensors (which a
+    broadcasting matmul does). Here that would be 500 * 2000 * 18 * 18 floats ~= 1.3GB.
+    """
+    import subprocess
+    import sys
+
+    res = subprocess.run([sys.executable, '-c', _MEMORY_SCRIPT, model], capture_output=True, text=True, check=True)
+    peak_increase_mb = float(res.stdout.strip().splitlines()[-1])
+    assert peak_increase_mb < 300, f"sample() increased peak memory by {peak_increase_mb:.0f}MB"

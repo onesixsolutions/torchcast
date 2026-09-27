@@ -265,16 +265,28 @@ class Predictions:
         num_rows = self.state_means_flat.shape[0]
         to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
 
-        # sample the state:
-        z = torch.randn((num_samples, num_rows, self.state_means.shape[-1]), generator=generator, **to)
-        states = self.state_means_flat + (_cov_sqrt(self.state_covs_flat) @ z.unsqueeze(-1)).squeeze(-1)
-
-        # convert to the measured-mean:
+        # sample the state, and convert to the measured-mean.
+        # note: avoid broadcasting matmuls like ``(rows, d, d) @ (samples, rows, d, 1)``, which materialize a
+        # (samples, rows, d, d) copy -- huge for long series. use einsum instead, and sample in chunks where needed.
         if self.measurement_model_flat.is_nonlinear:
-            means = torch.stack([self.measurement_model_flat(s, time=0)[0] for s in states.unbind(0)])
+            # need samples of the full state, to pass through the nonlinear measurement-function:
+            state_rank = self.state_means.shape[-1]
+            state_cov_sqrt = _cov_sqrt(self.state_covs_flat)
+            chunk_size = max(1, _SAMPLE_CHUNK_NUMEL // (num_rows * state_rank))
+            means = []
+            for start in range(0, num_samples, chunk_size):
+                n = min(chunk_size, num_samples - start)
+                z = torch.randn((n, num_rows, state_rank), generator=generator, **to)
+                states = self.state_means_flat + torch.einsum('rij,nrj->nri', state_cov_sqrt, z)
+                means.extend(self.measurement_model_flat(s, time=0)[0] for s in states.unbind(0))
+            means = torch.stack(means)
         else:
-            _, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
-            means = (measure_mat @ states.unsqueeze(-1)).squeeze(-1)
+            # linear: the measured-mean given a sampled state is gaussian with mean H @ mu and cov H @ P @ H.T, so
+            # sample that directly (much smaller than the state):
+            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+            measured_cov = measure_mat @ self.state_covs_flat @ measure_mat.transpose(-1, -2)
+            z = torch.randn((num_samples, num_rows, len(measures)), generator=generator, **to)
+            means = measured_mean + torch.einsum('rij,nrj->nri', _cov_sqrt(measured_cov), z)
         covs = self._conditional_measure_covs(means)
 
         # sample the regime:
@@ -338,7 +350,10 @@ class Predictions:
                              covs: torch.Tensor,
                              generator: Optional[torch.Generator]) -> torch.Tensor:
         z = torch.randn(means.shape, generator=generator, dtype=means.dtype, device=means.device)
-        return means + (_cov_sqrt(covs) @ z.unsqueeze(-1)).squeeze(-1)
+        if covs.stride(0) == 0:
+            # the same covariance for every sample (an expanded view): only decompose it once
+            return means + torch.einsum('rij,nrj->nri', _cov_sqrt(covs[0]), z)
+        return means + torch.einsum('nrij,nrj->nri', _cov_sqrt(covs), z)
 
     @torch.inference_mode()
     def samples_to_dataframe(self,
@@ -1050,9 +1065,10 @@ class Predictions:
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         em_idx = [i for i in range(em_dim) if i not in missing_midx]
         wn = self.mc_white_noise(num_dim=em_dim, dtype=_chol.dtype, device=_chol.device)[:, em_idx]
-        _offsets = chol.unsqueeze(0) @ wn.view(-1, 1, len(em_idx), 1)
+        # (einsum rather than a broadcasting matmul, which would materialize a (samples, rows, dim, dim) copy of chol)
+        _offsets = torch.einsum('rij,nj->nri', chol, wn)
 
-        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets.squeeze(-1)
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets
 
         # each of these samples represents a draw from a concatenated set of means: (1) the measured-mean of the
         # linear processes with (2) the nonlinear processes' state-means.
@@ -1359,6 +1375,10 @@ class DatasetMetadata:
             group_colname=self.group_colname,
             time_colname=self.time_colname
         )
+
+
+# max number of elements in each chunk of state-samples in ``Predictions.sample()`` (for nonlinear models):
+_SAMPLE_CHUNK_NUMEL = 2 ** 22
 
 
 def _cov_sqrt(cov: torch.Tensor) -> torch.Tensor:
