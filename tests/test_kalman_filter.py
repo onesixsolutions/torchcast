@@ -484,3 +484,36 @@ def test_nonlinear_covs_warns_once():
         assert pred.covs is None
         assert pred.covs is None
     assert len([w for w in caught if 'no closed-form covariance' in str(w.message)]) == 1
+
+
+@pytest.mark.parametrize("config", ['sigmoid', 'saturated', 'saturated+sigmoid'])
+def test_ekf_jacobian_matches_autograd(config: str):
+    """
+    The EKF linearization: the measurement-matrix returned by the MeasurementModel should be the jacobian of the
+    measured-mean wrt the state (in particular, a measure-function's derivative is evaluated at its input).
+    """
+    from torchcast.process import SaturatedLinearModel
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+    torch.manual_seed(0)
+    processes = [LocalLevel(id='level')]
+    kwargs = {}
+    if 'saturated' in config:
+        processes.append(SaturatedLinearModel(id='slm', predictors=['a', 'b']))
+        kwargs['X'] = torch.randn(4, 3, 2)
+    kf = KalmanFilter(processes=processes, measures=['y'],
+                      measure_funs={'y': 'sigmoid'} if 'sigmoid' in config else None)
+    kf.mc_sampling = FixedWhiteNoise(10, random_state=np.random.RandomState(0))
+    with torch.no_grad():
+        pred = kf(torch.rand(4, 3, 1), **kwargs)
+    mm = pred.measurement_model
+    means = pred.state_means[:, 1].clone()
+    _, measure_mat = mm(means, time=1)
+    for g in range(means.shape[0]):
+        def fun(state):
+            full = means.clone()
+            full[g] = state
+            return mm(full, time=1)[0][g]
+
+        jac = torch.autograd.functional.jacobian(fun, means[g].clone())
+        assert torch.allclose(measure_mat[g], jac, atol=1e-5), (g, measure_mat[g], jac)
