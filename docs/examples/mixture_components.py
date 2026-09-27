@@ -141,6 +141,7 @@ with torch.no_grad():
 
     mix = pred_mixture.get_mixture('log_spend')
     fcast_mixture = (mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)
+    # (``pred_mixture.to_dataframe(transform=LogTransform())`` does this for you -- see below.)
     # for comparison, back-transforming the collapsed moments:
     fcast_collapsed = torch.exp(mix.mean() + mix.var() / 2)
 
@@ -162,8 +163,9 @@ pd.Series({
 # holdout (a forecast that knew each customer's true level at the start of the holdout, and the true regime
 # parameters, would still have about 13% error).
 #
-# On the log scale, `Predictions.to_dataframe()` (and so `plot()`) uses the exact quantiles of the mixture for the
-# prediction intervals -- note the long lower tail from the 'quick' regime. Similarly, the plotted mean is the mean of
+# `to_dataframe(transform=LogTransform())` does this back-transformation for you, for both the mean and the
+# intervals. On the log scale, `Predictions.to_dataframe()` (and so `plot()`) uses the exact quantiles of the mixture
+# for the prediction intervals -- note the long lower tail from the 'quick' regime. Similarly, the plotted mean is the mean of
 # the mixture, which sits below this customer's typical spend, since it averages in the chance of a quick visit. (The
 # small dips right after each quick visit reflect the learned stickiness: a quick visit makes another one slightly
 # more likely.)

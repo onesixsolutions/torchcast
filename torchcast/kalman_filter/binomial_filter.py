@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from torchcast.process import Process
     from torchcast.state_space.mixture import MixtureComponent, MixtureModel
     from torchcast.state_space import StateTuple
+    from torchcast.state_space.transforms import Transform
     from torchcast.utils import TimeSeriesDataset
 
 
@@ -395,7 +396,8 @@ class BinomialPredictions(Predictions):
                       group_colname: str,
                       time_colname: str,
                       conf: float,
-                      use_map: bool) -> pd.DataFrame:
+                      use_map: bool,
+                      transform: Optional[Union['Transform', dict]] = None) -> pd.DataFrame:
 
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
@@ -405,7 +407,8 @@ class BinomialPredictions(Predictions):
             group_colname=group_colname,
             time_colname=time_colname,
             conf=conf,
-            use_map=use_map
+            use_map=use_map,
+            transform=transform,
         )
 
     def _to_components_dataframe(self,

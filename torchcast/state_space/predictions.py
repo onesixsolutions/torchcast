@@ -1,3 +1,4 @@
+import math
 from math import log
 
 from dataclasses import dataclass, fields
@@ -16,6 +17,7 @@ from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, r
 
 if TYPE_CHECKING:
     from .mixture import MixtureModel, MixtureOfNormals
+    from .transforms import Transform
     from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
@@ -129,7 +131,8 @@ class Predictions:
                      group_colname: Optional[str] = None,
                      time_colname: Optional[str] = None,
                      conf: Optional[float] = .95,
-                     use_map: Optional[bool] = None) -> pd.DataFrame:
+                     use_map: Optional[bool] = None,
+                     transform: Union['Transform', dict[str, 'Transform'], None] = None) -> pd.DataFrame:
         """
         :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
         :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
@@ -140,26 +143,12 @@ class Predictions:
          state distribution (``use_map=False``) or whether the MAP is used to apply any non-linearities to the
          state-mean directly (``use_map=True``). The latter can sometimes exhibit better predictive performance on
          traditional supervised learning metrics.
+        :param transform: For measures that were transformed before modeling (e.g. log), a :class:`.Transform` to
+         map the predictions (and actuals) back to the original scale: either a single ``Transform`` for all measures,
+         or a dictionary of ``{measure: Transform}``. The mean is back-transformed exactly (not just the mean on the
+         modeled scale, back-transformed), as are the intervals. Only for ``type='predictions'``.
         """
-        if dataset is None:
-            dataset = self.dataset_metadata.copy()
-            if dataset.group_names is None:
-                warn(
-                    "This ``Predictions`` object doesn't have access to the group-names, consider calling "
-                    "``predictions.set_metadata()``."
-                )
-                dataset.group_names = [f"group_{i}" for i in range(self.num_groups)]
-            if dataset.start_offsets.dtype.name.startswith('date') and not dataset.dt_unit:
-                raise ValueError(
-                    "Unable to infer `dt_unit`, please call ``predictions.set_metadata(dt_unit=X)``, or pass `dataset` "
-                    "to ``predictions.to_dataframe()``"
-                )
-            if dataset.dt_unit and not dataset.start_offsets.dtype.name.startswith('date'):
-                raise ValueError(
-                    "Expected `start_offsets` to be a datetime64 array, but got a different dtype. If you don't have "
-                    "dates, then set `dt_unit=None`."
-                )
-
+        dataset = self._resolve_dataset(dataset)
         group_colname = group_colname or self.dataset_metadata.group_colname
         time_colname = time_colname or self.dataset_metadata.time_colname
 
@@ -167,9 +156,13 @@ class Predictions:
             assert conf >= .50
 
         type = type.casefold()
+        if transform is not None and not type.startswith('pred'):
+            raise ValueError("`transform` is only supported for ``type='predictions'``.")
         if type.startswith('pred'):
             return_std = False
             if conf is None:
+                if transform is not None:
+                    raise ValueError("`conf=None` (i.e. returning `std`) is not supported with `transform`.")
                 conf = stats.norm.ppf(2 * stats.norm.cdf(-.5))
                 return_std = True
 
@@ -178,7 +171,8 @@ class Predictions:
                 group_colname=group_colname,
                 time_colname=time_colname,
                 conf=conf,
-                use_map=use_map
+                use_map=use_map,
+                transform=transform,
             )
             if return_std:
                 df['std'] = df.pop('upper') - df.pop('lower')
@@ -197,6 +191,68 @@ class Predictions:
             )
         else:
             raise ValueError(f"Expected type to be 'predictions', 'states', or 'observed_states', got '{type}'.")
+
+    @torch.inference_mode()
+    def samples_to_dataframe(self,
+                             samples: dict[str, torch.Tensor],
+                             dataset: Optional['TimeSeriesDataset'] = None,
+                             conf: float = .95,
+                             actuals: Optional[dict[str, torch.Tensor]] = None,
+                             group_colname: Optional[str] = None,
+                             time_colname: Optional[str] = None) -> pd.DataFrame:
+        """
+        Summarize samples (e.g. of some quantity computed from ``sample()``) into a dataframe with the same format as
+        ``to_dataframe()``: the mean and the ``conf`` interval across samples, for each group and timestep.
+
+        :param samples: A dictionary with ``(num_samples, num_groups, num_timesteps)`` tensors. The keys become the
+         'measure' column of the output.
+        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
+        :param conf: The confidence level for the intervals.
+        :param actuals: Optionally, a dictionary with ``(num_groups, num_timesteps)`` tensors of actual values for some
+         keys of ``samples``.
+        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
+        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
+        """
+        assert .5 <= conf < 1
+        alpha = (1 - conf) / 2
+        by_name = {}
+        for name, x in samples.items():
+            if x.shape[1:] != (self.num_groups, self.num_timesteps):
+                raise ValueError(
+                    f"Expected `samples['{name}']` to have shape (num_samples, {self.num_groups}, {self.num_timesteps})"
+                    f", got {tuple(x.shape)}"
+                )
+            by_name[name] = (x.mean(0), _quantile(x, alpha), _quantile(x, 1 - alpha))
+        return self._summaries_to_dataframe(
+            by_name,
+            actuals=actuals or {},
+            dataset=self._resolve_dataset(dataset),
+            group_colname=group_colname or self.dataset_metadata.group_colname,
+            time_colname=time_colname or self.dataset_metadata.time_colname,
+        )
+
+    def _resolve_dataset(self,
+                         dataset: Optional['TimeSeriesDataset']) -> Union['TimeSeriesDataset', 'DatasetMetadata']:
+        if dataset is not None:
+            return dataset
+        dataset = self.dataset_metadata.copy()
+        if dataset.group_names is None:
+            warn(
+                "This ``Predictions`` object doesn't have access to the group-names, consider calling "
+                "``predictions.set_metadata()``."
+            )
+            dataset.group_names = [f"group_{i}" for i in range(self.num_groups)]
+        if dataset.start_offsets.dtype.name.startswith('date') and not dataset.dt_unit:
+            raise ValueError(
+                "Unable to infer `dt_unit`, please call ``predictions.set_metadata(dt_unit=X)``, or pass `dataset` "
+                "to ``predictions.to_dataframe()``"
+            )
+        if dataset.dt_unit and not dataset.start_offsets.dtype.name.startswith('date'):
+            raise ValueError(
+                "Expected `start_offsets` to be a datetime64 array, but got a different dtype. If you don't have "
+                "dates, then set `dt_unit=None`."
+            )
+        return dataset
 
     @torch.inference_mode()
     def _to_components_dataframe(self,
@@ -292,7 +348,11 @@ class Predictions:
         out = pd.concat(out)
         return out
 
-    def _get_mc_pred_intervals(self, alpha: float, use_map: bool) -> dict[str, torch.Tensor]:
+    def _get_mc_pred_intervals(self,
+                               alpha: float,
+                               use_map: bool,
+                               transforms: Optional[dict[str, 'Transform']] = None) -> dict[str, torch.Tensor]:
+        transforms = transforms or {}
         batch_shape = self.state_means.shape[0:2]
         mmean_samples = self._get_measured_mean_samples(
             measurement_model=self.measurement_model_flat,
@@ -326,7 +386,12 @@ class Predictions:
         by_measure = {}
         for i, measure in enumerate(self.measurement_model.measures):
             samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
-            mean = torch.mean(samples, dim=0) if measured_mean is None else measured_mean[..., i]
+            if measure in transforms:
+                # the mean of the back-transformed samples (MAP isn't meaningful for the back-transformed mean):
+                samples = transforms[measure].inverse(samples)
+                mean = torch.mean(samples, dim=0)
+            else:
+                mean = torch.mean(samples, dim=0) if measured_mean is None else measured_mean[..., i]
             lower = torch.quantile(samples, q=alpha, dim=0)
             upper = torch.quantile(samples, q=1 - alpha, dim=0)
             by_measure[measure] = (
@@ -335,10 +400,13 @@ class Predictions:
                 upper.view(*batch_shape)
             )
         # mixture measures are linear-gaussian (within each regime), so use their closed-form mixture:
-        by_measure.update(self._get_mixture_intervals(alpha))
+        by_measure.update(self._get_mixture_intervals(alpha, transforms))
         return by_measure
 
-    def _get_pred_intervals(self, alpha: float) -> dict[str, torch.Tensor]:
+    def _get_pred_intervals(self,
+                            alpha: float,
+                            transforms: Optional[dict[str, 'Transform']] = None) -> dict[str, torch.Tensor]:
+        transforms = transforms or {}
         measured_mean, system_cov = self._measured_moments_flat()
 
         batch_shape = self.state_means.shape[0:2]
@@ -350,22 +418,60 @@ class Predictions:
             var = system_cov[..., i, i]
             lower = mean - multi * torch.sqrt(var)
             upper = mean + multi * torch.sqrt(var)
+            if measure in transforms:
+                t = transforms[measure]
+                mean, lower, upper = t.inverse_mean(mean, var), t.inverse(lower), t.inverse(upper)
             by_measure[measure] = (
                 mean.view(*batch_shape),
                 lower.view(*batch_shape),
                 upper.view(*batch_shape)
             )
-        by_measure.update(self._get_mixture_intervals(alpha))
+        by_measure.update(self._get_mixture_intervals(alpha, transforms))
         return by_measure
 
-    def _get_mixture_intervals(self, alpha: float) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _get_mixture_intervals(self,
+                               alpha: float,
+                               transforms: Optional[dict[str, 'Transform']] = None
+                               ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         if self.mixture is None:
             return {}
+        transforms = transforms or {}
         out = {}
         for measure in self.mixture.mixture_measures:
             mixture = self.get_mixture(measure)
-            out[measure] = (mixture.mean(), mixture.quantile(alpha), mixture.quantile(1 - alpha))
+            lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
+            if measure in transforms:
+                t = transforms[measure]
+                # back-transform each regime, then mix:
+                mean = (mixture.probs * t.inverse_mean(mixture.means, mixture.vars)).sum(-1)
+                out[measure] = (mean, t.inverse(lower), t.inverse(upper))
+            else:
+                out[measure] = (mixture.mean(), lower, upper)
         return out
+
+    def _standardize_transforms(self,
+                                transform: Union['Transform', dict[str, 'Transform'], None]) -> dict[str, 'Transform']:
+        from .transforms import Transform
+
+        measures = list(self.measurement_model.measures)
+        if transform is None:
+            return {}
+        if isinstance(transform, Transform):
+            transforms = {m: transform for m in measures}
+        elif isinstance(transform, dict):
+            transforms = dict(transform)
+            unknown = set(transforms) - set(measures)
+            if unknown:
+                raise ValueError(f"`transform` has measures not in the model: {unknown}")
+        else:
+            raise TypeError(f"Expected `transform` to be a `Transform` or a dict of them, got {type(transform)}")
+        nonlinear = [m for m in transforms if m in self.measurement_model.measure_funs]
+        if nonlinear:
+            raise ValueError(
+                f"`transform` is not supported for measures with a measure-function (e.g. binary measures): "
+                f"{nonlinear}. To transform only some measures, pass a dict."
+            )
+        return transforms
 
     def _measured_moments_flat(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -462,9 +568,11 @@ class Predictions:
                       group_colname: str,
                       time_colname: str,
                       conf: float,
-                      use_map: bool) -> pd.DataFrame:
+                      use_map: bool,
+                      transform: Union['Transform', dict[str, 'Transform'], None] = None) -> pd.DataFrame:
 
         alpha = (1 - conf) / 2
+        transforms = self._standardize_transforms(transform)
 
         if self.mc_white_noise is not None:
             if use_map is None:
@@ -473,11 +581,11 @@ class Predictions:
                     "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
                 )
                 use_map = True
-            by_measure = self._get_mc_pred_intervals(alpha, use_map=use_map)
+            by_measure = self._get_mc_pred_intervals(alpha, use_map=use_map, transforms=transforms)
         else:
             if use_map:
                 warn("``use_map`` disregarded, no monte-carlo")
-            by_measure = self._get_pred_intervals(alpha)
+            by_measure = self._get_pred_intervals(alpha, transforms=transforms)
 
         from torchcast.utils import TimeSeriesDataset
 
@@ -488,12 +596,37 @@ class Predictions:
                     if m not in by_measure:
                         continue
                     actuals[m] = tens[..., mgroup.index(m)]
+                    if m in transforms:
+                        actuals[m] = transforms[m].inverse(actuals[m])
             missing = set(by_measure) - set(dataset.all_measures)
             if missing:
                 warn(
                     f"The following measures in your model are not present in your dataset, please double-check that "
                     f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
                 )
+        return self._summaries_to_dataframe(
+            by_measure,
+            actuals=actuals,
+            dataset=dataset,
+            group_colname=group_colname,
+            time_colname=time_colname,
+        )
+
+    def _summaries_to_dataframe(self,
+                                by_measure: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                                actuals: dict[str, torch.Tensor],
+                                dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                                group_colname: str,
+                                time_colname: str) -> pd.DataFrame:
+        """
+        :param by_measure: For each measure (or other named quantity), a tuple of ``(num_groups, num_timesteps)``
+         tensors: mean, lower, upper.
+        :param actuals: Optionally, ``(num_groups, num_timesteps)`` actuals for some measures/quantities (can have
+         fewer timesteps).
+        :return: A long-format dataframe with columns for group, time, mean, lower, upper, (actual,) and measure.
+        """
+        from torchcast.utils import TimeSeriesDataset
+
         out = []
         times = TimeSeriesDataset.get_dataset_times(
             dataset.start_offsets, num_timesteps=self.state_means.shape[1], dt_unit=dataset.dt_unit
@@ -1051,6 +1184,18 @@ class DatasetMetadata:
             group_colname=self.group_colname,
             time_colname=self.time_colname
         )
+
+
+def _quantile(x: torch.Tensor, q: float) -> torch.Tensor:
+    """
+    Quantile along the first dimension, with linear interpolation (like ``torch.quantile``, which has an input-size
+    limit).
+    """
+    x = x.sort(0).values
+    pos = q * (x.shape[0] - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, x.shape[0] - 1)
+    return x[lo] + (pos - lo) * (x[hi] - x[lo])
 
 
 def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:

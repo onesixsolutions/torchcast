@@ -23,6 +23,18 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
 - With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
 
+### New feature: back-transforming predictions
+
+- `Predictions.to_dataframe(transform=...)` maps predictions of transformed measures back to the original scale,
+  e.g. `transform=LogTransform()` (for all measures) or `transform={'sales': LogTransform(base=10)}`. Intervals are
+  back-transformed exactly (quantiles pass through monotone transforms), and so is the mean: `E[inverse(Y)]` rather
+  than `inverse(E[Y])`, via closed form where available and gauss-hermite quadrature otherwise. For models with
+  mixture components, each regime is back-transformed and then mixed. Actuals are back-transformed too.
+- `Transform` is the base class: subclasses only need to implement `inverse()`. `LogTransform` and
+  `BoxCoxTransform` (with `lmbda >= 0`) are provided.
+- `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
+  `to_dataframe()`.
+
 ### Other changes
 
 - `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`

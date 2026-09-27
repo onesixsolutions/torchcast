@@ -8,6 +8,7 @@ API
    kalman_filter
    binomial_filter
    mixture
+   transforms
    exp_smooth
    processes
    covariance
