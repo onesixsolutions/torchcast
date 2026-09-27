@@ -440,7 +440,8 @@ class BinomialPredictions(Predictions):
                       conf: float,
                       use_map: bool,
                       transform: Optional[Union['Transform', dict]] = None,
-                      derived: Optional[dict] = None) -> pd.DataFrame:
+                      derived: Optional[dict] = None,
+                      derived_num_samples: int = 1000) -> pd.DataFrame:
 
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
@@ -453,6 +454,7 @@ class BinomialPredictions(Predictions):
             use_map=use_map,
             transform=transform,
             derived=derived,
+            derived_num_samples=derived_num_samples,
         )
 
     def _to_components_dataframe(self,

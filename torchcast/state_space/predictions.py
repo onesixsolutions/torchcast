@@ -34,8 +34,6 @@ class Predictions:
     _means = None
     _covs = None
 
-    #: The number of samples used for ``to_dataframe(derived=...)``.
-    derived_num_samples: int = 1000
     # fixed seed, so that repeated calls to ``to_dataframe(derived=...)`` give the same results:
     _derived_seed: int = 2 ** 31 - 1
 
@@ -138,8 +136,8 @@ class Predictions:
                      conf: Optional[float] = .95,
                      use_map: Optional[bool] = None,
                      transform: Union['Transform', dict[str, 'Transform'], None] = None,
-                     derived: Optional[dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]]] = None
-                     ) -> pd.DataFrame:
+                     derived: Optional[dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]]] = None,
+                     derived_num_samples: int = 1000) -> pd.DataFrame:
         """
         :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
         :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
@@ -158,9 +156,10 @@ class Predictions:
          Each function receives a dictionary of ``{measure: (num_samples, num_groups, num_timesteps)}`` samples from
          the (joint) predictive distribution, including observation noise and on the scale given by ``transform``, and
          should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
-         key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample` and
-         ``Predictions.derived_num_samples``). If there are actuals, the function is applied to them too (so it should
-         handle missing values, which are nan). Only for ``type='predictions'``.
+         key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
+         actuals, the function is applied to them too (so it should handle missing values, which are nan). Only for
+         ``type='predictions'``.
+        :param derived_num_samples: The number of samples used for ``derived``.
         """
         dataset = self._resolve_dataset(dataset)
         group_colname = group_colname or self.dataset_metadata.group_colname
@@ -189,6 +188,7 @@ class Predictions:
                 use_map=use_map,
                 transform=transform,
                 derived=derived,
+                derived_num_samples=derived_num_samples,
             )
             if return_std:
                 df['std'] = df.pop('upper') - df.pop('lower')
@@ -210,6 +210,7 @@ class Predictions:
 
     def _add_derived(self,
                      derived: dict[str, Callable],
+                     num_samples: int,
                      alpha: float,
                      transforms: dict[str, 'Transform'],
                      by_measure: dict,
@@ -223,12 +224,12 @@ class Predictions:
         if overlap:
             raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
         generator = torch.Generator(device=self.state_means.device).manual_seed(self._derived_seed)
-        samples = self.sample(self.derived_num_samples, observation_noise=True, generator=generator)
+        samples = self.sample(num_samples, observation_noise=True, generator=generator)
         values = {m: samples[m] for m in measures}
         for m, t in transforms.items():
             values[m] = t.inverse(values[m])
 
-        expected_shape = (self.derived_num_samples, self.num_groups, self.num_timesteps)
+        expected_shape = (num_samples, self.num_groups, self.num_timesteps)
         for name, fun in derived.items():
             out = fun(values)
             if tuple(out.shape) != expected_shape:
@@ -730,7 +731,8 @@ class Predictions:
                       conf: float,
                       use_map: bool,
                       transform: Union['Transform', dict[str, 'Transform'], None] = None,
-                      derived: Optional[dict[str, Callable]] = None) -> pd.DataFrame:
+                      derived: Optional[dict[str, Callable]] = None,
+                      derived_num_samples: int = 1000) -> pd.DataFrame:
 
         alpha = (1 - conf) / 2
         transforms = self._standardize_transforms(transform)
@@ -766,7 +768,8 @@ class Predictions:
                     f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
                 )
         if derived:
-            self._add_derived(derived, alpha=alpha, transforms=transforms, by_measure=by_measure, actuals=actuals)
+            self._add_derived(derived, num_samples=derived_num_samples, alpha=alpha, transforms=transforms,
+                              by_measure=by_measure, actuals=actuals)
         return self._summaries_to_dataframe(
             by_measure,
             actuals=actuals,

@@ -106,8 +106,6 @@ def test_derived_sum_of_correlated_measures():
     For linear-gaussian measures, a + b is gaussian with variance var(a) + var(b) + 2 * cov(a, b): a derived quantity
     must account for the correlation.
     """
-    from torchcast.state_space.predictions import Predictions
-
     kf = _correlated_kf()
     pred = kf(torch.randn(3, 12, 2).cumsum(1))
     conf = .9
@@ -117,7 +115,7 @@ def test_derived_sum_of_correlated_measures():
     mean, cov = pred
     total_mean = (mean[..., 0] + mean[..., 1]).reshape(-1).numpy()
     total_sd = (cov[..., 0, 0] + cov[..., 1, 1] + 2 * cov[..., 0, 1]).sqrt().reshape(-1).numpy()
-    n = Predictions.derived_num_samples
+    n = 1000  # (the default `derived_num_samples`)
     assert np.all(np.abs(df_total['mean'].values - total_mean) < 5 * total_sd / math.sqrt(n))
     z = stats.norm.ppf(.95)
     # (the se of a sample-quantile of a normal at the 95th %ile is ~2.1 * sd / sqrt(n))
@@ -136,7 +134,6 @@ def test_derived_sum_of_correlated_measures():
 @torch.no_grad()
 def test_derived_with_transform_and_actuals():
     from torchcast.utils import TimeSeriesDataset
-    from torchcast.state_space.predictions import Predictions
 
     kf = _correlated_kf()
     y = torch.randn(2, 10, 2).cumsum(1) * .2
@@ -154,7 +151,7 @@ def test_derived_with_transform_and_actuals():
     # the exact standard-error of the sample-mean of exp(a) + exp(b) (lognormal variances/covariance):
     lognormal_var = torch.exp(2 * mean + var) * (torch.exp(var) - 1)
     lognormal_cov = torch.exp(mean.sum(-1) + var.sum(-1) / 2) * (torch.exp(cov[..., 0, 1]) - 1)
-    se = ((lognormal_var.sum(-1) + 2 * lognormal_cov) / Predictions.derived_num_samples).sqrt()
+    se = ((lognormal_var.sum(-1) + 2 * lognormal_cov) / 1000).sqrt()  # (the default `derived_num_samples`)
     assert np.all(np.abs(df_total['mean'].values - expected.reshape(-1).numpy()) < 5 * se.reshape(-1).numpy())
     # the function is also applied to the (back-transformed) actuals:
     expected_actual = y.exp().sum(-1).reshape(-1).numpy()
@@ -167,7 +164,9 @@ def test_derived_with_transform_and_actuals():
         pred.to_dataframe(derived={'bad': lambda s: s['a'].mean(0)})
     with pytest.raises(ValueError, match="conf=None"):
         pred.to_dataframe(derived={'total': lambda s: s['a'] + s['b']}, conf=None)
-    assert Predictions.derived_num_samples == 1000
+    # the sample-count is configurable:
+    df_small = pred.to_dataframe(derived={'total': lambda s: s['a'] + s['b']}, derived_num_samples=50)
+    assert not np.allclose(df_small.query("measure == 'total'")['mean'].values, df_total['mean'].values)
 
 
 @torch.no_grad()
