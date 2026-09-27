@@ -16,6 +16,12 @@ class MeasureFun:
         raise NotImplementedError
 
     def adjust_measure_mat(self, measure_mat: torch.Tensor, measured_mean: torch.Tensor) -> torch.Tensor:
+        """
+        Apply the chain-rule for this measure-function to the measurement-matrix (the EKF linearization).
+
+        :param measure_mat: The row(s) of the measurement matrix for this measure.
+        :param measured_mean: The *input* to this measure-function, i.e. the measured-mean before it's applied.
+        """
         raise NotImplementedError
 
     @classmethod
@@ -32,7 +38,19 @@ class MeasureFun:
 
 
 class Sigmoid(MeasureFun):
+    """
+    The sigmoid measure-function (e.g. for the binary measures of :class:`.BinomialFilter`).
+
+    ``legacy_jacobian``: before v1.1.3, the EKF linearization of the sigmoid was (incorrectly) evaluated at the
+    post-sigmoid value, i.e. ``sigmoid'(sigmoid(z))`` rather than ``sigmoid'(z)``. Setting
+    ``my_model.measure_funs['my_measure'].legacy_jacobian = True`` reproduces that, for comparing results against the
+    previous behavior. Sigmoid objects unpickled from an earlier version don't have this attribute, and keep the
+    previous behavior. Will be removed in a future version.
+    """
     aliases = ('sigmoid', 'ilogit', 'expit', 'inv_logit')
+
+    def __init__(self):
+        self.legacy_jacobian = False
 
     def __call__(self, measured_mean: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(measured_mean.clamp(-8, 8))
@@ -42,6 +60,9 @@ class Sigmoid(MeasureFun):
         return torch.special.logit(input_mean, eps=1e-7)
 
     def adjust_measure_mat(self, measure_mat: torch.Tensor, measured_mean: torch.Tensor) -> torch.Tensor:
+        # a missing attribute means this object was unpickled from a version before the fix: keep the old behavior.
+        if getattr(self, 'legacy_jacobian', True):
+            measured_mean = self(measured_mean)  # (see `legacy_jacobian` in the class docstring)
         measured_mean = measured_mean.clamp(-8, 8)
         numer = torch.exp(-measured_mean)
         denom = (torch.exp(-measured_mean) + 1) ** 2

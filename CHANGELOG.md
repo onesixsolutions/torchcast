@@ -23,6 +23,18 @@ measurement std-devs are ~10), which in turn distorted the predicted means via t
 `num_groups` was affected for the same reason. The error is negligible when measurement std-devs are close to 1 (e.g.
 standardized data). Now only the default initial covariance (when no covariance is passed) is scaled.
 
+### Bug fix: EKF linearization of the sigmoid (`BinomialFilter`)
+
+The EKF jacobian of the sigmoid measure-function was evaluated at the post-sigmoid value -- `sigmoid'(sigmoid(z))`
+rather than `sigmoid'(z)`. Since `sigmoid(z)` is in (0, 1), that derivative was always ~0.20-0.25, whereas the
+correct one approaches 0 for probabilities near 0 or 1; so updates for extreme probabilities were too large. This
+changes the predictions of `BinomialFilter` models (and any model with a sigmoid `measure_fun`). In simulations the
+effect on held-out likelihood was negligible with the default `do_post_hoc_correction=True`.
+
+To compare against the previous behavior: `my_model.measure_funs['my_measure'].legacy_jacobian = True`. Models
+pickled with an earlier version keep the previous behavior automatically when loaded (models created with this
+version don't). `legacy_jacobian` will be removed in a future version.
+
 ### Other bug fixes
 
 - Adaptive scaling (`adaptive_scaling=True`) raised an `IndexError` when a measure without a measure-variance (e.g. a
