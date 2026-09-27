@@ -35,6 +35,18 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
   `to_dataframe()`.
 
+### New feature: sampling predictions, and derived quantities
+
+- `Predictions.sample(num_samples, observation_noise=True)` draws from the predictive distribution, jointly across
+  measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and
+  regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`,
+  observations are sampled too (binomial draws for binary measures). Returns a `PredictionSamples`.
+- `Predictions.to_dataframe(derived={'total': lambda s: s['a'] + s['b']})` adds quantities computed from several
+  measures, from joint samples (so correlations between measures are accounted for), on the scale given by
+  `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
+  `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
+  `transform={'log_spend': LogTransform()}`.
+
 ### Other changes
 
 - `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`

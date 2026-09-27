@@ -178,7 +178,9 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 # ### Other Notes
 #
 # - Mixture components are also supported in the `BinomialFilter`, on its non-binary measures. For example, with a
-#   binary 'visited' measure and a 'log-spend' measure that's missing whenever there was no visit.
+#   binary 'visited' measure and a 'log-spend' measure that's missing whenever there was no visit. Then
+#   `to_dataframe(transform={'log_spend': LogTransform()}, derived={'spend': lambda s: s['visited'] *
+#   s['log_spend'].nan_to_num()})` gives forecasts of weekly spend (from joint samples of both measures).
 # - With multiple measures, each measure can have its own components. Regime-probabilities are tracked jointly across
 #   measures; `Predictions.get_regime_combos()` gives the joint predictive distribution.
 # - To carry regime-probabilities over into a later forecast, pass the output of `Predictions.get_state_at_times()`

@@ -391,6 +391,38 @@ class BinomialPredictions(Predictions):
 
         return out
 
+    def _binary_idx(self) -> list[int]:
+        measures = list(self.measurement_model.measures)
+        return [measures.index(m) for m in self.binary_measures]
+
+    def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
+        covs = super()._conditional_measure_covs(means).clone()
+        idx = self._binary_idx()
+        if idx:
+            # binomial variance of the proportion, given the (sampled) probability:
+            p = means[..., idx].clamp(0, 1)
+            num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype)
+            covs[..., idx, idx] = p * (1 - p) / num_obs
+        return covs
+
+    def _sample_observations(self,
+                             means: torch.Tensor,
+                             covs: torch.Tensor,
+                             generator: Optional[torch.Generator]) -> torch.Tensor:
+        """
+        Gaussian measures are sampled as usual (their observation noise is uncorrelated with the binary measures');
+        binary measures are sampled from a binomial, then (like the rest of ``BinomialPredictions``) returned as
+        proportions.
+        """
+        observations = super()._sample_observations(means, covs, generator=generator)
+        idx = self._binary_idx()
+        if idx:
+            p = means[..., idx].clamp(0, 1)
+            num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype).expand_as(p)
+            observations = observations.clone()
+            observations[..., idx] = torch.binomial(num_obs.contiguous(), p.contiguous(), generator=generator) / num_obs
+        return observations
+
     def _standardize_transforms(self, transform: Union['Transform', dict, None]) -> dict:
         transforms = super()._standardize_transforms(transform)
         binary = [m for m in transforms if m in self.binary_measures]
@@ -407,7 +439,8 @@ class BinomialPredictions(Predictions):
                       time_colname: str,
                       conf: float,
                       use_map: bool,
-                      transform: Optional[Union['Transform', dict]] = None) -> pd.DataFrame:
+                      transform: Optional[Union['Transform', dict]] = None,
+                      derived: Optional[dict] = None) -> pd.DataFrame:
 
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
@@ -419,6 +452,7 @@ class BinomialPredictions(Predictions):
             conf=conf,
             use_map=use_map,
             transform=transform,
+            derived=derived,
         )
 
     def _to_components_dataframe(self,
