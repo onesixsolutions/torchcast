@@ -60,6 +60,12 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   `_update_step()` to adjust its inputs (as `BinomialFilter` did) should override `_prepare_update()` instead.
 - Adds `benchmarks/profile_simple_model.py`, for checking performance against other git refs.
 
+### Bug fix that changes predictions: `to_dataframe(conf=None)`
+
+- The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
+  uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
+  larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+
 ## v1.2.0 (2026-06-08)
 
 ### New Features
