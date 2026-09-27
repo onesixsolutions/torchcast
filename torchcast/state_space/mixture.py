@@ -5,7 +5,7 @@ A measure can have one or more :class:`MixtureComponent` alternatives to its sta
 model. Each component is *stateless*: an observation explained by it is scored against the component's own learned
 mean and variance, and does not update the latent state.
 
-The :class:`RegimeModel` owns the components and enumerates a fixed table of regime "combos" -- one entry per
+The :class:`MixtureModel` owns the components and enumerates a fixed table of regime "combos" -- one entry per
 combination of regimes across the mixture measures (the standard regime, or one of that measure's components). Regime
 probabilities are tracked jointly over this table.
 """
@@ -128,42 +128,45 @@ class StickyTransition(RegimeTransition):
         return torch.diag(stay) + (1 - stay).unsqueeze(-1) * self._jump_probs(base_probs).unsqueeze(0)
 
 
-class RegimeModel(torch.nn.Module):
+class MixtureModel(torch.nn.Module):
     """
-    Owns the :class:`MixtureComponent` objects for a model and the fixed table of regime-combos.
+    Experimental. Mixture components for a state-space model: pass as the ``mixture`` argument of
+    :class:`.KalmanFilter` (or :class:`.BinomialFilter`). Owns the :class:`MixtureComponent` objects, the
+    :class:`RegimeTransition`, and the fixed table of regime-combos.
 
     A combo is a tuple with one entry per mixture measure (in the order of ``self.mixture_measures``): either ``None``
     (the standard regime) or one of that measure's components. Measures without components are always in the standard
     regime, and do not appear in the table. The first combo is always all-standard.
 
-    :param components: The mixture components.
-    :param measures: All measures of the model (used to validate and order the mixture measures).
-    :param transition: A :class:`RegimeTransition`. Defaults to :class:`StickyTransition`.
+    :param components: The mixture components. Mixture measures are ordered by their first appearance here.
+    :param transition: A :class:`RegimeTransition`, controlling how regime-probabilities evolve over time. Defaults to
+     :class:`StickyTransition`.
+    :param univariate_prob: If True, the per-timestep regime-probabilities are computed using only the likelihood of
+     the mixture measures, rather than of all observed measures. This is an approximation (exact if the other
+     measures' residuals are uncorrelated with the mixture measures'), but can be cheaper, and avoids letting other
+     measures' likelihoods -- e.g. the gaussian approximation for a binary measure -- influence the regime.
     """
 
     def __init__(self,
                  components: Sequence[MixtureComponent],
-                 measures: Sequence[str],
-                 transition: Optional[RegimeTransition] = None):
+                 transition: Optional[RegimeTransition] = None,
+                 univariate_prob: bool = False):
         super().__init__()
         if not components:
             raise ValueError("`components` cannot be empty.")
 
         by_measure = {}
         for component in components:
-            if component.measure not in measures:
-                raise ValueError(
-                    f"MixtureComponent '{component.id}' has measure '{component.measure}' not in `measures`"
-                )
             by_measure.setdefault(component.measure, []).append(component)
         for measure, comps in by_measure.items():
             ids = [c.id for c in comps]
             if len(ids) != len(set(ids)):
                 raise ValueError(f"Mixture components must have unique ids within a measure, but '{measure}' got {ids}")
 
-        self.mixture_measures = [m for m in measures if m in by_measure]
+        self.mixture_measures = list(by_measure)
         self.components = torch.nn.ModuleList([c for m in self.mixture_measures for c in by_measure[m]])
-        self._by_measure = {m: by_measure[m] for m in self.mixture_measures}
+        self._by_measure = by_measure
+        self.univariate_prob = univariate_prob
 
         self.combos: list[tuple[Optional[MixtureComponent], ...]] = list(
             itertools.product(*[[None] + self._by_measure[m] for m in self.mixture_measures])
@@ -174,6 +177,25 @@ class RegimeModel(torch.nn.Module):
         elif transition.num_combos != self.num_combos:
             raise ValueError(f"`transition` has {transition.num_combos} combos, but expected {self.num_combos}")
         self.transition = transition
+
+    def validate(self, measures: Sequence[str], measure_funs: dict, processes: Sequence) -> None:
+        """
+        Called by the :class:`.StateSpaceModel`. Mixture measures must be measures of the model, and must have a
+        linear-gaussian measurement model (no measure-function, no nonlinear processes).
+        """
+        for component in self.components:
+            if component.measure not in measures:
+                raise ValueError(
+                    f"MixtureComponent '{component.id}' has measure '{component.measure}' not in `measures`"
+                )
+        for measure in self.mixture_measures:
+            if measure in measure_funs:
+                raise ValueError(f"Mixture components are not supported for '{measure}', which has a measure-function.")
+            nonlinear = [p.id for p in processes if p.measure == measure and not p.linear_measurement]
+            if nonlinear:
+                raise ValueError(
+                    f"Mixture components are not supported for '{measure}', which has nonlinear processes: {nonlinear}"
+                )
 
     @property
     def num_combos(self) -> int:
@@ -234,19 +256,6 @@ class RegimeModel(torch.nn.Module):
                 k = self.mixture_measures.index(measure)
                 mask[:, j] = torch.as_tensor([float(combo[k] is None) for combo in self.combos])
         return regime_probs @ mask
-
-    def validate_measures(self, measure_funs: dict, processes: Sequence) -> None:
-        """
-        Mixture measures must have a linear-Gaussian measurement model (no measure-function, no nonlinear processes).
-        """
-        for measure in self.mixture_measures:
-            if measure in measure_funs:
-                raise ValueError(f"Mixture components are not supported for '{measure}', which has a measure-function.")
-            nonlinear = [p.id for p in processes if p.measure == measure and not p.linear_measurement]
-            if nonlinear:
-                raise ValueError(
-                    f"Mixture components are not supported for '{measure}', which has nonlinear processes: {nonlinear}"
-                )
 
 
 @dataclass

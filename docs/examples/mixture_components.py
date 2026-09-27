@@ -38,7 +38,7 @@ warnings.filterwarnings('ignore', category=PlotnineWarning)
 # original (non-log) scale, since back-transforming requires `exp(mean + var / 2)`, which is very sensitive to the
 # variance.
 #
-# With `mixture_components`, a measure can have one or more alternative *regimes*. Each is described by a learned
+# With the `mixture` argument, a measure can have one or more alternative *regimes*. Each is described by a learned
 # mean and variance, and a learned probability. An observation that's explained by a component's regime is scored
 # against that component, and doesn't update the latent state.
 
@@ -99,7 +99,7 @@ torch.manual_seed(1)
 kf_mixture = KalmanFilter(
     processes=[LocalLevel(id='level')],
     measures=['log_spend'],
-    mixture_components=[MixtureComponent(measure='log_spend', mean_init=0., prob_init=.05, id='quick')]
+    mixture=[MixtureComponent(measure='log_spend', mean_init=0., prob_init=.05, id='quick')]
 )
 kf_mixture.fit(y_train, verbose=0);
 
@@ -110,12 +110,12 @@ kf_mixture.fit(y_train, verbose=0);
 # which has to accommodate the quick visits:
 
 # %%
-component = kf_mixture.regime_model.components[0]
+component = kf_mixture.mixture.components[0]
 pd.Series({
     'component mean': component.mean.item(),
     'component std': component.var.sqrt().item(),
-    'component probability': kf_mixture.regime_model.base_probs()[1].item(),
-    'stickiness (standard, quick)': kf_mixture.regime_model.transition.stay.detach().numpy().round(3),
+    'component probability': kf_mixture.mixture.base_probs()[1].item(),
+    'stickiness (standard, quick)': kf_mixture.mixture.transition.stay.detach().numpy().round(3),
     'measurement std (mixture model)': kf_mixture.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),
     'measurement std (standard model)': kf_standard.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),
 })
@@ -181,5 +181,7 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 #   measures; `Predictions.get_regime_combos()` gives the joint predictive distribution.
 # - To carry regime-probabilities over into a later forecast, pass the output of `Predictions.get_state_at_times()`
 #   as `initial_state` (it includes the regime-probabilities as well as the state mean/covariance).
-# - The learned "stickiness" controls how regime-probabilities persist over time: see `StickyTransition`. You can
-#   also pass your own `regime_transition`.
+# - Passing a list of components is shorthand for `mixture=MixtureModel(components)`. To configure it, pass the
+#   `MixtureModel` yourself: e.g. `MixtureModel(components, transition=...)`. The default `StickyTransition` learns
+#   a "stickiness" that controls how regime-probabilities persist over time; you can also write your own
+#   `RegimeTransition`.

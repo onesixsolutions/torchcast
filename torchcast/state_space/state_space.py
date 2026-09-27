@@ -13,7 +13,7 @@ from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
 
-from .mixture import MixtureComponent, RegimeModel, RegimeTransition
+from .mixture import MixtureComponent, MixtureModel, RegimeTransition
 from .state import StateTuple, _as_state_tuple
 from .predictions import Predictions
 from .adaptive_scaling import EWMAdaptiveScaler, AdaptiveScaler
@@ -32,10 +32,9 @@ class StateSpaceModel(torch.nn.Module):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
-    :param mixture_components: Experimental. A list of :class:`.MixtureComponent` objects: alternative regimes for one
-     or more measures, which explain an observation without updating the state.
-    :param regime_transition: Experimental. A :class:`.RegimeTransition` controlling how regime-probabilities evolve
-     over time; defaults to :class:`.StickyTransition`. Only used if ``mixture_components`` are passed.
+    :param mixture: Experimental. A :class:`.MixtureModel` of alternative regimes for one or more measures -- e.g. for
+     outliers, which are then explained by a mixture component rather than updating the state. Can also pass a list of
+     :class:`.MixtureComponent` objects, as shorthand for ``MixtureModel(components)``.
     """
 
     def __init__(self,
@@ -44,8 +43,7 @@ class StateSpaceModel(torch.nn.Module):
                  measure_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: Union[bool, AdaptiveScaler] = False,
-                 mixture_components: Optional[Sequence[MixtureComponent]] = None,
-                 regime_transition: Optional[RegimeTransition] = None):
+                 mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
         super().__init__()
 
         # measures:
@@ -95,12 +93,11 @@ class StateSpaceModel(torch.nn.Module):
                 else:
                     self.dt_unit = process.dt_unit
 
-        self.regime_model: Optional[RegimeModel] = None
-        if mixture_components:
-            self.regime_model = RegimeModel(mixture_components, measures=measures, transition=regime_transition)
-            self.regime_model.validate_measures(self.measure_funs, list(self.processes.values()))
-        elif regime_transition is not None:
-            raise ValueError("`regime_transition` was passed, but there are no `mixture_components`.")
+        if mixture is not None and not isinstance(mixture, MixtureModel):
+            mixture = MixtureModel(mixture)
+        self.mixture: Optional[MixtureModel] = mixture
+        if self.mixture is not None:
+            self.mixture.validate(measures, self.measure_funs, list(self.processes.values()))
 
     def forward(self,
                 y: Optional[torch.Tensor] = None,
@@ -226,8 +223,8 @@ class StateSpaceModel(torch.nn.Module):
 
         # regime-probabilities (if mixture components):
         base_probs = regime_prior = None
-        if self.regime_model is not None:
-            base_probs = self.regime_model.base_probs()
+        if self.mixture is not None:
+            base_probs = self.mixture.base_probs()
             regime_prior = self._initial_regime_prior(init_regime_probs, base_probs, num_groups)
         elif init_regime_probs is not None:
             raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
@@ -283,8 +280,8 @@ class StateSpaceModel(torch.nn.Module):
             meanus.append(meanu)
             covus.append(covu)
             regimeus.append(regime_post)
-            if self.regime_model is not None:
-                regime_prior = self.regime_model.transition(regime_post, base_probs)
+            if self.mixture is not None:
+                regime_prior = self.mixture.transition(regime_post, base_probs)
 
         # 2nd loop to get n_step predicts:
         meanps = {}
@@ -315,7 +312,7 @@ class StateSpaceModel(torch.nn.Module):
                             mask=tmask
                         )
                         if regimep is not None:
-                            regimep = self.regime_model.transition(regimep, base_probs)
+                            regimep = self.mixture.transition(regimep, base_probs)
                     if tu_h not in meanps:
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp
@@ -327,18 +324,16 @@ class StateSpaceModel(torch.nn.Module):
                         # timepoint in the input
                         assert every_step
 
-        preds = [meanps[t] for t in range(out_timesteps)], [covps[t] for t in range(out_timesteps)]
+        preds = [
+            StateTuple(meanps[t], covps[t], regime_probs=regimeps[t]) for t in range(out_timesteps)
+        ]
 
         if include_updates_in_output:
-            updates = meanus, covus
+            updates = [StateTuple(m, c, regime_probs=r) for m, c, r in zip(meanus, covus, regimeus)]
         else:
             updates = None
 
         prediction_kwargs = prediction_kwargs or {}
-        if self.regime_model is not None:
-            prediction_kwargs['regime_priors'] = [regimeps[t] for t in range(out_timesteps)]
-            if include_updates_in_output:
-                prediction_kwargs['update_regime_probs'] = regimeus
         preds = self._generate_predictions(
             preds=preds,
             updates=updates,
@@ -389,10 +384,10 @@ class StateSpaceModel(torch.nn.Module):
             idx = self.measure_covariance.non_empty_idx
             nan_mask = input[..., idx].isnan()
             resid = input[..., idx].nan_to_num() - measured_mean[..., idx]
-            if self.regime_model is None or regime_probs is None:
+            if self.mixture is None or regime_probs is None:
                 multi = self.adaptive_scaling(resid, nan_mask)
             else:
-                weights = self.regime_model.standard_probs(regime_probs, [self.measures[i] for i in idx])
+                weights = self.mixture.standard_probs(regime_probs, [self.measures[i] for i in idx])
                 multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
 
             # Handle empty measures (those not in the covariance structure)
@@ -547,13 +542,11 @@ class StateSpaceModel(torch.nn.Module):
         self._mc_sampling = mc_sampling
 
     def _generate_predictions(self,
-                              preds: tuple[list[torch.Tensor], list[torch.Tensor]],
-                              updates: Optional[tuple[list[torch.Tensor], list[torch.Tensor]]],
+                              preds: Sequence[StateTuple],
+                              updates: Optional[Sequence[StateTuple]],
                               measure_covs: torch.Tensor,
                               measurement_model: 'MeasurementModel',
                               nan_groups: Optional[List[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]]] = None,
-                              regime_priors: Optional[Sequence[torch.Tensor]] = None,
-                              update_regime_probs: Optional[Sequence[torch.Tensor]] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
@@ -565,9 +558,7 @@ class StateSpaceModel(torch.nn.Module):
             measure_covs=measure_covs,
             updates=updates,
             mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
-            regime_model=self.regime_model,
-            regime_priors=regime_priors,
-            update_regime_probs=update_regime_probs,
+            mixture=self.mixture,
         )
 
     def _initial_regime_prior(self,
@@ -579,12 +570,12 @@ class StateSpaceModel(torch.nn.Module):
         mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
         transition. If not given, the transition's ``initial()`` is used.
         """
-        transition = self.regime_model.transition
+        transition = self.mixture.transition
         if init_regime_probs is None:
             return transition.initial(base_probs, num_groups)
-        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.regime_model.num_combos:
+        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.mixture.num_combos:
             raise ValueError(
-                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.regime_model.num_combos}), "
+                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.mixture.num_combos}), "
                 f"got {tuple(init_regime_probs.shape)}"
             )
         if init_regime_probs.shape[0] not in (1, num_groups):

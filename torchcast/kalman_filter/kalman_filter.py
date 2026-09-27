@@ -10,10 +10,10 @@ from torchcast.covariance import Covariance
 from torchcast.internals.utils import update_tensor, mvnorm_log_prob
 from torchcast.process import Process
 
-from torchcast.state_space.mixture import MixtureComponent, RegimeTransition
+from torchcast.state_space.mixture import MixtureComponent, MixtureModel
 from torchcast.state_space.state_space import StateSpaceModel, StateTuple
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -28,13 +28,8 @@ class KalmanFilter(StateSpaceModel):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
-    :param mixture_components: Experimental. A list of :class:`.MixtureComponent` objects: alternative regimes for one
-     or more measures, which explain an observation without updating the state.
-    :param regime_transition: Experimental. A :class:`.RegimeTransition`; see :class:`.StateSpaceModel`.
-    :param univariate_mixture_prob: If True, the per-timestep regime-probabilities are computed using only the
-     likelihood of the mixture measures, rather than all observed measures. This is an approximation (exact if the
-     other measures' residuals are uncorrelated with the mixture measures'), but can be cheaper, and avoids letting
-     other measures' likelihoods -- e.g. the gaussian approximation for a binary measure -- influence the regime.
+    :param mixture: Experimental. A :class:`.MixtureModel` (or a list of :class:`.MixtureComponent` objects); see
+     :class:`.StateSpaceModel`.
     """
 
     def __init__(self,
@@ -45,9 +40,7 @@ class KalmanFilter(StateSpaceModel):
                  initial_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: bool = False,
-                 mixture_components: Optional[Sequence[MixtureComponent]] = None,
-                 regime_transition: Optional[RegimeTransition] = None,
-                 univariate_mixture_prob: bool = False):
+                 mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
 
         if initial_covariance is None:
             initial_covariance = Covariance.from_processes(processes, cov_type='initial')
@@ -61,13 +54,10 @@ class KalmanFilter(StateSpaceModel):
             measure_covariance=measure_covariance,
             measure_funs=measure_funs,
             adaptive_scaling=adaptive_scaling,
-            mixture_components=mixture_components,
-            regime_transition=regime_transition,
+            mixture=mixture,
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
-
-        self.univariate_mixture_prob = univariate_mixture_prob
 
     def _predict_cov(self,
                      cov: torch.Tensor,
@@ -101,7 +91,7 @@ class KalmanFilter(StateSpaceModel):
             measure_cov=measure_cov,
             **kwargs
         )
-        if self.regime_model is None:
+        if self.mixture is None:
             return self._kalman_update(
                 input=input,
                 mean=mean,
@@ -181,11 +171,11 @@ class KalmanFilter(StateSpaceModel):
         """
         num_groups = input.shape[0]
         if regime_prior is None:
-            log_prior = self.regime_model.log_base_probs().expand(num_groups, -1)
+            log_prior = self.mixture.log_base_probs().expand(num_groups, -1)
         else:
             log_prior = regime_prior.clamp_min(1e-30).log()
 
-        effective, mapping = self.regime_model.effective_combos(measures)
+        effective, mapping = self.mixture.effective_combos(measures)
 
         measured_cov = cov @ measure_mat.permute(0, 2, 1)
         system_cov = measure_mat @ measured_cov + measure_cov
@@ -205,8 +195,8 @@ class KalmanFilter(StateSpaceModel):
             return standard
 
         # which measures contribute to the responsibilities:
-        if self.univariate_mixture_prob:
-            score_idx = {i for i, m in enumerate(measures) if m in self.regime_model.mixture_measures}
+        if self.mixture.univariate_prob:
+            score_idx = {i for i, m in enumerate(measures) if m in self.mixture.mixture_measures}
         else:
             score_idx = set(range(len(measures)))
 
@@ -364,7 +354,7 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
         #          + [Season(id=f'season_{m}', measure=m, dt_unit='D', period=7, K=2) for m in measures]
         ,
         measures=measures,
-        mixture_components=[
+        mixture=[
             MixtureComponent(measure='dim1', mean_init=-5, prob_init=0.1, id='dim1_low'),
         ]
     )

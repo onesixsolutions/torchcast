@@ -7,18 +7,21 @@ from torch.distributions import MultivariateNormal, Normal
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel
-from torchcast.state_space.mixture import MixtureComponent, RegimeModel, RegimeTransition, StickyTransition
+from torchcast.state_space.mixture import MixtureComponent, MixtureModel, RegimeTransition, StickyTransition
 
 
-def _make_kf(measures, mixture_measures, **kwargs) -> KalmanFilter:
+def _make_kf(measures, mixture_measures, **mixture_kwargs) -> KalmanFilter:
     torch.manual_seed(123)
+    mixture = None
+    if mixture_measures:
+        mixture = MixtureModel(
+            [MixtureComponent(measure=m, mean_init=-4., prob_init=.2, id=f'{m}_low') for m in mixture_measures],
+            **mixture_kwargs
+        )
     return KalmanFilter(
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
-        mixture_components=[
-            MixtureComponent(measure=m, mean_init=-4., prob_init=.2, id=f'{m}_low') for m in mixture_measures
-        ] or None,
-        **kwargs
+        mixture=mixture,
     )
 
 
@@ -29,13 +32,13 @@ def _make_y(num_groups: int = 3, num_times: int = 15, num_measures: int = 2) -> 
     return y
 
 
-def test_regime_model_combos():
+def test_mixture_model_combos():
     components = [
         MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1'),
         MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c1'),
         MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c2'),
     ]
-    rm = RegimeModel(components, measures=['a', 'b', 'c'])
+    rm = MixtureModel(components)
     assert rm.mixture_measures == ['a', 'c']
     assert rm.num_combos == 2 * 3
     assert rm.combos[0] == (None, None)
@@ -58,28 +61,33 @@ def test_regime_model_combos():
     assert {i for eff in effective for i, _ in eff} == {1}
 
 
-def test_regime_model_validation():
+def test_mixture_model_validation():
     with pytest.raises(ValueError, match="not in `measures`"):
-        RegimeModel([MixtureComponent(measure='z', mean_init=0., prob_init=.1, id='z1')], measures=['a'])
-    with pytest.raises(ValueError, match="unique ids"):
-        RegimeModel(
-            [MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='x') for _ in range(2)],
-            measures=['a']
-        )
-    with pytest.raises(ValueError, match="combos"):
-        RegimeModel(
-            [MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1')],
+        KalmanFilter(
+            processes=[LocalLevel(id='lvl')],
             measures=['a'],
+            mixture=[MixtureComponent(measure='z', mean_init=0., prob_init=.1, id='z1')]
+        )
+    with pytest.raises(ValueError, match="unique ids"):
+        MixtureModel([MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='x') for _ in range(2)])
+    with pytest.raises(ValueError, match="combos"):
+        MixtureModel(
+            [MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1')],
             transition=StickyTransition(num_combos=3)
         )
-    with pytest.raises(ValueError, match="no `mixture_components`"):
-        KalmanFilter(processes=[LocalLevel(id='lvl')], measures=['a'], regime_transition=StickyTransition(2))
     with pytest.raises(ValueError, match="measure-function"):
         BinomialFilter(
             processes=[LocalLevel(id='lvl', measure='visit')],
             measures=['visit'],
-            mixture_components=[MixtureComponent(measure='visit', mean_init=0., prob_init=.1, id='v1')]
+            mixture=[MixtureComponent(measure='visit', mean_init=0., prob_init=.1, id='v1')]
         )
+    # a list of components is shorthand for a MixtureModel:
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='lvl')],
+        measures=['a'],
+        mixture=[MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1')]
+    )
+    assert isinstance(kf.mixture, MixtureModel) and isinstance(kf.mixture.transition, StickyTransition)
 
 
 def test_sticky_transition():
@@ -110,8 +118,8 @@ def test_custom_transition():
         def forward(self, posterior, base_probs):
             return posterior
 
-    kf = _make_kf(['y'], ['y'], regime_transition=MyTransition(num_combos=2))
-    assert isinstance(kf.regime_model.transition, MyTransition)
+    kf = _make_kf(['y'], ['y'], transition=MyTransition(num_combos=2))
+    assert isinstance(kf.mixture.transition, MyTransition)
 
 
 class StaticTransition(RegimeTransition):
@@ -125,17 +133,17 @@ class StaticTransition(RegimeTransition):
 def test_parameters_registered_and_get_grads():
     kf = _make_kf(['y1', 'y2'], ['y1'])
     names = {n for n, _ in kf.named_parameters()}
-    for expected in ('regime_model.components.0.mean', 'regime_model.components.0._log_std',
-                     'regime_model.components.0.logit', 'regime_model.transition._stay_logit'):
+    for expected in ('mixture.components.0.mean', 'mixture.components.0._log_std',
+                     'mixture.components.0.logit', 'mixture.transition._stay_logit'):
         assert expected in names
-    assert any(k.startswith('regime_model.') for k in kf.state_dict())
+    assert any(k.startswith('mixture.') for k in kf.state_dict())
 
     y = _make_y()
     kf(y).log_prob(y).sum().backward()
-    component = kf.regime_model.components[0]
+    component = kf.mixture.components[0]
     for param in (component.mean, component._log_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
-    assert (kf.regime_model.transition._stay_logit.grad.abs() > 0).all()
+    assert (kf.mixture.transition._stay_logit.grad.abs() > 0).all()
 
 
 @pytest.mark.parametrize("measures,mixture_measures", [
@@ -146,10 +154,10 @@ def test_parameters_registered_and_get_grads():
 @torch.no_grad()
 def test_negligible_mixture_matches_kf(measures, mixture_measures):
     kf_mix = _make_kf(measures, mixture_measures)
-    for component in kf_mix.regime_model.components:
+    for component in kf_mix.mixture.components:
         component.logit.fill_(-30.)
     kf = _make_kf(measures, [])
-    kf.load_state_dict({k: v for k, v in kf_mix.state_dict().items() if not k.startswith('regime_model.')})
+    kf.load_state_dict({k: v for k, v in kf_mix.state_dict().items() if not k.startswith('mixture.')})
 
     y = _make_y(num_measures=len(measures))
     y[0, 3:6, 0] = float('nan')
@@ -163,7 +171,7 @@ def test_negligible_mixture_matches_kf(measures, mixture_measures):
 @torch.no_grad()
 def test_update_step_univariate():
     kf = _make_kf(['y'], ['y'])
-    component = kf.regime_model.components[0]
+    component = kf.mixture.components[0]
     prob = .2
 
     mean = torch.tensor([[1.0]])
@@ -211,7 +219,7 @@ def test_update_step_unobserved_mixture_measure():
     assert torch.allclose(state.mean, expected_mean)
     assert torch.allclose(state.cov, expected_cov)
     # the regime is unobserved, so the posterior is the prior:
-    assert torch.allclose(state.regime_probs, kf.regime_model.base_probs().expand(4, -1))
+    assert torch.allclose(state.regime_probs, kf.mixture.base_probs().expand(4, -1))
 
 
 @torch.no_grad()
@@ -223,7 +231,7 @@ def test_log_prob_brute_force():
     pred = kf(y)
     lp = pred.log_prob(y)
 
-    rm = kf.regime_model
+    rm = kf.mixture
     H = torch.eye(2)
     R = kf.measure_covariance({}, num_groups=1, num_times=1)[0, 0]
     for g, t in [(0, 0), (1, 4), (2, 9), (0, 5)]:
@@ -232,7 +240,7 @@ def test_log_prob_brute_force():
         m = pred.state_means[g, t] @ H.T
         S = H @ pred.state_covs[g, t] @ H.T + R
         total = 0.
-        for combo, prob in zip(rm.combos, pred.regime_priors[g, t]):
+        for combo, prob in zip(rm.combos, pred.regime_probs[g, t]):
             normal = [i for i in observed if combo[i] is None]
             lik = 1.
             if normal:
@@ -244,8 +252,8 @@ def test_log_prob_brute_force():
         assert math.isclose(lp[g, t].item(), math.log(total), rel_tol=1e-4)
 
 
-@pytest.mark.parametrize("univariate_mixture_prob", [False, True])
-def test_binomial_filter_with_mixture(univariate_mixture_prob: bool):
+@pytest.mark.parametrize("univariate_prob", [False, True])
+def test_binomial_filter_with_mixture(univariate_prob: bool):
     """
     A binary measure (e.g. 'did they visit') plus a gaussian measure with a mixture component (e.g. 'log-spend'), where
     the gaussian measure is missing whenever the binary one is 0.
@@ -263,15 +271,17 @@ def test_binomial_filter_with_mixture(univariate_mixture_prob: bool):
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         binary_measures=['visit'],
-        mixture_components=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
-        univariate_mixture_prob=univariate_mixture_prob,
+        mixture=MixtureModel(
+            [MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+            univariate_prob=univariate_prob
+        ),
     )
     bf.mc_sampling = 50
     pred = bf(y)
     lp = pred.log_prob(y)
     assert torch.isfinite(lp).all()
     lp.sum().backward()
-    component = bf.regime_model.components[0]
+    component = bf.mixture.components[0]
     for param in (component.mean, component._log_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
 
@@ -283,34 +293,34 @@ def test_binomial_filter_with_mixture(univariate_mixture_prob: bool):
 @torch.no_grad()
 def test_no_stickiness_is_static():
     measures = ['y1', 'y2']
-    kf_static = _make_kf(measures, measures, regime_transition=StaticTransition(num_combos=4))
+    kf_static = _make_kf(measures, measures, transition=StaticTransition(num_combos=4))
     kf_sticky = _make_kf(measures, measures)
     kf_sticky.load_state_dict(
         {k: v for k, v in kf_static.state_dict().items() if 'transition' not in k}, strict=False
     )
-    kf_sticky.regime_model.transition._stay_logit.fill_(-30.)
+    kf_sticky.mixture.transition._stay_logit.fill_(-30.)
     y = _make_y(num_measures=2)
     y[0, 3:6, 0] = float('nan')
     pred_static, pred_sticky = kf_static(y), kf_sticky(y)
-    base_probs = kf_static.regime_model.base_probs()
-    assert torch.allclose(pred_static.regime_priors, base_probs.expand_as(pred_static.regime_priors))
-    assert torch.allclose(pred_sticky.regime_priors, pred_static.regime_priors, atol=1e-6)
+    base_probs = kf_static.mixture.base_probs()
+    assert torch.allclose(pred_static.regime_probs, base_probs.expand_as(pred_static.regime_probs))
+    assert torch.allclose(pred_sticky.regime_probs, pred_static.regime_probs, atol=1e-6)
     assert torch.allclose(pred_sticky.state_means, pred_static.state_means, atol=1e-5)
     assert torch.allclose(pred_sticky.log_prob(y), pred_static.log_prob(y), atol=1e-5)
 
 
 @torch.no_grad()
-def test_regime_priors_through_time():
+def test_regime_probs_through_time():
     kf = _make_kf(['y'], ['y'])
-    transition = kf.regime_model.transition
+    transition = kf.mixture.transition
     transition._stay_logit.fill_(2.)  # stay ~ .88
-    base_probs = kf.regime_model.base_probs()
+    base_probs = kf.mixture.base_probs()
 
     y = torch.zeros((2, 10, 1))
     y[0, 4] = -4.  # an outlier (at the component's mean) for group 0 only
     y[:, 7] = float('nan')
     pred = kf(y)
-    priors = pred.regime_priors
+    priors = pred.regime_probs
     assert torch.allclose(priors[:, 0], base_probs.expand(2, -1))
     # after the outlier, group 0 is more likely to be in the 'low' regime -- both vs. the base-rate and vs. group 1:
     assert priors[0, 5, 1] > .5 > base_probs[1]
@@ -321,20 +331,20 @@ def test_regime_priors_through_time():
     assert torch.allclose(priors[:, 8], transition(priors[:, 7], base_probs), atol=1e-6)
     # forecasting past the data:
     pred_fcast = kf(y, out_timesteps=13)
-    assert torch.allclose(pred_fcast.regime_priors[:, 11], transition(pred_fcast.regime_priors[:, 10], base_probs))
+    assert torch.allclose(pred_fcast.regime_probs[:, 11], transition(pred_fcast.regime_probs[:, 10], base_probs))
     # slicing keeps priors aligned:
-    assert torch.allclose(pred[:, 4:6].regime_priors, priors[:, 4:6])
+    assert torch.allclose(pred[:, 4:6].regime_probs, priors[:, 4:6])
 
 
 @pytest.mark.parametrize("n_step,every_step", [(2, True), (3, True), (3, False)])
 @torch.no_grad()
-def test_n_step_regime_priors(n_step: int, every_step: bool):
+def test_n_step_regime_probs(n_step: int, every_step: bool):
     """
     As in ``test_n_step_matches_nan_forecast``: an h-step prediction for t should match a 1-step prediction with the
     observations between t - h and t missing.
     """
     kf = _make_kf(['y1', 'y2'], ['y1'])
-    kf.regime_model.transition._stay_logit.fill_(1.)
+    kf.mixture.transition._stay_logit.fill_(1.)
     y = _make_y(num_measures=2)
     pred_n = kf(y, n_step=n_step, every_step=every_step)
     for t in range(y.shape[1]):
@@ -344,7 +354,7 @@ def test_n_step_regime_priors(n_step: int, every_step: bool):
         pred_1 = kf(y_nan, n_step=1)
         assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
         assert torch.allclose(pred_n.state_covs[:, t], pred_1.state_covs[:, t], atol=1e-5)
-        assert torch.allclose(pred_n.regime_priors[:, t], pred_1.regime_priors[:, t], atol=1e-6)
+        assert torch.allclose(pred_n.regime_probs[:, t], pred_1.regime_probs[:, t], atol=1e-6)
     # so the log-prob matches too:
     assert torch.allclose(pred_n.log_prob(y)[:, -1], kf(y_nan, n_step=1).log_prob(y)[:, -1], atol=1e-5)
 
@@ -352,31 +362,31 @@ def test_n_step_regime_priors(n_step: int, every_step: bool):
 @torch.no_grad()
 def test_initial_state_continuation():
     kf = _make_kf(['y1', 'y2'], ['y1'])
-    kf.regime_model.transition._stay_logit.fill_(1.)
+    kf.mixture.transition._stay_logit.fill_(1.)
     y = _make_y(num_measures=2)
     y[:, 11, 0] = -4.  # an outlier right before the split, so the regime-probs at the split are informative
     split = 12
 
     full = kf(y)
     state = kf(y[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
-    assert state.regime_probs.shape == (y.shape[0], kf.regime_model.num_combos)
+    assert state.regime_probs.shape == (y.shape[0], kf.mixture.num_combos)
     cont = kf(y[:, split:], initial_state=state)
     assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-5)
     assert torch.allclose(cont.state_covs, full.state_covs[:, split:], atol=1e-5)
-    assert torch.allclose(cont.regime_priors, full.regime_priors[:, split:], atol=1e-6)
+    assert torch.allclose(cont.regime_probs, full.regime_probs[:, split:], atol=1e-6)
     assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
 
     # a plain (mean, cov) tuple restarts regime-probs from the transition's initial distribution:
     cont_tuple = kf(y[:, split:], initial_state=tuple(state))
-    assert torch.allclose(cont_tuple.regime_priors[:, 0], kf.regime_model.base_probs().expand(y.shape[0], -1))
+    assert torch.allclose(cont_tuple.regime_probs[:, 0], kf.mixture.base_probs().expand(y.shape[0], -1))
 
     # 'prediction'-type states also carry regime-probs:
     pred_state = full.get_state_at_times(split, type_='prediction')
-    assert torch.allclose(pred_state.regime_probs, full.regime_priors[:, split])
+    assert torch.allclose(pred_state.regime_probs, full.regime_probs[:, split])
 
     # simulate from the state:
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
-    assert sim.regime_priors.shape == (2 * y.shape[0], 5, kf.regime_model.num_combos)
+    assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
 
     # a model without mixture components rejects regime-probs:
     kf_plain = _make_kf(['y1', 'y2'], [])
@@ -390,7 +400,7 @@ def test_standard_probs():
         MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c1'),
         MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c2'),
     ]
-    rm = RegimeModel(components, measures=['a', 'b', 'c'])
+    rm = MixtureModel(components)
     regime_probs = torch.softmax(torch.randn(4, rm.num_combos), -1)
     probs = rm.standard_probs(regime_probs, ['a', 'b', 'c'])
     for j, m in enumerate(['a', 'b', 'c']):
@@ -456,12 +466,12 @@ def test_adaptive_scaling_ignores_explained_outliers():
             processes=[LocalLevel(id='level')],
             measures=['y'],
             adaptive_scaling=True,
-            mixture_components=[MixtureComponent('y', mean_init=-6., prob_init=.05, id='low')] if with_mixture else None
+            mixture=[MixtureComponent('y', mean_init=-6., prob_init=.05, id='low')] if with_mixture else None
         )
         kf.adaptive_scaling.initialize(30)
         kf.adaptive_scaling.weight.fill_(1.)
         if with_mixture:
-            kf.regime_model.components[0]._log_std.fill_(-1.)
+            kf.mixture.components[0]._log_std.fill_(-1.)
         return kf
 
     torch.manual_seed(1)
@@ -551,9 +561,9 @@ def test_prediction_outputs():
 @torch.no_grad()
 def test_negligible_mixture_outputs_match_kf():
     kf_mix = _make_kf(['y1', 'y2'], ['y1'])
-    kf_mix.regime_model.components[0].logit.fill_(-30.)
+    kf_mix.mixture.components[0].logit.fill_(-30.)
     kf = _make_kf(['y1', 'y2'], [])
-    kf.load_state_dict({k: v for k, v in kf_mix.state_dict().items() if not k.startswith('regime_model.')})
+    kf.load_state_dict({k: v for k, v in kf_mix.state_dict().items() if not k.startswith('mixture.')})
     y = _make_y(num_measures=2)
     pred_mix, pred = kf_mix(y), kf(y)
     assert torch.allclose(pred_mix.means, pred.means, atol=1e-5)
@@ -576,7 +586,7 @@ def test_binomial_prediction_outputs():
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         binary_measures=['visit'],
-        mixture_components=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+        mixture=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
     )
     bf.mc_sampling = 200
     pred = bf(y)

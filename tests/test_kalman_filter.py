@@ -484,3 +484,23 @@ def test_nonlinear_covs_warns_once():
         assert pred.covs is None
         assert pred.covs is None
     assert len([w for w in caught if 'no closed-form covariance' in str(w.message)]) == 1
+
+
+@torch.no_grad()
+def test_predictions_state_formats():
+    from torchcast.state_space import Predictions, StateTuple
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    y = torch.randn(2, 6, 1)
+    pred = kf(y)
+    kwargs = dict(measurement_model=pred.measurement_model, measure_covs=pred.measure_covs)
+    for states in [
+        (pred.state_means, pred.state_covs),  # tuple of stacked tensors
+        (list(pred.state_means.unbind(1)), list(pred.state_covs.unbind(1))),  # tuple of per-timestep lists
+        StateTuple(pred.state_means, pred.state_covs),  # stacked StateTuple
+        [StateTuple(m, c) for m, c in zip(pred.state_means.unbind(1), pred.state_covs.unbind(1))],  # per-timestep
+    ]:
+        pred2 = Predictions(states=states, **kwargs)
+        assert torch.equal(pred2.state_means, pred.state_means) and torch.equal(pred2.state_covs, pred.state_covs)
+        assert torch.allclose(pred2.log_prob(y), pred.log_prob(y))

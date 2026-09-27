@@ -11,4 +11,4 @@ This class is abstract; see :class:`torchcast.kalman_filter.KalmanFilter` for th
 from .state_space import StateSpaceModel, LossFun
 from .state import StateTuple
 from .predictions import Predictions
-from .mixture import MixtureComponent, RegimeTransition, StickyTransition, MixtureOfNormals
+from .mixture import MixtureModel, MixtureComponent, RegimeTransition, StickyTransition, MixtureOfNormals

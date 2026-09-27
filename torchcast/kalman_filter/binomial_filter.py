@@ -17,7 +17,8 @@ from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
     from torchcast.process import Process
-    from torchcast.state_space.mixture import MixtureComponent, RegimeTransition
+    from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+    from torchcast.state_space import StateTuple
     from torchcast.utils import TimeSeriesDataset
 
 
@@ -35,9 +36,7 @@ class BinomialFilter(KalmanFilter):
     :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
-    :param mixture_components: Experimental. See :class:`.KalmanFilter`. Only supported for non-binary measures.
-    :param regime_transition: Experimental. See :class:`.KalmanFilter`.
-    :param univariate_mixture_prob: See :class:`.KalmanFilter`.
+    :param mixture: Experimental. See :class:`.KalmanFilter`. Only supported for non-binary measures.
     """
 
     def __init__(self,
@@ -50,9 +49,7 @@ class BinomialFilter(KalmanFilter):
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
                  adaptive_scaling: bool = False,
-                 mixture_components: Optional[Sequence['MixtureComponent']] = None,
-                 regime_transition: Optional['RegimeTransition'] = None,
-                 univariate_mixture_prob: bool = False):
+                 mixture: Union['MixtureModel', Sequence['MixtureComponent'], None] = None):
 
         if binary_measures is None:
             binary_measures = list(measures)
@@ -73,9 +70,7 @@ class BinomialFilter(KalmanFilter):
             initial_covariance=initial_covariance,
             adaptive_scaling=adaptive_scaling,
             measure_funs={m: 'ilogit' for m in binary_measures},
-            mixture_components=mixture_components,
-            regime_transition=regime_transition,
-            univariate_mixture_prob=univariate_mixture_prob,
+            mixture=mixture,
         )
 
         if do_post_hoc_correction:
@@ -124,14 +119,12 @@ class BinomialFilter(KalmanFilter):
         return measure_covariance
 
     def _generate_predictions(self,
-                              preds: tuple[list[torch.Tensor], list[torch.Tensor]],
-                              updates: Optional[tuple[list[torch.Tensor], list[torch.Tensor]]],
+                              preds: Sequence['StateTuple'],
+                              updates: Optional[Sequence['StateTuple']],
                               measure_covs: torch.Tensor,
                               measurement_model: 'MeasurementModel',
                               num_obs: Sequence[torch.Tensor],
                               observed_counts: bool,
-                              regime_priors: Optional[Sequence[torch.Tensor]] = None,
-                              update_regime_probs: Optional[Sequence[torch.Tensor]] = None,
                               **kwargs
                               ) -> 'Predictions':
         if kwargs:
@@ -144,9 +137,7 @@ class BinomialFilter(KalmanFilter):
             mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
             num_obs=num_obs,
             observed_counts=observed_counts,
-            regime_model=self.regime_model,
-            regime_priors=regime_priors,
-            update_regime_probs=update_regime_probs,
+            mixture=self.mixture,
         )
 
     def _mask_mats(self,

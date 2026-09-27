@@ -7,14 +7,14 @@
 A measure can now have one or more alternative *regimes* -- e.g. for outliers that shouldn't update the state or
 inflate the variance. See the new [mixture components example](https://docs.strong.io/torchcast/examples/mixture_components.html).
 
-- `KalmanFilter(mixture_components=[MixtureComponent(...), ...])`: each `MixtureComponent` has a learned mean,
-  variance, and base-rate. An observation explained by a component is scored against it, rather than updating the
+- `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):
+  each `MixtureComponent` has a learned mean, variance, and base-rate. An observation explained by a component is scored against it, rather than updating the
   state. Components are supported on any linear-gaussian measure, including the non-binary measures of a
   `BinomialFilter`.
 - Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
   a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
-  mixture when that's zero). A custom transition can be passed via `regime_transition=`.
-- `univariate_mixture_prob=True` computes the per-timestep regime-probabilities from the mixture measures' likelihood
+  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
+- `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
   only (an approximation, but cheaper, and avoids e.g. a binary measure's gaussian approximation influencing them).
 - `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
 - Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each

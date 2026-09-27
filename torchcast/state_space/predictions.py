@@ -15,7 +15,7 @@ from torch.distributions import MultivariateNormal
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
-    from .mixture import RegimeModel, MixtureOfNormals
+    from .mixture import MixtureModel, MixtureOfNormals
     from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
@@ -34,24 +34,30 @@ class Predictions:
 
     def __init__(self,
                  measurement_model: 'MeasurementModel',
-                 states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
+                 states: Union[Sequence['StateTuple'], 'StateTuple', tuple],
                  measure_covs: Union[Sequence[torch.Tensor], torch.Tensor],
-                 updates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+                 updates: Union[Sequence['StateTuple'], 'StateTuple', tuple, None] = None,
                  mc_white_noise: Optional['FixedWhiteNoise'] = None,
-                 regime_model: Optional['RegimeModel'] = None,
-                 regime_priors: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None,
-                 update_regime_probs: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None):
-        self.state_means = _maybe_stack(states[0], 1)
-        self.state_covs = _maybe_stack(states[1], 1)
+                 mixture: Optional['MixtureModel'] = None):
+        """
+        :param measurement_model: The ``MeasurementModel``.
+        :param states: The predicted states: a sequence (one per timestep) of :class:`.StateTuple`; or a single
+         ``StateTuple`` whose tensors have leading dims ``(num_groups, num_timesteps)``; or a tuple of means and covs.
+         For models with mixture components, the ``StateTuple`` objects carry the ``regime_probs``.
+        :param measure_covs: The measure-covariance for each timestep.
+        :param updates: Optionally, the updated (filtered) states, in the same format as ``states``.
+        :param mc_white_noise: Required if the measurement-model is nonlinear.
+        :param mixture: The model's :class:`.MixtureModel`, if any.
+        """
+        self.state_means, self.state_covs, self.regime_probs = _unpack_states(states)
         self.measure_covs = _maybe_stack(measure_covs, 1)
 
         self.measurement_model = measurement_model
         self.measurement_model_flat = self.measurement_model.flattened()
 
-        self.update_means = self.update_covs = None
+        self.update_means = self.update_covs = self.update_regime_probs = None
         if updates is not None:
-            self.update_means = _maybe_stack(updates[0], 1)
-            self.update_covs = _maybe_stack(updates[1], 1)
+            self.update_means, self.update_covs, self.update_regime_probs = _unpack_states(updates)
 
         if mc_white_noise is None and self.measurement_model.is_nonlinear:
             raise ValueError(
@@ -65,13 +71,9 @@ class Predictions:
         self._state_covs_flat = None
         self._mcovs_flat = None
 
-        self.regime_model = regime_model
-        # (num_groups, num_timesteps, num_combos) prior regime-probabilities for each prediction:
-        self.regime_priors = None if regime_priors is None else _maybe_stack(regime_priors, 1)
-        if self.regime_model is not None and self.regime_priors is None:
-            raise ValueError("If `regime_model` is passed, must also pass `regime_priors`.")
-        # (num_groups, num_timesteps, num_combos) posterior regime-probabilities, if `updates` were passed:
-        self.update_regime_probs = None if update_regime_probs is None else _maybe_stack(update_regime_probs, 1)
+        self.mixture = mixture
+        if self.mixture is not None and self.regime_probs is None:
+            raise ValueError("If `mixture` is passed, `states` must carry `regime_probs`.")
 
     @property
     def num_groups(self) -> int:
@@ -357,10 +359,10 @@ class Predictions:
         return by_measure
 
     def _get_mixture_intervals(self, alpha: float) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        if self.regime_model is None:
+        if self.mixture is None:
             return {}
         out = {}
-        for measure in self.regime_model.mixture_measures:
+        for measure in self.mixture.mixture_measures:
             mixture = self.get_mixture(measure)
             out[measure] = (mixture.mean(), mixture.quantile(alpha), mixture.quantile(1 - alpha))
         return out
@@ -377,7 +379,7 @@ class Predictions:
     def get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         For models with mixture components: the predictive distribution as a mixture over regime-combos (see
-        :class:`.RegimeModel`). Within each combo the prediction is multivariate normal: measures in the standard
+        :class:`.MixtureModel`). Within each combo the prediction is multivariate normal: measures in the standard
         regime have the usual (state-dependent) mean and covariance; measures in a mixture-component's regime have
         that component's mean and variance, and are uncorrelated with the other measures.
 
@@ -389,9 +391,9 @@ class Predictions:
          ``(num_groups, num_timesteps, num_combos, num_measures)`` tensor of means, and (4) a ``(num_groups,
          num_timesteps, num_combos, num_measures, num_measures)`` tensor of covariances.
         """
-        if self.regime_model is None:
+        if self.mixture is None:
             raise RuntimeError("This model has no mixture components.")
-        rm = self.regime_model
+        rm = self.mixture
         measures = list(self.measurement_model.measures)
         measured_mean, system_cov = self._measured_moments_flat()
         means, covs = [], []
@@ -412,7 +414,7 @@ class Predictions:
         labels = [tuple('standard' if c is None else c.id for c in combo) for combo in rm.combos]
         return (
             labels,
-            self.regime_priors,
+            self.regime_probs,
             torch.stack(means, 1).view(*batch_shape, rm.num_combos, len(measures)),
             torch.stack(covs, 1).view(*batch_shape, rm.num_combos, len(measures), len(measures)),
         )
@@ -427,9 +429,9 @@ class Predictions:
         """
         from .mixture import MixtureOfNormals
 
-        if self.regime_model is None or measure not in self.regime_model.mixture_measures:
+        if self.mixture is None or measure not in self.mixture.mixture_measures:
             raise ValueError(f"'{measure}' has no mixture components.")
-        rm = self.regime_model
+        rm = self.mixture
         j = list(self.measurement_model.measures).index(measure)
         k = rm.mixture_measures.index(measure)
         components = [None] + [c for c in rm.components if c.measure == measure]
@@ -442,9 +444,9 @@ class Predictions:
         probs, means, vars_ = [], [], []
         for component in components:
             in_regime = torch.as_tensor(
-                [combo[k] is component for combo in rm.combos], device=self.regime_priors.device
+                [combo[k] is component for combo in rm.combos], device=self.regime_probs.device
             )
-            probs.append(self.regime_priors[..., in_regime].sum(-1))
+            probs.append(self.regime_probs[..., in_regime].sum(-1))
             means.append(standard_mean if component is None else component.mean.expand(*batch_shape))
             vars_.append(standard_var if component is None else component.var.expand(*batch_shape))
         return MixtureOfNormals(
@@ -527,14 +529,14 @@ class Predictions:
                 state_covs=self.state_covs_flat,
             )
             measured_mean = torch.mean(mmean_samples, dim=0).view(*batch_shape, -1)
-            if self.regime_model is not None:
+            if self.mixture is not None:
                 # mixture measures are linear-gaussian within each regime, so use the closed-form mixture-mean:
                 measured_mean = measured_mean.clone()
-                for measure in self.regime_model.mixture_measures:
+                for measure in self.mixture.mixture_measures:
                     j = list(self.measurement_model.measures).index(measure)
                     measured_mean[..., j] = self.get_mixture(measure).mean()
             return measured_mean, None
-        elif self.regime_model is not None:
+        elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
             _, probs, means, covs = self.get_regime_combos()
             mean = (probs.unsqueeze(-1) * means).sum(-2)
@@ -657,9 +659,9 @@ class Predictions:
         :param measure_idx: The observed measures, or None if all are observed.
         """
         out = {}
-        if self.regime_priors is not None:
-            regime_priors_flat = self.regime_priors.reshape(-1, self.regime_priors.shape[-1])
-            out['regime_log_prior'] = regime_priors_flat[group_idx].clamp_min(1e-30).log()
+        if self.regime_probs is not None:
+            regime_probs_flat = self.regime_probs.reshape(-1, self.regime_probs.shape[-1])
+            out['regime_log_prior'] = regime_probs_flat[group_idx].clamp_min(1e-30).log()
         return out
 
     def _log_prob(self,
@@ -674,8 +676,8 @@ class Predictions:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
         assert measurement_model.num_timesteps == 1
 
-        has_mixture = self.regime_model is not None and any(
-            m in measurement_model.measures for m in self.regime_model.mixture_measures
+        has_mixture = self.mixture is not None and any(
+            m in measurement_model.measures for m in self.mixture.mixture_measures
         )
 
         if measurement_model.is_nonlinear:
@@ -720,9 +722,9 @@ class Predictions:
         """
         num_rows = obs.shape[0]
         if log_prior is None:
-            log_prior = self.regime_model.log_base_probs().expand(num_rows, -1)
+            log_prior = self.mixture.log_base_probs().expand(num_rows, -1)
 
-        effective, mapping = self.regime_model.effective_combos(measures)
+        effective, mapping = self.mixture.effective_combos(measures)
         resid = obs - measured_mean
         out = []
         for e, eff in enumerate(effective):
@@ -824,7 +826,7 @@ class Predictions:
 
         preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
         if type_.startswith('pred'):
-            regime_probs = None if preds.regime_priors is None else preds.regime_priors.squeeze(1)
+            regime_probs = None if preds.regime_probs is None else preds.regime_probs.squeeze(1)
             return StateTuple(preds.state_means.squeeze(1), preds.state_covs.squeeze(1), regime_probs=regime_probs)
         elif type_.startswith('update'):
             if preds.update_means is None:
@@ -997,21 +999,23 @@ class Predictions:
     def _getitem_helper(self, item: tuple) -> dict:
         if not isinstance(item, tuple):
             item = (item,)
+        from .state import StateTuple
+
+        def _slice(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return None if x is None else x[item]
+
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
-            'states': (self.state_means[item], self.state_covs[item]),
+            'states': StateTuple(self.state_means[item], self.state_covs[item], regime_probs=_slice(self.regime_probs)),
             'measure_covs': self.measure_covs[item],
             # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
             'mc_white_noise': self.mc_white_noise,
-            'regime_model': self.regime_model,
-            'regime_priors': None if self.regime_priors is None else self.regime_priors[item],
+            'mixture': self.mixture,
         }
         if self.update_means is not None:
-            kwargs.update({
-                'updates': (self.update_means[item], self.update_covs[item])
-            })
-        if self.update_regime_probs is not None:
-            kwargs['update_regime_probs'] = self.update_regime_probs[item]
+            kwargs['updates'] = StateTuple(
+                self.update_means[item], self.update_covs[item], regime_probs=_slice(self.update_regime_probs)
+            )
 
         return kwargs
 
@@ -1047,6 +1051,23 @@ class DatasetMetadata:
             group_colname=self.group_colname,
             time_colname=self.time_colname
         )
+
+
+def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    :return: Stacked (num_groups, num_timesteps, ...) means, covs, and regime-probs (or None).
+    """
+    from .state import StateTuple
+
+    if isinstance(states, StateTuple):  # already stacked
+        return states.mean, states.cov, states.regime_probs
+    if len(states) and all(isinstance(s, StateTuple) for s in states):
+        regime_probs = None
+        if states[0].regime_probs is not None:
+            regime_probs = torch.stack([s.regime_probs for s in states], 1)
+        return torch.stack([s.mean for s in states], 1), torch.stack([s.cov for s in states], 1), regime_probs
+    means, covs = states
+    return _maybe_stack(means, 1), _maybe_stack(covs, 1), None
 
 
 def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> torch.Tensor:
