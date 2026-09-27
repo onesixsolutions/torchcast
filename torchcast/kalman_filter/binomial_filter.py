@@ -391,6 +391,16 @@ class BinomialPredictions(Predictions):
 
         return out
 
+    def _standardize_transforms(self, transform: Union['Transform', dict, None]) -> dict:
+        transforms = super()._standardize_transforms(transform)
+        binary = [m for m in transforms if m in self.binary_measures]
+        if binary:
+            raise ValueError(
+                f"`transform` is not supported for binary measures: {binary}. To transform only some measures, pass a "
+                f"dict of `{{measure: Transform}}`."
+            )
+        return transforms
+
     def _to_dataframe(self,
                       dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
                       group_colname: str,

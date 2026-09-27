@@ -465,12 +465,9 @@ class Predictions:
                 raise ValueError(f"`transform` has measures not in the model: {unknown}")
         else:
             raise TypeError(f"Expected `transform` to be a `Transform` or a dict of them, got {type(transform)}")
-        nonlinear = [m for m in transforms if m in self.measurement_model.measure_funs]
-        if nonlinear:
-            raise ValueError(
-                f"`transform` is not supported for measures with a measure-function (e.g. binary measures): "
-                f"{nonlinear}. To transform only some measures, pass a dict."
-            )
+        # note: measures with a nonlinear measurement (measure-fun or nonlinear process) are fine -- the model is
+        # `T(y) = g(state) + noise`, and the monte-carlo path back-transforms samples of `g(state) + noise`. Subclasses
+        # with non-gaussian measures (e.g. BinomialPredictions) should disallow them here.
         return transforms
 
     def _measured_moments_flat(self) -> tuple[torch.Tensor, torch.Tensor]:

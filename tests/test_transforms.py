@@ -120,8 +120,28 @@ def test_to_dataframe_transform_binomial():
     measured_mean, system_cov = pred._measured_moments_flat()
     expected = torch.exp(measured_mean[:, 1] + system_cov[:, 1, 1] / 2).numpy()
     assert np.allclose(df_t.query("measure == 'spend'")['mean'].values, expected, rtol=.02)
-    with pytest.raises(ValueError, match="measure-function"):
+    with pytest.raises(ValueError, match="binary measures"):
         pred.to_dataframe(transform=LogTransform())
+
+
+@torch.no_grad()
+def test_to_dataframe_transform_nonlinear_gaussian():
+    """
+    A transform can be combined with a nonlinear measurement (as long as the likelihood is gaussian): the model is
+    `T(y) = g(state) + noise`, so predictions on the original scale are `inverse(g(state) + noise)`.
+    """
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    kf.mc_sampling = 20_000
+    y = torch.rand(2, 8, 1) * .5 + .25
+    pred = kf(y)
+    df = pred.to_dataframe(conf=.9, use_map=False)
+    df_t = pred.to_dataframe(conf=.9, use_map=False, transform=LogTransform())
+    # quantiles pass through the (monotone) back-transform:
+    assert np.allclose(df_t['lower'].values, np.exp(df['lower'].values), rtol=1e-4)
+    assert np.allclose(df_t['upper'].values, np.exp(df['upper'].values), rtol=1e-4)
+    # the mean is the mean of the back-transformed samples, so exceeds the back-transformed mean (jensen's):
+    assert (df_t['mean'].values > np.exp(df['mean'].values)).all()
 
 
 @torch.no_grad()
