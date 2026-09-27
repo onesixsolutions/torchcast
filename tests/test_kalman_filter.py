@@ -504,3 +504,13 @@ def test_predictions_state_formats():
         pred2 = Predictions(states=states, **kwargs)
         assert torch.equal(pred2.state_means, pred.state_means) and torch.equal(pred2.state_covs, pred.state_covs)
         assert torch.allclose(pred2.log_prob(y), pred.log_prob(y))
+
+
+@torch.no_grad()
+def test_to_dataframe_std():
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(2, 6, 1))
+    df = pred.to_dataframe(conf=None)
+    _, cov = pred
+    assert np.allclose(df['std'].values, cov[..., 0, 0].sqrt().reshape(-1).numpy(), rtol=1e-5)

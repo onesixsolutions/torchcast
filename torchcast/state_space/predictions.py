@@ -177,7 +177,8 @@ class Predictions:
             if conf is None:
                 if transform is not None or derived:
                     raise ValueError("`conf=None` (i.e. returning `std`) is not supported with `transform`/`derived`.")
-                conf = stats.norm.ppf(2 * stats.norm.cdf(-.5))
+                # the conf-level for which upper - lower == 1 std-dev (i.e. +/- .5 std-devs):
+                conf = 1 - 2 * stats.norm.cdf(-.5)
                 return_std = True
 
             df = self._to_dataframe(
