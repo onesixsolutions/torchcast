@@ -565,8 +565,12 @@ class Predictions:
                 lower.view(*batch_shape),
                 upper.view(*batch_shape)
             )
-        # mixture measures are linear-gaussian (within each regime), so use their closed-form mixture:
+        # mixture measures with a linear measurement are gaussian within each regime, so use their closed-form mixture:
         by_measure.update(self._get_mixture_intervals(alpha, transforms))
+        # otherwise, sample from the mixture (for the standard regime, the mean from above is still appropriate):
+        by_measure.update(self._get_sampled_mixture_intervals(
+            alpha, standard_means={m: v[0] for m, v in by_measure.items()}, transforms=transforms
+        ))
         return by_measure
 
     def _get_pred_intervals(self,
@@ -604,6 +608,8 @@ class Predictions:
         transforms = transforms or {}
         out = {}
         for measure in self.mixture.mixture_measures:
+            if measure in self._nonlinear_measures:
+                continue  # see _get_sampled_mixture_intervals
             mixture = self.get_mixture(measure)
             lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
             if measure in transforms:
@@ -613,6 +619,44 @@ class Predictions:
                 out[measure] = (mean, t.inverse(lower), t.inverse(upper))
             else:
                 out[measure] = (mixture.mean(), lower, upper)
+        return out
+
+    def _get_sampled_mixture_intervals(self,
+                                       alpha: float,
+                                       standard_means: dict[str, torch.Tensor],
+                                       transforms: Optional[dict[str, 'Transform']] = None
+                                       ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        For mixture measures with a nonlinear measurement, the standard regime isn't gaussian, so the mixture has no
+        closed form. The intervals are quantiles of samples from :func:`sample` (with a fixed seed, so repeated calls
+        agree). The mean doesn't need the regimes to be sampled, since their probabilities are known.
+
+        :param standard_means: For each measure, the ``(num_groups, num_timesteps)`` mean of the standard regime (on
+         the scale given by ``transforms``).
+        """
+        from .transforms import gauss_hermite_mean
+
+        if self.mixture is None:
+            return {}
+        measures = [m for m in self.mixture.mixture_measures if m in self._nonlinear_measures]
+        if not measures:
+            return {}
+        transforms = transforms or {}
+        generator = torch.Generator(device=self.state_means.device).manual_seed(_DERIVED_SEED)
+        samples = self.sample(self.mc_white_noise.num_samples, observation_noise=True, generator=generator)
+        out = {}
+        for measure in measures:
+            standard_mean = standard_means[measure]
+            mixture = self._get_mixture(measure, standard_mean, torch.zeros_like(standard_mean))
+            x = samples[measure]
+            component_means = mixture.means[..., 1:]
+            if measure in transforms:
+                t = transforms[measure]
+                x = t.inverse(x)
+                # (the full back-transformed mean, like the standard regime's -- bias_adjust is ignored for MC)
+                component_means = gauss_hermite_mean(t.inverse, component_means, mixture.vars[..., 1:])
+            mean = mixture.probs[..., 0] * standard_mean + (mixture.probs[..., 1:] * component_means).sum(-1)
+            out[measure] = (mean, _quantile(x, alpha), _quantile(x, 1 - alpha))
         return out
 
     def _standardize_transforms(self,
@@ -632,9 +676,31 @@ class Predictions:
         else:
             raise TypeError(f"Expected `transform` to be a `Transform` or a dict of them, got {type(transform)}")
         # note: measures with a nonlinear measurement (measure-fun or nonlinear process) are fine -- the model is
-        # `T(y) = g(state) + noise`, and the monte-carlo path back-transforms samples of `g(state) + noise`. Subclasses
-        # with non-gaussian measures (e.g. BinomialPredictions) should disallow them here.
+        # `T(y) = g(state) + noise`, and the monte-carlo path back-transforms samples of `g(state) + noise`. but
+        # measures with a non-gaussian likelihood aren't:
+        non_gaussian = [m for m in transforms if m in self._non_gaussian_measures]
+        if non_gaussian:
+            raise ValueError(
+                f"`transform` is not supported for measures with a non-gaussian likelihood (e.g. binary measures): "
+                f"{non_gaussian}. To transform only some measures, pass a dict of `{{measure: Transform}}`."
+            )
         return transforms
+
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        """
+        Measures whose likelihood isn't gaussian (e.g. the binary measures of ``BinomialPredictions``).
+        """
+        return ()
+
+    @property
+    def _nonlinear_measures(self) -> set[str]:
+        """
+        Measures whose measured-mean is a nonlinear function of the state (via a measure-function or a nonlinear
+        process), so their predictive distribution isn't gaussian even with a gaussian likelihood.
+        """
+        mm = self.measurement_model
+        return set(mm.measure_funs) | {p.measure for p in mm.nonlinear_processes}
 
     def _measured_moments_flat(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -652,8 +718,9 @@ class Predictions:
         regime have the usual (state-dependent) mean and covariance; measures in a mixture-component's regime have
         that component's mean and variance, and are uncorrelated with the other measures.
 
-        Note that for measures with a measure-function (e.g. binary measures), the standard-regime moments are from
-        the linearized measurement-model, so are approximate.
+        Note that for measures with a nonlinear measurement (a measure-function, e.g. binary measures, or nonlinear
+        processes), the standard-regime moments are from the linearized measurement-model, so are approximate (with a
+        warning, if any of these are mixture measures).
 
         :return: A tuple of (1) a label for each combo: a tuple with the regime of each mixture measure ('standard' or
          the component id), (2) a ``(num_groups, num_timesteps, num_combos)`` tensor of combo probabilities, (3) a
@@ -663,6 +730,12 @@ class Predictions:
         if self.mixture is None:
             raise RuntimeError("This model has no mixture components.")
         rm = self.mixture
+        nonlinear = [m for m in rm.mixture_measures if m in self._nonlinear_measures]
+        if nonlinear:
+            warn(
+                f"Mixture measures {nonlinear} have a nonlinear measurement, so the standard regime's moments are from "
+                f"the linearized measurement-model (approximate). The regime-probabilities are exact."
+            )
         measures = list(self.measurement_model.measures)
         measured_mean, system_cov = self._measured_moments_flat()
         means, covs = [], []
@@ -693,22 +766,44 @@ class Predictions:
         For a measure with mixture components, the predictive distribution as a (univariate) mixture of normals: the
         standard regime, then each of the measure's components.
 
+        For a measure with a nonlinear measurement (a measure-function or nonlinear processes), the standard regime
+        isn't actually normal: its mean and variance are from the linearized (EKF) measurement-model, so are
+        approximate (with a warning). The regime-probabilities are still exact. (``to_dataframe()`` and ``means`` use
+        monte-carlo for these measures instead.)
+
         :param measure: The name of the measure.
         :return: A :class:`.MixtureOfNormals` whose tensors have shape ``(num_groups, num_timesteps, num_components)``.
+        """
+        if measure in self._nonlinear_measures:
+            warn(
+                f"'{measure}' has a nonlinear measurement, so the standard regime's mean and variance are from the "
+                f"linearized measurement-model (approximate). The regime-probabilities are exact."
+            )
+        j = list(self.measurement_model.measures).index(measure)
+        measured_mean, system_cov = self._measured_moments_flat()
+        batch_shape = self.state_means.shape[0:2]
+        return self._get_mixture(
+            measure,
+            standard_mean=measured_mean[:, j].view(*batch_shape),
+            standard_var=system_cov[:, j, j].view(*batch_shape),
+        )
+
+    def _get_mixture(self,
+                     measure: str,
+                     standard_mean: torch.Tensor,
+                     standard_var: torch.Tensor) -> 'MixtureOfNormals':
+        """
+        :param standard_mean: A ``(num_groups, num_timesteps)`` tensor with the mean of the standard regime.
+        :param standard_var: A ``(num_groups, num_timesteps)`` tensor with the variance of the standard regime.
         """
         from .mixture import MixtureOfNormals
 
         if self.mixture is None or measure not in self.mixture.mixture_measures:
             raise ValueError(f"'{measure}' has no mixture components.")
         rm = self.mixture
-        j = list(self.measurement_model.measures).index(measure)
         k = rm.mixture_measures.index(measure)
         components = [None] + [c for c in rm.components if c.measure == measure]
-
-        measured_mean, system_cov = self._measured_moments_flat()
         batch_shape = self.state_means.shape[0:2]
-        standard_mean = measured_mean[:, j].view(*batch_shape)
-        standard_var = system_cov[:, j, j].view(*batch_shape)
 
         probs, means, vars_ = [], [], []
         for component in components:
@@ -831,11 +926,18 @@ class Predictions:
             )
             measured_mean = torch.mean(mmean_samples, dim=0).view(*batch_shape, -1)
             if self.mixture is not None:
-                # mixture measures are linear-gaussian within each regime, so use the closed-form mixture-mean:
-                measured_mean = measured_mean.clone()
+                # P(standard) * E[standard] + sum_k P(k) * mean_k. E[standard] is the monte-carlo mean for measures
+                # with a nonlinear measurement; otherwise it has a closed form.
+                linear_mean, _ = self._measured_moments_flat()
+                linear_mean = linear_mean.view(*batch_shape, -1)
+                nonlinear = self._nonlinear_measures
+                out = measured_mean.clone()
                 for measure in self.mixture.mixture_measures:
                     j = list(self.measurement_model.measures).index(measure)
-                    measured_mean[..., j] = self.get_mixture(measure).mean()
+                    standard_mean = measured_mean[..., j] if measure in nonlinear else linear_mean[..., j]
+                    mixture = self._get_mixture(measure, standard_mean, torch.zeros_like(standard_mean))
+                    out[..., j] = mixture.mean()
+                measured_mean = out
             return measured_mean, None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
@@ -989,13 +1091,22 @@ class Predictions:
         )
 
         if measurement_model.is_nonlinear:
-            if has_mixture:
-                raise NotImplementedError("`log_prob` not yet supported with mixture components + nonlinear measures.")
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
                 state_covs=state_covs,
             )
+            if has_mixture:
+                def standard_log_lik(idx: torch.Tensor) -> torch.Tensor:
+                    # the monte-carlo marginal likelihood of the standard-regime measures:
+                    mc_log_probs = _mc_mvnorm_log_prob(
+                        resid=obs[:, idx] - mmean_samples[..., idx],
+                        cov=measure_cov[:, idx.unsqueeze(-1), idx.unsqueeze(0)]
+                    )
+                    return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
+
+                return self._mixture_log_prob(obs=obs, measures=measurement_model.measures,
+                                              standard_log_lik=standard_log_lik, log_prior=regime_log_prior)
 
             # evaluate the log-prob of the observations under each sampled measured-mean:
             mc_log_probs = MultivariateNormal(
@@ -1011,20 +1122,29 @@ class Predictions:
         system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
         if not has_mixture:
             return MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
-        return self._mixture_log_prob(obs=obs, measured_mean=measured_mean, system_cov=system_cov,
-                                      measures=measurement_model.measures, log_prior=regime_log_prior)
+
+        def standard_log_lik(idx: torch.Tensor) -> torch.Tensor:
+            # all regime-combos share the same predicted state, so this is just a sub-block of `system_cov`:
+            return mvnorm_log_prob(
+                resid=obs[:, idx] - measured_mean[:, idx],
+                cov=system_cov[:, idx.unsqueeze(-1), idx.unsqueeze(0)]
+            )
+
+        return self._mixture_log_prob(obs=obs, measures=measurement_model.measures,
+                                      standard_log_lik=standard_log_lik, log_prior=regime_log_prior)
 
     def _mixture_log_prob(self,
                           obs: torch.Tensor,
-                          measured_mean: torch.Tensor,
-                          system_cov: torch.Tensor,
                           measures: Sequence[str],
+                          standard_log_lik: Callable[[torch.Tensor], torch.Tensor],
                           log_prior: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        The marginal log-likelihood under the mixture: ``logsumexp_c(log_prior_c + log_lik_c)``. All regime-combos share
-        the same predicted state, so each combo's likelihood just uses a sub-block of ``system_cov`` for the measures
-        in the standard regime, plus each non-standard measure's component likelihood.
+        The marginal log-likelihood under the mixture: ``logsumexp_c(log_prior_c + log_lik_c)``. Each combo's
+        likelihood is the (joint) likelihood of the measures in the standard regime, plus each non-standard measure's
+        component likelihood.
 
+        :param standard_log_lik: A function that takes the indices (into ``measures``) of the measures in the standard
+         regime, and returns their ``(batch,)`` marginal log-likelihood.
         :param log_prior: A ``(batch, num_combos)`` tensor of log prior regime-probabilities. Defaults to the
          regime-model's base-probs.
         """
@@ -1033,15 +1153,13 @@ class Predictions:
             log_prior = self.mixture.log_base_probs().expand(num_rows, -1)
 
         effective, mapping = self.mixture.effective_combos(measures)
-        resid = obs - measured_mean
         out = []
         for e, eff in enumerate(effective):
             weird_idx = [i for i, _ in eff]
             normal_idx = [i for i in range(len(measures)) if i not in weird_idx]
             log_lik = torch.zeros(num_rows, dtype=obs.dtype, device=obs.device)
             if normal_idx:
-                idx = torch.as_tensor(normal_idx, dtype=torch.long, device=obs.device)
-                log_lik = log_lik + mvnorm_log_prob(resid[:, idx], system_cov[:, idx.unsqueeze(-1), idx.unsqueeze(0)])
+                log_lik = log_lik + standard_log_lik(torch.as_tensor(normal_idx, dtype=torch.long, device=obs.device))
             for i, component in eff:
                 log_lik = log_lik + mvnorm_log_prob(
                     (obs[:, i] - component.mean).unsqueeze(-1),
@@ -1401,6 +1519,22 @@ def _warn_bias_adjust_ignored(transform: 'Transform') -> None:
     if transform.bias_adjust is not None:
         warn(f"`{type(transform).__name__}(bias_adjust=...)` is ignored for monte-carlo predictions (the mean is the "
              f"mean of back-transformed samples).")
+
+
+def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
+    """
+    :param resid: A ``(num_samples, batch, d)`` tensor of residuals, one per monte-carlo sample.
+    :param cov: A ``(batch, d, d)`` covariance, shared across samples.
+    :return: A ``(num_samples, batch)`` tensor of log-densities of a zero-mean multivariate normal.
+    """
+    d = resid.shape[-1]
+    if d == 1:
+        return mvnorm_log_prob(resid, cov)
+    # (solve for all samples at once, rather than broadcasting -- which would copy the cholesky for each sample)
+    L = torch.linalg.cholesky(0.5 * (cov + cov.transpose(-2, -1)))
+    z = torch.linalg.solve_triangular(L, resid.permute(1, 2, 0), upper=False)  # (batch, d, num_samples)
+    logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+    return -0.5 * (d * math.log(2 * math.pi) + logdet.unsqueeze(0) + (z ** 2).sum(1).T)
 
 
 def _cov_sqrt(cov: torch.Tensor) -> torch.Tensor:

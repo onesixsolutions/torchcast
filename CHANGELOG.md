@@ -9,16 +9,21 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 
 - `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):
   each `MixtureComponent` has a learned mean, variance, and base-rate. An observation explained by a component is scored against it, rather than updating the
-  state. Components are supported on any linear-gaussian measure, including the non-binary measures of a
-  `BinomialFilter`.
+  state. Components are supported on any measure with a gaussian likelihood, including the non-binary measures of a
+  `BinomialFilter`, and measures with a nonlinear measurement (a nonlinear process such as `SaturatedLinearModel`, or
+  a measure-function): for these, the update-step uses the linearized (EKF) measurement, while `log_prob()`, `means`,
+  and `to_dataframe()` use monte-carlo.
 - Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
   a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
   mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
 - `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
-  only (an approximation, but cheaper, and avoids e.g. a binary measure's gaussian approximation influencing them).
+  only (an approximation, but cheaper). Binary measures never influence the regime-probabilities (their gaussian
+  approximation in the update-step is crude).
 - `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
 - Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
-  regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing.
+  regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing. (For
+  a measure with a nonlinear measurement, the standard regime's mean and variance are the linearized approximation,
+  with a warning.)
   `means`/`covs` are the mixture's exact moments (accessing `covs` warns, since it's easy to misuse), and
   `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
 - With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.

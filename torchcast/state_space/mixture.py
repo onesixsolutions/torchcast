@@ -178,10 +178,14 @@ class MixtureModel(torch.nn.Module):
             raise ValueError(f"`transition` has {transition.num_combos} combos, but expected {self.num_combos}")
         self.transition = transition
 
-    def validate(self, measures: Sequence[str], measure_funs: dict, processes: Sequence) -> None:
+    def validate(self, measures: Sequence[str], non_gaussian_measures: Sequence[str] = ()) -> None:
         """
-        Called by the :class:`.StateSpaceModel`. Mixture measures must be measures of the model, and must have a
-        linear-gaussian measurement model (no measure-function, no nonlinear processes).
+        Called by the :class:`.StateSpaceModel`. Mixture measures must be measures of the model, with a gaussian
+        likelihood. (A nonlinear measured-mean -- from a measure-function or nonlinear processes -- is fine.)
+
+        :param measures: The model's measures.
+        :param non_gaussian_measures: Measures whose likelihood isn't gaussian (e.g. the binary measures of a
+         :class:`.BinomialFilter`).
         """
         for component in self.components:
             if component.measure not in measures:
@@ -189,12 +193,9 @@ class MixtureModel(torch.nn.Module):
                     f"MixtureComponent '{component.id}' has measure '{component.measure}' not in `measures`"
                 )
         for measure in self.mixture_measures:
-            if measure in measure_funs:
-                raise ValueError(f"Mixture components are not supported for '{measure}', which has a measure-function.")
-            nonlinear = [p.id for p in processes if p.measure == measure and not p.linear_measurement]
-            if nonlinear:
+            if measure in non_gaussian_measures:
                 raise ValueError(
-                    f"Mixture components are not supported for '{measure}', which has nonlinear processes: {nonlinear}"
+                    f"Mixture components are not yet supported for '{measure}', which has a non-gaussian likelihood."
                 )
 
     @property

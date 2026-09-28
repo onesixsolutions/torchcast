@@ -75,7 +75,7 @@ def test_mixture_model_validation():
             [MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1')],
             transition=StickyTransition(num_combos=3)
         )
-    with pytest.raises(ValueError, match="measure-function"):
+    with pytest.raises(ValueError, match="not yet supported .* non-gaussian"):
         BinomialFilter(
             processes=[LocalLevel(id='lvl', measure='visit')],
             measures=['visit'],
@@ -288,6 +288,39 @@ def test_binomial_filter_with_mixture(univariate_prob: bool):
     # end-to-end training:
     bf.zero_grad()
     bf.fit(y, stopping={'max_iter': 3}, verbose=0)
+
+
+@torch.no_grad()
+def test_binary_measures_excluded_from_responsibilities():
+    """
+    Binary measures don't contribute to regime-probabilities: with only a binary measure besides the mixture measure,
+    scoring all measures is the same as scoring only the mixture measures (``univariate_prob=True``).
+    """
+    torch.manual_seed(1)
+    visit = (torch.rand(3, 12) > .4).float()
+    spend = torch.randn(3, 12).cumsum(1) * .2 + 3.
+    spend[torch.rand(3, 12) > .8] = -1.
+    spend[visit == 0] = float('nan')
+    y = torch.stack([visit, spend], -1)
+
+    preds = {}
+    for univariate_prob in (False, True):
+        torch.manual_seed(2)
+        bf = BinomialFilter(
+            processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
+            measures=['visit', 'spend'],
+            binary_measures=['visit'],
+            mixture=MixtureModel(
+                [MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+                univariate_prob=univariate_prob
+            ),
+        )
+        bf.mc_sampling = 20
+        preds[univariate_prob] = bf(y, include_updates_in_output=True)
+    assert torch.allclose(preds[False].update_regime_probs, preds[True].update_regime_probs)
+    assert torch.allclose(preds[False].state_means, preds[True].state_means)
+    # (and responsibilities are actually informative here:)
+    assert preds[False].update_regime_probs[..., 1].max() > .5
 
 
 @torch.no_grad()

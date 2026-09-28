@@ -82,6 +82,10 @@ class BinomialFilter(KalmanFilter):
         else:
             self.post_correction_module = None
 
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        return self.binary_measures
+
     @classmethod
     def _validate_measure_cov(cls,
                               measures: Sequence[str],
@@ -423,15 +427,9 @@ class BinomialPredictions(Predictions):
             observations[..., idx] = torch.binomial(num_obs.contiguous(), p.contiguous(), generator=generator) / num_obs
         return observations
 
-    def _standardize_transforms(self, transform: Union['Transform', dict, None]) -> dict:
-        transforms = super()._standardize_transforms(transform)
-        binary = [m for m in transforms if m in self.binary_measures]
-        if binary:
-            raise ValueError(
-                f"`transform` is not supported for binary measures: {binary}. To transform only some measures, pass a "
-                f"dict of `{{measure: Transform}}`."
-            )
-        return transforms
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        return self.binary_measures
 
     def _to_dataframe(self,
                       dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],

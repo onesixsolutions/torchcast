@@ -180,7 +180,12 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 # - Mixture components are also supported in the `BinomialFilter`, on its non-binary measures. For example, with a
 #   binary 'visited' measure and a 'log-spend' measure that's missing whenever there was no visit. Then
 #   `to_dataframe(transform={'log_spend': LogTransform()}, derived={'spend': lambda s: s['visited'] *
-#   s['log_spend'].nan_to_num()})` gives forecasts of weekly spend (from joint samples of both measures).
+#   s['log_spend'].nan_to_num()})` gives forecasts of weekly spend (from joint samples of both measures). The binary
+#   measure doesn't influence the regime-probabilities (its gaussian approximation in the update is crude).
+# - A mixture measure can have a nonlinear measurement -- e.g. a `SaturatedLinearModel` process, or a sigmoid
+#   measure-function with a gaussian likelihood. Then `log_prob()`, `means`, and `to_dataframe()` use monte-carlo for
+#   it (as for nonlinear measures without mixtures), and `get_mixture()` warns that its standard regime is the
+#   linearized approximation (its regime-probabilities are still exact).
 # - With multiple measures, each measure can have its own components. Regime-probabilities are tracked jointly across
 #   measures; `Predictions.sample()` gives joint draws of all measures (incl. the regimes).
 # - To carry regime-probabilities over into a later forecast, pass the output of `Predictions.get_state_at_times()`

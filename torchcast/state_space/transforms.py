@@ -49,13 +49,24 @@ class Transform(torch.nn.Module):
         :param var: The variance of ``Y``, same shape as ``mean``.
         :return: A tensor with the same shape as ``mean``.
         """
-        var = var * self._var_multi
-        # E[f(Y)], Y ~ N(mean, var)  ~=  sum_i w_i / sqrt(pi) * f(mean + sqrt(2 * var) * x_i)
-        x, w = np.polynomial.hermite.hermgauss(self.num_nodes)
-        x = torch.as_tensor(x, dtype=mean.dtype, device=mean.device)
-        w = torch.as_tensor(w / math.sqrt(math.pi), dtype=mean.dtype, device=mean.device)
-        nodes = mean.unsqueeze(-1) + (2 * var).sqrt().unsqueeze(-1) * x
-        return (w * self.inverse(nodes)).sum(-1)
+        return gauss_hermite_mean(self.inverse, mean, var * self._var_multi, num_nodes=self.num_nodes)
+
+
+def gauss_hermite_mean(fun: callable, mean: torch.Tensor, var: torch.Tensor, num_nodes: int = 32) -> torch.Tensor:
+    """
+    ``E[fun(Y)]`` for gaussian ``Y``, elementwise, by gauss-hermite quadrature.
+
+    :param fun: An elementwise function.
+    :param mean: The mean of ``Y``.
+    :param var: The variance of ``Y``, same shape as ``mean``.
+    :param num_nodes: The number of quadrature nodes.
+    """
+    # E[f(Y)], Y ~ N(mean, var)  ~=  sum_i w_i / sqrt(pi) * f(mean + sqrt(2 * var) * x_i)
+    x, w = np.polynomial.hermite.hermgauss(num_nodes)
+    x = torch.as_tensor(x, dtype=mean.dtype, device=mean.device)
+    w = torch.as_tensor(w / math.sqrt(math.pi), dtype=mean.dtype, device=mean.device)
+    nodes = mean.unsqueeze(-1) + (2 * var).sqrt().unsqueeze(-1) * x
+    return (w * fun(nodes)).sum(-1)
 
 
 class LogTransform(Transform):

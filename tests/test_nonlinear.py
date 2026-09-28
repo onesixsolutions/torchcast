@@ -6,6 +6,7 @@ test_kalman_filter.py.) Where possible, results are compared to an independent g
 `FixedWhiteNoise`, so these tests are deterministic.
 """
 import math
+from typing import Optional
 
 import numpy as np
 import pytest
@@ -16,6 +17,8 @@ from torch.distributions import Binomial
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, SaturatedLinearModel
+from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+from torchcast.state_space.transforms import LogTransform
 
 
 def _white_noise(num_samples: int, seed: int = 0) -> FixedWhiteNoise:
@@ -241,3 +244,228 @@ def test_binomial_fit_recovers_probability():
         pred = bf(y)
         mean_prob = pred.means[:, -10:, 0].mean().item()
     assert abs(mean_prob - true_prob) < .05
+
+
+# mixture components on measures with a nonlinear measurement --------------------------------------------------------
+
+_COMPONENT_MEAN, _COMPONENT_SD = .05, .03
+
+
+def _sigmoid_mixture_kf(num_samples: int = 20_000, process_var_multi: Optional[float] = None) -> KalmanFilter:
+    """
+    A sigmoid measure-function with gaussian likelihood, plus a 'low' mixture component.
+
+    :param process_var_multi: If set, the process-variance (relative to the measure-variance) -- e.g. large enough
+     that the sigmoid's nonlinearity matters (vs. the linearized approximation).
+    """
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level')],
+        measures=['y'],
+        measure_funs={'y': 'sigmoid'},
+        mixture=[MixtureComponent(measure='y', mean_init=_COMPONENT_MEAN, prob_init=.2, id='low')],
+    )
+    with torch.no_grad():
+        kf.measure_covariance.cholesky_log_diag.fill_(math.log(.05))
+        if process_var_multi is not None:
+            kf.process_covariance.cholesky_log_diag.fill_(math.log(process_var_multi))
+        kf.mixture.components[0]._log_std.fill_(math.log(_COMPONENT_SD))
+    kf.mc_sampling = _white_noise(num_samples)
+    return kf
+
+
+def _sigmoid_mixture_data(low: float = .2, high: float = .8) -> torch.Tensor:
+    torch.manual_seed(0)
+    y = torch.rand(3, 8, 1) * (high - low) + low
+    y[torch.rand(3, 8) < .2] = _COMPONENT_MEAN
+    return y
+
+
+@torch.no_grad()
+def test_mixture_nonlinear_log_prob_matches_quadrature():
+    """
+    The marginal likelihood is ``P(standard) * E[N(y; sigmoid(Z), R)] + P(low) * N(y; mu, sigma^2)``, using the
+    regime-prior at each timestep.
+
+    (With default state-uncertainty: the monte-carlo log-prob converges slowly when the measurement-noise is small
+    relative to the spread of the sampled means, so this tests the mixture logic rather than monte-carlo efficiency.)
+    """
+    kf = _sigmoid_mixture_kf()
+    y = _sigmoid_mixture_data()
+    pred = kf(y)
+    lp = pred.log_prob(y).reshape(-1).double()
+
+    z_mean, z_var = _linear_moments(pred, 0)
+    r = pred.measure_covs_flat[:, 0, 0].double()
+    obs = y.reshape(-1).double()
+    probs = pred.regime_probs.reshape(-1, 2).double()  # combos: (standard, low)
+
+    def density(z):
+        mu = torch.sigmoid(z.clamp(-8, 8))
+        return torch.exp(-.5 * (obs.unsqueeze(-1) - mu) ** 2 / r.unsqueeze(-1)) / (2 * math.pi * r.unsqueeze(-1)).sqrt()
+
+    standard_lik = _gauss_hermite_expectation(density, z_mean, z_var)
+    component_lik = torch.distributions.Normal(_COMPONENT_MEAN, _COMPONENT_SD).log_prob(obs).exp()
+    exact = (probs[:, 0] * standard_lik + probs[:, 1] * component_lik).log()
+    # (monte-carlo error; confirmed to shrink at ~1/sqrt(num_samples), i.e. not a bias)
+    assert torch.allclose(lp, exact, atol=.01)
+    assert (lp - exact).abs().mean() < .003
+
+    # and it's differentiable wrt the component's params:
+    with torch.enable_grad():
+        pred = kf(y)
+        pred.log_prob(y).sum().backward()
+    component = kf.mixture.components[0]
+    for param in (component.mean, component._log_std, component.logit):
+        assert param.grad is not None and param.grad.abs() > 0
+
+
+@torch.no_grad()
+def test_mixture_nonlinear_predictions_match_quadrature():
+    """
+    Means: ``P(standard) * E[sigmoid(Z)] + P(low) * mu``. Intervals: quantiles of the mixture of
+    ``sigmoid(Z) + noise`` and the component. With ``use_map=True``, the standard-regime's mean is ``sigmoid(E[Z])``.
+    """
+    # (enough state-uncertainty that the nonlinearity matters -- the linearized mean/intervals fail this test)
+    kf = _sigmoid_mixture_kf(process_var_multi=5.)
+    y = _sigmoid_mixture_data(.7, .9)  # (away from sigmoid(0), where the sigmoid is ~linear)
+    pred = kf(y, out_timesteps=14)  # (forecasts, so the state-uncertainty grows)
+
+    z_mean, z_var = _linear_moments(pred, 0)
+    r = pred.measure_covs_flat[:, 0, 0].double()
+    probs = pred.regime_probs.reshape(-1, 2).double()
+    standard_mean = _gauss_hermite_expectation(lambda z: torch.sigmoid(z.clamp(-8, 8)), z_mean, z_var)
+    expected_mean = probs[:, 0] * standard_mean + probs[:, 1] * _COMPONENT_MEAN
+
+    assert np.allclose(pred.means.reshape(-1).numpy(), expected_mean.numpy(), atol=.003)
+
+    df = pred.to_dataframe(conf=.9, use_map=False)
+    assert np.allclose(df['mean'].values, expected_mean.numpy(), atol=.003)
+
+    def cdf_at(q):
+        q = torch.as_tensor(q, dtype=torch.float64)
+        standard = _gauss_hermite_expectation(
+            lambda z: torch.special.ndtr((q.unsqueeze(-1) - torch.sigmoid(z.clamp(-8, 8))) / r.unsqueeze(-1).sqrt()),
+            z_mean, z_var
+        )
+        component = torch.special.ndtr((q - _COMPONENT_MEAN) / _COMPONENT_SD)
+        return probs[:, 0] * standard + probs[:, 1] * component
+
+    # (~5 standard-errors for a sample-quantile's coverage with 20k samples)
+    assert np.allclose(cdf_at(df['lower'].values).numpy(), .05, atol=.01)
+    assert np.allclose(cdf_at(df['upper'].values).numpy(), .95, atol=.01)
+
+    df_map = pred.to_dataframe(conf=.9, use_map=True)
+    map_mean = probs[:, 0] * torch.sigmoid(z_mean.double()) + probs[:, 1] * _COMPONENT_MEAN
+    assert np.allclose(df_map['mean'].values, map_mean.numpy(), atol=1e-5)
+    assert np.allclose(df_map['lower'].values, df['lower'].values)
+
+    # with a transform, the draws are back-transformed (so the mean is E[exp(Y)] under the mixture):
+    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform())
+    standard_exp = _gauss_hermite_expectation(lambda z: torch.exp(torch.sigmoid(z.clamp(-8, 8))), z_mean, z_var)
+    expected_exp = (
+        probs[:, 0] * standard_exp * torch.exp(r / 2) +
+        probs[:, 1] * math.exp(_COMPONENT_MEAN + _COMPONENT_SD ** 2 / 2)
+    )
+    assert np.allclose(df_exp['mean'].values, expected_exp.numpy(), atol=.005)
+    assert np.allclose(df_exp['lower'].values, np.exp(df['lower'].values), rtol=1e-5)
+
+
+@torch.no_grad()
+def test_mixture_nonlinear_get_mixture_warns():
+    kf = _sigmoid_mixture_kf(num_samples=100)
+    y = _sigmoid_mixture_data()
+    pred = kf(y)
+    with pytest.warns(UserWarning, match="linearized"):
+        mixture = pred.get_mixture('y')
+    # the regime-probabilities are exact:
+    assert torch.allclose(mixture.probs, pred.regime_probs)
+    with pytest.warns(UserWarning, match="linearized"):
+        pred._get_regime_combos()
+
+
+def test_binomial_mixture_with_nonlinear_process():
+    """
+    The motivating use-case: a binary 'visit' measure, plus a 'spend' measure (missing when there's no visit) with a
+    saturating (nonlinear) process and a mixture component for low-spend visits.
+    """
+    torch.manual_seed(0)
+    num_groups, num_times = 4, 15
+    X = torch.randn(num_groups, num_times, 2)
+    visit = (torch.rand(num_groups, num_times) > .4).float()
+    spend = torch.randn(num_groups, num_times).cumsum(1) * .2 + 3.
+    spend[torch.rand(num_groups, num_times) > .85] = -1.
+    spend[visit == 0] = float('nan')
+    y = torch.stack([visit, spend], -1)
+
+    bf = BinomialFilter(
+        processes=[
+            LocalLevel(id='level_visit', measure='visit'),
+            LocalLevel(id='level_spend', measure='spend'),
+            SaturatedLinearModel(id='slm', predictors=['a', 'b'], measure='spend'),
+        ],
+        measures=['visit', 'spend'],
+        binary_measures=['visit'],
+        mixture=MixtureModel([MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')]),
+    )
+    bf.mc_sampling = _white_noise(50)
+    pred = bf(y, X=X)
+    lp = pred.log_prob(y)
+    assert torch.isfinite(lp).all()
+    lp.sum().backward()
+    assert bf.mixture.components[0].mean.grad.abs() > 0
+
+    with torch.no_grad():
+        df = pred.to_dataframe(conf=.9, transform={'spend': LogTransform()})
+    assert np.isfinite(df[['mean', 'lower', 'upper']].values).all()
+
+    bf.zero_grad()
+    bf.fit(y, X=X, stopping={'max_iter': 3}, verbose=0)
+
+
+@torch.no_grad()
+def test_mc_mvnorm_log_prob():
+    from torchcast.state_space.predictions import _mc_mvnorm_log_prob
+
+    torch.manual_seed(0)
+    for d in (1, 3):
+        A = torch.randn(5, d, d)
+        cov = A @ A.transpose(-1, -2) + torch.eye(d)
+        resid = torch.randn(7, 5, d)
+        expected = torch.distributions.MultivariateNormal(torch.zeros(d), cov).log_prob(resid)
+        assert torch.allclose(_mc_mvnorm_log_prob(resid, cov), expected, atol=1e-5)
+
+
+@torch.no_grad()
+def test_mixture_nonlinear_multivariate_negligible():
+    """
+    With two gaussian measures (one nonlinear, with a mixture component), a negligible component gives the same
+    log-prob as no mixture -- incl. the joint (bivariate) monte-carlo likelihood of the standard regime.
+    """
+    torch.manual_seed(0)
+    measures = ['a', 'b']
+    X = torch.randn(3, 10, 2)
+    y = torch.randn(3, 10, 2).cumsum(1) * .2
+    y[0, 4, 1] = float('nan')
+
+    def make(mixture):
+        torch.manual_seed(1)
+        kf = KalmanFilter(
+            processes=[
+                LocalLevel(id='level_a', measure='a'),
+                LocalLevel(id='level_b', measure='b'),
+                SaturatedLinearModel(id='slm', predictors=['x1', 'x2'], measure='b'),
+            ],
+            measures=measures,
+            mixture=mixture,
+        )
+        kf.mc_sampling = _white_noise(200)
+        return kf
+
+    kf_mix = make([MixtureComponent(measure='b', mean_init=-3., prob_init=.1, id='low')])
+    with torch.no_grad():
+        kf_mix.mixture.components[0].logit.fill_(-40.)
+    kf = make(None)
+    kf.load_state_dict({k: v for k, v in kf_mix.state_dict().items() if not k.startswith('mixture.')})
+    lp_mix = kf_mix(y, X=X).log_prob(y)
+    lp = kf(y, X=X).log_prob(y)
+    assert torch.allclose(lp_mix, lp, atol=1e-4)

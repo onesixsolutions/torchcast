@@ -97,7 +97,15 @@ class StateSpaceModel(torch.nn.Module):
             mixture = MixtureModel(mixture)
         self.mixture: Optional[MixtureModel] = mixture
         if self.mixture is not None:
-            self.mixture.validate(measures, self.measure_funs, list(self.processes.values()))
+            self.mixture.validate(measures, non_gaussian_measures=self._non_gaussian_measures)
+
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        """
+        Measures whose likelihood isn't gaussian. These can't have mixture components, and are excluded when scoring
+        regime-probabilities.
+        """
+        return ()
 
     def forward(self,
                 y: Optional[torch.Tensor] = None,
