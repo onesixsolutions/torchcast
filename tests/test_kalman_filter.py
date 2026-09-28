@@ -484,3 +484,86 @@ def test_nonlinear_covs_warns_once():
         assert pred.covs is None
         assert pred.covs is None
     assert len([w for w in caught if 'no closed-form covariance' in str(w.message)]) == 1
+
+
+@pytest.mark.parametrize("config", ['sigmoid', 'saturated', 'saturated+sigmoid'])
+def test_ekf_jacobian_matches_autograd(config: str):
+    """
+    The EKF linearization: the measurement-matrix returned by the MeasurementModel should be the jacobian of the
+    measured-mean wrt the state (in particular, a measure-function's derivative is evaluated at its input).
+    """
+    from torchcast.process import SaturatedLinearModel
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+    torch.manual_seed(0)
+    processes = [LocalLevel(id='level')]
+    kwargs = {}
+    if 'saturated' in config:
+        processes.append(SaturatedLinearModel(id='slm', predictors=['a', 'b']))
+        kwargs['X'] = torch.randn(4, 3, 2)
+    kf = KalmanFilter(processes=processes, measures=['y'],
+                      measure_funs={'y': 'sigmoid'} if 'sigmoid' in config else None)
+    kf.mc_sampling = FixedWhiteNoise(10, random_state=np.random.RandomState(0))
+    with torch.no_grad():
+        pred = kf(torch.rand(4, 3, 1), **kwargs)
+    mm = pred.measurement_model
+    means = pred.state_means[:, 1].clone()
+    _, measure_mat = mm(means, time=1)
+    for g in range(means.shape[0]):
+        def fun(state):
+            full = means.clone()
+            full[g] = state
+            return mm(full, time=1)[0][g]
+
+        jac = torch.autograd.functional.jacobian(fun, means[g].clone())
+        assert torch.allclose(measure_mat[g], jac, atol=1e-5), (g, measure_mat[g], jac)
+
+
+@torch.no_grad()
+def test_sigmoid_legacy_jacobian():
+    """The (deprecated) `legacy_jacobian` flag reproduces the pre-1.1.3 linearization: sigmoid'(sigmoid(z))."""
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    kf.mc_sampling = FixedWhiteNoise(10, random_state=np.random.RandomState(0))
+    pred = kf(torch.rand(4, 3, 1))
+    mm = pred.measurement_model
+    means = pred.state_means[:, 1]
+    z = means[:, 0]  # (LocalLevel: the pre-sigmoid measured mean is the state)
+
+    def deriv(x):
+        return torch.sigmoid(x) * (1 - torch.sigmoid(x))
+
+    _, measure_mat = mm(means, time=1)
+    assert torch.allclose(measure_mat[:, 0, 0], deriv(z), atol=1e-6)
+    kf.measure_funs['y'].legacy_jacobian = True
+    _, measure_mat_legacy = mm(means, time=1)
+    assert torch.allclose(measure_mat_legacy[:, 0, 0], deriv(torch.sigmoid(z)), atol=1e-6)
+    # the flag is per-model:
+    kf2 = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    assert not kf2.measure_funs['y'].legacy_jacobian
+
+
+def test_sigmoid_legacy_jacobian_unpickling():
+    """
+    Models pickled before v1.1.3 have Sigmoid measure-funs without a `legacy_jacobian` instance-attribute; on loading,
+    they should keep their original (legacy) behavior. Models created (and pickled) with this version should not.
+    """
+    import pickle
+    from torchcast.internals.batch_design import Sigmoid
+
+    z = torch.tensor([[2.]])
+
+    def jacobian(sigmoid) -> torch.Tensor:
+        return sigmoid.adjust_measure_mat(torch.ones(1, 1), z)
+
+    fixed = torch.sigmoid(z) * (1 - torch.sigmoid(z))
+    legacy = torch.sigmoid(torch.sigmoid(z)) * (1 - torch.sigmoid(torch.sigmoid(z)))
+    new = pickle.loads(pickle.dumps(Sigmoid()))
+    assert new.legacy_jacobian is False and torch.allclose(jacobian(new), fixed)
+    # simulate an object pickled by an older version (no `legacy_jacobian` attribute):
+    old_style = Sigmoid()
+    del old_style.legacy_jacobian
+    old_loaded = pickle.loads(pickle.dumps(old_style))
+    assert not hasattr(old_loaded, 'legacy_jacobian') and torch.allclose(jacobian(old_loaded), legacy)
