@@ -11,20 +11,14 @@ class StateTuple:
 
     Behaves like the tuple ``(mean, cov)`` -- e.g. ``mean, cov = state`` -- so it can be passed anywhere a
     ``(mean, cov)`` tuple is accepted, such as the ``initial_state`` argument of :func:`StateSpaceModel.forward`.
-
-    Internally, the output of ``_update_step()`` can also carry the residual and system-covariance of the update.
     """
 
     def __init__(self,
                  mean: torch.Tensor,
                  cov: torch.Tensor,
-                 resid: Optional[torch.Tensor] = None,
-                 system_cov: Optional[torch.Tensor] = None,
                  regime_probs: Optional[torch.Tensor] = None):
         self.mean = mean
         self.cov = cov
-        self.resid = resid
-        self.system_cov = system_cov
         self.regime_probs = regime_probs
 
     def __iter__(self) -> Iterator[torch.Tensor]:

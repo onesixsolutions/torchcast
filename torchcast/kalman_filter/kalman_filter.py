@@ -148,7 +148,7 @@ class KalmanFilter(StateSpaceModel):
         K = self._kalman_gain(measured_cov=measured_cov, system_cov=system_cov)
         new_mean = self._mean_update(mean=mean, K=K, resid=resid)
         new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
-        return StateTuple(new_mean, new_cov, resid=resid, system_cov=system_cov)
+        return StateTuple(new_mean, new_cov)
 
     def _mixture_update(self,
                         input: torch.Tensor,
