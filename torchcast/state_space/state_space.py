@@ -267,7 +267,7 @@ class StateSpaceModel(torch.nn.Module):
                         tmask = (tu_h <= last_measured_per_group)
                         meanp, F = transition_model(meanp, time=tu_h, mask=tmask)
                         covp = self._predict_cov(
-                            cov=covu,
+                            cov=covp,
                             transition_mat=F,
                             **{k: v[tu_h] for k, v in predict_kwargs.items()},
                             scaling=scaling,
@@ -340,7 +340,7 @@ class StateSpaceModel(torch.nn.Module):
 
             # Handle empty measures (those not in the covariance structure)
             multi_padded = torch.ones_like(input)
-            multi_padded[..., idx] = multi[..., idx]
+            multi_padded[..., idx] = multi
             return multi_padded
         else:
             return None
@@ -703,7 +703,7 @@ class StateSpaceModel(torch.nn.Module):
             init_mean = [m if len(m.shape) == 2 else m.expand(1, -1) for m in init_mean]
             ngroups = max(m.shape[0] for m in init_mean)
             init_mean = torch.cat([m.expand(ngroups, -1) for m in init_mean], -1)
-            init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+            init_cov = self._default_initial_cov()
         else:
             # TODO: we don't call `get_initial_mean` when initial_state is passed...
             #   this makes sense in some contexts -- e.g. a seasonal process from a previous call to forward() --
@@ -715,16 +715,19 @@ class StateSpaceModel(torch.nn.Module):
                     f"Expected ``init_mean`` to have two-dimensions for (num_groups, state_dim), got {init_mean.shape}"
                 )
             if init_cov is None:
-                init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+                init_cov = self._default_initial_cov()
             if len(init_cov.shape) != 3:
                 raise ValueError(
                     f"Expected ``init_cov`` to be 3-D with (num_groups, state_dim, state_dim), got {init_cov.shape}"
                 )
 
-        measure_scaling = self._get_measure_scaling()
-        init_cov = self._apply_cov_scaling(init_cov, scaling=measure_scaling, is_process_cov=True)
-
         return init_mean, init_cov
+
+    def _default_initial_cov(self) -> torch.Tensor:
+        # the initial covariance is parameterized relative to the measure-scale. note this scaling only applies to the
+        # default: a user-supplied cov (e.g. from ``get_state_at_times()``) is already on the right scale.
+        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        return self._apply_cov_scaling(init_cov, scaling=self._get_measure_scaling(), is_process_cov=True)
 
     def _get_measure_scaling(self) -> torch.Tensor:
         mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
