@@ -55,8 +55,11 @@ class MeasurementModel(DesignModel):
         nl_procs_and_means = list(self._get_nonlinear_processes_and_means(mean))
 
         if self.is_nonlinear:
-            measured_mean = self.adjust_measured_mean(measured_mean, nl_procs_and_means, time)
-            measure_mat = self._adjust_measure_mat(measure_mat, nl_procs_and_means, measured_mean, time)
+            # process-level adjustments, then measure-wide functions (e.g. sigmoid). the jacobian of a measure-wide
+            # function must be evaluated at its *input*, i.e. before the function is applied.
+            pre_fun_mean = self.apply_process_adjustments(measured_mean, nl_procs_and_means, time)
+            measured_mean = self.get_measure_wide_adjustments(pre_fun_mean) if self.measure_funs else pre_fun_mean
+            measure_mat = self._adjust_measure_mat(measure_mat, nl_procs_and_means, pre_fun_mean, time)
 
         return measured_mean, measure_mat
 
@@ -101,21 +104,23 @@ class MeasurementModel(DesignModel):
             pidx = self.process2slice[process.id]
             yield process, mean[..., pidx]
 
-    def adjust_measured_mean(self,
-                             linear_measured_mean: torch.Tensor,
-                             nl_processes_and_means: Iterable[tuple['Process', torch.Tensor]],
-                             time: int) -> Union[torch.Tensor, float]:
-        # process-level adjustments:
+    def apply_process_adjustments(self,
+                                  linear_measured_mean: torch.Tensor,
+                                  nl_processes_and_means: Iterable[tuple['Process', torch.Tensor]],
+                                  time: int) -> torch.Tensor:
+        """
+        Take the linear-measured mean and apply the contributions from any non-linear processes.
+        """
         out = linear_measured_mean.clone()
         for pid, this_mm in self._get_measured_mean_adjustments(nl_processes_and_means, time):
             out = out + this_mm
-
-        # measure-wide adjustments:
-        if self.measure_funs:
-            out = self._get_measure_wide_adjustments(out)
         return out
 
-    def _get_measure_wide_adjustments(self, measured_mean: torch.Tensor) -> torch.Tensor:
+    def get_measure_wide_adjustments(self, measured_mean: torch.Tensor) -> torch.Tensor:
+        """
+        Take the measured-mean (the output of ``apply_process_adjustments()``) and apply any measure-wide nonlinear
+        measurement functions.
+        """
         assert self.measure_funs
         measured_mean = list(measured_mean.unbind(-1))
         for i, measure in enumerate(self.measures):

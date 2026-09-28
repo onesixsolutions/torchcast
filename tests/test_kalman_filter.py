@@ -10,6 +10,7 @@ from torchcast.internals.batch_design import TransitionModel, MeasurementModel
 from torchcast.internals.utils import get_nan_groups
 
 from torchcast.kalman_filter import KalmanFilter
+from torchcast.exp_smooth import ExpSmoother
 
 import numpy as np
 from filterpy.kalman import KalmanFilter as filterpy_KalmanFilter
@@ -233,6 +234,48 @@ def test_equations_preds(n_step: int = 1):
             assert (resid ** 2).mean() < .02
 
 
+@pytest.mark.parametrize(
+    "klass,n_step,every_step",
+    list(itertools.product([KalmanFilter, ExpSmoother], [2, 3, 5], [True, False]))
+)
+@torch.no_grad()
+def test_n_step_matches_nan_forecast(klass: type, n_step: int, every_step: bool):
+    """
+    An h-step-ahead prediction for time t is a forecast from the update at t - h. So it should exactly match the
+    1-step-ahead prediction for time t when the observations between t - h and t are missing.
+
+    With every_step=True, h=n_step (except for the first n_step timesteps, which forecast from the initial state). With
+    every_step=False, the horizon cycles through 1...n_step.
+    """
+    torch.manual_seed(123)
+    measures = ['y1', 'y2']
+    model = klass(
+        processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in measures],
+        measures=measures
+    )
+    if isinstance(model, ExpSmoother):
+        # default init gives K~0 (so covs~0), which would make this test trivially pass
+        model.smoothing_matrix.init_bias = 0
+    num_times = 12
+    y = torch.randn((3, num_times, len(measures))).cumsum(1)
+    pred_n = model(y, n_step=n_step, every_step=every_step)
+    assert (pred_n.state_covs.diagonal(dim1=-2, dim2=-1) > .01).any()
+
+    for t in range(num_times):
+        h = min(t + 1, n_step) if every_step else (t % n_step) + 1
+        y_nan = y.clone()
+        y_nan[:, (t - h + 1):t] = float('nan')
+        pred_1 = model(y_nan, n_step=1)
+        assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
+        assert torch.allclose(pred_n.state_covs[:, t], pred_1.state_covs[:, t], atol=1e-5)
+
+    # a prediction should never depend on observations after it:
+    y_later = y.clone()
+    y_later[:, -1] = float('nan')
+    pred_later = model(y_later, n_step=n_step, every_step=every_step)
+    assert torch.allclose(pred_n.state_covs[:, :-1], pred_later.state_covs[:, :-1], atol=1e-5)
+
+
 def test_keyword_dispatch():
     _counter = defaultdict(int)
 
@@ -351,3 +394,206 @@ def test_dtype(dtype: torch.dtype, ndim: int, compiled: bool):
     assert pred.means.dtype == dtype
     loss = pred.log_prob(data)
     assert loss.dtype == dtype
+
+
+@pytest.mark.parametrize("measure_log_std", [0., 2.])
+@torch.no_grad()
+def test_initial_state_continuation(measure_log_std: float):
+    """
+    Filtering the first part of a series, then forecasting from ``get_state_at_times()`` on the rest, should match a
+    single pass over the whole series.
+    """
+    torch.manual_seed(0)
+    measures = ['y1', 'y2']
+    kf = KalmanFilter(processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in measures], measures=measures)
+    kf.measure_covariance.cholesky_log_diag.fill_(measure_log_std)
+    y = torch.randn((3, 20, len(measures))).cumsum(1) * 10
+    split = 12
+
+    full = kf(y)
+    first = kf(y[:, :split], include_updates_in_output=True)
+    state = first.get_state_at_times(split - 1)
+    # backwards-compatible with the (mean, cov) tuple that used to be returned:
+    mean, cov = state
+    assert len(state) == 2 and state[0] is mean and state[1] is cov
+
+    cont = kf(y[:, split:], initial_state=state)
+    assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-4)
+    assert torch.allclose(cont.state_covs, full.state_covs[:, split:], rtol=1e-4, atol=1e-4)
+    # passing a plain tuple is equivalent:
+    cont_tuple = kf(y[:, split:], initial_state=(mean, cov))
+    assert torch.allclose(cont_tuple.state_covs, cont.state_covs)
+
+
+@torch.no_grad()
+def test_adaptive_scaling_with_empty_measure_cov():
+    """
+    With adaptive scaling, measures without a measure-variance (e.g. binary measures in the BinomialFilter) should get
+    no scaling, and the ordering of measures shouldn't matter.
+    """
+    from torchcast.kalman_filter import BinomialFilter
+
+    def make(measures):
+        torch.manual_seed(0)
+        return BinomialFilter(
+            processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+            measures=measures,
+            binary_measures=['visit'],
+            adaptive_scaling=True
+        )
+
+    torch.manual_seed(1)
+    y = torch.stack([(torch.rand(3, 15) > .5).float(), torch.randn(3, 15).cumsum(1) * 3], -1)  # visit, spend
+    bf1 = make(['visit', 'spend'])
+    bf1.adaptive_scaling.initialize(y.shape[1])
+    # make an equivalent model with the measures (and so the state-elements) in the opposite order.
+    # copy parameters by name (not buffers, which encode which measure is binary); state-covariances are position-based,
+    # so make them diagonal and flip:
+    bf2 = make(['spend', 'visit'])
+    params2 = dict(bf2.named_parameters())
+    for name, param in bf1.named_parameters():
+        params2[name].copy_(param)
+    for bf in (bf1, bf2):
+        for cov in (bf.initial_covariance, bf.process_covariance):
+            cov.cholesky_off_diag.zero_()
+    for cov1, cov2 in [(bf1.initial_covariance, bf2.initial_covariance),
+                       (bf1.process_covariance, bf2.process_covariance)]:
+        cov2.cholesky_log_diag.copy_(cov1.cholesky_log_diag.flip(0))
+
+    pred1 = bf1(y)
+    pred2 = bf2(y.flip(-1))
+    assert torch.allclose(pred1.state_means, pred2.state_means.flip(-1), atol=1e-5)
+    assert torch.allclose(pred1.measure_covs, pred2.measure_covs.flip(-1).flip(-2), atol=1e-5)
+    # scaling was actually applied to the gaussian measure:
+    assert not torch.allclose(pred1.measure_covs[:, 1:, 1, 1], pred1.measure_covs[:, :1, 1, 1].expand(-1, 14))
+
+
+@torch.no_grad()
+def test_nonlinear_covs_warns_once():
+    import warnings
+    from torchcast.kalman_filter import BinomialFilter
+    from torchcast.state_space import predictions
+
+    torch.manual_seed(0)
+    bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['visit'])
+    bf.mc_sampling = 10
+    pred = bf((torch.rand(2, 5, 1) > .5).float())
+    predictions._warn_once.pop('cov', None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        assert pred.covs is None
+        assert pred.covs is None
+    assert len([w for w in caught if 'no closed-form covariance' in str(w.message)]) == 1
+
+
+@torch.no_grad()
+def test_predictions_state_formats():
+    from torchcast.state_space import Predictions, StateTuple
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    y = torch.randn(2, 6, 1)
+    pred = kf(y)
+    kwargs = dict(measurement_model=pred.measurement_model, measure_covs=pred.measure_covs)
+    for states in [
+        (pred.state_means, pred.state_covs),  # tuple of stacked tensors
+        (list(pred.state_means.unbind(1)), list(pred.state_covs.unbind(1))),  # tuple of per-timestep lists
+        StateTuple(pred.state_means, pred.state_covs),  # stacked StateTuple
+        [StateTuple(m, c) for m, c in zip(pred.state_means.unbind(1), pred.state_covs.unbind(1))],  # per-timestep
+    ]:
+        pred2 = Predictions(states=states, **kwargs)
+        assert torch.equal(pred2.state_means, pred.state_means) and torch.equal(pred2.state_covs, pred.state_covs)
+        assert torch.allclose(pred2.log_prob(y), pred.log_prob(y))
+
+
+@torch.no_grad()
+def test_to_dataframe_std():
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(2, 6, 1))
+    df = pred.to_dataframe(conf=None)
+    _, cov = pred
+    assert np.allclose(df['std'].values, cov[..., 0, 0].sqrt().reshape(-1).numpy(), rtol=1e-5)
+
+
+@pytest.mark.parametrize("config", ['sigmoid', 'saturated', 'saturated+sigmoid'])
+def test_ekf_jacobian_matches_autograd(config: str):
+    """
+    The EKF linearization: the measurement-matrix returned by the MeasurementModel should be the jacobian of the
+    measured-mean wrt the state (in particular, a measure-function's derivative is evaluated at its input).
+    """
+    from torchcast.process import SaturatedLinearModel
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+    torch.manual_seed(0)
+    processes = [LocalLevel(id='level')]
+    kwargs = {}
+    if 'saturated' in config:
+        processes.append(SaturatedLinearModel(id='slm', predictors=['a', 'b']))
+        kwargs['X'] = torch.randn(4, 3, 2)
+    kf = KalmanFilter(processes=processes, measures=['y'],
+                      measure_funs={'y': 'sigmoid'} if 'sigmoid' in config else None)
+    kf.mc_sampling = FixedWhiteNoise(10, random_state=np.random.RandomState(0))
+    with torch.no_grad():
+        pred = kf(torch.rand(4, 3, 1), **kwargs)
+    mm = pred.measurement_model
+    means = pred.state_means[:, 1].clone()
+    _, measure_mat = mm(means, time=1)
+    for g in range(means.shape[0]):
+        def fun(state):
+            full = means.clone()
+            full[g] = state
+            return mm(full, time=1)[0][g]
+
+        jac = torch.autograd.functional.jacobian(fun, means[g].clone())
+        assert torch.allclose(measure_mat[g], jac, atol=1e-5), (g, measure_mat[g], jac)
+
+
+@torch.no_grad()
+def test_sigmoid_legacy_jacobian():
+    """The (deprecated) `legacy_jacobian` flag reproduces the pre-1.1.3 linearization: sigmoid'(sigmoid(z))."""
+    from torchcast.internals.monte_carlo import FixedWhiteNoise
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    kf.mc_sampling = FixedWhiteNoise(10, random_state=np.random.RandomState(0))
+    pred = kf(torch.rand(4, 3, 1))
+    mm = pred.measurement_model
+    means = pred.state_means[:, 1]
+    z = means[:, 0]  # (LocalLevel: the pre-sigmoid measured mean is the state)
+
+    def deriv(x):
+        return torch.sigmoid(x) * (1 - torch.sigmoid(x))
+
+    _, measure_mat = mm(means, time=1)
+    assert torch.allclose(measure_mat[:, 0, 0], deriv(z), atol=1e-6)
+    kf.measure_funs['y'].legacy_jacobian = True
+    _, measure_mat_legacy = mm(means, time=1)
+    assert torch.allclose(measure_mat_legacy[:, 0, 0], deriv(torch.sigmoid(z)), atol=1e-6)
+    # the flag is per-model:
+    kf2 = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    assert not kf2.measure_funs['y'].legacy_jacobian
+
+
+def test_sigmoid_legacy_jacobian_unpickling():
+    """
+    Models pickled before v1.1.3 have Sigmoid measure-funs without a `legacy_jacobian` instance-attribute; on loading,
+    they should keep their original (legacy) behavior. Models created (and pickled) with this version should not.
+    """
+    import pickle
+    from torchcast.internals.batch_design import Sigmoid
+
+    z = torch.tensor([[2.]])
+
+    def jacobian(sigmoid) -> torch.Tensor:
+        return sigmoid.adjust_measure_mat(torch.ones(1, 1), z)
+
+    fixed = torch.sigmoid(z) * (1 - torch.sigmoid(z))
+    legacy = torch.sigmoid(torch.sigmoid(z)) * (1 - torch.sigmoid(torch.sigmoid(z)))
+    new = pickle.loads(pickle.dumps(Sigmoid()))
+    assert new.legacy_jacobian is False and torch.allclose(jacobian(new), fixed)
+    # simulate an object pickled by an older version (no `legacy_jacobian` attribute):
+    old_style = Sigmoid()
+    del old_style.legacy_jacobian
+    old_loaded = pickle.loads(pickle.dumps(old_style))
+    assert not hasattr(old_loaded, 'legacy_jacobian') and torch.allclose(jacobian(old_loaded), legacy)

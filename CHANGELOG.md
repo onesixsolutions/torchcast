@@ -1,5 +1,73 @@
 # CHANGELOG
 
+## Unreleased
+
+### New feature: mixture components (experimental)
+
+A measure can now have one or more alternative *regimes* -- e.g. for outliers that shouldn't update the state or
+inflate the variance. See the new [mixture components example](https://docs.strong.io/torchcast/examples/mixture_components.html).
+
+- `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):
+  each `MixtureComponent` has a learned mean, variance, and base-rate. An observation explained by a component is scored against it, rather than updating the
+  state. Components are supported on any linear-gaussian measure, including the non-binary measures of a
+  `BinomialFilter`.
+- Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
+  a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
+  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
+- `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
+  only (an approximation, but cheaper, and avoids e.g. a binary measure's gaussian approximation influencing them).
+- `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
+- Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
+  regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing.
+  `means`/`covs` are the mixture's exact moments (accessing `covs` warns, since it's easy to misuse), and
+  `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
+- With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
+
+### New feature: back-transforming predictions
+
+- `Predictions.to_dataframe(transform=...)` maps predictions of transformed measures back to the original scale,
+  e.g. `transform=LogTransform()` (for all measures) or `transform={'sales': LogTransform(base=10)}`. Intervals are
+  back-transformed exactly (quantiles pass through monotone transforms), and so is the mean: `E[inverse(Y)]` rather
+  than `inverse(E[Y])`, via closed form where available and gauss-hermite quadrature otherwise. For models with
+  mixture components, each regime is back-transformed and then mixed. Actuals are back-transformed too.
+- `Transform` is the base class: subclasses only need to implement `inverse()`. `LogTransform` and
+  `BoxCoxTransform` (with `lmbda >= 0`) are provided.
+  `bias_adjust` (0-1) controls how much bias-adjustment is applied to the back-transformed mean (0 = the
+  back-transformed median; default = the full mean); it doesn't affect intervals.
+- `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
+  `to_dataframe()`.
+
+### New feature: sampling predictions, and derived quantities
+
+- `Predictions.sample(num_samples, observation_noise=True)` draws from the predictive distribution, jointly across
+  measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and
+  regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`,
+  observations are sampled too (binomial draws for binary measures). Returns a `PredictionSamples`.
+- `Predictions.to_dataframe(derived={'total': lambda s: s['a'] + s['b']})` adds quantities computed from several
+  measures, from joint samples (so correlations between measures are accounted for), on the scale given by
+  `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
+  `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
+  `transform={'log_spend': LogTransform()}`.
+
+### Other changes
+
+- `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
+  tuple it replaces (unpacking, `len()`, indexing), and also carries the regime-probabilities of models with mixture
+  components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks
+  `isinstance(..., tuple)` will need updating.)
+- `AdaptiveScaler.forward()` takes an optional `weights` argument. It's only passed for models with mixture
+  components, so custom subclasses only need to accept it to be used with mixtures.
+- For subclasses of `KalmanFilter`: the update-step is now split into `_prepare_update()` (a hook to adjust
+  inputs, called once per step), `_kalman_update()`, and `_mixture_update()`. Subclasses that previously overrode
+  `_update_step()` to adjust its inputs (as `BinomialFilter` did) should override `_prepare_update()` instead.
+- Adds `benchmarks/profile_simple_model.py`, for checking performance against other git refs.
+
+### Bug fix that changes predictions: `to_dataframe(conf=None)`
+
+- The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
+  uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
+  larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+
 ## v1.2.0 (2026-06-08)
 
 ### New Features
