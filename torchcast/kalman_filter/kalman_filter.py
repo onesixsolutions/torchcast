@@ -225,14 +225,16 @@ class KalmanFilter(StateSpaceModel):
                     states_by_weird[weird_idx] = StateTuple(mean, cov)
             states.append(states_by_weird[weird_idx])
 
-            log_lik = torch.zeros(num_groups, dtype=input.dtype, device=input.device)
             scored_normal = [i for i in normal_idx if i in score_idx]
             if scored_normal:
                 idx = torch.as_tensor(scored_normal, dtype=torch.long, device=input.device)
-                log_lik = log_lik + mvnorm_log_prob(
+                log_lik = mvnorm_log_prob(
                     resid=input[:, idx] - measured_mean[:, idx],
                     cov=system_cov[:, idx.unsqueeze(-1), idx.unsqueeze(0)]
                 )
+            else:
+                log_lik = torch.zeros(num_groups, dtype=input.dtype, device=input.device)
+
             for i, component in eff:
                 log_lik = log_lik + mvnorm_log_prob(
                     resid=(input[:, i] - component.mean).unsqueeze(-1),
