@@ -245,28 +245,30 @@ class KalmanFilter(StateSpaceModel):
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + torch.stack(log_liks, -1)[:, mapping]
         regime_post = torch.softmax(log_post, -1)
-        weights = torch.zeros((num_groups, len(effective)), dtype=input.dtype, device=input.device)
-        weights = weights.index_add(1, mapping.to(input.device), regime_post)
-
-        new_state = self._mix_updates(states, weights)
-        new_state.regime_probs = regime_post
-        return new_state
+        return self._mix_updates(states, regime_post, mapping)
 
     @staticmethod
-    def _mix_updates(states: Sequence['StateTuple'], weights: torch.Tensor) -> 'StateTuple':
+    def _mix_updates(states: Sequence['StateTuple'],
+                     regime_post: torch.Tensor,
+                     mapping: torch.Tensor) -> 'StateTuple':
         """
         Collapse a mixture of gaussian states into a single gaussian via moment-matching.
 
-        :param states: The states to mix.
-        :param weights: A ``(num_groups, len(states))`` tensor of mixture-weights, summing to 1 along the last dim.
+        :param states: The (effective-combo) states to mix.
+        :param regime_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
+        :param mapping: A ``(num_combos,)`` tensor mapping each combo to its index in ``states`` (combos that are
+         indistinguishable given the observed measures share a state).
+        :return: The collapsed state, with ``regime_probs`` set to ``regime_post``.
         """
-        weights = weights.unbind(-1)
+        # the weight of each state is the total probability of the combos that map to it:
+        weights = torch.zeros((regime_post.shape[0], len(states)), dtype=regime_post.dtype, device=regime_post.device)
+        weights = weights.index_add(1, mapping.to(regime_post.device), regime_post).unbind(-1)
         new_mean = sum(w.unsqueeze(-1) * s.mean for w, s in zip(weights, states))
         new_cov = 0
         for w, s in zip(weights, states):
             diff = (s.mean - new_mean).unsqueeze(-1)
             new_cov = new_cov + w.view(-1, 1, 1) * (s.cov + diff @ diff.permute(0, 2, 1))
-        return StateTuple(mean=new_mean, cov=new_cov)
+        return StateTuple(mean=new_mean, cov=new_cov, regime_probs=regime_post)
 
     @staticmethod
     def _covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
