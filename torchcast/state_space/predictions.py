@@ -1083,9 +1083,13 @@ class Predictions:
                 (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
                 for proc in self.measurement_model.nonlinear_processes
             ]
-            mmean_samples.append(
-                measurement_model.adjust_measured_mean(sampled_pmean[..., 0:nmeasures], procs_and_means, time=0)
+            mmean_sample = measurement_model.apply_process_adjustments(
+                sampled_pmean[..., 0:nmeasures], procs_and_means, time=0
             )
+            if measurement_model.measure_funs:
+                mmean_sample = measurement_model.get_measure_wide_adjustments(mmean_sample)
+            mmean_samples.append(mmean_sample)
+
         return torch.stack(mmean_samples, dim=0)
 
     def with_new_start_times(self,
