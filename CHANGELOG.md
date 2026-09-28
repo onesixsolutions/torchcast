@@ -19,7 +19,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
 - Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
   regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing.
-  `Predictions.get_regime_combos()` gives the joint version. `means`/`covs` are the mixture's exact moments, and
+  `means`/`covs` are the mixture's exact moments (accessing `covs` warns, since it's easy to misuse), and
   `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
 - With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
 
@@ -32,6 +32,8 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   mixture components, each regime is back-transformed and then mixed. Actuals are back-transformed too.
 - `Transform` is the base class: subclasses only need to implement `inverse()`. `LogTransform` and
   `BoxCoxTransform` (with `lmbda >= 0`) are provided.
+  `bias_adjust` (0-1) controls how much bias-adjustment is applied to the back-transformed mean (0 = the
+  back-transformed median; default = the full mean); it doesn't affect intervals.
 - `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
   `to_dataframe()`.
 

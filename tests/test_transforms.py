@@ -162,3 +162,44 @@ def test_samples_to_dataframe():
         assert torch.allclose(_quantile(samples, q), torch.quantile(samples, q, dim=0), atol=1e-6)
     with pytest.raises(ValueError, match="shape"):
         pred.samples_to_dataframe({'thing': torch.randn(10, 2, 4)})
+
+
+@torch.no_grad()
+def test_bias_adjust():
+    mean = torch.tensor([0., 1., 5.], dtype=torch.float64)
+    var = torch.tensor([.25, 1., 4.], dtype=torch.float64)
+    # 0 -> no adjustment (the median); .5 -> half the variance; None/1 -> the mean:
+    assert torch.allclose(LogTransform(bias_adjust=0).inverse_mean(mean, var), mean.exp())
+    assert torch.allclose(LogTransform(bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
+    assert torch.allclose(LogTransform(bias_adjust=1).inverse_mean(mean, var), LogTransform().inverse_mean(mean, var))
+    # quadrature and closed-form agree:
+    assert torch.allclose(_QuadratureLog(bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
+    assert torch.allclose(BoxCoxTransform(0, bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
+    assert torch.allclose(BoxCoxTransform(.5, bias_adjust=0).inverse_mean(mean, var), BoxCoxTransform(.5).inverse(mean))
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        LogTransform(bias_adjust=1.5)
+
+    # in to_dataframe: the mean changes, the intervals don't
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(2, 6, 1))
+    df_full = pred.to_dataframe(transform=LogTransform())
+    df_none = pred.to_dataframe(transform=LogTransform(bias_adjust=0))
+    assert np.allclose(df_none['mean'].values, np.exp(pred.to_dataframe()['mean'].values), rtol=1e-5)
+    assert (df_none['mean'].values < df_full['mean'].values).all()
+    assert np.allclose(df_none[['lower', 'upper']].values, df_full[['lower', 'upper']].values)
+
+
+@torch.no_grad()
+def test_bias_adjust_warns_for_monte_carlo():
+    torch.manual_seed(1)
+    y = torch.stack([(torch.rand(2, 8) > .4).float(), torch.randn(2, 8) * .3 + 2], -1)
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
+        measures=['visit', 'spend'],
+        binary_measures=['visit'],
+    )
+    bf.mc_sampling = 50
+    pred = bf(y)
+    with pytest.warns(UserWarning, match="bias_adjust"):
+        pred.to_dataframe(transform={'spend': LogTransform(bias_adjust=.5)}, use_map=True)

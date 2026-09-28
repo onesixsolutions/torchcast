@@ -541,7 +541,7 @@ def test_prediction_outputs():
     assert torch.allclose(covs[..., 1, 1], system_cov[:, 1, 1].view(G, T), atol=1e-5)
 
     # cross-covariance vs. sampling from the mixture, for one group/time:
-    labels, probs, combo_means, combo_covs = pred.get_regime_combos()
+    labels, probs, combo_means, combo_covs = pred._get_regime_combos()
     assert labels == [('standard',), ('y1_low',)]
     g, t = 1, 8
     torch.manual_seed(0)
@@ -596,3 +596,20 @@ def test_binomial_prediction_outputs():
     df = pred.to_dataframe(use_map=True)
     assert set(df['measure']) == {'visit', 'spend'}
     assert np.isfinite(df[['mean', 'lower', 'upper']].values).all()
+
+
+@torch.no_grad()
+def test_mixture_covs_warns_once():
+    import warnings
+    from torchcast.state_space import predictions
+
+    kf = _make_kf(['y1', 'y2'], ['y1'])
+    pred = kf(_make_y(num_measures=2))
+    predictions._warn_once.pop('mixture_cov', None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        _ = pred.means
+        assert not [w for w in caught if 'mixture' in str(w.message)]
+        mean, cov = pred  # (the common pattern the warning is for)
+        _ = pred.covs
+    assert len([w for w in caught if 'covariance of a (non-gaussian) mixture' in str(w.message)]) == 1

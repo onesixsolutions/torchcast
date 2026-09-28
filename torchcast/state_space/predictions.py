@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from torchcast.internals.monte_carlo import FixedWhiteNoise
 
 _RANDOM_STATE = np.random.RandomState().get_state()
+# seed for ``to_dataframe(derived=...)``, drawn at import: repeated calls within a process give the same results
+_DERIVED_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
 
 
 class Predictions:
@@ -34,8 +36,6 @@ class Predictions:
     _means = None
     _covs = None
 
-    # fixed seed, so that repeated calls to ``to_dataframe(derived=...)`` give the same results:
-    _derived_seed: int = 2 ** 31 - 1
 
     def __init__(self,
                  measurement_model: 'MeasurementModel',
@@ -223,10 +223,11 @@ class Predictions:
         overlap = set(derived) & set(measures)
         if overlap:
             raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
-        generator = torch.Generator(device=self.state_means.device).manual_seed(self._derived_seed)
+        generator = torch.Generator(device=self.state_means.device).manual_seed(_DERIVED_SEED)
         samples = self.sample(num_samples, observation_noise=True, generator=generator)
         values = {m: samples[m] for m in measures}
         for m, t in transforms.items():
+            _warn_bias_adjust_ignored(t)
             values[m] = t.inverse(values[m])
 
         expected_shape = (num_samples, self.num_groups, self.num_timesteps)
@@ -552,6 +553,7 @@ class Predictions:
             samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
             if measure in transforms:
                 # the mean of the back-transformed samples (MAP isn't meaningful for the back-transformed mean):
+                _warn_bias_adjust_ignored(transforms[measure])
                 samples = transforms[measure].inverse(samples)
                 mean = torch.mean(samples, dim=0)
             else:
@@ -643,7 +645,7 @@ class Predictions:
         system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
         return measured_mean, system_cov
 
-    def get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         For models with mixture components: the predictive distribution as a mixture over regime-combos (see
         :class:`.MixtureModel`). Within each combo the prediction is multivariate normal: measures in the standard
@@ -837,7 +839,7 @@ class Predictions:
             return measured_mean, None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
-            _, probs, means, covs = self.get_regime_combos()
+            _, probs, means, covs = self._get_regime_combos()
             mean = (probs.unsqueeze(-1) * means).sum(-2)
             second_moment = (probs[..., None, None] * (covs + means.unsqueeze(-1) * means.unsqueeze(-2))).sum(-3)
             return mean, second_moment - mean.unsqueeze(-1) * mean.unsqueeze(-2)
@@ -852,7 +854,7 @@ class Predictions:
 
         For models with mixture components, ``means`` and ``covs`` are the exact mean and covariance of the mixture
         over regimes -- but the predictive distribution is not gaussian, so e.g. don't use them to construct intervals,
-        or to back-transform a transformed measure. Use :func:`get_mixture` (or :func:`get_regime_combos`) instead.
+        or to back-transform a transformed measure. Use :func:`get_mixture` (or ``_get_regime_combos()``) instead.
         """
         if self._means is None:
             self._means, self._covs = self._observe()
@@ -866,6 +868,13 @@ class Predictions:
             if not _warn_once.get('cov', False):
                 warn("The measurement model is nonlinear, so no closed-form covariance is available, returning None.")
                 _warn_once['cov'] = True
+        elif self.mixture is not None and not _warn_once.get('mixture_cov', False):
+            warn(
+                "With mixture components, `covs` is the covariance of a (non-gaussian) mixture: e.g. don't use it to "
+                "construct intervals, sample, or back-transform. See `get_mixture()`, `to_dataframe(transform=...)`, "
+                "and `sample()`."
+            )
+            _warn_once['mixture_cov'] = True
         return self._covs
 
     def _flatten(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1386,6 +1395,12 @@ class DatasetMetadata:
 
 # max number of elements in each chunk of state-samples in ``Predictions.sample()`` (for nonlinear models):
 _SAMPLE_CHUNK_NUMEL = 2 ** 22
+
+
+def _warn_bias_adjust_ignored(transform: 'Transform') -> None:
+    if transform.bias_adjust is not None:
+        warn(f"`{type(transform).__name__}(bias_adjust=...)` is ignored for monte-carlo predictions (the mean is the "
+             f"mean of back-transformed samples).")
 
 
 def _cov_sqrt(cov: torch.Tensor) -> torch.Tensor:

@@ -182,7 +182,7 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 #   `to_dataframe(transform={'log_spend': LogTransform()}, derived={'spend': lambda s: s['visited'] *
 #   s['log_spend'].nan_to_num()})` gives forecasts of weekly spend (from joint samples of both measures).
 # - With multiple measures, each measure can have its own components. Regime-probabilities are tracked jointly across
-#   measures; `Predictions.get_regime_combos()` gives the joint predictive distribution.
+#   measures; `Predictions.sample()` gives joint draws of all measures (incl. the regimes).
 # - To carry regime-probabilities over into a later forecast, pass the output of `Predictions.get_state_at_times()`
 #   as `initial_state` (it includes the regime-probabilities as well as the state mean/covariance).
 # - Passing a list of components is shorthand for `mixture=MixtureModel(components)`. To configure it, pass the
