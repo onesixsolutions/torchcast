@@ -157,7 +157,8 @@ class Predictions:
          the (joint) predictive distribution, including observation noise and on the scale given by ``transform``, and
          should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
          key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
-         actuals, the function is applied to them too (so it should handle missing values, which are nan). Only for
+         actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
+         that aren't in ``dataset`` are all-nan). Only for
          ``type='predictions'``.
         :param derived_num_samples: The number of samples used for ``derived``.
         """
@@ -216,8 +217,8 @@ class Predictions:
                      by_measure: dict,
                      actuals: dict[str, torch.Tensor]) -> None:
         """
-        Adds summaries of derived quantities to ``by_measure`` (and to ``actuals``, where the actuals of the measures
-        each function uses are available). Modifies both in place.
+        Adds summaries of derived quantities to ``by_measure``, and (if there are any actuals, i.e. a dataset) the
+        derived actuals to ``actuals``. Modifies both in place.
         """
         measures = list(self.measurement_model.measures)
         overlap = set(derived) & set(measures)
@@ -230,17 +231,21 @@ class Predictions:
             _warn_bias_adjust_ignored(t)
             values[m] = t.inverse(values[m])
 
+        # the functions are also applied to the actuals (as a batch of one sample), if there's a dataset. measures that
+        # aren't in the dataset are nan, like missing values:
+        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
+        if measure_actuals:
+            nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
+            measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
+
         expected_shape = (num_samples, self.num_groups, self.num_timesteps)
         for name, fun in derived.items():
             out = fun(values)
             if tuple(out.shape) != expected_shape:
                 raise ValueError(f"`derived['{name}']` returned shape {tuple(out.shape)}, expected {expected_shape}.")
             by_measure[name] = (out.mean(0), _quantile(out, alpha), _quantile(out, 1 - alpha))
-            try:
-                actual = fun({m: a.unsqueeze(0) for m, a in actuals.items() if m in measures})
-            except KeyError:
-                continue  # (some measures the function uses aren't in the dataset)
-            actuals[name] = actual.squeeze(0)
+            if measure_actuals:
+                actuals[name] = fun(measure_actuals).squeeze(0)
 
     def sample(self,
                num_samples: int,
@@ -267,28 +272,16 @@ class Predictions:
         num_rows = self.state_means_flat.shape[0]
         to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
 
-        # sample the state, and convert to the measured-mean.
-        # note: avoid broadcasting matmuls like ``(rows, d, d) @ (samples, rows, d, 1)``, which materialize a
-        # (samples, rows, d, d) copy -- huge for long series. use einsum instead, and sample in chunks where needed.
-        if self.measurement_model_flat.is_nonlinear:
-            # need samples of the full state, to pass through the nonlinear measurement-function:
-            state_rank = self.state_means.shape[-1]
-            state_cov_sqrt = _cov_sqrt(self.state_covs_flat)
-            chunk_size = max(1, _SAMPLE_CHUNK_NUMEL // (num_rows * state_rank))
-            means = []
-            for start in range(0, num_samples, chunk_size):
-                n = min(chunk_size, num_samples - start)
-                z = torch.randn((n, num_rows, state_rank), generator=generator, **to)
-                states = self.state_means_flat + torch.einsum('rij,nrj->nri', state_cov_sqrt, z)
-                means.extend(self.measurement_model_flat(s, time=0)[0] for s in states.unbind(0))
-            means = torch.stack(means)
-        else:
-            # linear: the measured-mean given a sampled state is gaussian with mean H @ mu and cov H @ P @ H.T, so
-            # sample that directly (much smaller than the state):
-            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
-            measured_cov = measure_mat @ self.state_covs_flat @ measure_mat.transpose(-1, -2)
-            z = torch.randn((num_samples, num_rows, len(measures)), generator=generator, **to)
-            means = measured_mean + torch.einsum('rij,nrj->nri', _cov_sqrt(measured_cov), z)
+        # sample the measured-mean (via the state). independent noise for each row (unlike the fixed noise used for
+        # the monte-carlo log-prob, which is shared across rows):
+        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        white_noise = torch.randn((num_samples, num_rows, em_dim), generator=generator, **to)
+        means = self._get_measured_mean_samples(
+            measurement_model=self.measurement_model_flat,
+            state_means=self.state_means_flat,
+            state_covs=self.state_covs_flat,
+            white_noise=white_noise,
+        )
         covs = self._conditional_measure_covs(means)
 
         # sample the regime:
@@ -308,6 +301,11 @@ class Predictions:
 
     def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
         """
+        The covariance of the observations given a sampled state. For gaussian measures this is just ``measure_covs``
+        (it doesn't depend on the state); subclasses whose observation-noise *does* depend on the state override this
+        (e.g. ``BinomialPredictions``: ``p * (1 - p) / num_obs`` for binary measures, whose ``measure_covs`` entries
+        are empty).
+
         :param means: A ``(num_samples, num_rows, num_measures)`` tensor of measured means, each from a sampled state.
         :return: A ``(num_samples, num_rows, num_measures, num_measures)`` tensor with the covariance of the measures
          given the state.
@@ -1173,51 +1171,70 @@ class Predictions:
     def _get_measured_mean_samples(self,
                                    measurement_model: 'MeasurementModel',
                                    state_means: torch.Tensor,
-                                   state_covs: torch.Tensor):
+                                   state_covs: torch.Tensor,
+                                   white_noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Samples of the measured-mean, from samples of the state. Rather than sampling the full state, this samples a
+        lower-dimensional gaussian: the measured-mean of the linear processes, concatenated with the state-elements of
+        any nonlinear processes (see ``MeasurementModel.extended_measure_mat``). The nonlinear processes'
+        contributions, then any measure-functions, are applied to those samples.
+
+        :param measurement_model: A flattened measurement-model (possibly a subset of the measures, for nans).
+        :param state_means: A ``(num_rows, state_rank)`` tensor.
+        :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
+        :param white_noise: Standard-normal noise for the *full* model's extended dimensions (dims for measures that
+         ``measurement_model`` drops are dropped here), either ``(num_samples, dim)`` -- the same draws for every row
+         -- or ``(num_samples, num_rows, dim)``. Defaults to ``mc_white_noise``, which is fixed (so that the
+         monte-carlo log-prob is a deterministic function of the parameters) and shared across rows.
+        :return: A ``(num_samples, num_rows, num_measures)`` tensor.
+        """
         nmeasures = len(measurement_model.measures)
 
-        # use the extended measure-mat to reduce dimensionality
         extended_measure_mat = measurement_model.extended_measure_mat
         partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
         partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
 
-        # then we sample from that multivariate distribution.
-        # some measures might have no linear components, which means we can't take the cholesky for those
-        # todo: add zero_safe_cholesky helper?
+        # some dims might be all-zero (e.g. a measure with no linear processes), which means we can't take the
+        # cholesky for those, so only factorize the nonzero block:
         nonzero = (extended_measure_mat != 0).any(0).any(1).cpu().nonzero(as_tuple=True)[0]
         m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
-        _chol = torch.linalg.cholesky(partial_measured_cov[m2d])
         chol = torch.zeros_like(partial_measured_cov)
-        chol[m2d] = _chol
+        chol[m2d] = _cov_sqrt(partial_measured_cov[m2d])
 
         # take care to drop missing measures:
         missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         em_idx = [i for i in range(em_dim) if i not in missing_midx]
-        wn = self.mc_white_noise(num_dim=em_dim, dtype=_chol.dtype, device=_chol.device)[:, em_idx]
+        if white_noise is None:
+            white_noise = self.mc_white_noise(num_dim=em_dim, dtype=chol.dtype, device=chol.device)
+        white_noise = white_noise[..., em_idx]
         # (einsum rather than a broadcasting matmul, which would materialize a (samples, rows, dim, dim) copy of chol)
-        _offsets = torch.einsum('rij,nj->nri', chol, wn)
+        if white_noise.ndim == 2:
+            offsets = torch.einsum('rij,nj->nri', chol, white_noise)
+        else:
+            offsets = torch.einsum('rij,nrj->nri', chol, white_noise)
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + offsets
 
-        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _offsets
-
-        # each of these samples represents a draw from a concatenated set of means: (1) the measured-mean of the
-        # linear processes with (2) the nonlinear processes' state-means.
-        # for each sample, we take those draws from the (nonlinear) state distribution and use them to apply
-        # adjustment to the linear measured-mean.
-        mmean_samples = []
-        for sampled_pmean in sampled_pmmeans.unbind(0):
-            procs_and_means = [
-                (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
-                for proc in self.measurement_model.nonlinear_processes
-            ]
-            mmean_sample = measurement_model.apply_process_adjustments(
-                sampled_pmean[..., 0:nmeasures], procs_and_means, time=0
-            )
-            if measurement_model.measure_funs:
-                mmean_sample = measurement_model.get_measure_wide_adjustments(mmean_sample)
-            mmean_samples.append(mmean_sample)
-
-        return torch.stack(mmean_samples, dim=0)
+        # each of these samples is a draw of (1) the measured-mean of the linear processes, concatenated with (2) the
+        # nonlinear processes' state-means. use (2) to add the nonlinear processes' contributions to (1):
+        mmean_samples = sampled_pmmeans[..., 0:nmeasures]
+        if measurement_model.nonlinear_processes:
+            # (processes' measured-means aren't vectorized over samples, so loop)
+            mmean_samples = torch.stack([
+                measurement_model.apply_process_adjustments(
+                    sampled_pmean[..., 0:nmeasures],
+                    [
+                        (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
+                        for proc in measurement_model.nonlinear_processes
+                    ],
+                    time=0
+                )
+                for sampled_pmean in sampled_pmmeans.unbind(0)
+            ])
+        if measurement_model.measure_funs:
+            # (elementwise, so no need to loop)
+            mmean_samples = measurement_model.get_measure_wide_adjustments(mmean_samples)
+        return mmean_samples
 
     def with_new_start_times(self,
                              start_times: Union[np.ndarray, np.datetime64],
@@ -1511,10 +1528,6 @@ class DatasetMetadata:
         )
 
 
-# max number of elements in each chunk of state-samples in ``Predictions.sample()`` (for nonlinear models):
-_SAMPLE_CHUNK_NUMEL = 2 ** 22
-
-
 def _warn_bias_adjust_ignored(transform: 'Transform') -> None:
     if transform.bias_adjust is not None:
         warn(f"`{type(transform).__name__}(bias_adjust=...)` is ignored for monte-carlo predictions (the mean is the "
@@ -1539,8 +1552,12 @@ def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
 
 def _cov_sqrt(cov: torch.Tensor) -> torch.Tensor:
     """
-    A matrix ``L`` with ``L @ L.T == cov``: the cholesky factor, or (for covariances that are only positive
-    semi-definite, e.g. with zero-variance elements) a square-root from the eigen-decomposition.
+    A matrix ``L`` with ``L @ L.T == cov``, so that ``mean + L @ z`` with ``z ~ N(0, I)`` is a sample from
+    ``N(mean, cov)``. This is the cholesky factor if it exists. If not -- the covariance is only positive
+    semi-definite, e.g. with a zero-variance element -- falls back to the eigen-decomposition ``cov = V diag(e) V.T``,
+    for which ``L = V diag(sqrt(e))`` (with tiny negative eigenvalues from rounding error clamped to 0). (The fallback
+    applies to the whole batch, if any element fails; and eigh's gradients are unstable for repeated eigenvalues, so
+    don't rely on gradients through it.)
     """
     cov = (cov + cov.transpose(-1, -2)) / 2
     chol, info = torch.linalg.cholesky_ex(cov)

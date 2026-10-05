@@ -6,7 +6,7 @@ import torch
 from scipy import stats
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
-from torchcast.process import LocalLevel, LocalTrend
+from torchcast.process import LocalLevel, LocalTrend, SaturatedLinearModel
 from torchcast.state_space import MixtureComponent, LogTransform
 
 # monte-carlo tests: sample sizes and tolerances are chosen so that each check is ~5 standard-errors
@@ -167,6 +167,46 @@ def test_derived_with_transform_and_actuals():
     # the sample-count is configurable:
     df_small = pred.to_dataframe(derived={'total': lambda s: s['a'] + s['b']}, derived_num_samples=50)
     assert not np.allclose(df_small.query("measure == 'total'")['mean'].values, df_total['mean'].values)
+
+
+@torch.no_grad()
+def test_sample_nonlinear_independent_rows():
+    """
+    For nonlinear models, samples are drawn via the monte-carlo machinery (sampling the linear measured-mean plus the
+    nonlinear processes' states), but -- unlike the fixed monte-carlo noise, which is shared across rows -- with
+    independent draws for each group/timestep. They should also match the monte-carlo predictive mean.
+    """
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level'), SaturatedLinearModel(id='slm', predictors=['x1', 'x2'])],
+        measures=['y'],
+    )
+    kf.mc_sampling = 5000
+    X = torch.randn(2, 6, 2)
+    pred = kf(torch.randn(2, 6, 1), X=X)
+    samples = pred.sample(5000, observation_noise=False, generator=_gen())
+    means = samples.means[..., 0].reshape(5000, -1)  # (samples, rows)
+    corr = np.corrcoef(means.T.numpy())
+    off_diag = corr[~np.eye(corr.shape[0], dtype=bool)]
+    assert np.abs(off_diag).max() < .1  # (~5 standard-errors of a correlation with 5000 samples is .07)
+    se = means.std(0) / math.sqrt(5000)
+    assert ((means.mean(0) - pred.means.reshape(-1)).abs() < 5 * se + 1e-3).all()
+
+
+@torch.no_grad()
+def test_derived_actuals_missing_measure():
+    """Measures that aren't in the dataset are all-nan when a derived function is applied to the actuals."""
+    from torchcast.utils import TimeSeriesDataset
+
+    kf = _correlated_kf()
+    y = torch.randn(2, 5, 1)
+    dataset = TimeSeriesDataset(y, group_names=['g0', 'g1'], start_times=np.zeros(2, dtype='int'),
+                                measures=[['a']], dt_unit=None)
+    pred = kf(torch.cat([y, torch.randn(2, 5, 1)], -1))
+    with pytest.warns(UserWarning, match="not present in your dataset"):
+        df = pred.to_dataframe(dataset, derived={'total': lambda s: s['a'] + s['b'], 'a2': lambda s: s['a'] * 2})
+    assert df.query("measure == 'total'")['actual'].isna().all()
+    assert np.allclose(df.query("measure == 'a2'")['actual'].values, 2 * y.reshape(-1).numpy())
 
 
 @torch.no_grad()
