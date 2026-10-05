@@ -23,9 +23,10 @@ if TYPE_CHECKING:
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise
 
-_RANDOM_STATE = np.random.RandomState().get_state()
-# seed for ``to_dataframe(derived=...)``, drawn at import: repeated calls within a process give the same results
-_DERIVED_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
+# seed for sample-based outputs (``to_dataframe()`` intervals for nonlinear measures, ``derived``, states), drawn at
+# import: repeated calls within a process give the same results. (Separate from the model's ``mc_sampling``,
+# which is fixed so that the monte-carlo log-prob -- and ``means`` -- are deterministic functions of the parameters.)
+_OUTPUT_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
 
 
 class Predictions:
@@ -224,8 +225,7 @@ class Predictions:
         overlap = set(derived) & set(measures)
         if overlap:
             raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
-        generator = torch.Generator(device=self.state_means.device).manual_seed(_DERIVED_SEED)
-        samples = self.sample(num_samples, observation_noise=True, generator=generator)
+        samples = self.sample(num_samples, observation_noise=True, generator=self._output_generator())
         values = {m: samples[m] for m in measures}
         for m, t in transforms.items():
             _warn_bias_adjust_ignored(t)
@@ -441,13 +441,16 @@ class Predictions:
         batch_shape = self.state_means.shape[0:2]
 
         if self.mc_white_noise is not None:
-            # sample from the state distribution:
-            # todo: use chol @ self.white_noise like in _get_measured_mean_samples
-            state_mean_samples = MultivariateNormal(
-                loc=self.state_means_flat,
-                covariance_matrix=self.state_covs_flat,
-                validate_args=False
-            ).sample((self.mc_white_noise.num_samples,))
+            # sample from the state distribution (einsum rather than a broadcasting matmul, which would materialize a
+            # (samples, rows, dim, dim) copy of the cholesky):
+            chol = torch.linalg.cholesky(self.state_covs_flat)
+            white_noise = torch.randn(
+                (self.mc_white_noise.num_samples, *self.state_means_flat.shape),
+                generator=self._output_generator(),
+                dtype=chol.dtype,
+                device=chol.device,
+            )
+            state_mean_samples = self.state_means_flat + torch.einsum('rij,nrj->nri', chol, white_noise)
 
             # pass each sample to the `get_components` function, organize by process:
             samples_by_proc = {}
@@ -524,69 +527,111 @@ class Predictions:
         out = pd.concat(out)
         return out
 
+    def _output_generator(self) -> torch.Generator:
+        """
+        A generator with a fixed seed, so that sample-based outputs are the same on repeated calls.
+        """
+        return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED)
+
     def _get_mc_pred_intervals(self,
                                alpha: float,
                                use_map: bool,
-                               transforms: Optional[dict[str, 'Transform']] = None) -> dict[str, torch.Tensor]:
+                               transforms: Optional[dict[str, 'Transform']] = None
+                               ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        For measures with a nonlinear measured-mean (see ``_get_pred_intervals`` for the rest): the intervals are
+        quantiles of samples from :func:`sample`; the mean is from :func:`_get_means_nonlinear`.
+        """
         transforms = transforms or {}
-        batch_shape = self.state_means.shape[0:2]
-        mmean_samples = self._get_measured_mean_samples(
-            measurement_model=self.measurement_model_flat,
-            state_means=self.state_means_flat,
-            state_covs=self.state_covs_flat,
-        )
-
-        # _get_measured_mean_samples captures uncertainty in the state, then below we'll add n(0,measure_std) noise
-        # to capture uncertainty from the measure covariance:
-        mstds = self.measure_covs_flat.diagonal(dim1=-2, dim2=-1).sqrt()
-        # mc_white_noise will give the same num_samples*num_dims array for a given num_dims input.
-        # this is primarily used in _get_measured_mean_samples to sample from state uncertainty. but we additionally
-        # need fixed random sampling for measure variance when plotting. this can't be the same fixed random state
-        # as the state uncertainty, since we want state samples and measurement samples to be uncorrelated.
-        rs = np.random.RandomState()
-        rs.set_state(_RANDOM_STATE)
-        measurement_white_noise = torch.as_tensor(
-            rs.randn(self.mc_white_noise.num_samples, len(self.measurement_model.measures)),
-            dtype=self.state_means.dtype,
-            device=self.state_means.device
-        )
-
-        # if MAP is requested, monte-carlo only used for intervals
-        measured_mean = None
-        if use_map:
-            measured_mean, _ = self.measurement_model_flat(self.state_means_flat, time=0)
-        elif self.mc_white_noise.num_samples < 1000:
+        measures = list(self.measurement_model.measures)
+        nonlinear = [m for m in measures if m in self._nonlinear_measures]
+        if not nonlinear:
+            return {}
+        if not use_map and self.mc_white_noise.num_samples < 1000:
             warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
 
-        # for each measure, get mean/quantiles:
+        means = self._get_means_nonlinear(use_map=use_map, transforms=transforms)
+        samples = self.sample(
+            self.mc_white_noise.num_samples, observation_noise=True, generator=self._output_generator()
+        )
         by_measure = {}
-        for i, measure in enumerate(self.measurement_model.measures):
-            samples = mmean_samples[..., i] + mstds[..., i] * measurement_white_noise[..., i, None]
+        for measure in nonlinear:
+            j = measures.index(measure)
+            # (for non-gaussian measures, e.g. binary, the interval is for the mean -- e.g. the probability -- rather
+            # than for the observations)
+            x = samples.means[..., j] if measure in self._non_gaussian_measures else samples.observations[..., j]
             if measure in transforms:
-                # the mean of the back-transformed samples (MAP isn't meaningful for the back-transformed mean):
                 _warn_bias_adjust_ignored(transforms[measure])
-                samples = transforms[measure].inverse(samples)
-                mean = torch.mean(samples, dim=0)
-            else:
-                mean = torch.mean(samples, dim=0) if measured_mean is None else measured_mean[..., i]
-            lower = torch.quantile(samples, q=alpha, dim=0)
-            upper = torch.quantile(samples, q=1 - alpha, dim=0)
-            by_measure[measure] = (
-                mean.view(*batch_shape),
-                lower.view(*batch_shape),
-                upper.view(*batch_shape)
-            )
-        # mixture measures with a linear measurement are gaussian within each regime, so use their closed-form mixture:
-        by_measure.update(self._get_mixture_intervals(alpha, transforms))
-        # otherwise, sample from the mixture (for the standard regime, the mean from above is still appropriate):
-        by_measure.update(self._get_sampled_mixture_intervals(
-            alpha, standard_means={m: v[0] for m, v in by_measure.items()}, transforms=transforms
-        ))
+                x = transforms[measure].inverse(x)
+            by_measure[measure] = (means[..., j], _quantile(x, alpha), _quantile(x, 1 - alpha))
         return by_measure
+
+    def _get_means_nonlinear(self,
+                             use_map: bool = False,
+                             transforms: Optional[dict[str, 'Transform']] = None) -> torch.Tensor:
+        """
+        The predicted means for a model with nonlinear measures. Measures with a linear measured-mean have a closed
+        form. For the rest, the (standard regime's) mean is a monte-carlo mean over samples of the state, from the
+        fixed ``mc_white_noise`` (so it's deterministic) -- or, with ``use_map``, the measured-mean of the state-mean.
+        For mixture measures, this is mixed with the components' means using the (known) regime-probabilities.
+
+        :param transforms: Back-transforms for measures with a nonlinear measured-mean. (``use_map`` doesn't apply to
+         these: the back-transformed mean of the MAP isn't meaningful.)
+        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
+        """
+        from .transforms import gauss_hermite_mean
+
+        batch_shape = self.state_means.shape[0:2]
+        measures = list(self.measurement_model.measures)
+        nonlinear = self._nonlinear_measures
+        transforms = {m: t for m, t in (transforms or {}).items() if m in nonlinear}
+
+        # exact for linear measures; the MAP for nonlinear ones:
+        standard, _ = self._measured_moments_flat()
+        standard = standard.clone()
+        mc_idx = [j for j, m in enumerate(measures) if m in nonlinear and (not use_map or m in transforms)]
+        if mc_idx:
+            mmean_samples = self._get_measured_mean_samples(
+                measurement_model=self.measurement_model_flat,
+                state_means=self.state_means_flat,
+                state_covs=self.state_covs_flat,
+            )
+            for j in mc_idx:
+                if measures[j] in transforms:
+                    # E[inverse(g(state) + noise)]: monte-carlo over the state, quadrature over the noise
+                    inverse = transforms[measures[j]].inverse
+                    var = self.measure_covs_flat[:, j, j]
+                    standard[:, j] = torch.stack(
+                        [gauss_hermite_mean(inverse, x, var) for x in mmean_samples[..., j].unbind(0)]
+                    ).mean(0)
+                else:
+                    standard[:, j] = mmean_samples[..., j].mean(0)
+        standard = standard.view(*batch_shape, -1)
+
+        if self.mixture is None:
+            return standard
+        out = standard.clone()
+        for measure in self.mixture.mixture_measures:
+            j = measures.index(measure)
+            mixture = self._get_mixture(measure, standard[..., j], torch.zeros_like(standard[..., j]))
+            component_means = mixture.means[..., 1:]
+            if measure in transforms:
+                # (the full back-transformed mean, like the standard regime's -- bias_adjust is ignored for MC)
+                component_means = gauss_hermite_mean(
+                    transforms[measure].inverse, component_means, mixture.vars[..., 1:]
+                )
+            out[..., j] = mixture.probs[..., 0] * standard[..., j] + (mixture.probs[..., 1:] * component_means).sum(-1)
+        return out
 
     def _get_pred_intervals(self,
                             alpha: float,
-                            transforms: Optional[dict[str, 'Transform']] = None) -> dict[str, torch.Tensor]:
+                            transforms: Optional[dict[str, 'Transform']] = None
+                            ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Closed-form means and intervals, for measures with a linear measured-mean (whose predictive distribution is
+        gaussian, or a mixture of gaussians -- see ``_get_mixture_intervals``) -- including in a model with other,
+        nonlinear measures (see ``_get_mc_pred_intervals``).
+        """
         transforms = transforms or {}
         measured_mean, system_cov = self._measured_moments_flat()
 
@@ -595,6 +640,8 @@ class Predictions:
 
         by_measure = {}
         for i, measure in enumerate(self.measurement_model.measures):
+            if measure in self._nonlinear_measures:
+                continue
             mean = measured_mean[..., i]
             var = system_cov[..., i, i]
             lower = mean - multi * torch.sqrt(var)
@@ -620,7 +667,7 @@ class Predictions:
         out = {}
         for measure in self.mixture.mixture_measures:
             if measure in self._nonlinear_measures:
-                continue  # see _get_sampled_mixture_intervals
+                continue  # see _get_mc_pred_intervals
             mixture = self.get_mixture(measure)
             lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
             if measure in transforms:
@@ -630,44 +677,6 @@ class Predictions:
                 out[measure] = (mean, t.inverse(lower), t.inverse(upper))
             else:
                 out[measure] = (mixture.mean(), lower, upper)
-        return out
-
-    def _get_sampled_mixture_intervals(self,
-                                       alpha: float,
-                                       standard_means: dict[str, torch.Tensor],
-                                       transforms: Optional[dict[str, 'Transform']] = None
-                                       ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """
-        For mixture measures with a nonlinear measurement, the standard regime isn't gaussian, so the mixture has no
-        closed form. The intervals are quantiles of samples from :func:`sample` (with a fixed seed, so repeated calls
-        agree). The mean doesn't need the regimes to be sampled, since their probabilities are known.
-
-        :param standard_means: For each measure, the ``(num_groups, num_timesteps)`` mean of the standard regime (on
-         the scale given by ``transforms``).
-        """
-        from .transforms import gauss_hermite_mean
-
-        if self.mixture is None:
-            return {}
-        measures = [m for m in self.mixture.mixture_measures if m in self._nonlinear_measures]
-        if not measures:
-            return {}
-        transforms = transforms or {}
-        generator = torch.Generator(device=self.state_means.device).manual_seed(_DERIVED_SEED)
-        samples = self.sample(self.mc_white_noise.num_samples, observation_noise=True, generator=generator)
-        out = {}
-        for measure in measures:
-            standard_mean = standard_means[measure]
-            mixture = self._get_mixture(measure, standard_mean, torch.zeros_like(standard_mean))
-            x = samples[measure]
-            component_means = mixture.means[..., 1:]
-            if measure in transforms:
-                t = transforms[measure]
-                x = t.inverse(x)
-                # (the full back-transformed mean, like the standard regime's -- bias_adjust is ignored for MC)
-                component_means = gauss_hermite_mean(t.inverse, component_means, mixture.vars[..., 1:])
-            mean = mixture.probs[..., 0] * standard_mean + (mixture.probs[..., 1:] * component_means).sum(-1)
-            out[measure] = (mean, _quantile(x, alpha), _quantile(x, 1 - alpha))
         return out
 
     def _standardize_transforms(self,
@@ -845,6 +854,8 @@ class Predictions:
         alpha = (1 - conf) / 2
         transforms = self._standardize_transforms(transform)
 
+        # closed-form for measures with a linear measured-mean; monte-carlo for the rest:
+        by_measure = self._get_pred_intervals(alpha, transforms=transforms)
         if self.mc_white_noise is not None:
             if use_map is None:
                 warn(
@@ -852,11 +863,10 @@ class Predictions:
                     "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
                 )
                 use_map = True
-            by_measure = self._get_mc_pred_intervals(alpha, use_map=use_map, transforms=transforms)
-        else:
-            if use_map:
-                warn("``use_map`` disregarded, no monte-carlo")
-            by_measure = self._get_pred_intervals(alpha, transforms=transforms)
+            by_measure.update(self._get_mc_pred_intervals(alpha, use_map=use_map, transforms=transforms))
+            by_measure = {m: by_measure[m] for m in self.measurement_model.measures}  # (keep the measures' order)
+        elif use_map:
+            warn("``use_map`` disregarded, no monte-carlo")
 
         from torchcast.utils import TimeSeriesDataset
 
@@ -929,27 +939,8 @@ class Predictions:
         batch_shape = self.state_means.shape[0:2]
 
         if self.measurement_model.is_nonlinear:
-            # in this case, we need to use monte-carlo to get samples/distribution, there's no closed form cov
-            mmean_samples = self._get_measured_mean_samples(
-                measurement_model=self.measurement_model_flat,
-                state_means=self.state_means_flat,
-                state_covs=self.state_covs_flat,
-            )
-            measured_mean = torch.mean(mmean_samples, dim=0).view(*batch_shape, -1)
-            if self.mixture is not None:
-                # P(standard) * E[standard] + sum_k P(k) * mean_k. E[standard] is the monte-carlo mean for measures
-                # with a nonlinear measurement; otherwise it has a closed form.
-                linear_mean, _ = self._measured_moments_flat()
-                linear_mean = linear_mean.view(*batch_shape, -1)
-                nonlinear = self._nonlinear_measures
-                out = measured_mean.clone()
-                for measure in self.mixture.mixture_measures:
-                    j = list(self.measurement_model.measures).index(measure)
-                    standard_mean = measured_mean[..., j] if measure in nonlinear else linear_mean[..., j]
-                    mixture = self._get_mixture(measure, standard_mean, torch.zeros_like(standard_mean))
-                    out[..., j] = mixture.mean()
-                measured_mean = out
-            return measured_mean, None
+            # monte-carlo for the means of nonlinear measures; there's no closed form cov
+            return self._get_means_nonlinear(), None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
             _, probs, means, covs = self._get_regime_combos()

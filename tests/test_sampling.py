@@ -299,3 +299,39 @@ def test_sample_memory(model: str):
     res = subprocess.run([sys.executable, '-c', _MEMORY_SCRIPT, model], capture_output=True, text=True, check=True)
     peak_increase_mb = float(res.stdout.strip().splitlines()[-1])
     assert peak_increase_mb < 300, f"sample() increased peak memory by {peak_increase_mb:.0f}MB"
+
+
+@torch.no_grad()
+def test_nonlinear_model_linear_measures_exact():
+    """
+    In a nonlinear model (here, a binary measure), measures with a linear measured-mean still get closed-form outputs
+    -- incl. exact mixture quantiles -- while the nonlinear measures use monte-carlo; and sample-based outputs are the
+    same on repeated calls.
+    """
+    torch.manual_seed(0)
+    visit = (torch.rand(3, 10) > .4).float()
+    spend = torch.randn(3, 10).cumsum(1) * .2 + 3.
+    spend[visit == 0] = float('nan')
+    y = torch.stack([visit, spend], -1)
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
+        measures=['visit', 'spend'],
+        binary_measures=['visit'],
+        mixture=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+    )
+    bf.mc_sampling = 200
+    pred = bf(y)
+    df = pred.to_dataframe(conf=.9, use_map=False)
+    df_spend = df.query("measure == 'spend'")
+    mixture = pred.get_mixture('spend')
+    assert np.allclose(df_spend['lower'].values, mixture.quantile(.05).reshape(-1).numpy())
+    assert np.allclose(df_spend['upper'].values, mixture.quantile(.95).reshape(-1).numpy())
+    assert np.allclose(df_spend['mean'].values, mixture.mean().reshape(-1).numpy())
+    assert torch.allclose(pred.means[..., 1], mixture.mean())
+
+    # repeated calls agree (the fixed output-seed), incl. for the states dataframe:
+    df2 = pred.to_dataframe(conf=.9, use_map=False)
+    assert np.array_equal(df[['mean', 'lower', 'upper']].values, df2[['mean', 'lower', 'upper']].values)
+    df_states = pred.to_dataframe(type='states')
+    df_states2 = pred.to_dataframe(type='states')
+    assert np.array_equal(df_states[['lower', 'upper']].values, df_states2[['lower', 'upper']].values)

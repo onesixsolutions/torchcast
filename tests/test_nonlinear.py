@@ -175,8 +175,6 @@ def test_mc_predictions_match_quadrature():
     For a sigmoid measure-function with gaussian likelihood, the monte-carlo mean (use_map=False) should be
     E[sigmoid(Z)], and the interval-bounds should be quantiles of sigmoid(Z) + noise.
     """
-    import torchcast.state_space.predictions as predictions_module
-
     torch.manual_seed(0)
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
     # small measurement-noise, so that the monte-carlo error in the mean is dominated by the (pinned) state samples:
@@ -184,13 +182,7 @@ def test_mc_predictions_match_quadrature():
     kf.mc_sampling = _white_noise(20_000)
     y = torch.rand(3, 8, 1) * .6 + .2
     pred = kf(y)
-    old_state = predictions_module._RANDOM_STATE
-    try:
-        # (the measurement-noise samples must be independent of the state samples, so use a different seed)
-        predictions_module._RANDOM_STATE = np.random.RandomState(1).get_state()
-        df = pred.to_dataframe(conf=.9, use_map=False)
-    finally:
-        predictions_module._RANDOM_STATE = old_state
+    df = pred.to_dataframe(conf=.9, use_map=False)
 
     z_mean, z_var = _linear_moments(pred, 0)
     r = pred.measure_covs_flat[:, 0, 0].double()

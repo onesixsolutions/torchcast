@@ -192,6 +192,8 @@ def test_bias_adjust():
 
 @torch.no_grad()
 def test_bias_adjust_warns_for_monte_carlo():
+    import warnings
+
     torch.manual_seed(1)
     y = torch.stack([(torch.rand(2, 8) > .4).float(), torch.randn(2, 8) * .3 + 2], -1)
     bf = BinomialFilter(
@@ -201,5 +203,18 @@ def test_bias_adjust_warns_for_monte_carlo():
     )
     bf.mc_sampling = 50
     pred = bf(y)
+    # 'spend' has a linear measured-mean, so it's closed-form (even though the model is nonlinear) and bias_adjust
+    # applies:
+    with warnings.catch_warnings():
+        warnings.filterwarnings('error', message='.*bias_adjust.*')
+        df = pred.to_dataframe(transform={'spend': LogTransform(bias_adjust=.5)}, use_map=True)
+    mean, cov = pred._measured_moments_flat()  # (exact for 'spend')
+    expected = torch.exp(mean[:, 1] + .5 * cov[:, 1, 1] / 2)
+    assert np.allclose(df.query("measure == 'spend'")['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)
+
+    # a measure with a nonlinear measured-mean uses monte-carlo, where it's ignored:
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    kf.mc_sampling = 50
+    pred = kf(torch.rand(2, 8, 1))
     with pytest.warns(UserWarning, match="bias_adjust"):
-        pred.to_dataframe(transform={'spend': LogTransform(bias_adjust=.5)}, use_map=True)
+        pred.to_dataframe(transform=LogTransform(bias_adjust=.5), use_map=True)
