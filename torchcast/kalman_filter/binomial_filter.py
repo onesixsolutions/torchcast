@@ -423,7 +423,6 @@ class BinomialPredictions(Predictions):
         if idx:
             p = means[..., idx].clamp(0, 1)
             num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype).expand_as(p)
-            observations = observations.clone()
             observations[..., idx] = torch.binomial(num_obs.contiguous(), p.contiguous(), generator=generator) / num_obs
         return observations
 

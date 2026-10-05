@@ -349,11 +349,24 @@ class Predictions:
                              means: torch.Tensor,
                              covs: torch.Tensor,
                              generator: Optional[torch.Generator]) -> torch.Tensor:
-        z = torch.randn(means.shape, generator=generator, dtype=means.dtype, device=means.device)
+        """
+        Samples gaussian observation-noise around ``means``, for the gaussian measures. Non-gaussian measures (see
+        ``_non_gaussian_measures``) are left at their means, for subclasses to sample.
+        """
+        measures = list(self.measurement_model.measures)
+        idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        observations = means.clone()
+        if not idx:
+            return observations
+        z = torch.randn((*means.shape[:-1], len(idx)), generator=generator, dtype=means.dtype, device=means.device)
         if covs.stride(0) == 0:
             # the same covariance for every sample (an expanded view): only decompose it once
-            return means + torch.einsum('rij,nrj->nri', _cov_sqrt(covs[0]), z)
-        return means + torch.einsum('nrij,nrj->nri', _cov_sqrt(covs), z)
+            chol = torch.linalg.cholesky(covs[0][:, idx][:, :, idx])
+            observations[..., idx] += torch.einsum('rij,nrj->nri', chol, z)
+        else:
+            chol = torch.linalg.cholesky(covs[..., idx, :][..., idx])
+            observations[..., idx] += torch.einsum('nrij,nrj->nri', chol, z)
+        return observations
 
     @torch.inference_mode()
     def samples_to_dataframe(self,
@@ -1199,7 +1212,7 @@ class Predictions:
         nonzero = (extended_measure_mat != 0).any(0).any(1).cpu().nonzero(as_tuple=True)[0]
         m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
         chol = torch.zeros_like(partial_measured_cov)
-        chol[m2d] = _cov_sqrt(partial_measured_cov[m2d])
+        chol[m2d] = torch.linalg.cholesky(partial_measured_cov[m2d])
 
         # take care to drop missing measures:
         missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
@@ -1548,23 +1561,6 @@ def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
     z = torch.linalg.solve_triangular(L, resid.permute(1, 2, 0), upper=False)  # (batch, d, num_samples)
     logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
     return -0.5 * (d * math.log(2 * math.pi) + logdet.unsqueeze(0) + (z ** 2).sum(1).T)
-
-
-def _cov_sqrt(cov: torch.Tensor) -> torch.Tensor:
-    """
-    A matrix ``L`` with ``L @ L.T == cov``, so that ``mean + L @ z`` with ``z ~ N(0, I)`` is a sample from
-    ``N(mean, cov)``. This is the cholesky factor if it exists. If not -- the covariance is only positive
-    semi-definite, e.g. with a zero-variance element -- falls back to the eigen-decomposition ``cov = V diag(e) V.T``,
-    for which ``L = V diag(sqrt(e))`` (with tiny negative eigenvalues from rounding error clamped to 0). (The fallback
-    applies to the whole batch, if any element fails; and eigh's gradients are unstable for repeated eigenvalues, so
-    don't rely on gradients through it.)
-    """
-    cov = (cov + cov.transpose(-1, -2)) / 2
-    chol, info = torch.linalg.cholesky_ex(cov)
-    if not bool((info > 0).any()):
-        return chol
-    evals, evecs = torch.linalg.eigh(cov)
-    return evecs * evals.clamp_min(0).sqrt().unsqueeze(-2)
 
 
 def _quantile(x: torch.Tensor, q: float) -> torch.Tensor:

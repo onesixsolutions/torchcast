@@ -210,6 +210,31 @@ def test_derived_actuals_missing_measure():
 
 
 @torch.no_grad()
+def test_sample_binomial_saturated_probability():
+    """
+    A binary measure whose sampled probability is exactly 1 (in float32) has zero conditional variance; that
+    shouldn't break sampling the gaussian measures' observation-noise.
+    """
+    torch.manual_seed(0)
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
+        measures=['visit', 'spend'],
+        binary_measures=['visit'],
+    )
+    bf.mc_sampling = 10
+    y = torch.stack([torch.ones(2, 4), torch.randn(2, 4)], -1)
+    pred = bf(y)
+    # sampled means (num_samples, num_rows, num_measures), with the probability saturated at 1:
+    means = torch.stack([torch.ones(20, 8), torch.randn(20, 8)], -1)
+    covs = pred._conditional_measure_covs(means)
+    assert (covs[..., 0, 0] == 0).all()
+    observations = pred._sample_observations(means, covs, generator=_gen())
+    assert (observations[..., 0] == 1).all()
+    assert torch.isfinite(observations).all()
+    assert (observations[..., 1] != means[..., 1]).all()  # (noise was added to the gaussian measure)
+
+
+@torch.no_grad()
 def test_derived_binomial_spend():
     """
     The motivating example: expected weekly spend = visit * spend, where spend is only observed when there's a visit.
