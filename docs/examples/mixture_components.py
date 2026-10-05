@@ -190,6 +190,9 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 #   measures; `Predictions.sample()` gives joint draws of all measures (incl. the regimes).
 # - To carry regime-probabilities over into a later forecast, pass the output of `Predictions.get_state_at_times()`
 #   as `initial_state` (it includes the regime-probabilities as well as the state mean/covariance).
+# - A component's base-rate can depend on predictors, e.g. a treatment that makes 'quick visits' more common:
+#   `MixtureComponent(..., predictors=['treated'])`, then pass `X` (or `quick__X`, to keep it separate from another
+#   `LinearModel`'s `X`) to the model, covering the forecast horizon.
 # - Passing a list of components is shorthand for `mixture=MixtureModel(components)`. To configure it, pass the
 #   `MixtureModel` yourself: e.g. `MixtureModel(components, transition=...)`. The default `StickyTransition` learns
 #   a "stickiness" that controls how regime-probabilities persist over time; you can also write your own

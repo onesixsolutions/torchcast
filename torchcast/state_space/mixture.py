@@ -11,7 +11,7 @@ probabilities are tracked jointly over this table.
 """
 import itertools
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Mapping
 
 import torch
 
@@ -23,18 +23,29 @@ class MixtureComponent(torch.nn.Module):
     :param measure: The measure this component applies to.
     :param mean_init: Initial value for the component's mean.
     :param prob_init: Initial value for the component's base-rate, i.e. the long-run probability that an observation
-     for ``measure`` comes from this component (exact when it's the only component for this measure).
+     for ``measure`` comes from this component (exact when it's the only component for this measure). With
+     ``predictors``, this is the base-rate when the predictors are zero.
     :param id: A unique identifier (within the measure).
+    :param predictors: Optional names of predictors of the component's base-rate: each has a learned coefficient,
+     added to the component's logit (vs. the standard regime). E.g. a treatment that makes this regime more common.
+     The predictors are passed to the model's ``forward()`` as a ``(num_groups, num_timesteps, len(predictors))``
+     tensor ``X`` -- or, to use a different tensor than other consumers of ``X`` (e.g. a ``LinearModel``), as
+     ``{id}__X``. Like the predictors of a ``LinearModel``, they need to cover the forecast horizon too: the
+     regime-prior for each timestep uses that timestep's predictors.
     """
 
     def __init__(self,
                  measure: str,
                  mean_init: float,
                  prob_init: float,
-                 id: str):
+                 id: str,
+                 predictors: Optional[Sequence[str]] = None):
         super().__init__()
         self.measure = measure
         self.id = id
+        if isinstance(predictors, str):
+            raise ValueError("`predictors` should be a list of strings, not a string.")
+        self.predictors = list(predictors or [])
 
         mean_init = torch.as_tensor(mean_init, dtype=torch.get_default_dtype())
         self.mean = torch.nn.Parameter(mean_init)
@@ -44,6 +55,22 @@ class MixtureComponent(torch.nn.Module):
         prob_init = torch.as_tensor(prob_init, dtype=torch.get_default_dtype())
         # logit relative to the standard regime, whose logit is fixed at 0
         self.logit = torch.nn.Parameter(torch.log(prob_init) - torch.log1p(-prob_init))
+        self.coefs = None
+        if self.predictors:
+            self.coefs = torch.nn.Parameter(torch.zeros(len(self.predictors)))
+
+    kwarg_name = 'X'  # the default name of the ``forward()`` keyword-argument with the predictors
+
+    def get_logit(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        :param X: If the component has predictors, a ``(..., len(predictors))`` tensor.
+        :return: The logit vs. the standard regime: a scalar, or ``X.shape[:-1]`` with predictors.
+        """
+        if not self.predictors:
+            return self.logit
+        if X is None:
+            raise ValueError(f"MixtureComponent '{self.id}' has predictors, so needs `X` for its base-rate.")
+        return self.logit + X @ self.coefs
 
     @property
     def var(self) -> torch.Tensor:
@@ -60,7 +87,8 @@ class RegimeTransition(torch.nn.Module):
     the current timestep).
 
     Both receive ``base_probs``, the long-run probability of each combo implied by the :class:`MixtureComponent`
-    base-rates; implementations may use or ignore it.
+    base-rates; implementations may use or ignore it. It's a ``(num_combos,)`` tensor, or -- if any components have
+    predictors -- ``(num_groups, num_combos)``, for the timestep that the regime-prior is for.
     """
 
     def __init__(self, num_combos: int):
@@ -69,7 +97,7 @@ class RegimeTransition(torch.nn.Module):
 
     def initial(self, base_probs: torch.Tensor, num_groups: int) -> torch.Tensor:
         """
-        :param base_probs: A ``(num_combos,)`` tensor.
+        :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor.
         :param num_groups: The number of groups.
         :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
         """
@@ -78,7 +106,7 @@ class RegimeTransition(torch.nn.Module):
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         """
         :param posterior: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the current timestep.
-        :param base_probs: A ``(num_combos,)`` tensor.
+        :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor, for the next timestep.
         :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the next timestep.
         """
         raise NotImplementedError
@@ -92,7 +120,8 @@ class StickyTransition(RegimeTransition):
     Rather than learning ``b`` directly, it's derived so that the stationary distribution of ``T`` is ``base_probs``
     (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run probability of each
     combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture where the
-    regime-prior is always ``base_probs``.
+    regime-prior is always ``base_probs``. (If the base-rates vary over time -- components with predictors -- then
+    ``base_probs`` is the stationary distribution for the current predictors.)
 
     :param num_combos: The number of regime-combos.
     :param stay_init: Initial value for the probability of persisting in the current combo.
@@ -112,7 +141,7 @@ class StickyTransition(RegimeTransition):
 
     def _jump_probs(self, base_probs: torch.Tensor) -> torch.Tensor:
         b = base_probs * (1 - self.stay)
-        return b / b.sum()
+        return b / b.sum(-1, keepdim=True)
 
     def initial(self, base_probs: torch.Tensor, num_groups: int) -> torch.Tensor:
         return base_probs.expand(num_groups, -1)
@@ -124,6 +153,10 @@ class StickyTransition(RegimeTransition):
         return posterior * stay + leave * self._jump_probs(base_probs)
 
     def matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
+        """
+        :param base_probs: A ``(num_combos,)`` tensor.
+        :return: The ``(num_combos, num_combos)`` transition-matrix.
+        """
         stay = self.stay
         return torch.diag(stay) + (1 - stay).unsqueeze(-1) * self._jump_probs(base_probs).unsqueeze(0)
 
@@ -202,24 +235,65 @@ class MixtureModel(torch.nn.Module):
     def num_combos(self) -> int:
         return len(self.combos)
 
-    def log_base_probs(self) -> torch.Tensor:
+    @property
+    def has_predictors(self) -> bool:
+        return any(c.predictors for c in self.components)
+
+    def get_component_X(self, kwargs: Mapping) -> tuple[dict[int, torch.Tensor], set[str]]:
         """
-        :return: A ``(num_combos,)`` tensor with the log long-run probability of each combo. Regimes are independent
-         across measures; within a measure, the standard regime has logit 0 and each component has its own logit.
+        Pick out the predictors of components' base-rates from the model's ``forward()`` kwargs.
+
+        :param kwargs: The keyword-arguments.
+        :return: A tuple of (1) a dictionary mapping the index (in ``self.components``) of each component with
+         predictors to its ``(num_groups, num_timesteps, num_predictors)`` tensor, and (2) the keys used.
         """
+        out, used = {}, set()
+        for i, component in enumerate(self.components):
+            if not component.predictors:
+                continue
+            key = f'{component.id}__{component.kwarg_name}'
+            if key not in kwargs:
+                key = component.kwarg_name
+            if key not in kwargs:
+                raise TypeError(
+                    f"MixtureComponent '{component.id}' has predictors, so expected a `{component.kwarg_name}` (or "
+                    f"`{component.id}__{component.kwarg_name}`) keyword-argument."
+                )
+            X = kwargs[key]
+            if X.ndim != 3 or X.shape[-1] != len(component.predictors):
+                raise ValueError(
+                    f"Expected `{key}` to have shape (num_groups, num_timesteps, {len(component.predictors)}) for "
+                    f"MixtureComponent '{component.id}', got {tuple(X.shape)}."
+                )
+            out[i] = X
+            used.add(key)
+        return out, used
+
+    def log_base_probs(self, component_X: Optional[Mapping[int, torch.Tensor]] = None) -> torch.Tensor:
+        """
+        :param component_X: Required if any components have predictors: the output of :func:`get_component_X`, or
+         slices of it (e.g. for one timestep), all with the same leading dims.
+        :return: The log long-run probability of each combo: a ``(num_combos,)`` tensor, or with predictors
+         ``(*leading_dims, num_combos)``. Regimes are independent across measures; within a measure, the standard
+         regime has logit 0 and each component has its own logit.
+        """
+        component_X = component_X or {}
+        logits = [c.get_logit(component_X.get(i)) for i, c in enumerate(self.components)]
+        batch_shape = torch.broadcast_shapes(*(lg.shape for lg in logits))
+        logits = {id(c): lg.expand(batch_shape) for c, lg in zip(self.components, logits)}
+
         per_measure = {}
         for measure, comps in self._by_measure.items():
-            logits = torch.stack([torch.zeros_like(comps[0].logit)] + [c.logit for c in comps])
-            per_measure[measure] = {
-                None if i == 0 else comps[i - 1].id: lp for i, lp in enumerate(torch.log_softmax(logits, 0))
-            }
+            standard = torch.zeros(batch_shape, dtype=comps[0].logit.dtype, device=comps[0].logit.device)
+            lps = torch.log_softmax(torch.stack([standard] + [logits[id(c)] for c in comps], -1), -1).unbind(-1)
+            per_measure[measure] = {None: lps[0], **{id(c): lp for c, lp in zip(comps, lps[1:])}}
         return torch.stack([
-            sum(per_measure[m][None if c is None else c.id] for m, c in zip(self.mixture_measures, combo))
+            sum(per_measure[m][None if c is None else id(c)] for m, c in zip(self.mixture_measures, combo))
             for combo in self.combos
-        ])
+        ], -1)
 
-    def base_probs(self) -> torch.Tensor:
-        return self.log_base_probs().exp()
+    def base_probs(self, component_X: Optional[Mapping[int, torch.Tensor]] = None) -> torch.Tensor:
+        return self.log_base_probs(component_X).exp()
 
     def effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
         """

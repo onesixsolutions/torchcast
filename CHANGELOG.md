@@ -27,6 +27,10 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   `means`/`covs` are the mixture's exact moments (accessing `covs` warns, since it's easy to misuse), and
   `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
 - With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
+- A component's base-rate can depend on predictors: `MixtureComponent(..., predictors=['treated'])` learns a
+  coefficient for each (added to its logit), e.g. for a treatment that makes the regime more common. Pass them to
+  `forward()` as `X` (or `{component_id}__X`), as a `(num_groups, num_timesteps, num_predictors)` tensor covering the
+  forecast horizon. Custom `RegimeTransition`s then receive `base_probs` with shape `(num_groups, num_combos)`.
 
 ### New feature: back-transforming predictions
 

@@ -6,7 +6,7 @@ import torch
 from torch.distributions import MultivariateNormal, Normal
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
-from torchcast.process import LocalLevel
+from torchcast.process import LocalLevel, LinearModel
 from torchcast.state_space.mixture import MixtureComponent, MixtureModel, RegimeTransition, StickyTransition
 
 
@@ -425,6 +425,144 @@ def test_initial_state_continuation():
     kf_plain = _make_kf(['y1', 'y2'], [])
     with pytest.raises(ValueError, match="no mixture components"):
         kf_plain(y[:, split:], initial_state=state)
+
+
+def _make_kf_with_predictors(stay_logit: float = 1., coefs=(2., -.5)) -> KalmanFilter:
+    """Like ``_make_kf(['y1', 'y2'], ['y1'])``, but the component's base-rate depends on predictors."""
+    torch.manual_seed(123)
+    kf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['y1', 'y2']],
+        measures=['y1', 'y2'],
+        mixture=[
+            MixtureComponent(measure='y1', mean_init=-4., prob_init=.2, id='y1_low', predictors=['treated', 'other'])
+        ],
+    )
+    with torch.no_grad():
+        kf.mixture.components[0].coefs.copy_(torch.tensor(coefs))
+        kf.mixture.transition._stay_logit.fill_(stay_logit)
+    return kf
+
+
+def _make_X(num_groups: int = 3, num_times: int = 15) -> torch.Tensor:
+    torch.manual_seed(2)
+    treated = (torch.rand(num_groups, num_times) > .5).float()
+    return torch.stack([treated, torch.randn(num_groups, num_times)], -1)
+
+
+@torch.no_grad()
+def test_component_predictors_base_rates():
+    y, X = _make_y(num_measures=2), _make_X()
+
+    # zero coefficients: same as no predictors
+    kf_zero = _make_kf_with_predictors(coefs=(0., 0.))
+    kf_plain = _make_kf(['y1', 'y2'], ['y1'])
+    kf_plain.load_state_dict({k: v for k, v in kf_zero.state_dict().items() if not k.endswith('coefs')})
+    pred_zero, pred_plain = kf_zero(y, X=X), kf_plain(y)
+    assert torch.allclose(pred_zero.regime_probs, pred_plain.regime_probs)
+    assert torch.allclose(pred_zero.log_prob(y), pred_plain.log_prob(y))
+
+    # no stickiness: the regime-prior at each timestep is just the base-rate given that timestep's predictors:
+    kf = _make_kf_with_predictors(stay_logit=-30.)
+    component = kf.mixture.components[0]
+    pred = kf(y, X=X)
+    expected = torch.sigmoid(component.logit + X @ component.coefs)
+    assert torch.allclose(pred.regime_probs[..., 1], expected, atol=1e-6)
+    # incl. when forecasting past the data:
+    X_long = torch.cat([X, _make_X(num_times=4)], 1)
+    pred_fcast = kf(y, X=X_long, out_timesteps=19)
+    assert torch.allclose(pred_fcast.regime_probs[..., 1], torch.sigmoid(component.logit + X_long @ component.coefs),
+                          atol=1e-6)
+    # treated timesteps have more 'low' regime:
+    treated = X[..., 0].bool()
+    assert pred.regime_probs[..., 1][treated].mean() > 2 * pred.regime_probs[..., 1][~treated].mean()
+
+    # with stickiness, the base-probs for the current predictors are still the stationary distribution:
+    kf = _make_kf_with_predictors()
+    base = kf.mixture.base_probs({0: X[:, 0]})  # (num_groups, num_combos)
+    assert torch.allclose(kf.mixture.transition(base, base), base, atol=1e-6)
+    assert torch.allclose(kf(y, X=X).regime_probs[:, 0], base, atol=1e-6)
+
+
+@pytest.mark.parametrize("n_step,every_step", [(2, True), (3, True), (3, False)])
+@torch.no_grad()
+def test_component_predictors_n_step(n_step: int, every_step: bool):
+    """As in ``test_n_step_regime_probs``, but with time-varying base-rates (catches off-by-one time-indexing)."""
+    kf = _make_kf_with_predictors()
+    y, X = _make_y(num_measures=2), _make_X()
+    pred_n = kf(y, n_step=n_step, every_step=every_step, X=X)
+    for t in range(y.shape[1]):
+        h = min(t + 1, n_step) if every_step else (t % n_step) + 1
+        y_nan = y.clone()
+        y_nan[:, (t - h + 1):t] = float('nan')
+        pred_1 = kf(y_nan, n_step=1, X=X)
+        assert torch.allclose(pred_n.regime_probs[:, t], pred_1.regime_probs[:, t], atol=1e-6)
+        assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
+
+
+@torch.no_grad()
+def test_component_predictors_continuation():
+    kf = _make_kf_with_predictors()
+    y, X = _make_y(num_measures=2), _make_X()
+    split = 9
+    full = kf(y, X=X)
+    state = kf(y[:, :split], X=X[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
+    cont = kf(y[:, split:], X=X[:, split:], initial_state=state)
+    assert torch.allclose(cont.regime_probs, full.regime_probs[:, split:], atol=1e-6)
+    assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
+    sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2, X=X[:, split:split + 5])
+    assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
+
+
+def test_component_predictors_kwargs():
+    y, X = _make_y(num_measures=2), _make_X()
+    kf = _make_kf_with_predictors()
+    with pytest.raises(TypeError, match="expected a `X`"):
+        kf(y)
+    with pytest.raises(ValueError, match="to have shape"):
+        kf(y, X=X[..., :1])
+    with pytest.raises(ValueError, match="timesteps"):
+        kf(y, X=X[:, :5])
+    with pytest.raises(ValueError, match="needs `X`"):
+        kf.mixture.log_base_probs()
+    with pytest.raises(ValueError, match="list of strings"):
+        MixtureComponent(measure='y1', mean_init=0., prob_init=.1, id='x', predictors='treated')
+
+    # a different `X` for a LinearModel, via the `{id}__X` override:
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level', measure='y1'), LinearModel(id='lm', predictors=['a', 'b', 'c'], measure='y1')],
+        measures=['y1'],
+        mixture=[MixtureComponent(measure='y1', mean_init=-4., prob_init=.2, id='low', predictors=['treated'])],
+    )
+    X_lm = torch.randn(3, 15, 3)
+    pred = kf(y[..., :1], X=X_lm, low__X=X[..., :1])
+    lp = pred.log_prob(y[..., :1])
+    lp.sum().backward()
+    assert kf.mixture.components[0].coefs.grad.abs() > 0
+    with pytest.raises(RuntimeError, match="Unexpected kwargs"):
+        kf(y[..., :1], X=X_lm, low__X=X[..., :1], typo=1)
+
+
+def test_component_predictors_fit():
+    """A treatment that makes the 'low' regime more common: fitting recovers a positive coefficient."""
+    torch.manual_seed(0)
+    num_groups, num_times = 20, 30
+    treated = (torch.arange(num_groups) % 2).float().view(-1, 1).expand(-1, num_times)
+    y = torch.randn(num_groups, num_times).cumsum(1) * .1
+    is_low = torch.rand(num_groups, num_times) < torch.where(treated.bool(), .4, .05)
+    y[is_low] = -4. + torch.randn(int(is_low.sum())) * .3
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level')],
+        measures=['y'],
+        mixture=[MixtureComponent(measure='y', mean_init=-3., prob_init=.1, id='low', predictors=['treated'])],
+    )
+    kf.fit(y.unsqueeze(-1), X=treated.unsqueeze(-1), stopping={'max_iter': 30}, verbose=0)
+    component = kf.mixture.components[0]
+    with torch.no_grad():
+        p_untreated = torch.sigmoid(component.logit).item()
+        p_treated = torch.sigmoid(component.logit + component.coefs[0]).item()
+    assert .0 < p_untreated < .15
+    assert .25 < p_treated < .6
 
 
 def test_standard_probs():

@@ -225,15 +225,28 @@ class StateSpaceModel(torch.nn.Module):
             **kwargs
         )
         used_keys = used_keys.union(measurement_model.used_keys)
+        component_X = {}
+        if self.mixture is not None:
+            component_X, mixture_keys = self.mixture.get_component_X(kwargs)
+            used_keys.update(mixture_keys)
         unused_kwargs = set(kwargs) - used_keys
         if unused_kwargs:
             raise RuntimeError(f"Unexpected kwargs in {type(self).__name__}.forward(): {set(unused_kwargs)})")
 
-        # regime-probabilities (if mixture components):
+        # regime-probabilities (if mixture components). base_probs[t] are the base-rates for the regime-prior at t:
+        # time-varying if any components have predictors.
         base_probs = regime_prior = None
         if self.mixture is not None:
-            base_probs = self.mixture.base_probs()
-            regime_prior = self._initial_regime_prior(init_regime_probs, base_probs, num_groups)
+            if component_X:
+                base_probs = self.mixture.base_probs(component_X).unbind(1)
+                if len(base_probs) < out_timesteps:
+                    raise ValueError(
+                        f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
+                        f"{out_timesteps}."
+                    )
+            else:
+                base_probs = [self.mixture.base_probs()] * out_timesteps
+            regime_prior = self._initial_regime_prior(init_regime_probs, base_probs[0], num_groups)
         elif init_regime_probs is not None:
             raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
 
@@ -288,8 +301,8 @@ class StateSpaceModel(torch.nn.Module):
             meanus.append(meanu)
             covus.append(covu)
             regimeus.append(regime_post)
-            if self.mixture is not None:
-                regime_prior = self.mixture.transition(regime_post, base_probs)
+            if self.mixture is not None and t + 1 < out_timesteps:
+                regime_prior = self.mixture.transition(regime_post, base_probs[t + 1])
 
         # 2nd loop to get n_step predicts:
         meanps = {}
@@ -320,7 +333,7 @@ class StateSpaceModel(torch.nn.Module):
                             mask=tmask
                         )
                         if regimep is not None:
-                            regimep = self.mixture.transition(regimep, base_probs)
+                            regimep = self.mixture.transition(regimep, base_probs[tu_h])
                     if tu_h not in meanps:
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp
