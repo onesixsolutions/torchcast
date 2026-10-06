@@ -87,6 +87,12 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
   larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
 
+### Behavior change: adaptive scaling starts at "no adjustment"
+
+`EWMAdaptiveScaler` (used by `adaptive_scaling=True`) now starts its running mean of squared residuals at 1 instead of 0. Before, a group with no observations kept a running variance of `eps`, so its standard deviations were multiplied by `sqrt(eps) ** weight` (often ~0.2–0.3): its forecast intervals were arbitrarily narrow. And groups with only a few observations were shrunk towards zero variance unless the learned initial step-size (`rho`) was close to 1. Now a group with no observations gets a multiplier of exactly 1 (no adjustment), and a group with few observations is shrunk towards no adjustment.
+
+Models saved by older versions keep the old behavior, whether loaded by unpickling (`torch.load` of the whole model) or via `load_state_dict()` (state-dicts without the new `adaptive_scaling._extra_state` entry). Note that state-dicts saved by this version have that extra entry, so they can't be loaded with `strict=True` into older versions of torchcast.
+
 ## v1.2.0 (2026-06-08)
 
 ### New Features
