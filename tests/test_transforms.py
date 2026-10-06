@@ -326,3 +326,18 @@ def test_smearing_mixture():
         mix.probs[..., 1] * torch.exp(mix.means[..., 1] + mix.vars[..., 1] / 2)
     )
     assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)
+
+
+@torch.no_grad()
+def test_smearing_from_predictions_missing():
+    """Missing observations are skipped (incl. for mixture measures, whose residuals are weighted)."""
+    from torchcast.state_space import SmearingTransform
+
+    torch.manual_seed(0)
+    y = torch.randn(2, 10, 1).cumsum(1) * .1 + 3.
+    y[0, 3] = y[1, 7] = float('nan')
+    for mixture in (None, [MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')]):
+        kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], mixture=mixture)
+        smear = SmearingTransform.from_predictions(LogTransform(), kf(y), y, 'y')
+        assert smear.residuals.shape == (18,)
+        assert torch.isfinite(smear.residuals).all() and torch.isfinite(smear.weights).all()

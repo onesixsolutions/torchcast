@@ -239,8 +239,10 @@ class SmearingTransform(Transform):
             if mixture is not None and measure in mixture.mixture_measures:
                 mix = predictions.get_mixture(measure)
                 probs, means, vars_ = (x[:, :num_timesteps] for x in (mix.probs, mix.means, mix.vars))
-                # P(standard regime | observation):
-                log_liks = torch.distributions.Normal(means, vars_.sqrt()).log_prob(obs.unsqueeze(-1))
+                # P(standard regime | observation). (missing observations give nan weights/residuals, which are
+                # dropped -- so skip validation, which rejects nans.)
+                normal = torch.distributions.Normal(means, vars_.sqrt(), validate_args=False)
+                log_liks = normal.log_prob(obs.unsqueeze(-1))
                 weights = torch.softmax(probs.clamp_min(1e-30).log() + log_liks, -1)[..., 0]
                 mean, var = means[..., 0], vars_[..., 0]
             else:
