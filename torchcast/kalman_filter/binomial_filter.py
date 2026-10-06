@@ -181,6 +181,9 @@ class BinomialFilter(KalmanFilter):
             **kwargs
         )
 
+    def _group_kwarg_names(self) -> set[str]:
+        return super()._group_kwarg_names() | {'num_obs'}
+
     def _parse_kwargs(self,
                       num_groups: int,
                       num_timesteps: int,
