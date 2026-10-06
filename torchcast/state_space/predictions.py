@@ -579,8 +579,6 @@ class Predictions:
          these: the back-transformed mean of the MAP isn't meaningful.)
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
-        from .transforms import gauss_hermite_mean
-
         batch_shape = self.state_means.shape[0:2]
         measures = list(self.measurement_model.measures)
         nonlinear = self._nonlinear_measures
@@ -599,10 +597,10 @@ class Predictions:
             for j in mc_idx:
                 if measures[j] in transforms:
                     # E[inverse(g(state) + noise)]: monte-carlo over the state, quadrature over the noise
-                    inverse = transforms[measures[j]].inverse
+                    t = transforms[measures[j]]
                     var = self.measure_covs_flat[:, j, j]
                     standard[:, j] = torch.stack(
-                        [gauss_hermite_mean(inverse, x, var) for x in mmean_samples[..., j].unbind(0)]
+                        [t.expected_inverse(x, var) for x in mmean_samples[..., j].unbind(0)]
                     ).mean(0)
                 else:
                     standard[:, j] = mmean_samples[..., j].mean(0)
@@ -616,10 +614,9 @@ class Predictions:
             mixture = self._get_mixture(measure, standard[..., j], torch.zeros_like(standard[..., j]))
             component_means = mixture.means[..., 1:]
             if measure in transforms:
-                # (the full back-transformed mean, like the standard regime's -- bias_adjust is ignored for MC)
-                component_means = gauss_hermite_mean(
-                    transforms[measure].inverse, component_means, mixture.vars[..., 1:]
-                )
+                # (the full back-transformed mean, like the standard regime's -- bias_adjust is ignored for MC; and the
+                # components are gaussian, so e.g. no smearing for them)
+                component_means = transforms[measure].gaussian.expected_inverse(component_means, mixture.vars[..., 1:])
             out[..., j] = mixture.probs[..., 0] * standard[..., j] + (mixture.probs[..., 1:] * component_means).sum(-1)
         return out
 
@@ -672,8 +669,12 @@ class Predictions:
             lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
             if measure in transforms:
                 t = transforms[measure]
-                # back-transform each regime, then mix:
-                mean = (mixture.probs * t.inverse_mean(mixture.means, mixture.vars)).sum(-1)
+                # back-transform each regime, then mix (components are gaussian, so e.g. no smearing for them):
+                mean = (
+                    mixture.probs[..., 0] * t.inverse_mean(mixture.means[..., 0], mixture.vars[..., 0]) +
+                    (mixture.probs[..., 1:] * t.gaussian.inverse_mean(mixture.means[..., 1:], mixture.vars[..., 1:]))
+                    .sum(-1)
+                )
                 out[measure] = (mean, t.inverse(lower), t.inverse(upper))
             else:
                 out[measure] = (mixture.mean(), lower, upper)

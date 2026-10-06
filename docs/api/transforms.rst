@@ -5,7 +5,7 @@ Map predictions of a transformed measure (e.g. log) back to the original scale, 
 ``Predictions.to_dataframe(transform=...)``.
 
 .. automodule:: torchcast.state_space.transforms
-   :members: Transform, LogTransform, BoxCoxTransform
+   :members: Transform, LogTransform, BoxCoxTransform, SmearingTransform
    :member-order: bysource
    :show-inheritance:
 

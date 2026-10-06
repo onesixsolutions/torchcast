@@ -12,7 +12,7 @@ from torchcast.state_space import Transform, LogTransform, BoxCoxTransform, Mixt
 
 class _QuadratureLog(LogTransform):
     # forces the (default) gauss-hermite path, for comparison with the closed-form
-    inverse_mean = Transform.inverse_mean
+    expected_inverse = Transform.expected_inverse
 
 
 def test_inverse_mean():
@@ -218,3 +218,111 @@ def test_bias_adjust_warns_for_monte_carlo():
     pred = kf(torch.rand(2, 8, 1))
     with pytest.warns(UserWarning, match="bias_adjust"):
         pred.to_dataframe(transform=LogTransform(bias_adjust=.5), use_map=True)
+
+
+@torch.no_grad()
+def test_smearing_transform():
+    from torchcast.state_space import SmearingTransform
+
+    torch.manual_seed(0)
+    mean, var = torch.randn(4, 6), torch.rand(4, 6) + .1
+
+    # with few residuals, they're used directly: the mean is the smearing average
+    resids = torch.distributions.StudentT(3.).sample((50,))
+    smear = SmearingTransform(LogTransform(), resids)
+    expected = torch.exp(mean.unsqueeze(-1) + var.sqrt().unsqueeze(-1) * resids).mean(-1)
+    assert torch.allclose(smear.inverse_mean(mean, var), expected, rtol=1e-5)
+    assert torch.allclose(smear.inverse(mean), mean.exp())  # (intervals: unaffected)
+    # weights:
+    w = torch.rand(50)
+    expected_w = (torch.exp(mean.unsqueeze(-1) + var.sqrt().unsqueeze(-1) * resids) * w / w.sum()).sum(-1)
+    assert torch.allclose(SmearingTransform(LogTransform(), resids, weights=w).inverse_mean(mean, var), expected_w,
+                          rtol=1e-5)
+
+    # with many residuals, they're summarized by quantiles; gaussian residuals ~ the lognormal mean:
+    resids = torch.randn(200_000)
+    smear = SmearingTransform(LogTransform(), resids)
+    assert smear.residuals.shape == (100,)
+    assert torch.allclose(smear.inverse_mean(mean, var), LogTransform().inverse_mean(mean, var), rtol=.02)
+
+    # the summary is the quantiles at the midpoints of equal-probability bins:
+    smear = SmearingTransform(LogTransform(), torch.arange(1000.), num_nodes=10)
+    assert torch.allclose(smear.residuals, torch.arange(10.) * 100 + 49.5)
+    assert torch.allclose(smear.weights, torch.full((10,), .1))
+
+    # bias_adjust comes from the base transform:
+    assert torch.allclose(SmearingTransform(LogTransform(bias_adjust=0), resids).inverse_mean(mean, var), mean.exp())
+    # non-finite residuals are dropped; validation:
+    assert SmearingTransform(LogTransform(), torch.tensor([float('nan'), 1., -1.])).residuals.shape == (2,)
+    with pytest.raises(ValueError, match="non-negative"):
+        SmearingTransform(LogTransform(), torch.randn(5), weights=-torch.ones(5))
+    with pytest.raises(ValueError, match="No"):
+        SmearingTransform(LogTransform(), torch.tensor([float('nan')]))
+
+
+@torch.no_grad()
+def test_smearing_from_predictions():
+    from torchcast.state_space import SmearingTransform
+
+    torch.manual_seed(0)
+    # heavy-tailed noise on the log-scale:
+    y = (torch.randn(5, 40).cumsum(1) * .05 + torch.distributions.StudentT(3.).sample((5, 40)) * .3).unsqueeze(-1)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(y)
+    smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y', num_nodes=1000)
+    mean, cov = pred
+    resids = ((y - mean) / cov.diagonal(dim1=-2, dim2=-1).sqrt()).reshape(-1)
+    assert torch.allclose(smear.residuals.sort().values, resids.sort().values, atol=1e-5)
+
+    df = pred.to_dataframe(transform=smear, conf=.9)
+    df_log = pred.to_dataframe(transform=LogTransform(), conf=.9)
+    expected = smear.inverse_mean(mean[..., 0], cov[..., 0, 0])
+    assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)
+    assert np.allclose(df[['lower', 'upper']].values, df_log[['lower', 'upper']].values)
+
+    # nonlinear measures: not yet supported by `from_predictions()`
+    kf_nl = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
+    kf_nl.mc_sampling = 20
+    with pytest.raises(NotImplementedError, match="nonlinear"):
+        SmearingTransform.from_predictions(LogTransform(), kf_nl(torch.rand(2, 5, 1)), torch.rand(2, 5, 1), 'y')
+    # ...but a smearing transform can still be used with them (monte-carlo over the state, smearing for the noise):
+    df_nl = kf_nl(torch.rand(2, 5, 1)).to_dataframe(transform=smear, use_map=False)
+    assert np.isfinite(df_nl['mean'].values).all()
+
+
+@torch.no_grad()
+def test_smearing_mixture():
+    """
+    For a mixture measure, residuals are weighted by P(standard regime | observation), and only the standard regime's
+    back-transformed mean is smeared (the components are gaussian).
+    """
+    from torchcast.state_space import SmearingTransform
+
+    torch.manual_seed(0)
+    y = torch.randn(4, 30, 1).cumsum(1) * .05 + 3.
+    is_low = torch.rand(4, 30, 1) < .15
+    y[is_low] = -1.  # 'quick visits'
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level')],
+        measures=['y'],
+        mixture=[MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')],
+    )
+    with torch.no_grad():
+        kf.mixture.components[0]._log_std.fill_(math.log(.1))
+    pred = kf(y)
+    mix = pred.get_mixture('y')
+    smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y', num_nodes=1000)
+    # (fewer residuals than nodes, so they're used directly, in order:)
+    resids = ((y[..., 0] - mix.means[..., 0]) / mix.vars[..., 0].sqrt()).reshape(-1)
+    assert torch.allclose(smear.residuals, resids, atol=1e-5)
+    # the outliers get ~no weight (in total), even though they're ~15% of observations:
+    is_low = is_low.reshape(-1)
+    assert smear.weights[is_low].sum() < .01
+    assert smear.weights.sum().item() == pytest.approx(1.)
+
+    df = pred.to_dataframe(transform=smear)
+    expected = (
+        mix.probs[..., 0] * smear.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
+        mix.probs[..., 1] * torch.exp(mix.means[..., 1] + mix.vars[..., 1] / 2)
+    )
+    assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)

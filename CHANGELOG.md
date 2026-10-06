@@ -45,6 +45,12 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   back-transformed median; default = the full mean); it doesn't affect intervals.
 - `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
   `to_dataframe()`.
+- `SmearingTransform(base, residuals)` wraps a transform so that back-transformed means use the empirical
+  distribution of standardized residuals instead of assuming gaussian noise (Duan's smearing estimator); intervals
+  are unaffected. `SmearingTransform.from_predictions(base, predictions, y, measure)` builds one from a model's
+  residuals -- for a measure with mixture components, using the standard regime's residuals, weighted by the
+  probability that each observation came from it. Custom transforms can override `Transform.expected_inverse()`
+  (a closed form) or `Transform.noise_nodes()` (a different noise distribution).
 
 ### New feature: sampling predictions, and derived quantities
 
