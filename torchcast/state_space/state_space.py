@@ -385,8 +385,10 @@ class StateSpaceModel(torch.nn.Module):
          ``chunk_size`` groups at a time, accumulating the gradient across chunks. Only one chunk's computation-graph is
          in memory at a time, but the optimizer still sees the full-batch loss and gradient, so this is *not*
          mini-batching: the result is the same as without chunking (up to floating-point error), and LBFGS's
-         line-search and convergence behave the same. Kwargs (and outputs of ``callable_kwargs``) whose first
-         dimension equals the number of groups are split into chunks along with ``y``. A custom ``get_loss`` should be
+         line-search and convergence behave the same. Group-indexed kwargs (and outputs of ``callable_kwargs``) are
+         split into chunks along with ``y``: e.g. ``start_offsets``, ``initial_state`` and processes' model-matrices
+         (``X``); for kwargs used by covariance-modules (e.g. ``group_ids``), this is inferred from their shape (first
+         dimension equals the number of groups). A custom ``get_loss`` should be
          a mean over groups (like the default), since chunks' losses are combined as a weighted mean by the number of
          groups; a :class:`.LossFun` (e.g. with ``weights``) is split into chunks automatically.
         :return: This ``StateSpaceModel`` instance.
@@ -436,7 +438,7 @@ class StateSpaceModel(torch.nn.Module):
         chunks = []
         for group_slice in _get_group_slices(num_groups, chunk_size):
             y_chunk = y[group_slice]
-            chunk_kwargs = _subset_groups(kwargs, group_slice, num_groups)
+            chunk_kwargs = self._subset_kwargs(kwargs, group_slice, num_groups)
 
             # precompute nan-groups for forward pass
             isnan = torch.isnan(y_chunk)
@@ -530,6 +532,40 @@ class StateSpaceModel(torch.nn.Module):
             updates=updates,
             mc_white_noise=self.mc_sampling if self.is_nonlinear else None
         )
+
+    def _group_kwarg_names(self) -> set[str]:
+        """
+        Names of forward-kwargs that are indexed by group (first dim = num_groups), so that e.g. ``fit(chunk_size=...)``
+        knows to split them into chunks. Subclasses with their own group-indexed kwargs should extend this.
+        """
+        out = {'start_offsets', 'initial_state'}
+        for pid, process in self.processes.items():
+            for pkwarg in process.measurement_kwargs:
+                if pkwarg.is_group_time_tensor:
+                    out |= {pkwarg.name, f'{pid}__{pkwarg.name}'}
+        return out
+
+    def _subset_kwargs(self, kwargs: dict, group_slice: slice, num_groups: int) -> dict:
+        """
+        Subset forward-kwargs to a chunk of groups (see ``fit(chunk_size=...)``).
+        """
+        group_kwargs = self._group_kwarg_names()
+        # todo: ``Covariance.expected_kwargs`` don't declare which are group-indexed (e.g. ``group_ids`` is, but in
+        #  general they're whatever the ``predict_variance`` module takes), so we infer it from their shape. Make this
+        #  explicit in the planned ``Covariance`` refactor.
+        cov_kwargs = set()
+        for module in self.modules():
+            cov_kwargs.update(getattr(module, 'expected_kwargs', None) or [])
+
+        out = {}
+        for k, v in kwargs.items():
+            if k in group_kwargs:
+                out[k] = _subset_groups(v, group_slice, num_groups, strict=True, name=k)
+            elif k in cov_kwargs:
+                out[k] = _subset_groups(v, group_slice, num_groups)
+            else:
+                out[k] = v
+        return out
 
     def _parse_kwargs(self,
                       num_groups: int,
@@ -796,7 +832,7 @@ class StateSpaceModel(torch.nn.Module):
         hess = 0
         for group_slice in _get_group_slices(num_groups, chunk_size):
             y_chunk = y[group_slice]
-            pred = self(y_chunk, **_subset_groups(kwargs, group_slice, num_groups))
+            pred = self(y_chunk, **self._subset_kwargs(kwargs, group_slice, num_groups))
             loss = _subset_loss_fun(get_loss, group_slice, num_groups)(pred, y_chunk)
             hess = hess + hessian(output=loss.squeeze(), inputs=all_params, allow_unused=True, progress=False)
             del pred, loss
@@ -920,21 +956,24 @@ def _get_group_slices(num_groups: int, chunk_size: Optional[int]) -> List[slice]
     return [slice(start, start + chunk_size) for start in range(0, num_groups, chunk_size)]
 
 
-def _subset_groups(value: Any, group_slice: slice, num_groups: int) -> Any:
+def _subset_groups(value: Any, group_slice: slice, num_groups: int, strict: bool = False, name: str = '') -> Any:
     """
-    Subset a forward-pass kwarg to a chunk of groups: tensors/arrays/lists whose first dimension is ``num_groups`` are
-    sliced; tuples (e.g. ``initial_state``) and dicts are handled recursively; anything else is passed as-is.
+    Subset a forward-kwarg to a chunk of groups: tensors/arrays/lists whose first dimension is ``num_groups`` are
+    sliced; tuples (e.g. ``initial_state``) and dicts are handled recursively; anything else (e.g. scalars) is passed
+    as-is. With ``strict`` (for kwargs known to be group-indexed), a first dimension other than ``num_groups`` (or 1,
+    for broadcasting) raises.
     """
-    if isinstance(value, (torch.Tensor, np.ndarray)):
-        if value.ndim and value.shape[0] == num_groups:
+    if isinstance(value, (torch.Tensor, np.ndarray, list)):
+        size = len(value) if isinstance(value, list) else (value.shape[0] if value.ndim else None)
+        if size == num_groups:
             return value[group_slice]
+        if strict and size != 1:
+            raise ValueError(f"Expected `{name}` to have first dimension {num_groups} (num_groups), got {size}.")
         return value
-    if isinstance(value, list):
-        return value[group_slice] if len(value) == num_groups else value
     if isinstance(value, tuple):
-        return tuple(_subset_groups(v, group_slice, num_groups) for v in value)
+        return tuple(_subset_groups(v, group_slice, num_groups, strict, name) for v in value)
     if isinstance(value, dict):
-        return {k: _subset_groups(v, group_slice, num_groups) for k, v in value.items()}
+        return {k: _subset_groups(v, group_slice, num_groups, strict, name) for k, v in value.items()}
     return value
 
 
@@ -973,7 +1012,7 @@ class _OptimizerClosure:
             if self.callable_kwargs:
                 # called per chunk: outputs may be part of the graph, which is freed by each chunk's backward()
                 callable_kwargs = {k: v() for k, v in self.callable_kwargs.items()}
-                kwargs = {**kwargs, **_subset_groups(callable_kwargs, chunk.group_slice, self.num_groups)}
+                kwargs = {**kwargs, **self.ss_model._subset_kwargs(callable_kwargs, chunk.group_slice, self.num_groups)}
 
             try:
                 pred = self.ss_model(chunk.y, **kwargs)

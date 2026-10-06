@@ -6,12 +6,16 @@ import pytest
 import torch
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
+from torchcast.covariance import Covariance
 from torchcast.process import LocalLevel, LinearModel, Season
 from torchcast.state_space import LossFun
 from torchcast.utils import Stopping
 
 
-def _make_data(num_groups: int = 11, num_times: int = 20):
+NUM_GROUPS = 11
+
+
+def _make_data(num_groups: int = NUM_GROUPS, num_times: int = 20):
     torch.manual_seed(42)
     X = torch.randn(num_groups, num_times, 2)
     y = torch.stack([
@@ -29,7 +33,8 @@ def _make_data(num_groups: int = 11, num_times: int = 20):
 def _make_model(variant: str = 'kf') -> KalmanFilter:
     """
     :param variant: 'kf'; 'adaptive' (adaptive-scaling, which has per-group state); 'sigmoid' (a measure-fun, so a
-     monte-carlo log-prob using ``mc_sampling``, which is shared across groups); 'binomial' (BinomialFilter, binary y2).
+     monte-carlo log-prob using ``mc_sampling``, which is shared across groups); 'binomial' (BinomialFilter, binary y2);
+     'group_cov' (measure-variance predicted from ``group_ids``, a covariance kwarg).
     """
     torch.manual_seed(1)
     processes = [
@@ -42,9 +47,17 @@ def _make_model(variant: str = 'kf') -> KalmanFilter:
         model = BinomialFilter(processes=processes, measures=['y1', 'y2'], binary_measures=['y2'])
         model.mc_sampling = 50  # set before copying, so copies share the draws
         return model
+    measure_covariance = None
+    if variant == 'group_cov':
+        measure_covariance = Covariance.from_measures(
+            ['y1', 'y2'],
+            predict_variance=torch.nn.Sequential(torch.nn.Embedding(NUM_GROUPS, 2), torch.nn.Softplus()),
+            expected_kwargs=['group_ids'],
+        )
     model = KalmanFilter(
         processes=processes,
         measures=['y1', 'y2'],
+        measure_covariance=measure_covariance,
         adaptive_scaling=variant == 'adaptive',
         measure_funs={'y2': 'sigmoid'} if variant == 'sigmoid' else None,
     )
@@ -62,11 +75,13 @@ def _prepare_y(y: torch.Tensor, variant: str) -> torch.Tensor:
 
 @pytest.mark.parametrize('chunk_size', [1, 3, 11, 50])
 @pytest.mark.parametrize('use_weights', [False, True])
-@pytest.mark.parametrize('variant', ['kf', 'adaptive', 'sigmoid', 'binomial'])
+@pytest.mark.parametrize('variant', ['kf', 'adaptive', 'sigmoid', 'binomial', 'group_cov'])
 def test_chunked_loss_and_grad(chunk_size: int, use_weights: bool, variant: str):
     y, X, start_offsets, weights = _make_data()
     y = _prepare_y(y, variant)
     kwargs = {'X': X, 'start_offsets': start_offsets}
+    if variant == 'group_cov':
+        kwargs['group_ids'] = torch.arange(NUM_GROUPS)
     if use_weights:
         kwargs['get_loss'] = LossFun(weights=weights)
 
@@ -153,3 +168,27 @@ def test_chunked_callable_kwargs():
     )
     assert scale.grad is None  # zeroed (set to none) at the end of fit
     assert scale.item() != 1.
+
+
+def test_subset_kwargs():
+    num_groups, num_times = 6, 6  # equal, so shapes alone are ambiguous
+    model = _make_model()
+    model.measure_covariance.expected_kwargs = ['group_ids']
+    X = torch.randn(num_groups, num_times, 2)
+    kwargs = {
+        'X': X,  # ProcessKwarg -> always split
+        'lm__X': X,  # per-process override of the same
+        'group_ids': torch.arange(num_groups),  # covariance kwarg -> split by shape
+        'other': torch.arange(num_times),  # unknown -> never split, though its first dim equals num_groups
+        'initial_state': (torch.zeros(num_groups, 5), torch.eye(5).unsqueeze(0)),  # cov broadcasts over groups
+    }
+    out = model._subset_kwargs(kwargs, slice(2, 4), num_groups)
+    assert torch.equal(out['X'], X[2:4])
+    assert torch.equal(out['lm__X'], X[2:4])
+    assert torch.equal(out['group_ids'], torch.tensor([2, 3]))
+    assert out['other'] is kwargs['other']
+    assert out['initial_state'][0].shape == (2, 5)
+    assert out['initial_state'][1] is kwargs['initial_state'][1]
+
+    with pytest.raises(ValueError, match='`X`'):
+        model._subset_kwargs({'X': X[:3]}, slice(0, 2), num_groups)
