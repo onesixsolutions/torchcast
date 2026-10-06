@@ -51,8 +51,8 @@ class NewtonResult:
     :param loss_scale: The loss is a mean; this is the number of elements it's a mean over, so that
      ``hessian * loss_scale`` is the hessian of the summed loss (used for the Laplace approximation). ``None`` for a
      custom ``get_loss``, where this isn't known.
-    :param history: One dict per Newton step, with the loss, largest absolute gradient, etc. before the step; and the
-     line-search scale and largest absolute (scaled) step taken.
+    :param history: One dict per Newton step, with the loss, largest absolute gradient, parameters, etc. before the
+     step; and the line-search scale and largest absolute (scaled) step taken.
     """
     converged: bool
     stop_reason: str
@@ -179,6 +179,7 @@ def newton_refine(objective: NewtonObjective,
             'eig_max': evals[-1].item(),
             'num_negative': int((evals < 0).sum()),
             'hessian_age': hess_age,
+            'params': objective.get_vector().detach().clone(),
         }
         scale = _line_search(objective, loss, grad, step)
         record.update(ls_scale=scale, max_abs_step=max_abs_step * (scale or 0.))
