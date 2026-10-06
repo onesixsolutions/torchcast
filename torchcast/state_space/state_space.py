@@ -1,4 +1,4 @@
-from typing import Any, List, NamedTuple, Optional, Sequence, Union, TYPE_CHECKING, Callable, Iterator
+from typing import Any, Iterator, List, NamedTuple, Optional, Sequence, Union, TYPE_CHECKING, Callable
 from warnings import warn
 
 import numpy as np
@@ -7,10 +7,11 @@ import torch
 from tqdm.auto import tqdm
 
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
-from torchcast.internals.hessian import hessian
+from torchcast.internals.hessian import hessian, mvnorm_from_hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
+from torchcast.state_space.newton import NewtonResult, newton_refine as _newton_refine
 from torchcast.process.regression import Process
 
 from .mixture import MixtureComponent, MixtureModel, RegimeTransition
@@ -428,6 +429,7 @@ class StateSpaceModel(torch.nn.Module):
             callable_kwargs: Optional[dict[str, Callable]] = None,
             set_initial_values: bool = True,
             chunk_size: Optional[int] = None,
+            newton_finish: Union[bool, dict] = False,
             **kwargs):
         """
         A high-level interface for fitting a state-space model when all the training data fits in memory. If the data
@@ -464,6 +466,9 @@ class StateSpaceModel(torch.nn.Module):
          dimension equals the number of groups). A custom ``get_loss`` should be
          a mean over groups (like the default), since chunks' losses are combined as a weighted mean by the number of
          groups; a :class:`.LossFun` (e.g. with ``weights``) is split into chunks automatically.
+        :param newton_finish: If True (or a dict of keyword-arguments to :func:`newton_refine()`), after the optimizer
+         stops, refine the parameters with Newton steps; useful when the optimizer is slow along ridges. The result is
+         stored as ``self.newton_result`` (a :class:`.NewtonResult`). Skipped if fitting is interrupted.
         :return: This ``StateSpaceModel`` instance.
         """
 
@@ -507,45 +512,22 @@ class StateSpaceModel(torch.nn.Module):
         if get_loss is None:
             get_loss = LossFun()
 
-        num_groups = y.shape[0]
-        chunks = []
-        for group_slice in _get_group_slices(num_groups, chunk_size):
-            y_chunk = y[group_slice]
-            chunk_kwargs = self._subset_kwargs(kwargs, group_slice, num_groups)
-
-            # precompute nan-groups for forward pass
-            isnan = torch.isnan(y_chunk)
-            chunk_kwargs['nan_groups'] = [get_nan_groups(isnan_t) for isnan_t in isnan.unbind(1)]
-
-            # see `last_measured_per_group` in forward docstring
-            # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
-            any_measured_bool = ~isnan.all(2).cpu()
-            chunk_kwargs['last_measured_per_group'] = torch.as_tensor(
-                [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y_chunk.shape[0])],
-                dtype=torch.int,
-                device=y.device
-            ) + 1
-
-            chunks.append(_FitChunk(
-                group_slice=group_slice,
-                y=y_chunk,
-                kwargs=chunk_kwargs,
-                get_loss=_subset_loss_fun(get_loss, group_slice, num_groups),
-                # losses are means over groups, so chunks are combined as a weighted mean:
-                weight=y_chunk.shape[0] / num_groups,
-            ))
+        objective = _ChunkedObjective(
+            self,
+            chunks=self._prepare_chunks(y, chunk_size=chunk_size, get_loss=get_loss, reduce='mean', kwargs=kwargs),
+            num_groups=y.shape[0],
+            callable_kwargs=callable_kwargs,
+        )
 
         closure = _OptimizerClosure(
-            ss_model=self,
-            chunks=chunks,
-            num_groups=num_groups,
+            objective=objective,
             prog=prog,
-            callable_kwargs=callable_kwargs,
             optimizer=optimizer,
             stopping=stopping,
         )
 
         train_loss = float('nan')
+        interrupted = False
         for epoch in range(stopping.max_iter):
             try:
                 prog.reset()
@@ -557,11 +539,110 @@ class StateSpaceModel(torch.nn.Module):
                 if stopping(train_loss):
                     break
             except KeyboardInterrupt:
+                interrupted = True
                 break
             finally:
                 optimizer.zero_grad(set_to_none=True)
+        prog.close()
+
+        if newton_finish and not interrupted:
+            newton_kwargs = {} if newton_finish is True else dict(newton_finish)
+            newton_kwargs.setdefault('chunk_size', chunk_size)
+            newton_kwargs.setdefault('verbose', verbose > 0)
+            self.newton_result = self.newton_refine(
+                y, get_loss=get_loss, callable_kwargs=callable_kwargs, **newton_kwargs, **kwargs
+            )
 
         return self
+
+    def newton_refine(self,
+                      y: torch.Tensor,
+                      chunk_size: Optional[int] = None,
+                      hessian_chunk_size: Optional[int] = None,
+                      max_steps: int = 10,
+                      grad_tol: float = 1e-5,
+                      step_tol: float = 1e-4,
+                      max_step: float = 1.,
+                      eig_floor: float = 1e-6,
+                      decrement_tol: Optional[float] = 1e-3,
+                      reuse_hessian: int = 0,
+                      get_loss: Optional[Callable] = None,
+                      callable_kwargs: Optional[dict[str, Callable]] = None,
+                      verbose: bool = True,
+                      **kwargs) -> NewtonResult:
+        """
+        Refine the parameters of a (typically already fitted) model with Newton steps, using the exact hessian.
+        Optimizers like LBFGS can be slow along ridges -- directions where the loss is nearly flat, e.g. correlated or
+        weakly identified parameters -- so they stop early (loss-based stopping) or crawl (``monitor_params``). Near the
+        optimum, Newton's method converges quadratically. The hessian costs a backward pass per parameter, which is
+        affordable for typical models (tens to hundreds of parameters).
+
+        Each step: computes the loss, gradient and hessian on the full data (summed over chunks); takes a
+        "saddle-free" Newton step, ``-V diag(1 / |lambda|) V^T g`` (from the eigendecomposition of the hessian, so
+        it's a descent direction even where the hessian isn't positive definite); caps it; and backtracks (halving)
+        until the loss decreases sufficiently, treating a ``LinAlgError`` or non-finite loss as a rejection.
+
+        Parameters are the raw (unconstrained) ``nn.Parameter`` values, as in :func:`get_laplace_mvnorm()`. The loss is
+        the same as in :func:`fit()`, i.e. a mean; ``grad_tol`` and ``eig_floor`` are on that scale.
+
+        :param y: The data, as in :func:`fit()`.
+        :param chunk_size: Chunks of groups for the loss/gradient; see :func:`fit()`.
+        :param hessian_chunk_size: Chunks of groups for the hessian, which needs more memory per group than the
+         loss/gradient. Defaults to ``chunk_size``.
+        :param max_steps: The maximum number of Newton steps.
+        :param grad_tol: Converged when the largest absolute gradient is below ``grad_tol`` *and* the largest absolute
+         (proposed) step is below ``step_tol``.
+        :param step_tol: See ``grad_tol``.
+        :param max_step: Steps are scaled down so that no parameter changes by more than this.
+        :param eig_floor: The absolute eigenvalues are floored at ``eig_floor`` times the largest absolute eigenvalue.
+        :param decrement_tol: Also converged when the Newton decrement -- the decrease in the loss predicted by a full
+         Newton step, ``g^T |H|^-1 g / 2`` -- is below ``decrement_tol``. This is on the scale of the *summed* loss
+         (the negative log-likelihood) if known (i.e. for the default ``get_loss`` or a :class:`.LossFun`), so it
+         means: the remaining distance to the optimum is below ``sqrt(2 * decrement_tol)`` standard-errors (in the
+         Mahalanobis sense, with the Laplace approximation's precision), e.g. .045 for the default. This is what
+         usually stops refinement when some parameters are heading to a boundary (e.g. a log-variance to -inf), where
+         the loss is asymptotically flat, so the step never falls below ``step_tol``. ``None`` to disable.
+        :param reuse_hessian: Reuse the hessian for up to this many steps (computing only the loss/gradient), since the
+         hessian dominates the cost. If the line-search fails with a reused hessian, it's recomputed. The final hessian
+         in the result is always computed at the final parameters.
+        :param get_loss: See :func:`fit()`.
+        :param callable_kwargs: See :func:`fit()`.
+        :param verbose: Print each step, and at the end, the weakest directions (smallest eigenvalues of the hessian,
+         with the parameters that load most on them).
+        :param kwargs: Further keyword-arguments passed to :func:`StateSpaceModel.forward()`.
+        :return: A :class:`.NewtonResult`, with the final hessian, diagnostics, and ``laplace_mvnorm()``.
+        """
+        if get_loss is None:
+            get_loss = LossFun()
+        loss_scale = None
+        if isinstance(get_loss, LossFun) and get_loss.reduce == 'mean':
+            loss_scale = float(y.shape[0] * y.shape[1])  # mean over group X time
+
+        chunks = self._prepare_chunks(y, chunk_size=chunk_size, get_loss=get_loss, reduce='mean', kwargs=kwargs)
+        hessian_chunks = None
+        if hessian_chunk_size != chunk_size and hessian_chunk_size is not None:
+            hessian_chunks = self._prepare_chunks(
+                y, chunk_size=hessian_chunk_size, get_loss=get_loss, reduce='mean', kwargs=kwargs
+            )
+        objective = _ChunkedObjective(
+            self,
+            chunks=chunks,
+            num_groups=y.shape[0],
+            callable_kwargs=callable_kwargs,
+            hessian_chunks=hessian_chunks,
+        )
+        return _newton_refine(
+            objective,
+            max_steps=max_steps,
+            grad_tol=grad_tol,
+            step_tol=step_tol,
+            max_step=max_step,
+            eig_floor=eig_floor,
+            decrement_tol=decrement_tol,
+            reuse_hessian=reuse_hessian,
+            loss_scale=loss_scale,
+            verbose=verbose,
+        )
 
     @property
     def is_nonlinear(self) -> bool:
@@ -627,6 +708,51 @@ class StateSpaceModel(torch.nn.Module):
         if init_regime_probs.shape[0] not in (1, num_groups):
             raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
         return transition(init_regime_probs.expand(num_groups, -1), base_probs)
+
+    def _prepare_chunks(self,
+                        y: torch.Tensor,
+                        chunk_size: Optional[int],
+                        get_loss: Callable,
+                        reduce: str,
+                        kwargs: dict) -> List['_FitChunk']:
+        """
+        Split ``y`` and the forward-kwargs into chunks of groups (see ``fit(chunk_size=...)``), precomputing the
+        nan-groups for each.
+
+        :param reduce: 'mean' if ``get_loss`` returns a mean over groups (as in ``fit()``), so chunks' losses are
+         combined as a weighted mean by the number of groups; or 'sum' if it returns a sum, so they're summed.
+        """
+        num_groups = y.shape[0]
+        group_slices = _get_group_slices(num_groups, chunk_size)
+        if len(group_slices) > 1 and isinstance(get_loss, LossFun) and get_loss.reduce != reduce:
+            raise ValueError(f"With `chunk_size`, expected `get_loss.reduce` to be '{reduce}'.")
+
+        chunks = []
+        for group_slice in group_slices:
+            y_chunk = y[group_slice]
+            chunk_kwargs = self._subset_kwargs(kwargs, group_slice, num_groups)
+
+            # precompute nan-groups for forward pass
+            isnan = torch.isnan(y_chunk)
+            chunk_kwargs['nan_groups'] = [get_nan_groups(isnan_t) for isnan_t in isnan.unbind(1)]
+
+            # see `last_measured_per_group` in forward docstring
+            # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
+            any_measured_bool = ~isnan.all(2).cpu()
+            chunk_kwargs['last_measured_per_group'] = torch.as_tensor(
+                [np.max(true1d_idx(any_measured_bool[g]).numpy(), initial=0) for g in range(y_chunk.shape[0])],
+                dtype=torch.int,
+                device=y.device
+            ) + 1
+
+            chunks.append(_FitChunk(
+                group_slice=group_slice,
+                y=y_chunk,
+                kwargs=chunk_kwargs,
+                get_loss=_subset_loss_fun(get_loss, group_slice, num_groups),
+                weight=y_chunk.shape[0] / num_groups if reduce == 'mean' else 1.,
+            ))
+        return chunks
 
     def _group_kwarg_names(self) -> set[str]:
         """
@@ -957,42 +1083,13 @@ class StateSpaceModel(torch.nn.Module):
         if not get_loss:
             get_loss = LossFun(reduce='sum')
 
-        all_params = []
-        all_param_names = []
-        for nm, par in self.named_parameters():
-            if not par.requires_grad:
-                continue
-            all_param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
-            all_params.append(par)
-        # TODO: any way to verify reshape(-1) matches internals of hessian?
-        means = torch.cat([p.reshape(-1) for p in all_params])
-
-        num_groups = y.shape[0]
-        hess = 0
-        for group_slice in _get_group_slices(num_groups, chunk_size):
-            y_chunk = y[group_slice]
-            pred = self(y_chunk, **self._subset_kwargs(kwargs, group_slice, num_groups))
-            loss = _subset_loss_fun(get_loss, group_slice, num_groups)(pred, y_chunk)
-            hess = hess + hessian(output=loss.squeeze(), inputs=all_params, allow_unused=True, progress=False)
-            del pred, loss
-
-        # create mvnorm for laplace approx:
-        with torch.no_grad():
-            try:
-                mvnorm = torch.distributions.MultivariateNormal(
-                    means, precision_matrix=hess, validate_args=True
-                )
-            except (RuntimeError, ValueError) as e:
-                warn(
-                    f"Unable to get valid covariance from optimized parameters (see error below)."
-                    f"If you haven't already tried, scale your data, and fit the model with ``monitor_params=True`` "
-                    f"(see the ``stopping`` argument of ``fit()``)."
-                    f"\n{str(e)}"
-                )
-                fake_cov = torch.diag(torch.diag(hess).pow(-1).clip(min=1E-5))
-                mvnorm = torch.distributions.MultivariateNormal(means, covariance_matrix=fake_cov)
-
-        return mvnorm, all_param_names
+        objective = _ChunkedObjective(
+            self,
+            chunks=self._prepare_chunks(y, chunk_size=chunk_size, get_loss=get_loss, reduce='sum', kwargs=kwargs),
+            num_groups=y.shape[0],
+        )
+        _, _, hess = objective.loss_grad_hessian()
+        return mvnorm_from_hessian(objective.get_vector().detach(), hess), objective.param_names
 
     @torch.no_grad()
     def simulate(self,
@@ -1127,23 +1224,102 @@ def _subset_loss_fun(get_loss: Callable, group_slice: slice, num_groups: int) ->
     return get_loss.subset(group_slice, num_groups)
 
 
-class _OptimizerClosure:
+class _ChunkedObjective:
+    """
+    A model's loss, summed over chunks of groups (see ``fit(chunk_size=...)``), and its gradient/hessian w.r.t. the
+    parameters that require grad. Only one chunk's computation-graph is in memory at a time.
+
+    :param hessian_chunks: Chunks to use for the hessian, which needs more memory per group than the loss/gradient.
+     Defaults to ``chunks``.
+    """
 
     def __init__(self,
                  ss_model: StateSpaceModel,
                  chunks: Sequence[_FitChunk],
                  num_groups: int,
-                 optimizer: torch.optim.Optimizer,
-                 prog: tqdm,
-                 stopping: 'Stopping',
-                 callable_kwargs: dict[str, Callable]):
+                 callable_kwargs: Optional[dict[str, Callable]] = None,
+                 hessian_chunks: Optional[Sequence[_FitChunk]] = None):
         self.ss_model = ss_model
         self.chunks = chunks
+        self.hessian_chunks = hessian_chunks or chunks
         self.num_groups = num_groups
+        self.callable_kwargs = callable_kwargs or {}
+
+        self.params = []
+        self.param_names = []
+        for nm, par in ss_model.named_parameters():
+            if not par.requires_grad:
+                continue
+            self.param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
+            self.params.append(par)
+
+    def chunk_losses(self, chunks: Optional[Sequence[_FitChunk]] = None) -> Iterator[torch.Tensor]:
+        """
+        Yields each chunk's (weighted) loss. Callers should finish with each (e.g. ``backward()``) before the next, so
+        that only one graph is in memory.
+        """
+        for chunk in (self.chunks if chunks is None else chunks):
+            kwargs = chunk.kwargs
+            if self.callable_kwargs:
+                # called per chunk: outputs may be part of the graph, which is freed by each chunk's backward()
+                callable_kwargs = {k: v() for k, v in self.callable_kwargs.items()}
+                kwargs = {**kwargs, **self.ss_model._subset_kwargs(callable_kwargs, chunk.group_slice, self.num_groups)}
+            pred = self.ss_model(chunk.y, **kwargs)
+            yield chunk.get_loss(pred, chunk.y) * chunk.weight
+
+    @torch.no_grad()
+    def loss(self) -> float:
+        return sum(loss.item() for loss in self.chunk_losses())
+
+    def loss_and_grad(self) -> tuple[float, torch.Tensor]:
+        total_loss = 0.
+        total_grad = 0.
+        for loss in self.chunk_losses():
+            total_grad = total_grad + self._flat_grad(loss)
+            total_loss += loss.item()
+        return total_loss, total_grad
+
+    def loss_grad_hessian(self) -> tuple[float, torch.Tensor, torch.Tensor]:
+        total_loss = 0.
+        total_grad = 0.
+        total_hess = 0.
+        for loss in self.chunk_losses(self.hessian_chunks):
+            loss = loss.squeeze()
+            total_grad = total_grad + self._flat_grad(loss, retain_graph=True)
+            total_hess = total_hess + hessian(output=loss, inputs=self.params, allow_unused=True, progress=False)
+            total_loss += loss.item()
+            del loss
+        return total_loss, total_grad, total_hess
+
+    def _flat_grad(self, loss: torch.Tensor, retain_graph: bool = False) -> torch.Tensor:
+        grads = torch.autograd.grad(loss, self.params, retain_graph=retain_graph, allow_unused=True)
+        return torch.cat([
+            (torch.zeros_like(p) if g is None else g).reshape(-1) for p, g in zip(self.params, grads)
+        ]).detach()
+
+    def get_vector(self) -> torch.Tensor:
+        # matches the ordering of ``hessian()``, ``param_names``
+        return torch.cat([p.reshape(-1) for p in self.params])
+
+    @torch.no_grad()
+    def set_vector(self, vector: torch.Tensor):
+        offset = 0
+        for p in self.params:
+            p.copy_(vector[offset:offset + p.numel()].view_as(p))
+            offset += p.numel()
+
+
+class _OptimizerClosure:
+
+    def __init__(self,
+                 objective: _ChunkedObjective,
+                 optimizer: torch.optim.Optimizer,
+                 prog: tqdm,
+                 stopping: 'Stopping'):
+        self.objective = objective
         self.optimizer = optimizer
         self.prog = prog
         self.stopping = stopping
-        self.callable_kwargs = callable_kwargs
         self._bad_count = 0
         self._max_bad_count = self.optimizer.param_groups[0].get('max_eval', 10)
 
@@ -1151,32 +1327,23 @@ class _OptimizerClosure:
         self.optimizer.zero_grad()
 
         total_loss = 0.
-        for chunk in self.chunks:
-            kwargs = chunk.kwargs
-            if self.callable_kwargs:
-                # called per chunk: outputs may be part of the graph, which is freed by each chunk's backward()
-                callable_kwargs = {k: v() for k, v in self.callable_kwargs.items()}
-                kwargs = {**kwargs, **self.ss_model._subset_kwargs(callable_kwargs, chunk.group_slice, self.num_groups)}
-
-            try:
-                pred = self.ss_model(chunk.y, **kwargs)
-                loss = chunk.get_loss(pred, chunk.y) * chunk.weight
-            except torch.linalg.LinAlgError:
-                # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
-                # by back-tracking and trying a different (hopefully more stable) parameter proposal.
-                # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
-                self._bad_count += 1
-                if self._bad_count > self._max_bad_count:
-                    raise RuntimeError(
-                        "Optimizer cannot find a region of param-space where all covs are valid. "
-                        "Try again, potentially with a lower learning-rate."
-                    )
-                self.optimizer.zero_grad()  # discard gradients from earlier chunks
-                return torch.tensor(float('inf'))
-
-            loss.backward()
-            total_loss += loss.item()
-            del pred, loss
+        try:
+            for loss in self.objective.chunk_losses():
+                loss.backward()
+                total_loss += loss.item()
+                del loss
+        except torch.linalg.LinAlgError:
+            # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
+            # by back-tracking and trying a different (hopefully more stable) parameter proposal.
+            # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
+            self._bad_count += 1
+            if self._bad_count > self._max_bad_count:
+                raise RuntimeError(
+                    "Optimizer cannot find a region of param-space where all covs are valid. "
+                    "Try again, potentially with a lower learning-rate."
+                )
+            self.optimizer.zero_grad()  # discard gradients from earlier chunks
+            return torch.tensor(float('inf'))
 
         self._bad_count = 0
         self.prog.update()
