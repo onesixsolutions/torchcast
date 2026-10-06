@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from torchcast.kalman_filter import KalmanFilter
+from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel, Season
 from torchcast.state_space import LossFun
 from torchcast.utils import Stopping
@@ -26,28 +26,51 @@ def _make_data(num_groups: int = 11, num_times: int = 20):
     return y, X, start_offsets, weights
 
 
-def _make_model() -> KalmanFilter:
+def _make_model(variant: str = 'kf') -> KalmanFilter:
+    """
+    :param variant: 'kf'; 'adaptive' (adaptive-scaling, which has per-group state); 'sigmoid' (a measure-fun, so a
+     monte-carlo log-prob using ``mc_sampling``, which is shared across groups); 'binomial' (BinomialFilter, binary y2).
+    """
     torch.manual_seed(1)
-    return KalmanFilter(
-        processes=[
-            LocalLevel(id='level1', measure='y1'),
-            LinearModel(id='lm', measure='y1', predictors=['x1', 'x2']),
-            LocalLevel(id='level2', measure='y2'),
-            Season(id='season', measure='y2', period='7D', dt_unit='D', K=1),
-        ],
+    processes = [
+        LocalLevel(id='level1', measure='y1'),
+        LinearModel(id='lm', measure='y1', predictors=['x1', 'x2']),
+        LocalLevel(id='level2', measure='y2'),
+        Season(id='season', measure='y2', period='7D', dt_unit='D', K=1),
+    ]
+    if variant == 'binomial':
+        model = BinomialFilter(processes=processes, measures=['y1', 'y2'], binary_measures=['y2'])
+        model.mc_sampling = 50  # set before copying, so copies share the draws
+        return model
+    model = KalmanFilter(
+        processes=processes,
         measures=['y1', 'y2'],
+        adaptive_scaling=variant == 'adaptive',
+        measure_funs={'y2': 'sigmoid'} if variant == 'sigmoid' else None,
     )
+    if variant == 'sigmoid':
+        model.mc_sampling = 50
+    return model
+
+
+def _prepare_y(y: torch.Tensor, variant: str) -> torch.Tensor:
+    if variant == 'binomial':
+        y = y.clone()
+        y[..., 1] = torch.where(y[..., 1].isnan(), y[..., 1], (y[..., 1] > 0).float())
+    return y
 
 
 @pytest.mark.parametrize('chunk_size', [1, 3, 11, 50])
 @pytest.mark.parametrize('use_weights', [False, True])
-def test_chunked_loss_and_grad(chunk_size: int, use_weights: bool):
+@pytest.mark.parametrize('variant', ['kf', 'adaptive', 'sigmoid', 'binomial'])
+def test_chunked_loss_and_grad(chunk_size: int, use_weights: bool, variant: str):
     y, X, start_offsets, weights = _make_data()
+    y = _prepare_y(y, variant)
     kwargs = {'X': X, 'start_offsets': start_offsets}
     if use_weights:
         kwargs['get_loss'] = LossFun(weights=weights)
 
-    model = _make_model()
+    model = _make_model(variant)
     model_chunked = copy.deepcopy(model)
 
     # grads are zeroed at the end of fit, so capture them inside the closure via a hook on the optimizer:
