@@ -614,9 +614,14 @@ class Predictions:
             mixture = self._get_mixture(measure, standard[..., j], torch.zeros_like(standard[..., j]))
             component_means = mixture.means[..., 1:]
             if measure in transforms:
-                # (the full back-transformed mean, like the standard regime's -- bias_adjust is ignored for MC; and the
-                # components are gaussian, so e.g. no smearing for them)
-                component_means = transforms[measure].gaussian.expected_inverse(component_means, mixture.vars[..., 1:])
+                # (each regime with its own transform -- see `Transform.for_regime` -- and the full back-transformed
+                # mean, like the standard regime's: bias_adjust is ignored for MC)
+                component_means = []
+                for k, label in enumerate(mixture.labels[1:], start=1):
+                    t = transforms[measure].for_regime(label)
+                    _warn_bias_adjust_ignored(t)
+                    component_means.append(t.expected_inverse(mixture.means[..., k], mixture.vars[..., k]))
+                component_means = torch.stack(component_means, -1)
             out[..., j] = mixture.probs[..., 0] * standard[..., j] + (mixture.probs[..., 1:] * component_means).sum(-1)
         return out
 
@@ -669,12 +674,12 @@ class Predictions:
             lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
             if measure in transforms:
                 t = transforms[measure]
-                # back-transform each regime, then mix (components are gaussian, so e.g. no smearing for them):
-                mean = (
-                    mixture.probs[..., 0] * t.inverse_mean(mixture.means[..., 0], mixture.vars[..., 0]) +
-                    (mixture.probs[..., 1:] * t.gaussian.inverse_mean(mixture.means[..., 1:], mixture.vars[..., 1:]))
-                    .sum(-1)
-                )
+                # back-transform each regime (with its own transform, see `Transform.for_regime`), then mix:
+                regime_means = [t.inverse_mean(mixture.means[..., 0], mixture.vars[..., 0])] + [
+                    t.for_regime(label).inverse_mean(mixture.means[..., k], mixture.vars[..., k])
+                    for k, label in enumerate(mixture.labels[1:], start=1)
+                ]
+                mean = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
                 out[measure] = (mean, t.inverse(lower), t.inverse(upper))
             else:
                 out[measure] = (mixture.mean(), lower, upper)
@@ -705,6 +710,13 @@ class Predictions:
                 f"`transform` is not supported for measures with a non-gaussian likelihood (e.g. binary measures): "
                 f"{non_gaussian}. To transform only some measures, pass a dict of `{{measure: Transform}}`."
             )
+        from .transforms import RegimeTransform
+        for measure, t in transforms.items():
+            if isinstance(t, RegimeTransform):
+                ids = {c.id for c in self.mixture.components if c.measure == measure} if self.mixture else set()
+                unknown = set(t.components) - ids
+                if unknown:
+                    raise ValueError(f"`RegimeTransform` for '{measure}' has components that aren't its: {unknown}")
         return transforms
 
     @property

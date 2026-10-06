@@ -361,6 +361,14 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(df_exp['mean'].values, expected_exp.numpy(), atol=.005)
     assert np.allclose(df_exp['lower'].values, np.exp(df['lower'].values), rtol=1e-5)
 
+    # each regime's mean uses its own transform (`Transform.for_regime`): here, a component-transform whose noise is a
+    # single node at -10 (standard-deviations), so its back-transformed mean is exp(mu - 10 * sigma):
+    from torchcast.state_space import RegimeTransform, SmearingTransform
+    rt = RegimeTransform(LogTransform(), components={'low': SmearingTransform(LogTransform(), torch.tensor([-10.]))})
+    df_rt = pred.to_dataframe(conf=.9, transform=rt)
+    expected_rt = probs[:, 0] * standard_exp * torch.exp(r / 2) + probs[:, 1] * math.exp(_COMPONENT_MEAN - 10 * _COMPONENT_SD)
+    assert np.allclose(df_rt['mean'].values, expected_rt.numpy(), atol=.005)
+
 
 @torch.no_grad()
 def test_mixture_nonlinear_get_mixture_warns():

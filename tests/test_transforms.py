@@ -290,42 +290,104 @@ def test_smearing_from_predictions():
     assert np.isfinite(df_nl['mean'].values).all()
 
 
-@torch.no_grad()
-def test_smearing_mixture():
-    """
-    For a mixture measure, residuals are weighted by P(standard regime | observation), and only the standard regime's
-    back-transformed mean is smeared (the components are gaussian).
-    """
-    from torchcast.state_space import SmearingTransform
-
-    torch.manual_seed(0)
-    y = torch.randn(4, 30, 1).cumsum(1) * .05 + 3.
-    is_low = torch.rand(4, 30, 1) < .15
-    y[is_low] = -1.  # 'quick visits'
+def _smearing_mixture_kf(component_sd: float) -> KalmanFilter:
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
         mixture=[MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')],
     )
     with torch.no_grad():
-        kf.mixture.components[0]._log_std.fill_(math.log(.1))
-    pred = kf(y)
+        kf.mixture.components[0]._log_std.fill_(math.log(component_sd))
+    return kf
+
+
+def _smearing_mixture_y() -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(0)
+    y = torch.randn(4, 30, 1).cumsum(1) * .05 + 3.
+    is_low = torch.rand(4, 30, 1) < .15
+    y[is_low] = -1. + torch.randn(int(is_low.sum())) * .05  # 'quick visits'
+    return y, is_low
+
+
+@torch.no_grad()
+def test_smearing_mixture():
+    """
+    For a mixture measure, each regime is smeared with its own residuals, weighted by P(regime | observation).
+    """
+    from torchcast.state_space import SmearingTransform, RegimeTransform
+
+    y, is_low = _smearing_mixture_y()
+    pred = _smearing_mixture_kf(component_sd=.1)(y)
     mix = pred.get_mixture('y')
     smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y', num_nodes=1000)
-    # (fewer residuals than nodes, so they're used directly, in order:)
-    resids = ((y[..., 0] - mix.means[..., 0]) / mix.vars[..., 0].sqrt()).reshape(-1)
-    assert torch.allclose(smear.residuals, resids, atol=1e-5)
-    # the outliers get ~no weight (in total), even though they're ~15% of observations:
-    is_low = is_low.reshape(-1)
-    assert smear.weights[is_low].sum() < .01
-    assert smear.weights.sum().item() == pytest.approx(1.)
+    assert isinstance(smear, RegimeTransform)
+    standard, low = smear.standard, smear.components['low']
+    assert smear.for_regime('low') is low
+
+    # posterior regime-probabilities given each observation:
+    obs = y[..., 0]
+    lik = torch.distributions.Normal(mix.means, mix.vars.sqrt()).log_prob(obs.unsqueeze(-1)).exp()
+    post = mix.probs * lik / (mix.probs * lik).sum(-1, keepdim=True)
+
+    # standard regime: (fewer residuals than nodes, so they're used directly, in order)
+    assert torch.allclose(standard.residuals, ((obs - mix.means[..., 0]) / mix.vars[..., 0].sqrt()).reshape(-1),
+                          atol=1e-5)
+    assert torch.allclose(standard.weights, (post[..., 0] / post[..., 0].sum()).reshape(-1), atol=1e-6)
+    # ...where the outliers get ~no weight in total, though they're ~15% of observations:
+    assert standard.weights[is_low.reshape(-1)].sum() < .01
+
+    # the component's regime has a constant mean/var, so its smeared mean is the posterior-weighted average of the
+    # back-transformed observations:
+    expected_low = (post[..., 1] * obs.exp()).sum() / post[..., 1].sum()
+    assert torch.allclose(low.inverse_mean(mix.means[..., 1], mix.vars[..., 1]), expected_low.expand(4, 30), rtol=1e-4)
 
     df = pred.to_dataframe(transform=smear)
     expected = (
-        mix.probs[..., 0] * smear.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
-        mix.probs[..., 1] * torch.exp(mix.means[..., 1] + mix.vars[..., 1] / 2)
+        mix.probs[..., 0] * standard.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
+        mix.probs[..., 1] * expected_low
     )
-    assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)
+    assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-4)
+
+    # choosing per regime:
+    rt = RegimeTransform(standard=LogTransform(), components={'low': LogTransform(bias_adjust=0)})
+    df_rt = pred.to_dataframe(transform=rt)
+    expected_rt = (
+        mix.probs[..., 0] * torch.exp(mix.means[..., 0] + mix.vars[..., 0] / 2) +
+        mix.probs[..., 1] * torch.exp(mix.means[..., 1])
+    )
+    assert np.allclose(df_rt['mean'].values, expected_rt.reshape(-1).numpy(), rtol=1e-5)
+    with pytest.raises(ValueError, match="aren't its"):
+        pred.to_dataframe(transform=RegimeTransform(LogTransform(), components={'nope': LogTransform()}))
+    # a SmearingTransform on its own leaves components gaussian (its base):
+    single = SmearingTransform(LogTransform(), torch.randn(50))
+    assert single.for_regime('low') is single.base
+
+
+@torch.no_grad()
+def test_smearing_large_component_variance():
+    """
+    The motivating failure: a component with a large (learned) variance has a huge lognormal mean,
+    exp(mu + sigma^2 / 2), which dominates the mixed mean. Smearing the component's regime keeps it near the
+    observations attributed to it.
+    """
+    from torchcast.state_space import SmearingTransform, RegimeTransform
+
+    y, is_low = _smearing_mixture_y()
+    pred = _smearing_mixture_kf(component_sd=3.)(y)
+    mix = pred.get_mixture('y')
+    lognormal_low = torch.exp(mix.means[..., 1] + mix.vars[..., 1] / 2)
+    assert (lognormal_low > 30).all()  # (vs. 'quick visits' of ~exp(-1))
+
+    smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y')
+    smeared_low = smear.for_regime('low').inverse_mean(mix.means[..., 1], mix.vars[..., 1])
+    # (bounded by the observations; above exp(-1) because the broad component also gets some posterior weight from
+    # the standard observations)
+    assert (smeared_low < y.exp().max()).all()
+    assert (smeared_low < lognormal_low / 5).all()
+    # vs. smearing only the standard regime (the component lognormal):
+    df_smear = pred.to_dataframe(transform=smear)
+    df_standard_only = pred.to_dataframe(transform=RegimeTransform(smear.standard, components={'low': LogTransform()}))
+    assert (df_smear['mean'].values < df_standard_only['mean'].values).all()
 
 
 @torch.no_grad()
@@ -339,5 +401,6 @@ def test_smearing_from_predictions_missing():
     for mixture in (None, [MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')]):
         kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], mixture=mixture)
         smear = SmearingTransform.from_predictions(LogTransform(), kf(y), y, 'y')
-        assert smear.residuals.shape == (18,)
-        assert torch.isfinite(smear.residuals).all() and torch.isfinite(smear.weights).all()
+        for t in ([smear] if mixture is None else [smear.standard, smear.components['low']]):
+            assert t.residuals.shape == (18,)
+            assert torch.isfinite(t.residuals).all() and torch.isfinite(t.weights).all()

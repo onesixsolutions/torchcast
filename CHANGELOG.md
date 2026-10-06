@@ -48,9 +48,13 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - `SmearingTransform(base, residuals)` wraps a transform so that back-transformed means use the empirical
   distribution of standardized residuals instead of assuming gaussian noise (Duan's smearing estimator); intervals
   are unaffected. `SmearingTransform.from_predictions(base, predictions, y, measure)` builds one from a model's
-  residuals -- for a measure with mixture components, using the standard regime's residuals, weighted by the
-  probability that each observation came from it. Custom transforms can override `Transform.expected_inverse()`
-  (a closed form) or `Transform.noise_nodes()` (a different noise distribution).
+  residuals. For a measure with mixture components, it smears each regime with its own residuals, weighted by the
+  probability that each observation came from that regime -- so a component's back-transformed mean is the
+  weighted average of the observations attributed to it, rather than e.g. a lognormal mean that's very sensitive to
+  a large component variance. Custom transforms can override `Transform.expected_inverse()` (a closed form) or
+  `Transform.noise_nodes()` (a different noise distribution).
+- `RegimeTransform(standard, components={component_id: Transform})` chooses how each regime of a mixture measure is
+  back-transformed, e.g. `components={'quick': LogTransform(bias_adjust=0)}`.
 
 ### New feature: sampling predictions, and derived quantities
 
