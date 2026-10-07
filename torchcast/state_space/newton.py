@@ -51,6 +51,8 @@ class NewtonResult:
     :param loss_scale: The loss is a mean; this is the number of elements it's a mean over, so that
      ``hessian * loss_scale`` is the hessian of the summed loss (used for the Laplace approximation). ``None`` for a
      custom ``get_loss``, where this isn't known.
+    :param hessian_subsample: If the hessian was computed on a subsample of groups, the (expected) fraction used.
+     The hessian is then only an estimate (fine for ``weak_directions()``, but not for ``laplace_mvnorm()``).
     :param history: One dict per Newton step, with the loss, largest absolute gradient, parameters, etc. before the
      step; and the line-search scale and largest absolute (scaled) step taken.
     """
@@ -62,6 +64,7 @@ class NewtonResult:
     grad: torch.Tensor
     hessian: torch.Tensor
     loss_scale: Optional[float]
+    hessian_subsample: Optional[float] = None
     history: List[dict] = field(default_factory=list)
 
     def eigen(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,11 +94,27 @@ class NewtonResult:
         """
         :return: The hessian of the *summed* loss (rather than the mean), as used for a Laplace approximation.
         """
+        if self.hessian_subsample is not None:
+            raise RuntimeError(
+                "The hessian was computed on a subsample of groups (``hessian_subsample``), so it's only an estimate; "
+                "use ``get_laplace_mvnorm()`` for the Laplace approximation."
+            )
         if self.loss_scale is None:
             raise RuntimeError(
                 "The scale of the loss isn't known for a custom ``get_loss``; use ``get_laplace_mvnorm()`` instead."
             )
         return self.hessian * self.loss_scale
+
+    def decrement(self, eig_floor: float = 1e-6) -> float:
+        """
+        The Newton decrement at the final parameters, ``g^T |H|^-1 g / 2`` (on the scale of the summed loss, if
+        ``loss_scale`` is known): the loss-decrease predicted by another full Newton step. See ``decrement_tol`` in
+        :func:`StateSpaceModel.newton_refine()`. Uses the result's hessian, so it's an estimate if that's from a
+        subsample.
+        """
+        evals, evecs = self.eigen()
+        _, decrement = saddle_free_step(self.grad, evals, evecs, eig_floor)
+        return decrement * (self.loss_scale or 1.)
 
     def laplace_mvnorm(self) -> torch.distributions.MultivariateNormal:
         """
@@ -103,6 +122,54 @@ class NewtonResult:
         rather than recomputing it.
         """
         return mvnorm_from_hessian(self.params, self.summed_hessian())
+
+
+def compare_hessians(full: NewtonResult,
+                     approx: NewtonResult,
+                     num_weak: int = 3,
+                     eig_floor: float = 1e-6) -> dict:
+    """
+    Compare two hessians at the same parameters -- typically the full-data hessian and one from a subsample of groups
+    -- to check whether the subsample is good enough to steer Newton steps. E.g., on data small enough for the full
+    hessian::
+
+        full = model.newton_refine(y, max_steps=0, verbose=False, **kwargs)
+        approx = model.newton_refine(y, max_steps=0, verbose=False, hessian_subsample=.05, **kwargs)
+        compare_hessians(full, approx)
+
+    (``max_steps=0`` computes the hessian at the current parameters without stepping.) Also worth comparing: the
+    number of steps each takes to converge from the same start.
+
+    :return: A dict with:
+
+     - ``direction_cosine``: cosine between the (uncapped) saddle-free Newton directions. Near 1 means the subsample
+       steers the steps well.
+     - ``decrement_full``, ``decrement_approx``: the Newton decrement under each.
+     - ``smallest_eigenvalues_full``, ``smallest_eigenvalues_approx``: the ``num_weak`` smallest eigenvalues of each.
+     - ``weak_subspace_overlap``: mean squared cosine of the principal angles between the ``num_weak`` weakest
+       eigenvectors of each (1 = the same weak directions; ~``num_weak / num_params`` = unrelated).
+     - ``relative_error``: ``||H_approx - H_full|| / ||H_full||`` (frobenius).
+    """
+    if not torch.allclose(full.params, approx.params):
+        raise ValueError("The results should be at the same parameters (e.g. ``max_steps=0`` from the same model).")
+    grad = full.grad.double()
+    evals_f, evecs_f = full.eigen()
+    evals_a, evecs_a = approx.eigen()
+    step_f, dec_f = saddle_free_step(grad, evals_f, evecs_f, eig_floor)
+    step_a, dec_a = saddle_free_step(grad, evals_a, evecs_a, eig_floor)
+    k = min(num_weak, len(evals_f))
+    overlap = torch.linalg.svdvals(evecs_f[:, :k].T @ evecs_a[:, :k]).pow(2).mean().item()
+    scale = full.loss_scale or 1.
+    return {
+        'direction_cosine': torch.nn.functional.cosine_similarity(step_f, step_a, dim=0).item(),
+        'decrement_full': dec_f * scale,
+        'decrement_approx': dec_a * scale,
+        'smallest_eigenvalues_full': evals_f[:k].tolist(),
+        'smallest_eigenvalues_approx': evals_a[:k].tolist(),
+        'weak_subspace_overlap': overlap,
+        'relative_error': (torch.linalg.norm(approx.hessian.double() - full.hessian.double()) /
+                           torch.linalg.norm(full.hessian.double())).item(),
+    }
 
 
 def saddle_free_step(grad: torch.Tensor,
@@ -139,6 +206,7 @@ def newton_refine(objective: NewtonObjective,
                   decrement_tol: Optional[float] = 1e-3,
                   reuse_hessian: int = 0,
                   loss_scale: Optional[float] = None,
+                  hessian_subsample: Optional[float] = None,
                   verbose: bool = True) -> NewtonResult:
     """
     See :func:`StateSpaceModel.newton_refine()`.
@@ -208,6 +276,7 @@ def newton_refine(objective: NewtonObjective,
         grad=grad,
         hessian=hess,
         loss_scale=loss_scale,
+        hessian_subsample=hessian_subsample,
         history=history,
     )
     if verbose:
