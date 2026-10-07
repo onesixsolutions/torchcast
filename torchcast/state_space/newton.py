@@ -51,6 +51,8 @@ class NewtonResult:
     :param loss_scale: The loss is a mean; this is the number of elements it's a mean over, so that
      ``hessian * loss_scale`` is the hessian of the summed loss (used for the Laplace approximation). ``None`` for a
      custom ``get_loss``, where this isn't known.
+    :param hessian_subsample: If the hessian was computed on a subsample of groups, the fraction used. The hessian
+     is then only an estimate (fine for ``weak_directions()``, but not for ``laplace_mvnorm()``).
     :param history: One dict per Newton step, with the loss, largest absolute gradient, parameters, etc. before the
      step; and the line-search scale and largest absolute (scaled) step taken.
     """
@@ -62,6 +64,7 @@ class NewtonResult:
     grad: torch.Tensor
     hessian: torch.Tensor
     loss_scale: Optional[float]
+    hessian_subsample: Optional[float] = None
     history: List[dict] = field(default_factory=list)
 
     def eigen(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,6 +94,11 @@ class NewtonResult:
         """
         :return: The hessian of the *summed* loss (rather than the mean), as used for a Laplace approximation.
         """
+        if self.hessian_subsample is not None:
+            raise RuntimeError(
+                "The hessian was computed on a subsample of groups (``hessian_subsample``), so it's only an estimate; "
+                "use ``get_laplace_mvnorm()`` for the Laplace approximation."
+            )
         if self.loss_scale is None:
             raise RuntimeError(
                 "The scale of the loss isn't known for a custom ``get_loss``; use ``get_laplace_mvnorm()`` instead."
@@ -139,6 +147,7 @@ def newton_refine(objective: NewtonObjective,
                   decrement_tol: Optional[float] = 1e-3,
                   reuse_hessian: int = 0,
                   loss_scale: Optional[float] = None,
+                  hessian_subsample: Optional[float] = None,
                   verbose: bool = True) -> NewtonResult:
     """
     See :func:`StateSpaceModel.newton_refine()`.
@@ -208,6 +217,7 @@ def newton_refine(objective: NewtonObjective,
         grad=grad,
         hessian=hess,
         loss_scale=loss_scale,
+        hessian_subsample=hessian_subsample,
         history=history,
     )
     if verbose:

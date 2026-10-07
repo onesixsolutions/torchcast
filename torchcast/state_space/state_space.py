@@ -486,6 +486,8 @@ class StateSpaceModel(torch.nn.Module):
                       y: torch.Tensor,
                       chunk_size: Optional[int] = None,
                       hessian_chunk_size: Optional[int] = None,
+                      hessian_subsample: Optional[Union[float, int]] = None,
+                      hessian_subsample_seed: int = 0,
                       max_steps: int = 10,
                       grad_tol: float = 1e-5,
                       step_tol: float = 1e-4,
@@ -516,6 +518,15 @@ class StateSpaceModel(torch.nn.Module):
         :param chunk_size: Chunks of groups for the loss/gradient; see :func:`fit()`.
         :param hessian_chunk_size: Chunks of groups for the hessian, which needs more memory per group than the
          loss/gradient. Defaults to ``chunk_size``.
+        :param hessian_subsample: The hessian costs about ``1.3 * num_params`` loss/gradient evaluations, which is
+         slow for large datasets. If specified, the hessian is computed on a random subset of groups: a fraction (if
+         a float between 0 and 1) or a number (if an int) of them. The loss, gradient and line-search still use all
+         the data, so this converges to the same optimum (the hessian just sets the direction/scale of the steps),
+         though less than quadratically near the end. The hessian in the result is then also from the subsample, so
+         it can't be used for ``NewtonResult.laplace_mvnorm()``; use :func:`get_laplace_mvnorm()` instead. Group
+         kwargs, ``callable_kwargs`` and :class:`.LossFun` weights are subset to match; a custom ``get_loss`` must
+         handle any subset of groups.
+        :param hessian_subsample_seed: Seed for choosing the subsample, which is fixed for all steps.
         :param max_steps: The maximum number of Newton steps.
         :param grad_tol: Converged when the largest absolute gradient is below ``grad_tol`` *and* the largest absolute
          (proposed) step is below ``step_tol``.
@@ -545,18 +556,34 @@ class StateSpaceModel(torch.nn.Module):
         if isinstance(get_loss, LossFun) and get_loss.reduce == 'mean':
             loss_scale = float(y.shape[0] * y.shape[1])  # mean over group X time
 
+        num_groups = y.shape[0]
         chunks = self._prepare_chunks(y, chunk_size=chunk_size, get_loss=get_loss, reduce='mean', kwargs=kwargs)
         hessian_chunks = None
-        if hessian_chunk_size != chunk_size and hessian_chunk_size is not None:
+        group_idx = None
+        if hessian_subsample is not None:
+            if isinstance(hessian_subsample, float):
+                if not 0 < hessian_subsample <= 1:
+                    raise ValueError("If `hessian_subsample` is a float, it should be in (0, 1].")
+                hessian_subsample = max(1, round(hessian_subsample * num_groups))
+            if hessian_subsample < num_groups:
+                gen = torch.Generator().manual_seed(hessian_subsample_seed)
+                group_idx = torch.randperm(num_groups, generator=gen)[:hessian_subsample].sort().values
+        if group_idx is not None or (hessian_chunk_size is not None and hessian_chunk_size != chunk_size):
             hessian_chunks = self._prepare_chunks(
-                y, chunk_size=hessian_chunk_size, get_loss=get_loss, reduce='mean', kwargs=kwargs
+                y,
+                chunk_size=hessian_chunk_size or chunk_size,
+                get_loss=get_loss,
+                reduce='mean',
+                kwargs=kwargs,
+                group_idx=group_idx,
             )
         objective = _ChunkedObjective(
             self,
             chunks=chunks,
-            num_groups=y.shape[0],
+            num_groups=num_groups,
             callable_kwargs=callable_kwargs,
             hessian_chunks=hessian_chunks,
+            hessian_subsampled=group_idx is not None,
         )
         return _newton_refine(
             objective,
@@ -568,6 +595,7 @@ class StateSpaceModel(torch.nn.Module):
             decrement_tol=decrement_tol,
             reuse_hessian=reuse_hessian,
             loss_scale=loss_scale,
+            hessian_subsample=None if group_idx is None else len(group_idx) / num_groups,
             verbose=verbose,
         )
 
@@ -619,18 +647,25 @@ class StateSpaceModel(torch.nn.Module):
                         chunk_size: Optional[int],
                         get_loss: Callable,
                         reduce: str,
-                        kwargs: dict) -> List['_FitChunk']:
+                        kwargs: dict,
+                        group_idx: Optional[torch.Tensor] = None) -> List['_FitChunk']:
         """
         Split ``y`` and the forward-kwargs into chunks of groups (see ``fit(chunk_size=...)``), precomputing the
         nan-groups for each.
 
         :param reduce: 'mean' if ``get_loss`` returns a mean over groups (as in ``fit()``), so chunks' losses are
          combined as a weighted mean by the number of groups; or 'sum' if it returns a sum, so they're summed.
+        :param group_idx: Optionally, only use this subset of groups (e.g. ``newton_refine(hessian_subsample=...)``).
+         With 'mean', the chunks' losses are then a mean over this subset.
         """
         num_groups = y.shape[0]
-        group_slices = _get_group_slices(num_groups, chunk_size)
+        num_used = num_groups if group_idx is None else len(group_idx)
+        group_slices = _get_group_slices(num_used, chunk_size)
         if len(group_slices) > 1 and isinstance(get_loss, LossFun) and get_loss.reduce != reduce:
             raise ValueError(f"With `chunk_size`, expected `get_loss.reduce` to be '{reduce}'.")
+        if group_idx is not None:
+            # chunks index into the full data, so kwargs/callable-kwargs/loss-weights are subset consistently:
+            group_slices = [group_idx[group_slice] for group_slice in group_slices]
 
         chunks = []
         for group_slice in group_slices:
@@ -655,7 +690,7 @@ class StateSpaceModel(torch.nn.Module):
                 y=y_chunk,
                 kwargs=chunk_kwargs,
                 get_loss=_subset_loss_fun(get_loss, group_slice, num_groups),
-                weight=y_chunk.shape[0] / num_groups if reduce == 'mean' else 1.,
+                weight=y_chunk.shape[0] / num_used if reduce == 'mean' else 1.,
             ))
         return chunks
 
@@ -671,7 +706,7 @@ class StateSpaceModel(torch.nn.Module):
                     out |= {pkwarg.name, f'{pid}__{pkwarg.name}'}
         return out
 
-    def _subset_kwargs(self, kwargs: dict, group_slice: slice, num_groups: int) -> dict:
+    def _subset_kwargs(self, kwargs: dict, group_slice: Union[slice, torch.Tensor], num_groups: int) -> dict:
         """
         Subset forward-kwargs to a chunk of groups (see ``fit(chunk_size=...)``).
         """
@@ -1025,7 +1060,7 @@ class LossFun:
             return torch.sum(neg_log_prob)
         raise ValueError(f"Unrecognized `reduce` {self.reduce}")
 
-    def subset(self, group_slice: slice, num_groups: int) -> 'LossFun':
+    def subset(self, group_slice: Union[slice, torch.Tensor], num_groups: int) -> 'LossFun':
         """
         A copy of this ``LossFun`` for a subset of groups (e.g. a chunk in ``fit(chunk_size=...)``).
         """
@@ -1038,7 +1073,7 @@ class LossFun:
 
 
 class _FitChunk(NamedTuple):
-    group_slice: slice
+    group_slice: Union[slice, torch.Tensor]  # a slice, or indices, of the full data's groups
     y: torch.Tensor
     kwargs: dict
     get_loss: Callable
@@ -1053,7 +1088,11 @@ def _get_group_slices(num_groups: int, chunk_size: Optional[int]) -> List[slice]
     return [slice(start, start + chunk_size) for start in range(0, num_groups, chunk_size)]
 
 
-def _subset_groups(value: Any, group_slice: slice, num_groups: int, strict: bool = False, name: str = '') -> Any:
+def _subset_groups(value: Any,
+                   group_slice: Union[slice, torch.Tensor],
+                   num_groups: int,
+                   strict: bool = False,
+                   name: str = '') -> Any:
     """
     Subset a forward-kwarg to a chunk of groups: tensors/arrays/lists whose first dimension is ``num_groups`` are
     sliced; tuples (e.g. ``initial_state``) and dicts are handled recursively; anything else (e.g. scalars) is passed
@@ -1063,7 +1102,13 @@ def _subset_groups(value: Any, group_slice: slice, num_groups: int, strict: bool
     if isinstance(value, (torch.Tensor, np.ndarray, list)):
         size = len(value) if isinstance(value, list) else (value.shape[0] if value.ndim else None)
         if size == num_groups:
-            return value[group_slice]
+            if isinstance(group_slice, slice):
+                return value[group_slice]
+            if isinstance(value, list):
+                return [value[i] for i in group_slice.tolist()]
+            if isinstance(value, np.ndarray):
+                return value[group_slice.cpu().numpy()]
+            return value[group_slice.to(value.device)]
         if strict and size != 1:
             raise ValueError(f"Expected `{name}` to have first dimension {num_groups} (num_groups), got {size}.")
         return value
@@ -1074,8 +1119,8 @@ def _subset_groups(value: Any, group_slice: slice, num_groups: int, strict: bool
     return value
 
 
-def _subset_loss_fun(get_loss: Callable, group_slice: slice, num_groups: int) -> Callable:
-    if group_slice == slice(None) or not isinstance(get_loss, LossFun):
+def _subset_loss_fun(get_loss: Callable, group_slice: Union[slice, torch.Tensor], num_groups: int) -> Callable:
+    if (isinstance(group_slice, slice) and group_slice == slice(None)) or not isinstance(get_loss, LossFun):
         return get_loss
     return get_loss.subset(group_slice, num_groups)
 
@@ -1087,6 +1132,7 @@ class _ChunkedObjective:
 
     :param hessian_chunks: Chunks to use for the hessian, which needs more memory per group than the loss/gradient.
      Defaults to ``chunks``.
+    :param hessian_subsampled: Whether ``hessian_chunks`` are only a subsample of groups.
     """
 
     def __init__(self,
@@ -1094,10 +1140,12 @@ class _ChunkedObjective:
                  chunks: Sequence[_FitChunk],
                  num_groups: int,
                  callable_kwargs: Optional[dict[str, Callable]] = None,
-                 hessian_chunks: Optional[Sequence[_FitChunk]] = None):
+                 hessian_chunks: Optional[Sequence[_FitChunk]] = None,
+                 hessian_subsampled: bool = False):
         self.ss_model = ss_model
         self.chunks = chunks
         self.hessian_chunks = hessian_chunks or chunks
+        self.hessian_subsampled = hessian_subsampled
         self.num_groups = num_groups
         self.callable_kwargs = callable_kwargs or {}
 
@@ -1136,15 +1184,22 @@ class _ChunkedObjective:
         return total_loss, total_grad
 
     def loss_grad_hessian(self) -> tuple[float, torch.Tensor, torch.Tensor]:
+        """
+        The loss and gradient are always from all groups. If ``hessian_chunks`` are a subsample of groups, the hessian
+        is from those (as an estimate of the full-data hessian, on the same mean-scale).
+        """
         total_loss = 0.
         total_grad = 0.
         total_hess = 0.
         for loss in self.chunk_losses(self.hessian_chunks):
             loss = loss.squeeze()
-            total_grad = total_grad + self._flat_grad(loss, retain_graph=True)
+            if not self.hessian_subsampled:
+                total_grad = total_grad + self._flat_grad(loss, retain_graph=True)
+                total_loss += loss.item()
             total_hess = total_hess + hessian(output=loss, inputs=self.params, allow_unused=True, progress=False)
-            total_loss += loss.item()
             del loss
+        if self.hessian_subsampled:
+            total_loss, total_grad = self.loss_and_grad()
         return total_loss, total_grad, total_hess
 
     def _flat_grad(self, loss: torch.Tensor, retain_graph: bool = False) -> torch.Tensor:

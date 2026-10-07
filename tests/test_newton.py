@@ -148,3 +148,56 @@ def test_newton_end_to_end(variant: str):
     result = model.newton_refine(y, X=X, start_offsets=start_offsets, max_steps=1, verbose=False)
     losses = [h['loss'] for h in result.history] + [result.loss]
     assert all(b <= a + 1e-5 for a, b in zip(losses, losses[1:]))
+
+
+def test_hessian_subsample_matches_subset_data():
+    """
+    the subsampled hessian is the hessian of the (mean) loss on those groups: checks that kwargs and loss-weights are
+    subset consistently
+    """
+    y, X, start_offsets, weights = _make_data()
+    model = _make_model()
+    model.fit(y, X=X, start_offsets=start_offsets, verbose=0, stopping={'max_iter': 3})
+    kwargs = {'max_steps': 0, 'decrement_tol': None, 'verbose': False}
+
+    result = model.newton_refine(
+        y, X=X, start_offsets=start_offsets, get_loss=LossFun(weights=weights), hessian_subsample=5,
+        hessian_chunk_size=2, **kwargs
+    )
+    assert result.hessian_subsample == pytest.approx(5 / y.shape[0])
+    idx = torch.randperm(y.shape[0], generator=torch.Generator().manual_seed(0))[:5].sort().values
+    expected = model.newton_refine(
+        y[idx], X=X[idx], start_offsets=start_offsets[idx.numpy()], get_loss=LossFun(weights=weights[idx]), **kwargs
+    )
+    assert torch.allclose(result.hessian, expected.hessian, rtol=1e-4, atol=1e-5)
+    # (the loss/gradient are still from the full data)
+    full = model.newton_refine(y, X=X, start_offsets=start_offsets, get_loss=LossFun(weights=weights), **kwargs)
+    assert result.loss == pytest.approx(full.loss, rel=1e-6)
+    assert torch.allclose(result.grad, full.grad)
+
+    with pytest.raises(RuntimeError, match='subsample'):
+        result.laplace_mvnorm()
+
+
+def test_hessian_subsample_converges_to_same_optimum():
+    torch.manual_seed(0)
+    y = (torch.randn(20, 30) * .5).cumsum(1).unsqueeze(-1) + torch.randn(20, 30, 1)
+    model = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    model.fit(y, verbose=0, stopping={'abstol': 1e-2})
+    model_sub = copy.deepcopy(model)
+    result = model.newton_refine(y, max_steps=15, verbose=False)
+    result_sub = model_sub.newton_refine(y, max_steps=30, hessian_subsample=.3, verbose=False)
+    assert result.converged and result_sub.converged
+    assert result_sub.loss == pytest.approx(result.loss, abs=1e-5)
+
+
+def test_hessian_subsample_callable_kwargs():
+    y, X, start_offsets, _ = _make_data(num_times=10)
+    model = _make_model()
+    scale = torch.nn.Parameter(torch.ones(1))
+    model.register_parameter('x_scale', scale)
+    result = model.newton_refine(
+        y, start_offsets=start_offsets, callable_kwargs={'X': lambda: X * scale}, hessian_subsample=.5, max_steps=1,
+        verbose=False
+    )
+    assert len(result.history) == 1
