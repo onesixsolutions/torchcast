@@ -46,7 +46,7 @@ jobs:
 
       - name: Release
         run: |
-          semantic-release version --push --changelog --vcs-release --commit
+          semantic-release version --push --no-changelog --vcs-release --commit
         env:
           GH_TOKEN: ${{ secrets.STRONGIO_MACHINE_PAT }}
 
