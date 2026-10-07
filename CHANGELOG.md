@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## v1.1.3 (2026-09-26)
+## v1.1.3 (2026-10-07)
 
 ### Bug fix: covariance of `n_step > 1` predictions
 
