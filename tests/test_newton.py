@@ -179,16 +179,79 @@ def test_hessian_subsample_matches_subset_data():
         result.laplace_mvnorm()
 
 
-def test_hessian_subsample_converges_to_same_optimum():
+def _level_data_and_model():
     torch.manual_seed(0)
     y = (torch.randn(20, 30) * .5).cumsum(1).unsqueeze(-1) + torch.randn(20, 30, 1)
     model = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
     model.fit(y, verbose=0, stopping={'abstol': 1e-2})
+    return y, model
+
+
+@pytest.mark.parametrize('resample', [False, True])
+def test_hessian_subsample_converges_to_same_optimum(resample: bool):
+    y, model = _level_data_and_model()
     model_sub = copy.deepcopy(model)
     result = model.newton_refine(y, max_steps=15, verbose=False)
-    result_sub = model_sub.newton_refine(y, max_steps=30, hessian_subsample=.3, verbose=False)
-    assert result.converged and result_sub.converged
-    assert result_sub.loss == pytest.approx(result.loss, abs=1e-5)
+    assert result.converged
+    result_sub = model_sub.newton_refine(y, max_steps=30, hessian_subsample=.3, hessian_resample=resample, verbose=False)
+    # (the decrement uses the estimated hessian, so isn't used by default; nor is the step criterion exact, so with a
+    # fixed subsample this can be slow to declare convergence. but the loss and gradient are exact:)
+    assert result_sub.stop_reason != 'decrement'
+    assert result_sub.loss == pytest.approx(result.loss, abs=1e-6)
+    assert result_sub.grad.abs().max() < 1e-5
+
+
+def test_hessian_subsample_weights():
+    """
+    indices + weights: the hessian is that of the weighted mean of those groups' losses
+    """
+    y, X, start_offsets, weights = _make_data()
+    model = _make_model()
+    model.fit(y, X=X, start_offsets=start_offsets, verbose=0, stopping={'max_iter': 3})
+    kwargs = {'X': X, 'start_offsets': start_offsets, 'max_steps': 0, 'decrement_tol': None, 'verbose': False}
+    idx = torch.tensor([1, 4, 5, 9])
+    group_weights = torch.tensor([1., 3., 1., 2.])
+
+    result = model.newton_refine(
+        y, get_loss=LossFun(weights=weights), hessian_subsample=idx, hessian_subsample_weights=group_weights, **kwargs
+    )
+    # expected: the same groups, with LossFun weights multiplied by the (mean-1) group weights:
+    w = group_weights * len(group_weights) / group_weights.sum()
+    expected = model.newton_refine(
+        y[idx], X=X[idx], start_offsets=start_offsets[idx.numpy()], max_steps=0, decrement_tol=None, verbose=False,
+        get_loss=LossFun(weights=weights[idx] * w[:, None]),
+    )
+    assert torch.allclose(result.hessian, expected.hessian, rtol=1e-4, atol=1e-5)
+
+    # a function returning (indices, weights) is the same:
+    result2 = model.newton_refine(
+        y, get_loss=LossFun(weights=weights), hessian_subsample=lambda gen: (idx, group_weights), **kwargs
+    )
+    assert torch.allclose(result.hessian, result2.hessian)
+
+    with pytest.raises(ValueError, match='hessian_resample'):
+        model.newton_refine(y, hessian_subsample=idx, hessian_resample=True, **kwargs)
+
+
+def test_final_full_hessian_and_compare():
+    from torchcast.state_space.newton import compare_hessians
+
+    y, model = _level_data_and_model()
+    result = model.newton_refine(y, max_steps=3, hessian_subsample=.5, final_full_hessian=True, verbose=False)
+    assert result.hessian_subsample is None
+    full = copy.deepcopy(model).newton_refine(y, max_steps=0, verbose=False)
+    assert torch.allclose(result.hessian, full.hessian, rtol=1e-4, atol=1e-6)
+    result.laplace_mvnorm()  # allowed: full hessian
+    assert result.decrement() == pytest.approx(full.decrement(), rel=1e-3)
+
+    same = compare_hessians(full, full)
+    assert same['direction_cosine'] == pytest.approx(1.)
+    assert same['weak_subspace_overlap'] == pytest.approx(1.)
+    assert same['relative_error'] == 0.
+    approx = copy.deepcopy(model).newton_refine(y, max_steps=0, hessian_subsample=.5, verbose=False)
+    comparison = compare_hessians(full, approx)
+    assert 0 < comparison['direction_cosine'] <= 1
+    assert comparison['relative_error'] > 0
 
 
 def test_hessian_subsample_callable_kwargs():

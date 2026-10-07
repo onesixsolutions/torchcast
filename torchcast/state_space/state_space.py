@@ -486,14 +486,17 @@ class StateSpaceModel(torch.nn.Module):
                       y: torch.Tensor,
                       chunk_size: Optional[int] = None,
                       hessian_chunk_size: Optional[int] = None,
-                      hessian_subsample: Optional[Union[float, int]] = None,
+                      hessian_subsample: Union[float, int, Sequence[int], torch.Tensor, Callable, None] = None,
+                      hessian_subsample_weights: Optional[Sequence[float]] = None,
+                      hessian_resample: bool = False,
                       hessian_subsample_seed: int = 0,
+                      final_full_hessian: bool = False,
                       max_steps: int = 10,
                       grad_tol: float = 1e-5,
                       step_tol: float = 1e-4,
                       max_step: float = 1.,
                       eig_floor: float = 1e-6,
-                      decrement_tol: Optional[float] = 1e-3,
+                      decrement_tol: Union[float, str, None] = 'auto',
                       reuse_hessian: int = 0,
                       get_loss: Optional[Callable] = None,
                       callable_kwargs: Optional[dict[str, Callable]] = None,
@@ -519,14 +522,32 @@ class StateSpaceModel(torch.nn.Module):
         :param hessian_chunk_size: Chunks of groups for the hessian, which needs more memory per group than the
          loss/gradient. Defaults to ``chunk_size``.
         :param hessian_subsample: The hessian costs about ``1.3 * num_params`` loss/gradient evaluations, which is
-         slow for large datasets. If specified, the hessian is computed on a random subset of groups: a fraction (if
-         a float between 0 and 1) or a number (if an int) of them. The loss, gradient and line-search still use all
-         the data, so this converges to the same optimum (the hessian just sets the direction/scale of the steps),
-         though less than quadratically near the end. The hessian in the result is then also from the subsample, so
-         it can't be used for ``NewtonResult.laplace_mvnorm()``; use :func:`get_laplace_mvnorm()` instead. Group
-         kwargs, ``callable_kwargs`` and :class:`.LossFun` weights are subset to match; a custom ``get_loss`` must
-         handle any subset of groups.
-        :param hessian_subsample_seed: Seed for choosing the subsample, which is fixed for all steps.
+         slow for large datasets. If specified, the hessian is computed on a subset of groups. The loss, gradient,
+         line-search and stopping-rules still use all the data, so this converges to the same optimum (the hessian
+         just sets the direction/scale of the steps), though less than quadratically near the end. Can be:
+
+         - a fraction (float between 0 and 1) or a number (int) of groups, sampled uniformly at random;
+         - group indices (a tensor/array/list), e.g. a stratified sample, with ``hessian_subsample_weights``;
+         - a function taking a ``torch.Generator`` and returning indices, or ``(indices, weights)``: e.g. a stratified
+           sampler, which can be combined with ``hessian_resample``.
+
+         A uniform sample can estimate poorly the directions that only a few groups inform (e.g. parameters driven
+         by rare events or a small sub-population) -- often the weak directions. For those, oversample the
+         informative groups and pass weights.
+
+         The hessian in the result is then also from the subsample, so it can't be used for
+         ``NewtonResult.laplace_mvnorm()`` (unless ``final_full_hessian``). Group kwargs, ``callable_kwargs`` and
+         :class:`.LossFun` weights are subset to match; a custom ``get_loss`` must handle any subset of groups (and
+         can't be combined with weights).
+        :param hessian_subsample_weights: Relative weights for the groups in ``hessian_subsample`` (if indices), e.g.
+         inverse inclusion probabilities: the subsample's hessian is then the hessian of a weighted mean of the
+         groups' losses, an estimate of the full data's (mean) hessian.
+        :param hessian_resample: If True, draw a new subsample for each hessian, so that the subsample's errors average
+         out over steps, rather than a fixed one (the default; deterministic). Not for fixed indices.
+        :param hessian_subsample_seed: Seed for drawing the subsample(s).
+        :param final_full_hessian: With ``hessian_subsample``, compute the full-data hessian at the final parameters
+         (which is expensive), so that ``NewtonResult.laplace_mvnorm()``, ``decrement()`` and ``weak_directions()``
+         use it.
         :param max_steps: The maximum number of Newton steps.
         :param grad_tol: Converged when the largest absolute gradient is below ``grad_tol`` *and* the largest absolute
          (proposed) step is below ``step_tol``.
@@ -539,7 +560,9 @@ class StateSpaceModel(torch.nn.Module):
          means: the remaining distance to the optimum is below ``sqrt(2 * decrement_tol)`` standard-errors (in the
          Mahalanobis sense, with the Laplace approximation's precision), e.g. .045 for the default. This is what
          usually stops refinement when some parameters are heading to a boundary (e.g. a log-variance to -inf), where
-         the loss is asymptotically flat, so the step never falls below ``step_tol``. ``None`` to disable.
+         the loss is asymptotically flat, so the step never falls below ``step_tol``. ``None`` to disable. The
+         default, 'auto', is .001 -- but disabled with ``hessian_subsample``, since the decrement then uses an estimated
+         hessian, so only the (exact) gradient and step criteria are used.
         :param reuse_hessian: Reuse the hessian for up to this many steps (computing only the loss/gradient), since the
          hessian dominates the cost. If the line-search fails with a reused hessian, it's recomputed. The final hessian
          in the result is always computed at the final parameters.
@@ -558,34 +581,38 @@ class StateSpaceModel(torch.nn.Module):
 
         num_groups = y.shape[0]
         chunks = self._prepare_chunks(y, chunk_size=chunk_size, get_loss=get_loss, reduce='mean', kwargs=kwargs)
-        hessian_chunks = None
-        group_idx = None
-        if hessian_subsample is not None:
-            if isinstance(hessian_subsample, float):
-                if not 0 < hessian_subsample <= 1:
-                    raise ValueError("If `hessian_subsample` is a float, it should be in (0, 1].")
-                hessian_subsample = max(1, round(hessian_subsample * num_groups))
-            if hessian_subsample < num_groups:
-                gen = torch.Generator().manual_seed(hessian_subsample_seed)
-                group_idx = torch.randperm(num_groups, generator=gen)[:hessian_subsample].sort().values
-        if group_idx is not None or (hessian_chunk_size is not None and hessian_chunk_size != chunk_size):
-            hessian_chunks = self._prepare_chunks(
+
+        def _hessian_chunks(group_idx: Optional[torch.Tensor] = None,
+                            group_weights: Optional[torch.Tensor] = None) -> Optional[List[_FitChunk]]:
+            if group_idx is None and (hessian_chunk_size is None or hessian_chunk_size == chunk_size):
+                return None  # same as `chunks`
+            return self._prepare_chunks(
                 y,
                 chunk_size=hessian_chunk_size or chunk_size,
                 get_loss=get_loss,
                 reduce='mean',
                 kwargs=kwargs,
                 group_idx=group_idx,
+                group_weights=group_weights,
             )
+
+        sampler = _hessian_sampler(hessian_subsample, hessian_subsample_weights, num_groups)
+        subsampled = sampler is not None
+        if hessian_resample and not (subsampled and sampler.random):
+            raise ValueError("`hessian_resample` requires `hessian_subsample` to be a fraction, number or function.")
+        gen = torch.Generator().manual_seed(hessian_subsample_seed)
         objective = _ChunkedObjective(
             self,
             chunks=chunks,
             num_groups=num_groups,
             callable_kwargs=callable_kwargs,
-            hessian_chunks=hessian_chunks,
-            hessian_subsampled=group_idx is not None,
+            hessian_chunks=_hessian_chunks(*sampler(gen)) if subsampled else _hessian_chunks(),
+            hessian_subsampled=subsampled,
+            resample_hessian_chunks=(lambda: _hessian_chunks(*sampler(gen))) if hessian_resample else None,
         )
-        return _newton_refine(
+        if decrement_tol == 'auto':
+            decrement_tol = None if subsampled else 1e-3
+        result = _newton_refine(
             objective,
             max_steps=max_steps,
             grad_tol=grad_tol,
@@ -595,9 +622,19 @@ class StateSpaceModel(torch.nn.Module):
             decrement_tol=decrement_tol,
             reuse_hessian=reuse_hessian,
             loss_scale=loss_scale,
-            hessian_subsample=None if group_idx is None else len(group_idx) / num_groups,
+            hessian_subsample=sampler.fraction if subsampled else None,
             verbose=verbose,
         )
+
+        if subsampled and final_full_hessian:
+            objective.hessian_chunks = _hessian_chunks() or objective.chunks
+            objective.hessian_subsampled = False
+            objective.resample_hessian_chunks = None
+            result.loss, result.grad, result.hessian = objective.loss_grad_hessian()
+            result.hessian_subsample = None
+            if verbose:
+                print(f"Full-data hessian at the final parameters: decrement {result.decrement(eig_floor):.3g}")
+        return result
 
     @property
     def is_nonlinear(self) -> bool:
@@ -648,7 +685,8 @@ class StateSpaceModel(torch.nn.Module):
                         get_loss: Callable,
                         reduce: str,
                         kwargs: dict,
-                        group_idx: Optional[torch.Tensor] = None) -> List['_FitChunk']:
+                        group_idx: Optional[torch.Tensor] = None,
+                        group_weights: Optional[torch.Tensor] = None) -> List['_FitChunk']:
         """
         Split ``y`` and the forward-kwargs into chunks of groups (see ``fit(chunk_size=...)``), precomputing the
         nan-groups for each.
@@ -657,18 +695,32 @@ class StateSpaceModel(torch.nn.Module):
          combined as a weighted mean by the number of groups; or 'sum' if it returns a sum, so they're summed.
         :param group_idx: Optionally, only use this subset of groups (e.g. ``newton_refine(hessian_subsample=...)``).
          With 'mean', the chunks' losses are then a mean over this subset.
+        :param group_weights: Optionally, relative weights for the groups in ``group_idx`` (e.g. inverse inclusion
+         probabilities, for a stratified subsample), so that with 'mean', the chunks' losses are a weighted mean over
+         the subset. Requires ``get_loss`` to be a :class:`.LossFun`.
         """
         num_groups = y.shape[0]
         num_used = num_groups if group_idx is None else len(group_idx)
         group_slices = _get_group_slices(num_used, chunk_size)
         if len(group_slices) > 1 and isinstance(get_loss, LossFun) and get_loss.reduce != reduce:
             raise ValueError(f"With `chunk_size`, expected `get_loss.reduce` to be '{reduce}'.")
+        weight_slices = [None] * len(group_slices)
+        if group_weights is not None:
+            if group_idx is None or len(group_weights) != len(group_idx):
+                raise ValueError("`group_weights` requires `group_idx`, of the same length.")
+            if not isinstance(get_loss, LossFun):
+                raise TypeError("`group_weights` requires `get_loss` to be a `LossFun`.")
+            group_weights = torch.as_tensor(group_weights, dtype=y.dtype, device=y.device)
+            if (group_weights < 0).any() or not group_weights.sum() > 0:
+                raise ValueError("`group_weights` should be non-negative, with a positive sum.")
+            group_weights = group_weights * (len(group_weights) / group_weights.sum())  # mean 1
+            weight_slices = [group_weights[group_slice] for group_slice in group_slices]
         if group_idx is not None:
             # chunks index into the full data, so kwargs/callable-kwargs/loss-weights are subset consistently:
-            group_slices = [group_idx[group_slice] for group_slice in group_slices]
+            group_slices = [torch.as_tensor(group_idx)[group_slice] for group_slice in group_slices]
 
         chunks = []
-        for group_slice in group_slices:
+        for group_slice, weight_slice in zip(group_slices, weight_slices):
             y_chunk = y[group_slice]
             chunk_kwargs = self._subset_kwargs(kwargs, group_slice, num_groups)
 
@@ -685,11 +737,18 @@ class StateSpaceModel(torch.nn.Module):
                 device=y.device
             ) + 1
 
+            chunk_get_loss = _subset_loss_fun(get_loss, group_slice, num_groups)
+            if weight_slice is not None:
+                loss_weights = weight_slice[:, None] * torch.ones(y_chunk.shape[:2], dtype=y.dtype, device=y.device)
+                if chunk_get_loss.weights is not None:
+                    loss_weights = loss_weights * chunk_get_loss.weights
+                chunk_get_loss = LossFun(weights=loss_weights, reduce=chunk_get_loss.reduce)
+
             chunks.append(_FitChunk(
                 group_slice=group_slice,
                 y=y_chunk,
                 kwargs=chunk_kwargs,
-                get_loss=_subset_loss_fun(get_loss, group_slice, num_groups),
+                get_loss=chunk_get_loss,
                 weight=y_chunk.shape[0] / num_used if reduce == 'mean' else 1.,
             ))
         return chunks
@@ -1125,6 +1184,56 @@ def _subset_loss_fun(get_loss: Callable, group_slice: Union[slice, torch.Tensor]
     return get_loss.subset(group_slice, num_groups)
 
 
+class _HessianSampler:
+    """
+    Draws the subsample of groups for ``newton_refine(hessian_subsample=...)``: ``sampler(generator)`` returns
+    ``(group_idx, group_weights)``.
+    """
+
+    def __init__(self, fun: Callable, random: bool, fraction: float):
+        self.fun = fun
+        self.random = random  # can resample
+        self.fraction = fraction  # (expected) fraction of groups
+
+    def __call__(self, generator: torch.Generator) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        out = self.fun(generator)
+        idx, weights = out if isinstance(out, tuple) else (out, None)
+        return torch.as_tensor(idx, dtype=torch.long), weights
+
+
+def _hessian_sampler(subsample: Any,
+                     weights: Optional[Sequence[float]],
+                     num_groups: int) -> Optional[_HessianSampler]:
+    if subsample is None:
+        if weights is not None:
+            raise ValueError("`hessian_subsample_weights` requires `hessian_subsample` indices.")
+        return None
+    if callable(subsample):
+        if weights is not None:
+            raise ValueError("With a `hessian_subsample` function, return `(indices, weights)` from it instead.")
+        # (fraction for reporting only; from one draw)
+        idx, _ = _HessianSampler(subsample, True, 1.)(torch.Generator().manual_seed(0))
+        return _HessianSampler(subsample, random=True, fraction=len(idx) / num_groups)
+    if isinstance(subsample, (float, int)) and not isinstance(subsample, bool):
+        if isinstance(subsample, float):
+            if not 0 < subsample <= 1:
+                raise ValueError("If `hessian_subsample` is a float, it should be in (0, 1].")
+            subsample = max(1, round(subsample * num_groups))
+        if weights is not None:
+            raise ValueError("`hessian_subsample_weights` requires `hessian_subsample` indices.")
+        if subsample >= num_groups:
+            return None
+        n = subsample
+        return _HessianSampler(
+            lambda gen: torch.randperm(num_groups, generator=gen)[:n].sort().values, random=True, fraction=n / num_groups
+        )
+    # fixed indices:
+    idx = torch.as_tensor(subsample, dtype=torch.long)
+    if weights is not None and len(weights) != len(idx):
+        raise ValueError("`hessian_subsample_weights` should have one weight per index in `hessian_subsample`.")
+    return _HessianSampler(lambda gen: (idx, weights), random=False, fraction=len(idx) / num_groups)
+
+
 class _ChunkedObjective:
     """
     A model's loss, summed over chunks of groups (see ``fit(chunk_size=...)``), and its gradient/hessian w.r.t. the
@@ -1133,6 +1242,8 @@ class _ChunkedObjective:
     :param hessian_chunks: Chunks to use for the hessian, which needs more memory per group than the loss/gradient.
      Defaults to ``chunks``.
     :param hessian_subsampled: Whether ``hessian_chunks`` are only a subsample of groups.
+    :param resample_hessian_chunks: Optionally, a function returning new ``hessian_chunks`` (a new subsample), called
+     for each hessian.
     """
 
     def __init__(self,
@@ -1141,11 +1252,13 @@ class _ChunkedObjective:
                  num_groups: int,
                  callable_kwargs: Optional[dict[str, Callable]] = None,
                  hessian_chunks: Optional[Sequence[_FitChunk]] = None,
-                 hessian_subsampled: bool = False):
+                 hessian_subsampled: bool = False,
+                 resample_hessian_chunks: Optional[Callable[[], Sequence[_FitChunk]]] = None):
         self.ss_model = ss_model
         self.chunks = chunks
         self.hessian_chunks = hessian_chunks or chunks
         self.hessian_subsampled = hessian_subsampled
+        self.resample_hessian_chunks = resample_hessian_chunks
         self.num_groups = num_groups
         self.callable_kwargs = callable_kwargs or {}
 
@@ -1188,6 +1301,8 @@ class _ChunkedObjective:
         The loss and gradient are always from all groups. If ``hessian_chunks`` are a subsample of groups, the hessian
         is from those (as an estimate of the full-data hessian, on the same mean-scale).
         """
+        if self.resample_hessian_chunks is not None:
+            self.hessian_chunks = self.resample_hessian_chunks()
         total_loss = 0.
         total_grad = 0.
         total_hess = 0.
