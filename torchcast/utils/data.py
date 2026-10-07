@@ -333,38 +333,46 @@ class TimeSeriesDataset(TensorDataset):
                             group_colname: str,
                             time_colname: str,
                             measures: Sequence[str]) -> 'DataFrame':
-        # TODO: this could probably be better
-        from pandas import DataFrame, concat
+        from pandas import DataFrame
 
         tensor = tensor.cpu().numpy()
-        assert tensor.shape[0] == len(group_names)
-        assert tensor.shape[0] == len(times)
-        assert tensor.shape[1] <= times.shape[1]
-        assert tensor.shape[2] == len(measures)
+        num_groups, num_times, num_measures = tensor.shape
+        assert num_groups == len(group_names)
+        assert num_groups == len(times)
+        assert num_times <= times.shape[1]
+        assert num_measures == len(measures)
 
-        _all_nan_groups = []
-        dfs = []
-        for g, group_name in enumerate(group_names):
-            # get values, don't store trailing nans:
-            values = tensor[g]
-            all_nan_per_row = np.min(np.isnan(values), axis=1)
-            if all_nan_per_row.all():
-                _all_nan_groups.append(group_name)
-                continue
-            end_idx = true1d_idx(~all_nan_per_row).max() + 1
-            # convert to dataframe:
-            df = DataFrame(data=values[:end_idx, :], columns=measures)
-            df[group_colname] = group_name
-            df[time_colname] = np.nan
-            df[time_colname] = times[g, 0:len(df.index)]
-            dfs.append(df)
-        if _all_nan_groups:
-            warn(f"Groups have only missing values:{_all_nan_groups}")
+        all_nan_per_row = np.all(np.isnan(tensor), axis=2)
+        all_nan_groups = all_nan_per_row.all(axis=1)
 
-        if dfs:
-            return concat(dfs)
-        else:
+        if all_nan_groups.any():
+            warn(f"Groups have only missing values:{[name for name, flag in zip(group_names, all_nan_groups) if flag]}")
+
+        valid_idxs = np.where(~all_nan_groups)[0]
+        if not len(valid_idxs):
             return DataFrame(columns=list(measures) + [group_colname, time_colname])
+
+        # last valid timestep + 1 per group, found by scanning backwards
+        not_all_nan = ~all_nan_per_row[valid_idxs]
+        end_idxs = num_times - not_all_nan[:, ::-1].argmax(axis=1)
+
+        # build output arrays first, then one DataFrame constructor (avoids per-group concat overhead)
+        n_rows = end_idxs.sum()
+        values_out = np.empty((n_rows, num_measures), dtype=tensor.dtype)
+        times_out = np.empty(n_rows, dtype=times.dtype)
+        groups_out = np.empty(n_rows, dtype=object)
+
+        pos = 0
+        for grp_idx, grp_len in zip(valid_idxs, end_idxs):
+            values_out[pos:pos + grp_len] = tensor[grp_idx, :grp_len]
+            times_out[pos:pos + grp_len] = times[grp_idx, :grp_len]
+            groups_out[pos:pos + grp_len] = group_names[grp_idx]
+            pos += grp_len
+
+        df = DataFrame(values_out, columns=list(measures))
+        df[group_colname] = groups_out
+        df[time_colname] = times_out
+        return df
 
     @classmethod
     def from_dataframe(cls,

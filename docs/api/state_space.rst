@@ -2,7 +2,7 @@ State Space Model
 ==================
 
 .. automodule:: torchcast.state_space
-   :members: StateSpaceModel, Predictions
+   :members: StateSpaceModel, Predictions, LossFun
    :member-order: bysource
    :show-inheritance:
 

@@ -8,5 +8,5 @@ The base-class for time-series modeling with state-space models. Generates forec
 This class is abstract; see :class:`torchcast.kalman_filter.KalmanFilter` for the go-to forecasting model.
 """
 
-from .state_space import StateSpaceModel
+from .state_space import StateSpaceModel, LossFun
 from .predictions import Predictions

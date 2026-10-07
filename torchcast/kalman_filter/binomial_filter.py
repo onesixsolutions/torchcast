@@ -5,17 +5,19 @@ and (2) with a log_prob that use binomial likelihood (using monte-carlo approxim
 
 from math import log
 
+import pandas as pd
 import torch
 from torch.distributions import Binomial
 from typing import Sequence, TYPE_CHECKING, Optional, Union
 
 from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
 from torchcast.kalman_filter import KalmanFilter
-from torchcast.state_space import Predictions
+from torchcast.state_space.predictions import Predictions, DatasetMetadata
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
     from torchcast.process import Process
+    from torchcast.utils import TimeSeriesDataset
 
 
 class BinomialFilter(KalmanFilter):
@@ -90,11 +92,12 @@ class BinomialFilter(KalmanFilter):
 
         mcov_empty_idx = [i for i, m in enumerate(measures) if m in binary_measures]
         if measure_covariance is None:
-            measure_covariance = {'init_diag_multi': DEFAULT_MCOV_MULTI}
+            measure_covariance = {}
         if isinstance(measure_covariance, dict):
             measure_covariance['id'] = 'measure_covariance'
             measure_covariance['rank'] = len(measures)
             measure_covariance['empty_idx'] = mcov_empty_idx
+        measure_covariance['init_diag_multi'] = measure_covariance.get('init_diag_multi', DEFAULT_MCOV_MULTI)
 
         if isinstance(measure_covariance, Covariance):  # todo: we should be able to eliminate this mess
             if set(measure_covariance.empty_idx) != set(mcov_empty_idx):
@@ -236,8 +239,9 @@ class BinomialFilter(KalmanFilter):
                 raise ValueError("num_obs should be passed because observed_counts=True")
             input = input.clone()
             input[:, binary_idx] = input[:, binary_idx] / num_obs
-            if (input[:, binary_idx] > 1).any():
-                raise ValueError("Some inputs are > num_obs")
+
+        if (input[:, binary_idx] > 1).any():
+            raise ValueError("Some inputs are > num_obs")
 
         # adjust measure-cov based on binomial identity relationship:
         bin_measure_cov = torch.zeros_like(measure_cov)
@@ -385,6 +389,47 @@ class BinomialPredictions(Predictions):
 
         return out
 
+    def _to_dataframe(self,
+                      dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                      group_colname: str,
+                      time_colname: str,
+                      conf: float,
+                      use_map: bool) -> pd.DataFrame:
+
+        if self.observed_counts and not isinstance(dataset, DatasetMetadata):
+            dataset = self._counts_to_props(dataset)
+
+        return super()._to_dataframe(
+            dataset=dataset,
+            group_colname=group_colname,
+            time_colname=time_colname,
+            conf=conf,
+            use_map=use_map
+        )
+
+    def _to_components_dataframe(self,
+                                 dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                                 group_colname: str,
+                                 time_colname: str,
+                                 conf: float,
+                                 measured: bool) -> pd.DataFrame:
+        if self.observed_counts and not isinstance(dataset, DatasetMetadata):
+            dataset = self._counts_to_props(dataset)
+        return super()._to_components_dataframe(
+            dataset=dataset,
+            group_colname=group_colname,
+            time_colname=time_colname,
+            conf=conf,
+            measured=measured,
+        )
+
+    def _counts_to_props(self, dataset: 'TimeSeriesDataset') -> 'TimeSeriesDataset':
+        y_tens = dataset.tensors[0].clone()
+        for i, measure in enumerate(self.binary_measures):
+            ti = list(dataset.measures[0]).index(measure)
+            y_tens[..., ti] /= self.num_obs[..., i]
+        return dataset.with_new_tensors(y_tens, *dataset.tensors[1:])
+
     def _log_prob(self,
                   obs: torch.Tensor,
                   state_means: torch.Tensor,
@@ -397,6 +442,7 @@ class BinomialPredictions(Predictions):
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
 
         binary_idx = [i for i, m in enumerate(measurement_model.measures) if m in self.binary_measures]
+        binary_measures = [m for m in measurement_model.measures if m in self.binary_measures]
         gauss_idx = [i for i, m in enumerate(measurement_model.measures) if m not in self.binary_measures]
         gaussian_measures = [m for m in measurement_model.measures if m not in self.binary_measures]
         group_idx = torch.arange(obs.shape[0], dtype=torch.long)
@@ -419,7 +465,7 @@ class BinomialPredictions(Predictions):
             if num_obs is None:
                 raise RuntimeError("num_obs should be set because there are binary measures")
             mmean_samples = self._get_measured_mean_samples(
-                measurement_model=measurement_model.subset(measures=self.binary_measures),
+                measurement_model=measurement_model.subset(measures=binary_measures),
                 state_means=state_means,
                 state_covs=state_covs,
             )
