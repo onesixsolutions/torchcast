@@ -429,7 +429,7 @@ class Predictions:
         if self._means is None:
             self._means, self._covs = self._observe()
         if self._covs is None:
-            if _warn_once.get('cov', False):
+            if not _warn_once.get('cov', False):
                 warn("The measurement model is nonlinear, so no closed-form covariance is available, returning None.")
                 _warn_once['cov'] = True
         return self._covs
