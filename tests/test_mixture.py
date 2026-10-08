@@ -820,3 +820,35 @@ def test_components_are_offsets():
     assert (p_low[:, 20] > .99).all()
     # the quick visit barely moves the state (its offset is explained):
     assert torch.allclose(pred.update_means[:, 20], pred.update_means[:, 19], atol=.05)
+
+
+@torch.no_grad()
+def test_joseph_form_option():
+    """`MixtureModel(joseph_form=False)` uses the simpler covariance update -- the same, in exact arithmetic."""
+    y = _make_y(num_measures=2)
+    y[0, 3, 1] = float('nan')
+    preds = {}
+    for joseph_form in (True, False):
+        kf = _make_kf(['y1', 'y2'], ['y1', 'y2'], joseph_form=joseph_form)
+        assert kf.mixture.joseph_form is joseph_form
+        preds[joseph_form] = kf(y, include_updates_in_output=True)
+    assert MixtureModel([MixtureComponent(measure='y', mean_init=0., prob_init=.1, id='a')]).joseph_form
+    for attr in ('update_means', 'update_covs', 'update_regime_probs'):
+        assert torch.allclose(getattr(preds[True], attr), getattr(preds[False], attr), atol=1e-5)
+    assert torch.allclose(preds[True].log_prob(y), preds[False].log_prob(y), atol=1e-5)
+    # (symmetric:)
+    covs = preds[False].update_covs
+    assert torch.equal(covs, covs.transpose(-1, -2))
+
+    # the joseph-form update isn't used at all (all mixture measures are observed here, so every update-step is a
+    # mixture update):
+    kf = _make_kf(['y1', 'y2'], ['y1', 'y2'], joseph_form=False)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("joseph-form update was called")
+
+    kf._covariance_update = fail
+    kf(_make_y(num_measures=2))
+    kf.mixture.joseph_form = True
+    with pytest.raises(AssertionError, match="joseph-form"):
+        kf(_make_y(num_measures=2))

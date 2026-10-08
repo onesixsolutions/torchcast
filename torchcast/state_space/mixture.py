@@ -181,14 +181,19 @@ class MixtureModel(torch.nn.Module):
      :class:`StickyTransition`.
     :param univariate_prob: If True, the per-timestep regime-probabilities are computed using only the likelihood of
      the mixture measures, rather than of all observed measures. This is an approximation (exact if the other
-     measures' residuals are uncorrelated with the mixture measures'), but can be cheaper, and avoids letting other
-     measures' likelihoods -- e.g. the gaussian approximation for a binary measure -- influence the regime.
+     measures' residuals are uncorrelated with the mixture measures'), but can be cheaper. (Non-gaussian measures,
+     e.g. binary, never influence the regime-probabilities.)
+    :param joseph_form: If True (the default), the update-step uses the Joseph form of the covariance update, as
+     without mixtures. With mixtures, the update runs once for each regime-combo, and the Joseph form's intermediate
+     results (kept for the backward pass) can dominate memory-use during training; ``False`` uses the simpler
+     ``P - K @ H @ P`` instead -- less memory (and compute), but less numerically robust.
     """
 
     def __init__(self,
                  components: Sequence[MixtureComponent],
                  transition: Optional[RegimeTransition] = None,
-                 univariate_prob: bool = False):
+                 univariate_prob: bool = False,
+                 joseph_form: bool = True):
         super().__init__()
         if not components:
             raise ValueError("`components` cannot be empty.")
@@ -205,6 +210,7 @@ class MixtureModel(torch.nn.Module):
         self.components = torch.nn.ModuleList([c for m in self.mixture_measures for c in by_measure[m]])
         self._by_measure = by_measure
         self.univariate_prob = univariate_prob
+        self.joseph_form = joseph_form
 
         self.combos: list[tuple[Optional[MixtureComponent], ...]] = list(
             itertools.product(*[[None] + self._by_measure[m] for m in self.mixture_measures])

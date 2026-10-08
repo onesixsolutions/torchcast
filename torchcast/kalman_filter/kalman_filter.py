@@ -135,10 +135,12 @@ class KalmanFilter(StateSpaceModel):
                        measure_mat: torch.Tensor,
                        measure_cov: torch.Tensor,
                        measured_cov: Optional[torch.Tensor] = None,
-                       system_cov: Optional[torch.Tensor] = None) -> 'StateTuple':
+                       system_cov: Optional[torch.Tensor] = None,
+                       joseph: bool = True) -> 'StateTuple':
         """
         The kalman-filter update equations. ``measured_cov`` (P @ H.T) and ``system_cov`` (H @ P @ H.T + R) can be
-        passed if already computed.
+        passed if already computed. ``joseph=False`` uses the simpler covariance update ``P - K @ H @ P`` instead of
+        the Joseph form: less memory and compute, but less numerically robust.
         """
         resid = input - measured_mean
         if measured_cov is None:
@@ -147,7 +149,11 @@ class KalmanFilter(StateSpaceModel):
             system_cov = measure_mat @ measured_cov + measure_cov
         K = self._kalman_gain(measured_cov=measured_cov, system_cov=system_cov)
         new_mean = self._mean_update(mean=mean, K=K, resid=resid)
-        new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
+        if joseph:
+            new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
+        else:
+            new_cov = cov - K @ measured_cov.permute(0, 2, 1)
+            new_cov = .5 * (new_cov + new_cov.permute(0, 2, 1))  # (symmetric in exact arithmetic)
         return StateTuple(new_mean, new_cov)
 
     def _mixture_update(self,
@@ -222,6 +228,7 @@ class KalmanFilter(StateSpaceModel):
             measure_cov=flat(batched(measure_cov) + extra_cov),
             measured_cov=flat(batched(measured_cov)),
             system_cov=flat(system_cov),
+            joseph=getattr(self.mixture, 'joseph_form', True),  # (missing in older pickles)
         )
         resid = (input_e - measured_mean)[..., score_idx]
         log_liks = mvnorm_log_prob(
