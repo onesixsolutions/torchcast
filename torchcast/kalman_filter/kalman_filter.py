@@ -26,6 +26,12 @@ class KalmanFilter(StateSpaceModel):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
+    :param joseph_form: If True (the default), the update-step uses the Joseph form of the covariance update,
+     ``(I - K H) P (I - K H)' + K R K'``. This keeps the covariance positive semi-definite even with numerical error in
+     the kalman gain ``K`` (which then only has a second-order effect). ``False`` uses the simpler ``P - K H P``
+     (symmetrized): less memory during training (its intermediate results, kept for the backward pass, are smaller)
+     and faster, but errors in ``K`` have a first-order effect, so the covariance can lose positive-definiteness --
+     e.g. with float32, long series, near-zero process-variances, or very precise measurements.
     """
     def __init__(self,
                  processes: Sequence['Process'],
@@ -34,7 +40,8 @@ class KalmanFilter(StateSpaceModel):
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
-                 adaptive_scaling: bool = False):
+                 adaptive_scaling: bool = False,
+                 joseph_form: bool = True):
 
         if initial_covariance is None:
             initial_covariance = Covariance.from_processes(processes, cov_type='initial')
@@ -51,6 +58,7 @@ class KalmanFilter(StateSpaceModel):
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
+        self.joseph_form = joseph_form
 
     def _predict_cov(self,
                      cov: torch.Tensor,
@@ -81,7 +89,10 @@ class KalmanFilter(StateSpaceModel):
         resid = input - measured_mean
         K = self._kalman_gain(cov=cov, H=measure_mat, R=measure_cov)
         new_mean = self._mean_update(mean=mean, K=K, resid=resid)
-        new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
+        if getattr(self, 'joseph_form', True):  # (missing in older pickles)
+            new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
+        else:
+            new_cov = self._simple_covariance_update(cov=cov, K=K, H=measure_mat)
         return new_mean, new_cov
 
     @staticmethod
@@ -89,6 +100,11 @@ class KalmanFilter(StateSpaceModel):
         I = torch.eye(cov.shape[1], dtype=cov.dtype, device=cov.device).unsqueeze(0)
         ikh = I - K @ H
         return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
+
+    @staticmethod
+    def _simple_covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+        new_cov = cov - K @ (H @ cov)
+        return .5 * (new_cov + new_cov.permute(0, 2, 1))  # (symmetric in exact arithmetic)
 
     @staticmethod
     def _kalman_gain(cov: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:

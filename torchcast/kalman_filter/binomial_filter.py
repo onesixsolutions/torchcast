@@ -34,6 +34,8 @@ class BinomialFilter(KalmanFilter):
     :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
+    :param joseph_form: See :class:`.KalmanFilter`. (Binary measures whose probability is near 0 or 1 have a small
+     variance, which makes the update less well-conditioned -- where the Joseph form helps most.)
     """
 
     def __init__(self,
@@ -45,7 +47,8 @@ class BinomialFilter(KalmanFilter):
                  measure_covariance: Optional[Union[Covariance, dict]] = None,
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
-                 adaptive_scaling: bool = False):
+                 adaptive_scaling: bool = False,
+                 joseph_form: bool = True):
 
         if binary_measures is None:
             binary_measures = list(measures)
@@ -66,6 +69,7 @@ class BinomialFilter(KalmanFilter):
             initial_covariance=initial_covariance,
             adaptive_scaling=adaptive_scaling,
             measure_funs={m: 'ilogit' for m in binary_measures},
+            joseph_form=joseph_form,
         )
 
         if do_post_hoc_correction:
