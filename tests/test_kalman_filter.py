@@ -567,3 +567,59 @@ def test_sigmoid_legacy_jacobian_unpickling():
     del old_style.legacy_jacobian
     old_loaded = pickle.loads(pickle.dumps(old_style))
     assert not hasattr(old_loaded, 'legacy_jacobian') and torch.allclose(jacobian(old_loaded), legacy)
+
+
+@torch.no_grad()
+def test_joseph_form_option():
+    """`joseph_form=False` uses the simpler covariance update -- the same, in exact arithmetic."""
+    from torchcast.kalman_filter import BinomialFilter
+
+    torch.manual_seed(0)
+    y = torch.randn(4, 20, 2).cumsum(1) * .3
+    y[0, 3:6, 1] = float('nan')
+    preds = {}
+    for joseph_form in (True, False):
+        torch.manual_seed(1)
+        kf = KalmanFilter(
+            processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in ['a', 'b']],
+            measures=['a', 'b'],
+            joseph_form=joseph_form,
+        )
+        assert kf.joseph_form is joseph_form
+        preds[joseph_form] = kf(y, n_step=2)
+    assert torch.allclose(preds[True].state_means, preds[False].state_means, atol=1e-5)
+    assert torch.allclose(preds[True].state_covs, preds[False].state_covs, atol=1e-5)
+    assert torch.allclose(preds[True].log_prob(y), preds[False].log_prob(y), atol=1e-4)
+    # the simple update's output is exactly symmetric:
+    A = torch.randn(5, 4, 4)
+    cov = A @ A.transpose(-1, -2) + torch.eye(4)
+    H, R = torch.randn(5, 2, 4), torch.eye(2).expand(5, -1, -1)
+    K = KalmanFilter._kalman_gain(cov=cov, H=H, R=R)
+    new_cov = KalmanFilter._simple_covariance_update(cov=cov, K=K, H=H)
+    assert torch.equal(new_cov, new_cov.transpose(-1, -2))
+    assert torch.allclose(new_cov, KalmanFilter._covariance_update(cov=cov, K=K, H=H, R=R), atol=1e-5)
+
+    # the binomial-filter passes it through:
+    visit = (torch.rand(3, 15, 1) > .4).float()
+    bf_preds = []
+    for joseph_form in (True, False):
+        torch.manual_seed(1)
+        bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['visit'], joseph_form=joseph_form)
+        assert bf.joseph_form is joseph_form
+        bf_preds.append(bf(visit))
+    assert torch.allclose(bf_preds[0].state_covs, bf_preds[1].state_covs, atol=1e-5)
+
+    # the setting selects the update:
+    def fail(*args, **kwargs):
+        raise AssertionError("joseph-form update was called")
+
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['a'], joseph_form=False)
+    kf._covariance_update = fail
+    kf(y[..., :1])
+    kf.joseph_form = True
+    with pytest.raises(AssertionError, match="joseph-form"):
+        kf(y[..., :1])
+    # older pickles (no attribute) use the joseph form:
+    del kf.joseph_form
+    with pytest.raises(AssertionError, match="joseph-form"):
+        kf(y[..., :1])
