@@ -160,9 +160,10 @@ class KalmanFilter(StateSpaceModel):
                         measures: Sequence[str],
                         regime_prior: Optional[torch.Tensor] = None) -> 'StateTuple':
         """
-        Update step when there are mixture components. Each (effective) regime-combo implies a hypothesis: measures in
-        a non-standard regime are dropped from the kalman update, and instead scored against their component. The
-        hypotheses are weighted by their posterior probability and collapsed via moment-matching.
+        Update step when there are mixture components. Each (effective) regime-combo implies a hypothesis: for
+        measures in a non-standard regime, the measured-mean is offset by the component's mean, and the component's
+        variance is added to the measurement-noise. Each hypothesis is a full kalman update; they're weighted by their
+        posterior probability and collapsed via moment-matching.
 
         :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
         :param regime_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo. Defaults
@@ -202,47 +203,30 @@ class KalmanFilter(StateSpaceModel):
         else:
             score_idx = {i for i, m in enumerate(measures) if m not in self._non_gaussian_measures}
 
-        states_by_weird = {(): standard}
+        score_idx = torch.as_tensor(sorted(score_idx), dtype=torch.long, device=input.device)
+        score_idx2d = (slice(None), score_idx.unsqueeze(-1), score_idx.unsqueeze(0))
+        resid = input - measured_mean
         states = []
         log_liks = []
         for eff in effective:
-            weird_idx = tuple(i for i, _ in eff)
-            normal_idx = [i for i in range(len(measures)) if i not in weird_idx]
-            if weird_idx not in states_by_weird:
-                if normal_idx:
-                    idx = torch.as_tensor(normal_idx, dtype=torch.long, device=input.device)
-                    idx2d = (slice(None), idx.unsqueeze(-1), idx.unsqueeze(0))
-                    states_by_weird[weird_idx] = self._kalman_update(
-                        input=input[:, idx],
-                        mean=mean,
-                        cov=cov,
-                        measured_mean=measured_mean[:, idx],
-                        measure_mat=measure_mat[:, idx],
-                        measure_cov=measure_cov[idx2d],
-                        measured_cov=measured_cov[:, :, idx],
-                        system_cov=system_cov[idx2d],
-                    )
-                else:
-                    # all measures in a non-standard regime: no update
-                    states_by_weird[weird_idx] = StateTuple(mean, cov)
-            states.append(states_by_weird[weird_idx])
-
-            scored_normal = [i for i in normal_idx if i in score_idx]
-            if scored_normal:
-                idx = torch.as_tensor(scored_normal, dtype=torch.long, device=input.device)
-                log_lik = mvnorm_log_prob(
-                    resid=input[:, idx] - measured_mean[:, idx],
-                    cov=system_cov[:, idx.unsqueeze(-1), idx.unsqueeze(0)]
-                )
+            if eff:
+                shift, extra_var = self.mixture.effective_offsets(eff, len(measures), like=input)
+                extra_cov = torch.diag_embed(extra_var)
+                states.append(self._kalman_update(
+                    input=input - shift,
+                    mean=mean,
+                    cov=cov,
+                    measured_mean=measured_mean,
+                    measure_mat=measure_mat,
+                    measure_cov=measure_cov + extra_cov,
+                    measured_cov=measured_cov,
+                    system_cov=system_cov + extra_cov,
+                ))
+                combo_resid, combo_cov = resid - shift, system_cov + extra_cov
             else:
-                log_lik = torch.zeros(num_groups, dtype=input.dtype, device=input.device)
-
-            for i, component in eff:
-                log_lik = log_lik + mvnorm_log_prob(
-                    resid=(input[:, i] - component.mean).unsqueeze(-1),
-                    cov=component.var.expand(num_groups, 1, 1)
-                )
-            log_liks.append(log_lik)
+                states.append(standard)
+                combo_resid, combo_cov = resid, system_cov
+            log_liks.append(mvnorm_log_prob(resid=combo_resid[:, score_idx], cov=combo_cov[score_idx2d]))
 
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + torch.stack(log_liks, -1)[:, mapping]

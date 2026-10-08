@@ -240,7 +240,9 @@ def test_binomial_fit_recovers_probability():
 
 # mixture components on measures with a nonlinear measurement --------------------------------------------------------
 
-_COMPONENT_MEAN, _COMPONENT_SD = .05, .03
+# the 'low' component: an offset from the standard regime's (sigmoid) mean, with extra noise
+_COMPONENT_OFFSET, _COMPONENT_SD = -.4, .03
+_LOW_VALUE = .1
 
 
 def _sigmoid_mixture_kf(num_samples: int = 20_000, process_var_multi: Optional[float] = None) -> KalmanFilter:
@@ -254,7 +256,7 @@ def _sigmoid_mixture_kf(num_samples: int = 20_000, process_var_multi: Optional[f
         processes=[LocalLevel(id='level')],
         measures=['y'],
         measure_funs={'y': 'sigmoid'},
-        mixture=[MixtureComponent(measure='y', mean_init=_COMPONENT_MEAN, prob_init=.2, id='low')],
+        mixture=[MixtureComponent(measure='y', mean_init=_COMPONENT_OFFSET, prob_init=.2, id='low')],
     )
     with torch.no_grad():
         kf.measure_covariance.cholesky_log_diag.fill_(math.log(.05))
@@ -268,15 +270,15 @@ def _sigmoid_mixture_kf(num_samples: int = 20_000, process_var_multi: Optional[f
 def _sigmoid_mixture_data(low: float = .2, high: float = .8) -> torch.Tensor:
     torch.manual_seed(0)
     y = torch.rand(3, 8, 1) * (high - low) + low
-    y[torch.rand(3, 8) < .2] = _COMPONENT_MEAN
+    y[torch.rand(3, 8) < .2] = _LOW_VALUE
     return y
 
 
 @torch.no_grad()
 def test_mixture_nonlinear_log_prob_matches_quadrature():
     """
-    The marginal likelihood is ``P(standard) * E[N(y; sigmoid(Z), R)] + P(low) * N(y; mu, sigma^2)``, using the
-    regime-prior at each timestep.
+    The marginal likelihood is ``P(standard) * E[N(y; sigmoid(Z), R)] + P(low) * E[N(y; sigmoid(Z) + mu, R + sigma^2)]``,
+    using the regime-prior at each timestep.
 
     (With default state-uncertainty: the monte-carlo log-prob converges slowly when the measurement-noise is small
     relative to the spread of the sampled means, so this tests the mixture logic rather than monte-carlo efficiency.)
@@ -291,12 +293,14 @@ def test_mixture_nonlinear_log_prob_matches_quadrature():
     obs = y.reshape(-1).double()
     probs = pred.regime_probs.reshape(-1, 2).double()  # combos: (standard, low)
 
-    def density(z):
-        mu = torch.sigmoid(z.clamp(-8, 8))
-        return torch.exp(-.5 * (obs.unsqueeze(-1) - mu) ** 2 / r.unsqueeze(-1)) / (2 * math.pi * r.unsqueeze(-1)).sqrt()
+    def density(z, offset=0., var=r):
+        mu = torch.sigmoid(z.clamp(-8, 8)) + offset
+        return torch.exp(-.5 * (obs.unsqueeze(-1) - mu) ** 2 / var.unsqueeze(-1)) / (2 * math.pi * var.unsqueeze(-1)).sqrt()
 
     standard_lik = _gauss_hermite_expectation(density, z_mean, z_var)
-    component_lik = torch.distributions.Normal(_COMPONENT_MEAN, _COMPONENT_SD).log_prob(obs).exp()
+    component_lik = _gauss_hermite_expectation(
+        lambda z: density(z, offset=_COMPONENT_OFFSET, var=r + _COMPONENT_SD ** 2), z_mean, z_var
+    )
     exact = (probs[:, 0] * standard_lik + probs[:, 1] * component_lik).log()
     # (monte-carlo error; confirmed to shrink at ~1/sqrt(num_samples), i.e. not a bias)
     assert torch.allclose(lp, exact, atol=.01)
@@ -314,8 +318,9 @@ def test_mixture_nonlinear_log_prob_matches_quadrature():
 @torch.no_grad()
 def test_mixture_nonlinear_predictions_match_quadrature():
     """
-    Means: ``P(standard) * E[sigmoid(Z)] + P(low) * mu``. Intervals: quantiles of the mixture of
-    ``sigmoid(Z) + noise`` and the component. With ``use_map=True``, the standard-regime's mean is ``sigmoid(E[Z])``.
+    Means: ``E[sigmoid(Z)] + P(low) * mu`` (the component is an offset). Intervals: quantiles of the mixture of
+    ``sigmoid(Z) + noise`` and ``sigmoid(Z) + mu + noise'`` (with the component's extra variance). With
+    ``use_map=True``, ``E[sigmoid(Z)]`` is replaced by ``sigmoid(E[Z])``.
     """
     # (enough state-uncertainty that the nonlinearity matters -- the linearized mean/intervals fail this test)
     kf = _sigmoid_mixture_kf(process_var_multi=5.)
@@ -326,7 +331,7 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     r = pred.measure_covs_flat[:, 0, 0].double()
     probs = pred.regime_probs.reshape(-1, 2).double()
     standard_mean = _gauss_hermite_expectation(lambda z: torch.sigmoid(z.clamp(-8, 8)), z_mean, z_var)
-    expected_mean = probs[:, 0] * standard_mean + probs[:, 1] * _COMPONENT_MEAN
+    expected_mean = standard_mean + probs[:, 1] * _COMPONENT_OFFSET
 
     assert np.allclose(pred.means.reshape(-1).numpy(), expected_mean.numpy(), atol=.003)
 
@@ -339,7 +344,13 @@ def test_mixture_nonlinear_predictions_match_quadrature():
             lambda z: torch.special.ndtr((q.unsqueeze(-1) - torch.sigmoid(z.clamp(-8, 8))) / r.unsqueeze(-1).sqrt()),
             z_mean, z_var
         )
-        component = torch.special.ndtr((q - _COMPONENT_MEAN) / _COMPONENT_SD)
+        component = _gauss_hermite_expectation(
+            lambda z: torch.special.ndtr(
+                (q.unsqueeze(-1) - torch.sigmoid(z.clamp(-8, 8)) - _COMPONENT_OFFSET) /
+                (r.unsqueeze(-1) + _COMPONENT_SD ** 2).sqrt()
+            ),
+            z_mean, z_var
+        )
         return probs[:, 0] * standard + probs[:, 1] * component
 
     # (~5 standard-errors for a sample-quantile's coverage with 20k samples)
@@ -347,26 +358,30 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(cdf_at(df['upper'].values).numpy(), .95, atol=.01)
 
     df_map = pred.to_dataframe(conf=.9, use_map=True)
-    map_mean = probs[:, 0] * torch.sigmoid(z_mean.double()) + probs[:, 1] * _COMPONENT_MEAN
+    map_mean = torch.sigmoid(z_mean.double()) + probs[:, 1] * _COMPONENT_OFFSET
     assert np.allclose(df_map['mean'].values, map_mean.numpy(), atol=1e-5)
     assert np.allclose(df_map['lower'].values, df['lower'].values)
 
     # with a transform, the draws are back-transformed (so the mean is E[exp(Y)] under the mixture):
     df_exp = pred.to_dataframe(conf=.9, transform=LogTransform())
     standard_exp = _gauss_hermite_expectation(lambda z: torch.exp(torch.sigmoid(z.clamp(-8, 8))), z_mean, z_var)
-    expected_exp = (
-        probs[:, 0] * standard_exp * torch.exp(r / 2) +
-        probs[:, 1] * math.exp(_COMPONENT_MEAN + _COMPONENT_SD ** 2 / 2)
+    expected_exp = standard_exp * (
+        probs[:, 0] * torch.exp(r / 2) +
+        probs[:, 1] * torch.exp(_COMPONENT_OFFSET + (r + _COMPONENT_SD ** 2) / 2)
     )
     assert np.allclose(df_exp['mean'].values, expected_exp.numpy(), atol=.005)
     assert np.allclose(df_exp['lower'].values, np.exp(df['lower'].values), rtol=1e-5)
 
     # each regime's mean uses its own transform (`Transform.for_regime`): here, a component-transform whose noise is a
-    # single node at -10 (standard-deviations), so its back-transformed mean is exp(mu - 10 * sigma):
+    # single node at -10 (standard-deviations), so its back-transformed mean is
+    # E[exp(sigmoid(Z))] * exp(mu - 10 * sqrt(R + sigma^2)):
     from torchcast.state_space import RegimeTransform, SmearingTransform
     rt = RegimeTransform(LogTransform(), components={'low': SmearingTransform(LogTransform(), torch.tensor([-10.]))})
     df_rt = pred.to_dataframe(conf=.9, transform=rt)
-    expected_rt = probs[:, 0] * standard_exp * torch.exp(r / 2) + probs[:, 1] * math.exp(_COMPONENT_MEAN - 10 * _COMPONENT_SD)
+    expected_rt = standard_exp * (
+        probs[:, 0] * torch.exp(r / 2) +
+        probs[:, 1] * torch.exp(_COMPONENT_OFFSET - 10 * (r + _COMPONENT_SD ** 2).sqrt())
+    )
     assert np.allclose(df_rt['mean'].values, expected_rt.numpy(), atol=.005)
 
 

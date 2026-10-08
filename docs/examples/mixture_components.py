@@ -39,25 +39,28 @@ warnings.filterwarnings('ignore', category=PlotnineWarning)
 # variance.
 #
 # With the `mixture` argument, a measure can have one or more alternative *regimes*. Each is described by a learned
-# mean and variance, and a learned probability. An observation that's explained by a component's regime is scored
-# against that component, and doesn't update the latent state.
+# offset (relative to the usual, state-dependent prediction -- so "quick" means "well below *this* customer's typical
+# level"), extra variance, and probability. An observation that's explained by a component's regime is scored
+# against that offset, and updates the latent state accordingly -- so a quick visit doesn't drag down the forecast.
 
 # %% [markdown]
 # ### Simulated Data
 #
 # Each customer has a slowly-drifting typical (log) spend. Some weeks they don't visit (missing values), and
-# about 8% of visits are "quick visits" with low spend, unrelated to the customer's typical level.
+# about 8% of visits are "quick visits", with spend well below the customer's typical level (about exp(-4), i.e. 2%,
+# of it).
 
 # %%
 rs = np.random.RandomState(1234)
 NUM_GROUPS, NUM_TIMES, SPLIT = 60, 80, 60
-QUICK_PROB, QUICK_MEAN, QUICK_STD, NOISE_STD = .08, 1.0, .5, .3
+QUICK_PROB, QUICK_OFFSET, QUICK_STD, NOISE_STD = .08, -4.0, .5, .3
 
 level = 5 + rs.randn(NUM_GROUPS, 1) + np.cumsum(.05 * rs.randn(NUM_GROUPS, NUM_TIMES), axis=1)
 is_quick = rs.rand(NUM_GROUPS, NUM_TIMES) < QUICK_PROB
 log_spend = np.where(
     is_quick,
-    QUICK_MEAN + QUICK_STD * rs.randn(NUM_GROUPS, NUM_TIMES),
+    # (the quick visits' variability is on top of the usual measurement-noise)
+    level + QUICK_OFFSET + np.sqrt(NOISE_STD ** 2 + QUICK_STD ** 2) * rs.randn(NUM_GROUPS, NUM_TIMES),
     level + NOISE_STD * rs.randn(NUM_GROUPS, NUM_TIMES)
 )
 log_spend[rs.rand(NUM_GROUPS, NUM_TIMES) < .3] = np.nan  # weeks without a visit
@@ -65,7 +68,7 @@ log_spend[rs.rand(NUM_GROUPS, NUM_TIMES) < .3] = np.nan  # weeks without a visit
 # the true expected spend (on the original scale) for each customer-week:
 true_expected = (
         (1 - QUICK_PROB) * np.exp(level + NOISE_STD ** 2 / 2) +
-        QUICK_PROB * np.exp(QUICK_MEAN + QUICK_STD ** 2 / 2)
+        QUICK_PROB * np.exp(level + QUICK_OFFSET + (NOISE_STD ** 2 + QUICK_STD ** 2) / 2)
 )
 
 y = torch.as_tensor(log_spend, dtype=torch.float32).unsqueeze(-1)
@@ -83,8 +86,8 @@ SPLIT_DT = START + np.timedelta64(SPLIT, 'W')
 # %% [markdown]
 # ### Models
 #
-# We fit a standard model and one with a mixture-component for 'quick visits'. The component's `mean_init` and
-# `prob_init` are just starting values; they're learned during training (as is the component's variance, and how
+# We fit a standard model and one with a mixture-component for 'quick visits'. The component's `mean_init` (its
+# offset) and `prob_init` are just starting values; they're learned during training (as is the component's variance, and how
 # "sticky" the regime is from one timestep to the next).
 
 # %%
@@ -99,12 +102,12 @@ torch.manual_seed(1)
 kf_mixture = KalmanFilter(
     processes=[LocalLevel(id='level')],
     measures=['log_spend'],
-    mixture=[MixtureComponent(measure='log_spend', mean_init=0., prob_init=.05, id='quick')]
+    mixture=[MixtureComponent(measure='log_spend', mean_init=-2., prob_init=.05, id='quick')]
 )
 kf_mixture.fit(y_train, verbose=0);
 
 # %% [markdown]
-# The learned component closely matches the data-generating process (mean 1.0, std 0.5, probability 0.08). There is
+# The learned component closely matches the data-generating process (offset -4.0, extra std 0.5, probability 0.08). There is
 # no persistence in these simulated quick visits, so the learned stickiness stays low. Meanwhile the measurement noise
 # (std 0.3 in the simulation) is learned accurately by the mixture model, but is badly inflated in the standard model,
 # which has to accommodate the quick visits:
@@ -112,8 +115,8 @@ kf_mixture.fit(y_train, verbose=0);
 # %%
 component = kf_mixture.mixture.components[0]
 pd.Series({
-    'component mean': component.mean.item(),
-    'component std': component.var.sqrt().item(),
+    'component offset': component.mean.item(),
+    'component (extra) std': component.var.sqrt().item(),
     'component probability': kf_mixture.mixture.base_probs()[1].item(),
     'stickiness (standard, quick)': kf_mixture.mixture.transition.stay.detach().numpy().round(3),
     'measurement std (mixture model)': kf_mixture.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),

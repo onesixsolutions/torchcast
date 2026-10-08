@@ -221,9 +221,8 @@ class SmearingTransform(Transform):
 
         For a measure with mixture components, each regime is smeared with its own residuals: standardized by that
         regime's predicted mean and variance, and weighted by the probability (given the observation) that it came
-        from that regime. This returns a :class:`RegimeTransform`. A component's regime has a constant mean and
-        variance, so its back-transformed mean is then simply the weighted average of the back-transformed
-        observations attributed to it -- rather than e.g. a lognormal mean, which is sensitive to a large component
+        from that regime. This returns a :class:`RegimeTransform`. So a component's back-transformed mean uses the
+        residuals attributed to it -- rather than e.g. a lognormal mean, which is sensitive to a large component
         variance. (With few observations attributed to a component, this is correspondingly noisy. To use a
         different transform for some regimes, e.g. ``LogTransform(bias_adjust=0)``, build a :class:`RegimeTransform`
         from this one's ``standard``.)

@@ -1,9 +1,12 @@
 """
 Mixture-of-regimes support for state-space models.
 
-A measure can have one or more :class:`MixtureComponent` alternatives to its standard (state-dependent) measurement
-model. Each component is *stateless*: an observation explained by it is scored against the component's own learned
-mean and variance, and does not update the latent state.
+A measure can have one or more :class:`MixtureComponent` alternatives to its standard measurement model. Each
+component is an *offset* from the standard regime: in the component's regime, an observation is the usual
+(state-dependent) measured-mean plus the component's learned offset, with its learned variance added to the
+measurement-noise. So e.g. a "quick visit" component means "spend well below *this* player's usual level", rather
+than below some global level. Observations in a component's regime still update the state (accounting for the
+offset and the extra noise).
 
 The :class:`MixtureModel` owns the components and enumerates a fixed table of regime "combos" -- one entry per
 combination of regimes across the mixture measures (the standard regime, or one of that measure's components). Regime
@@ -18,10 +21,12 @@ import torch
 
 class MixtureComponent(torch.nn.Module):
     """
-    An alternative ('weird') regime for a single measure, with a learnable mean, variance, and base-rate.
+    An alternative ('weird') regime for a single measure: an offset from the standard regime's (state-dependent)
+    measured-mean, with a learnable mean (the offset), variance (added to the measurement-noise variance), and
+    base-rate.
 
     :param measure: The measure this component applies to.
-    :param mean_init: Initial value for the component's mean.
+    :param mean_init: Initial value for the component's offset, relative to the standard regime's measured-mean.
     :param prob_init: Initial value for the component's base-rate, i.e. the long-run probability that an observation
      for ``measure`` comes from this component (exact when it's the only component for this measure). With
      ``predictors``, this is the base-rate when the predictors are zero.
@@ -318,6 +323,43 @@ class MixtureModel(torch.nn.Module):
             mapping.append(effective.index(eff))
         return effective, torch.as_tensor(mapping, dtype=torch.long)
 
+    @staticmethod
+    def effective_offsets(effective_combo: tuple, num_measures: int, like: torch.Tensor
+                          ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param effective_combo: An entry from :func:`effective_combos`: ``(measure_idx, component)`` pairs.
+        :param num_measures: The number of (observed) measures that ``measure_idx`` indexes.
+        :param like: A tensor whose dtype/device to use.
+        :return: Two ``(num_measures,)`` tensors: the offset to the measured-mean, and the variance to add to the
+         measurement-noise, for each measure.
+        """
+        zero = torch.zeros((), dtype=like.dtype, device=like.device)
+        shift, extra_var = [zero] * num_measures, [zero] * num_measures
+        for i, component in effective_combo:
+            shift[i], extra_var[i] = component.mean, component.var
+        return torch.stack(shift), torch.stack(extra_var)
+
+    def combo_offsets(self, measures: Sequence[str], like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param measures: The measures.
+        :param like: A tensor whose dtype/device to use.
+        :return: Two ``(num_combos, len(measures))`` tensors: for each combo, the offset to each measure's
+         measured-mean, and the variance to add to its measurement-noise (zero for measures in the standard regime).
+        """
+        measures = list(measures)
+        offsets = [
+            self.effective_offsets(
+                tuple(
+                    (measures.index(m), c) for m, c in zip(self.mixture_measures, combo)
+                    if c is not None and m in measures
+                ),
+                num_measures=len(measures),
+                like=like,
+            )
+            for combo in self.combos
+        ]
+        return torch.stack([o[0] for o in offsets]), torch.stack([o[1] for o in offsets])
+
     def standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
         """
         :param regime_probs: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
@@ -337,7 +379,8 @@ class MixtureModel(torch.nn.Module):
 class MixtureOfNormals:
     """
     A batch of univariate mixtures of normals: the predictive distribution of a single measure with mixture components.
-    The last dimension of each tensor indexes the mixture's components; the first is the standard regime.
+    The last dimension of each tensor indexes the mixture's components; the first is the standard regime. (Each
+    component's mean and variance are the standard regime's plus that component's offset and extra variance.)
 
     For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
     then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.

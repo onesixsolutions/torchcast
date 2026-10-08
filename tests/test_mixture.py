@@ -182,17 +182,22 @@ def test_update_step_univariate():
         input = torch.tensor([[obs]])
         state = kf._update_step(input=input, mean=mean, cov=cov, measured_mean=mean, measure_mat=H, measure_cov=R)
 
-        # by hand:
-        S = cov + R
-        K = cov / S
-        mean_n = mean + K * (obs - mean)
-        cov_n = (1 - K) * cov
-        lik_n = Normal(mean, S.sqrt()).log_prob(input).exp()
-        lik_w = Normal(component.mean, component.var.sqrt()).log_prob(input).exp()
+        # by hand: the standard regime is the usual update; the component's regime is an update with the residual
+        # offset by the component's mean, and the component's variance added to the measurement-noise.
+        S_n = cov + R
+        K_n = cov / S_n
+        mean_n = mean + K_n * (obs - mean)
+        cov_n = (1 - K_n) * cov
+        S_w = cov + R + component.var
+        K_w = cov / S_w
+        mean_w = mean + K_w * (obs - mean - component.mean)
+        cov_w = (1 - K_w) * cov
+        lik_n = Normal(mean, S_n.sqrt()).log_prob(input).exp()
+        lik_w = Normal(mean + component.mean, S_w.sqrt()).log_prob(input).exp()
         w_w = prob * lik_w / (prob * lik_w + (1 - prob) * lik_n)
         w_n = 1 - w_w
-        expected_mean = w_n * mean_n + w_w * mean
-        expected_cov = w_n * (cov_n + (mean_n - expected_mean) ** 2) + w_w * (cov + (mean - expected_mean) ** 2)
+        expected_mean = w_n * mean_n + w_w * mean_w
+        expected_cov = w_n * (cov_n + (mean_n - expected_mean) ** 2) + w_w * (cov_w + (mean_w - expected_mean) ** 2)
 
         assert torch.allclose(state.regime_probs[:, 1], w_w.view(1), atol=1e-6)
         assert torch.allclose(state.mean, expected_mean.view(1, 1), atol=1e-6)
@@ -241,13 +246,11 @@ def test_log_prob_brute_force():
         S = H @ pred.state_covs[g, t] @ H.T + R
         total = 0.
         for combo, prob in zip(rm.combos, pred.regime_probs[g, t]):
-            normal = [i for i in observed if combo[i] is None]
-            lik = 1.
-            if normal:
-                lik *= MultivariateNormal(m[normal], S[normal][:, normal]).log_prob(obs[normal]).exp()
-            for i in observed:
-                if combo[i] is not None:
-                    lik *= Normal(combo[i].mean, combo[i].var.sqrt()).log_prob(obs[i]).exp()
+            # each measure in a component's regime: offset mean, and extra variance
+            offset = torch.stack([torch.tensor(0.) if c is None else c.mean for c in combo])
+            extra = torch.stack([torch.tensor(0.) if c is None else c.var for c in combo])
+            m_c, S_c = m + offset, S + torch.diag(extra)
+            lik = MultivariateNormal(m_c[observed], S_c[observed][:, observed]).log_prob(obs[observed]).exp()
             total += prob * lik
         assert math.isclose(lp[g, t].item(), math.log(total), rel_tol=1e-4)
 
@@ -784,3 +787,36 @@ def test_mixture_covs_warns_once():
         mean, cov = pred  # (the common pattern the warning is for)
         _ = pred.covs
     assert len([w for w in caught if 'covariance of a (non-gaussian) mixture' in str(w.message)]) == 1
+
+
+@torch.no_grad()
+def test_components_are_offsets():
+    """
+    A component is an offset from each group's own (state-dependent) level: a group whose level is low isn't thereby
+    in the 'low' regime -- only observations well below *its* level are.
+    """
+    torch.manual_seed(0)
+    num_times = 30
+    level = torch.tensor([3., -1.]).view(2, 1, 1)  # a typical group, and a group with a low level
+    y = level + torch.randn(2, num_times, 1) * .1
+    y[:, 20] -= 4.  # a 'quick visit' for both
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level')],
+        measures=['y'],
+        mixture=[MixtureComponent(measure='y', mean_init=-4., prob_init=.1, id='low')],
+    )
+    with torch.no_grad():
+        kf.mixture.components[0]._log_std.fill_(math.log(.3))
+        kf.measure_covariance.cholesky_log_diag.fill_(math.log(.1))
+    pred = kf(y, include_updates_in_output=True)
+    p_low = pred.update_regime_probs[..., 1]
+    # once each group's level is learned, normal observations are standard for both. (Before that, the offset and the
+    # level aren't identified: e.g. 'standard regime at level 3' vs. 'low regime at level 7' -- only the base-rate
+    # distinguishes them -- so allow a burn-in.)
+    normal = torch.ones(num_times, dtype=torch.bool)
+    normal[:8] = normal[20] = False
+    assert (p_low[:, normal] < .01).all()
+    # ...and the quick visit is 'low' for both:
+    assert (p_low[:, 20] > .99).all()
+    # the quick visit barely moves the state (its offset is explained):
+    assert torch.allclose(pred.update_means[:, 20], pred.update_means[:, 19], atol=.05)

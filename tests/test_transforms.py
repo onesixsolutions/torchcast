@@ -294,7 +294,7 @@ def _smearing_mixture_kf(component_sd: float) -> KalmanFilter:
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')],
+        mixture=[MixtureComponent(measure='y', mean_init=-4., prob_init=.1, id='low')],
     )
     with torch.no_grad():
         kf.mixture.components[0]._log_std.fill_(math.log(component_sd))
@@ -305,7 +305,7 @@ def _smearing_mixture_y() -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(0)
     y = torch.randn(4, 30, 1).cumsum(1) * .05 + 3.
     is_low = torch.rand(4, 30, 1) < .15
-    y[is_low] = -1. + torch.randn(int(is_low.sum())) * .05  # 'quick visits'
+    y[is_low] = y[is_low] - 4. + torch.randn(int(is_low.sum())) * .05  # 'quick visits': well below the usual level
     return y, is_low
 
 
@@ -334,17 +334,19 @@ def test_smearing_mixture():
                           atol=1e-5)
     assert torch.allclose(standard.weights, (post[..., 0] / post[..., 0].sum()).reshape(-1), atol=1e-6)
     # ...where the outliers get ~no weight in total, though they're ~15% of observations:
-    assert standard.weights[is_low.reshape(-1)].sum() < .01
+    assert standard.weights[is_low.reshape(-1)].sum() < .05
 
-    # the component's regime has a constant mean/var, so its smeared mean is the posterior-weighted average of the
-    # back-transformed observations:
-    expected_low = (post[..., 1] * obs.exp()).sum() / post[..., 1].sum()
-    assert torch.allclose(low.inverse_mean(mix.means[..., 1], mix.vars[..., 1]), expected_low.expand(4, 30), rtol=1e-4)
+    # the component's regime: standardized by its own moments (the standard regime's plus the component's offset and
+    # extra variance), and weighted by P(low | y):
+    assert torch.allclose(low.residuals, ((obs - mix.means[..., 1]) / mix.vars[..., 1].sqrt()).reshape(-1), atol=1e-5)
+    assert torch.allclose(low.weights, (post[..., 1] / post[..., 1].sum()).reshape(-1), atol=1e-6)
+    # ...where the standard observations get ~no weight in total:
+    assert low.weights[~is_low.reshape(-1)].sum() < .05
 
     df = pred.to_dataframe(transform=smear)
     expected = (
         mix.probs[..., 0] * standard.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
-        mix.probs[..., 1] * expected_low
+        mix.probs[..., 1] * low.inverse_mean(mix.means[..., 1], mix.vars[..., 1])
     )
     assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-4)
 
@@ -366,9 +368,8 @@ def test_smearing_mixture():
 @torch.no_grad()
 def test_smearing_large_component_variance():
     """
-    The motivating failure: a component with a large (learned) variance has a huge lognormal mean,
-    exp(mu + sigma^2 / 2), which dominates the mixed mean. Smearing the component's regime keeps it near the
-    observations attributed to it.
+    The motivating failure: a component with a large (learned) variance has a huge lognormal mean, which dominates the
+    mixed mean. Smearing the component's regime with the residuals attributed to it keeps it near those observations.
     """
     from torchcast.state_space import SmearingTransform, RegimeTransform
 
@@ -376,14 +377,14 @@ def test_smearing_large_component_variance():
     pred = _smearing_mixture_kf(component_sd=3.)(y)
     mix = pred.get_mixture('y')
     lognormal_low = torch.exp(mix.means[..., 1] + mix.vars[..., 1] / 2)
-    assert (lognormal_low > 30).all()  # (vs. 'quick visits' of ~exp(-1))
+    assert (lognormal_low[:, 10:] > 20).all()  # (vs. 'quick visits' of ~exp(-1), and typical visits of ~exp(3))
 
     smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y')
     smeared_low = smear.for_regime('low').inverse_mean(mix.means[..., 1], mix.vars[..., 1])
-    # (bounded by the observations; above exp(-1) because the broad component also gets some posterior weight from
-    # the standard observations)
+    # (bounded by the observations; well above the quick visits' ~exp(-1) because this unfitted component is so broad
+    # that the standard observations get substantial posterior weight in it)
     assert (smeared_low < y.exp().max()).all()
-    assert (smeared_low < lognormal_low / 5).all()
+    assert (smeared_low < lognormal_low / 3).all()
     # vs. smearing only the standard regime (the component lognormal):
     df_smear = pred.to_dataframe(transform=smear)
     df_standard_only = pred.to_dataframe(transform=RegimeTransform(smear.standard, components={'low': LogTransform()}))

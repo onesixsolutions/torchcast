@@ -64,12 +64,22 @@ def test_sample_mixture():
     s = pred.sample(n, generator=_gen())
     mix = pred.get_mixture('a')
 
-    in_low = s.means[..., 0] == component.mean
+    # in the 'low' regime, 'a' has the component's variance added to its measurement-noise (which identifies the
+    # regime here), and is offset by the component's mean:
+    R = pred.measure_covs[0, 0]
+    in_low = s.covs[..., 0, 0] > R[0, 0] + component.var / 2
     p = mix.probs[..., 1]
     assert ((in_low.float().mean(0) - p).abs() < 5 * (p * (1 - p) / n).sqrt()).all()
-    # in the 'low' regime, 'a' has the component's variance and is uncorrelated with 'b':
-    assert torch.allclose(s.covs[..., 0, 0][in_low], component.var.expand(int(in_low.sum())))
-    assert (s.covs[..., 0, 1][in_low] == 0).all()
+    assert torch.allclose(s.covs[..., 0, 0][in_low], (R[0, 0] + component.var).expand(int(in_low.sum())))
+    assert torch.allclose(s.covs[..., 0, 1], R[0, 1].expand_as(s.covs[..., 0, 1]))  # (correlation is unchanged)
+    # the same state-draws (`sample()` draws this white-noise first), without the regimes:
+    num_rows = pred.state_means_flat.shape[0]
+    white_noise = torch.randn((n, num_rows, 2), generator=_gen())
+    standard_means = pred._get_measured_mean_samples(
+        pred.measurement_model_flat, pred.state_means_flat, pred.state_covs_flat, white_noise=white_noise
+    ).view(n, 2, 8, 2)
+    offset = s.means[..., 0] - standard_means[..., 0]
+    assert torch.allclose(offset[in_low], component.mean.expand(int(in_low.sum())), atol=1e-5)
     # the observations follow the mixture:
     for q in (.05, .5, .95):
         emp_cdf_at_quantile = (s['a'] <= mix.quantile(q)).float().mean(0)

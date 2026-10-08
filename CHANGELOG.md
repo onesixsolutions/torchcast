@@ -8,8 +8,10 @@ A measure can now have one or more alternative *regimes* -- e.g. for outliers th
 inflate the variance. See the new [mixture components example](https://docs.strong.io/torchcast/examples/mixture_components.html).
 
 - `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):
-  each `MixtureComponent` has a learned mean, variance, and base-rate. An observation explained by a component is scored against it, rather than updating the
-  state. Components are supported on any measure with a gaussian likelihood, including the non-binary measures of a
+  each `MixtureComponent` is an *offset* from the standard regime: a learned offset to the (state-dependent)
+  measured-mean, extra variance (added to the measurement-noise), and base-rate. E.g. a 'quick visit' component means
+  'spend well below *this* customer's usual level'. An observation in a component's regime updates the state as
+  usual, but accounting for the offset and the extra noise -- so it doesn't drag the state towards it. Components are supported on any measure with a gaussian likelihood, including the non-binary measures of a
   `BinomialFilter`, and measures with a nonlinear measurement (a nonlinear process such as `SaturatedLinearModel`, or
   a measure-function): for these, the update-step uses the linearized (EKF) measurement, while `log_prob()`, `means`,
   and `to_dataframe()` use monte-carlo.
@@ -49,9 +51,9 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   distribution of standardized residuals instead of assuming gaussian noise (Duan's smearing estimator); intervals
   are unaffected. `SmearingTransform.from_predictions(base, predictions, y, measure)` builds one from a model's
   residuals. For a measure with mixture components, it smears each regime with its own residuals, weighted by the
-  probability that each observation came from that regime -- so a component's back-transformed mean is the
-  weighted average of the observations attributed to it, rather than e.g. a lognormal mean that's very sensitive to
-  a large component variance. Custom transforms can override `Transform.expected_inverse()` (a closed form) or
+  probability that each observation came from that regime -- so a component's back-transformed mean uses the
+  residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
+  variance. Custom transforms can override `Transform.expected_inverse()` (a closed form) or
   `Transform.noise_nodes()` (a different noise distribution).
 - `RegimeTransform(standard, components={component_id: Transform})` chooses how each regime of a mixture measure is
   back-transformed, e.g. `components={'quick': LogTransform(bias_adjust=0)}`.
