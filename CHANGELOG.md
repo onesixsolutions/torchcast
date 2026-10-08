@@ -30,8 +30,9 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
 - With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
 - `MixtureModel(..., joseph_form=False)` uses the simpler covariance update (`P - K @ H @ P`) instead of the Joseph
-  form in the mixture update-step, which runs once per regime-combo: less memory during training (~30% in a test) and
-  faster, but less numerically robust. The default is the Joseph form, as without mixtures.
+  form for the non-standard regime-combos (the update-step runs once per combo; the standard regime follows the
+  model's own covariance-update): less memory during training, and faster, but less numerically robust -- though the
+  non-standard combos are the better-conditioned ones. The default is the Joseph form.
 - A component's base-rate can depend on predictors: `MixtureComponent(..., predictors=['treated'])` learns a
   coefficient for each (added to its logit), e.g. for a treatment that makes the regime more common. Pass them to
   `forward()` as `X` (or `{component_id}__X`), as a `(num_groups, num_timesteps, num_predictors)` tensor covering the

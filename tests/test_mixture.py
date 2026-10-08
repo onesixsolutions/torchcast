@@ -824,7 +824,10 @@ def test_components_are_offsets():
 
 @torch.no_grad()
 def test_joseph_form_option():
-    """`MixtureModel(joseph_form=False)` uses the simpler covariance update -- the same, in exact arithmetic."""
+    """
+    `MixtureModel(joseph_form=False)` uses the simpler covariance update for the non-standard regime-combos -- the same,
+    in exact arithmetic. The standard combo follows the model's `joseph_form`.
+    """
     y = _make_y(num_measures=2)
     y[0, 3, 1] = float('nan')
     preds = {}
@@ -836,19 +839,36 @@ def test_joseph_form_option():
     for attr in ('update_means', 'update_covs', 'update_regime_probs'):
         assert torch.allclose(getattr(preds[True], attr), getattr(preds[False], attr), atol=1e-5)
     assert torch.allclose(preds[True].log_prob(y), preds[False].log_prob(y), atol=1e-5)
-    # (symmetric:)
-    covs = preds[False].update_covs
-    assert torch.equal(covs, covs.transpose(-1, -2))
 
-    # the joseph-form update isn't used at all (all mixture measures are observed here, so every update-step is a
-    # mixture update):
-    kf = _make_kf(['y1', 'y2'], ['y1', 'y2'], joseph_form=False)
+    # which update each combo uses: record the batch-size of each call. all mixture measures are observed here, so
+    # every update-step is a mixture update, with 4 effective combos x 3 groups -- the first 3 rows are the standard
+    # combo.
+    kf = _make_kf(['y1', 'y2'], ['y1', 'y2'])
+    calls = {}
 
-    def fail(*args, **kwargs):
-        raise AssertionError("joseph-form update was called")
+    def record(name, fun):
+        def wrapped(cov, *args, **kwargs):
+            calls.setdefault(name, set()).add(cov.shape[0])
+            return fun(cov, *args, **kwargs)
+        return wrapped
 
-    kf._covariance_update = fail
-    kf(_make_y(num_measures=2))
-    kf.mixture.joseph_form = True
-    with pytest.raises(AssertionError, match="joseph-form"):
+    kf._covariance_update = record('joseph', KalmanFilter._covariance_update)
+    kf._simple_covariance_update = record('simple', KalmanFilter._simple_covariance_update)
+    expected = {
+        # (model, mixture): calls
+        (True, True): {'joseph': {12}},
+        (True, False): {'joseph': {3}, 'simple': {9}},
+        (False, True): {'joseph': {9}, 'simple': {3}},
+        (False, False): {'simple': {12}},
+    }
+    for (model_joseph, mixture_joseph), expected_calls in expected.items():
+        calls.clear()
+        kf.joseph_form = model_joseph
+        kf.mixture.joseph_form = mixture_joseph
         kf(_make_y(num_measures=2))
+        assert calls == expected_calls, (model_joseph, mixture_joseph)
+    # older pickles (no attributes) use the joseph form:
+    calls.clear()
+    del kf.joseph_form, kf.mixture.joseph_form
+    kf(_make_y(num_measures=2))
+    assert calls == {'joseph': {12}}

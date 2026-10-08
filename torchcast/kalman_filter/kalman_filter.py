@@ -136,11 +136,12 @@ class KalmanFilter(StateSpaceModel):
                        measure_cov: torch.Tensor,
                        measured_cov: Optional[torch.Tensor] = None,
                        system_cov: Optional[torch.Tensor] = None,
-                       joseph: bool = True) -> 'StateTuple':
+                       joseph: Optional[bool] = None) -> 'StateTuple':
         """
         The kalman-filter update equations. ``measured_cov`` (P @ H.T) and ``system_cov`` (H @ P @ H.T + R) can be
         passed if already computed. ``joseph=False`` uses the simpler covariance update ``P - K @ H @ P`` instead of
-        the Joseph form: less memory and compute, but less numerically robust.
+        the Joseph form: less memory and compute, but less numerically robust. Defaults to the model's
+        ``joseph_form`` (the Joseph form, if not set).
         """
         resid = input - measured_mean
         if measured_cov is None:
@@ -149,11 +150,12 @@ class KalmanFilter(StateSpaceModel):
             system_cov = measure_mat @ measured_cov + measure_cov
         K = self._kalman_gain(measured_cov=measured_cov, system_cov=system_cov)
         new_mean = self._mean_update(mean=mean, K=K, resid=resid)
+        if joseph is None:
+            joseph = getattr(self, 'joseph_form', True)
         if joseph:
             new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
         else:
-            new_cov = cov - K @ measured_cov.permute(0, 2, 1)
-            new_cov = .5 * (new_cov + new_cov.permute(0, 2, 1))  # (symmetric in exact arithmetic)
+            new_cov = self._simple_covariance_update(cov=cov, K=K, H=measure_mat)
         return StateTuple(new_mean, new_cov)
 
     def _mixture_update(self,
@@ -219,7 +221,7 @@ class KalmanFilter(StateSpaceModel):
         system_cov = batched(measure_mat @ measured_cov + measure_cov) + extra_cov  # (num_effective, G, M, M)
         input_e = batched(input) - shift
         flat = lambda x: x.reshape(num_effective * num_groups, *x.shape[2:])  # noqa: E731
-        states = self._kalman_update(
+        update_kwargs = dict(
             input=flat(input_e),
             mean=flat(batched(mean)),
             cov=flat(batched(cov)),
@@ -228,8 +230,18 @@ class KalmanFilter(StateSpaceModel):
             measure_cov=flat(batched(measure_cov) + extra_cov),
             measured_cov=flat(batched(measured_cov)),
             system_cov=flat(system_cov),
-            joseph=getattr(self.mixture, 'joseph_form', True),  # (missing in older pickles)
         )
+        # the standard combo (the first) uses the model's covariance-update; the others, the mixture's:
+        standard_joseph = getattr(self, 'joseph_form', True)
+        mixture_joseph = getattr(self.mixture, 'joseph_form', True)  # (missing in older pickles)
+        if standard_joseph == mixture_joseph:
+            states = self._kalman_update(**update_kwargs, joseph=standard_joseph)
+        else:
+            standard = self._kalman_update(**{k: v[:num_groups] for k, v in update_kwargs.items()},
+                                           joseph=standard_joseph)
+            others = self._kalman_update(**{k: v[num_groups:] for k, v in update_kwargs.items()},
+                                         joseph=mixture_joseph)
+            states = StateTuple(torch.cat([standard.mean, others.mean]), torch.cat([standard.cov, others.cov]))
         resid = (input_e - measured_mean)[..., score_idx]
         log_liks = mvnorm_log_prob(
             resid=flat(resid),
@@ -275,6 +287,11 @@ class KalmanFilter(StateSpaceModel):
         I = torch.eye(cov.shape[1], dtype=cov.dtype, device=cov.device).unsqueeze(0)
         ikh = I - K @ H
         return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
+
+    @staticmethod
+    def _simple_covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+        new_cov = cov - K @ (H @ cov)
+        return .5 * (new_cov + new_cov.permute(0, 2, 1))  # (symmetric in exact arithmetic)
 
     @staticmethod
     def _kalman_gain(measured_cov: torch.Tensor, system_cov: torch.Tensor) -> torch.Tensor:

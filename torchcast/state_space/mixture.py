@@ -183,10 +183,13 @@ class MixtureModel(torch.nn.Module):
      the mixture measures, rather than of all observed measures. This is an approximation (exact if the other
      measures' residuals are uncorrelated with the mixture measures'), but can be cheaper. (Non-gaussian measures,
      e.g. binary, never influence the regime-probabilities.)
-    :param joseph_form: If True (the default), the update-step uses the Joseph form of the covariance update, as
-     without mixtures. With mixtures, the update runs once for each regime-combo, and the Joseph form's intermediate
-     results (kept for the backward pass) can dominate memory-use during training; ``False`` uses the simpler
-     ``P - K @ H @ P`` instead -- less memory (and compute), but less numerically robust.
+    :param joseph_form: Whether the update-step for the *non-standard* regime-combos (those with any measure in a
+     component's regime) uses the Joseph form of the covariance update. (The standard regime's update follows the
+     model's ``joseph_form``.) With mixtures, the update runs once for each regime-combo, and the Joseph form's
+     intermediate results (kept for the backward pass) can dominate memory-use during training; ``False`` uses the
+     simpler ``P - K @ H @ P`` instead -- less memory (and compute), but less numerically robust. The non-standard
+     combos are the safer place for this: a component's extra variance makes their update better-conditioned, and
+     their covariances only matter in proportion to their posterior probability. Default True.
     """
 
     def __init__(self,
