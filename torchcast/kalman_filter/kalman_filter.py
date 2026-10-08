@@ -177,21 +177,16 @@ class KalmanFilter(StateSpaceModel):
             log_prior = regime_prior.clamp_min(1e-30).log()
 
         effective, mapping = self.mixture.effective_combos(measures)
-
-        measured_cov = cov @ measure_mat.permute(0, 2, 1)
-        system_cov = measure_mat @ measured_cov + measure_cov
-        standard = self._kalman_update(
-            input=input,
-            mean=mean,
-            cov=cov,
-            measured_mean=measured_mean,
-            measure_mat=measure_mat,
-            measure_cov=measure_cov,
-            measured_cov=measured_cov,
-            system_cov=system_cov,
-        )
         if len(effective) == 1:
             # no mixture measures observed, so observations are uninformative about the regime:
+            standard = self._kalman_update(
+                input=input,
+                mean=mean,
+                cov=cov,
+                measured_mean=measured_mean,
+                measure_mat=measure_mat,
+                measure_cov=measure_cov,
+            )
             standard.regime_probs = log_prior.exp()
             return standard
 
@@ -199,61 +194,73 @@ class KalmanFilter(StateSpaceModel):
         # gaussian approximation is crude, and their log-prob is computed separately from the gaussian measures' (so
         # using their correlation here would be inconsistent with training).
         if self.mixture.univariate_prob:
-            score_idx = {i for i, m in enumerate(measures) if m in self.mixture.mixture_measures}
+            score_idx = [i for i, m in enumerate(measures) if m in self.mixture.mixture_measures]
         else:
-            score_idx = {i for i, m in enumerate(measures) if m not in self._non_gaussian_measures}
+            score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
-        score_idx = torch.as_tensor(sorted(score_idx), dtype=torch.long, device=input.device)
-        score_idx2d = (slice(None), score_idx.unsqueeze(-1), score_idx.unsqueeze(0))
-        resid = input - measured_mean
-        states = []
-        log_liks = []
-        for eff in effective:
-            if eff:
-                shift, extra_var = self.mixture.effective_offsets(eff, len(measures), like=input)
-                extra_cov = torch.diag_embed(extra_var)
-                states.append(self._kalman_update(
-                    input=input - shift,
-                    mean=mean,
-                    cov=cov,
-                    measured_mean=measured_mean,
-                    measure_mat=measure_mat,
-                    measure_cov=measure_cov + extra_cov,
-                    measured_cov=measured_cov,
-                    system_cov=system_cov + extra_cov,
-                ))
-                combo_resid, combo_cov = resid - shift, system_cov + extra_cov
-            else:
-                states.append(standard)
-                combo_resid, combo_cov = resid, system_cov
-            log_liks.append(mvnorm_log_prob(resid=combo_resid[:, score_idx], cov=combo_cov[score_idx2d]))
+        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
+        # updated in one batch: stack them along the group dimension.
+        num_effective = len(effective)
+        offsets = [self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective]
+        shift = torch.stack([o[0] for o in offsets]).unsqueeze(1)  # (num_effective, 1, num_measures)
+        extra_cov = torch.diag_embed(torch.stack([o[1] for o in offsets])).unsqueeze(1)  # (num_effective, 1, M, M)
+
+        def batched(x: torch.Tensor) -> torch.Tensor:
+            return x.unsqueeze(0).expand(num_effective, *x.shape)
+
+        measured_cov = cov @ measure_mat.permute(0, 2, 1)
+        system_cov = batched(measure_mat @ measured_cov + measure_cov) + extra_cov  # (num_effective, G, M, M)
+        input_e = batched(input) - shift
+        flat = lambda x: x.reshape(num_effective * num_groups, *x.shape[2:])  # noqa: E731
+        states = self._kalman_update(
+            input=flat(input_e),
+            mean=flat(batched(mean)),
+            cov=flat(batched(cov)),
+            measured_mean=flat(batched(measured_mean)),
+            measure_mat=flat(batched(measure_mat)),
+            measure_cov=flat(batched(measure_cov) + extra_cov),
+            measured_cov=flat(batched(measured_cov)),
+            system_cov=flat(system_cov),
+        )
+        resid = (input_e - measured_mean)[..., score_idx]
+        log_liks = mvnorm_log_prob(
+            resid=flat(resid),
+            cov=flat(system_cov[..., score_idx.unsqueeze(-1), score_idx.unsqueeze(0)])
+        ).view(num_effective, num_groups).T  # (G, num_effective)
 
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
-        log_post = log_prior + torch.stack(log_liks, -1)[:, mapping]
+        log_post = log_prior + log_liks[:, mapping]
         regime_post = torch.softmax(log_post, -1)
-        return self._mix_updates(states, regime_post, mapping)
+        return self._mix_updates(
+            means=states.mean.view(num_effective, num_groups, mean.shape[-1]),
+            covs=states.cov.view(num_effective, num_groups, *cov.shape[1:]),
+            regime_post=regime_post,
+            mapping=mapping,
+        )
 
     @staticmethod
-    def _mix_updates(states: Sequence['StateTuple'],
+    def _mix_updates(means: torch.Tensor,
+                     covs: torch.Tensor,
                      regime_post: torch.Tensor,
                      mapping: torch.Tensor) -> 'StateTuple':
         """
         Collapse a mixture of gaussian states into a single gaussian via moment-matching.
 
-        :param states: The (effective-combo) states to mix.
+        :param means: A ``(num_effective, num_groups, state_rank)`` tensor: the (effective-combo) state-means to mix.
+        :param covs: A ``(num_effective, num_groups, state_rank, state_rank)`` tensor: their covariances.
         :param regime_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
-        :param mapping: A ``(num_combos,)`` tensor mapping each combo to its index in ``states`` (combos that are
+        :param mapping: A ``(num_combos,)`` tensor mapping each combo to its index in ``means`` (combos that are
          indistinguishable given the observed measures share a state).
         :return: The collapsed state, with ``regime_probs`` set to ``regime_post``.
         """
         # the weight of each state is the total probability of the combos that map to it:
-        weights = torch.zeros((regime_post.shape[0], len(states)), dtype=regime_post.dtype, device=regime_post.device)
-        weights = weights.index_add(1, mapping.to(regime_post.device), regime_post).unbind(-1)
-        new_mean = sum(w.unsqueeze(-1) * s.mean for w, s in zip(weights, states))
-        new_cov = 0
-        for w, s in zip(weights, states):
-            diff = (s.mean - new_mean).unsqueeze(-1)
-            new_cov = new_cov + w.view(-1, 1, 1) * (s.cov + diff @ diff.permute(0, 2, 1))
+        to = {'dtype': regime_post.dtype, 'device': regime_post.device}
+        weights = torch.zeros((regime_post.shape[0], means.shape[0]), **to)
+        weights = weights.index_add(1, mapping.to(regime_post.device), regime_post)  # (G, num_effective)
+        new_mean = torch.einsum('ge,egs->gs', weights, means)
+        diff = means - new_mean
+        new_cov = torch.einsum('ge,egij->gij', weights, covs + diff.unsqueeze(-1) * diff.unsqueeze(-2))
         return StateTuple(mean=new_mean, cov=new_cov, regime_probs=regime_post)
 
     @staticmethod
