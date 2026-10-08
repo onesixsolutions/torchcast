@@ -92,6 +92,9 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
   uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
   larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+### New option: `joseph_form`
+
+`KalmanFilter(joseph_form=False)` (and `BinomialFilter`) uses the simpler covariance update `P - K H P` (symmetrized) instead of the Joseph form `(I - K H) P (I - K H)' + K R K'`. It uses less memory during training (in a test with a state-size of 44: ~20-25% less peak memory for forward + backward) and is faster, but it's less numerically robust: errors in the kalman gain have a first-order (rather than second-order) effect on the covariance, which can lose positive-definiteness. The default is unchanged (`joseph_form=True`), as are models saved by older versions.
 
 ### Behavior change: adaptive scaling starts at "no adjustment"
 
@@ -99,7 +102,49 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 
 Models saved by older versions keep the old behavior, whether loaded by unpickling (`torch.load` of the whole model) or via `load_state_dict()` (state-dicts without the new `adaptive_scaling._extra_state` entry). Note that state-dicts saved by this version have that extra entry, so they can't be loaded with `strict=True` into older versions of torchcast.
 
-## v1.2.0 (2026-06-08)
+## v1.1.3 (2026-10-07)
+
+### Bug fix: covariance of `n_step > 1` predictions
+
+For `n_step > 1` (with either `every_step` setting), the state-covariance of each h-step-ahead prediction (for h > 1)
+was propagated from the wrong covariance: the final filtered update of the whole series, rather than the (h-1)-step
+prediction. This affected the prediction intervals and `log_prob()` of any model called with `n_step > 1` (and
+therefore models trained on multi-step losses); predicted means were unaffected. `n_step=1` predictions, including
+those for timesteps with missing values or beyond the end of the data, were not affected.
+
+- `KalmanFilter`: multi-step covariances were computed from an unrelated timestep's update, so they depended on the
+  missingness pattern at the end of the series rather than growing correctly with the forecast horizon.
+- `ExpSmoother`: multi-step covariances did not grow with the forecast horizon (they stayed at the 1-step covariance).
+
+### Bug fix: covariance when forecasting from `initial_state`
+
+A covariance passed via `forward(initial_state=...)` -- typically from `Predictions.get_state_at_times()` -- was
+incorrectly re-scaled by the measurement standard-deviations (which are already baked into it). So continuing a
+forecast from a saved state started with an inflated covariance (by roughly the measurement variance: e.g. ~100x if
+measurement std-devs are ~10), which in turn distorted the predicted means via the kalman gain. `simulate()` with
+`num_groups` was affected for the same reason. The error is negligible when measurement std-devs are close to 1 (e.g.
+standardized data). Now only the default initial covariance (when no covariance is passed) is scaled.
+
+### Bug fix: EKF linearization of the sigmoid (`BinomialFilter`)
+
+The EKF jacobian of the sigmoid measure-function was evaluated at the post-sigmoid value -- `sigmoid'(sigmoid(z))`
+rather than `sigmoid'(z)`. Since `sigmoid(z)` is in (0, 1), that derivative was always ~0.20-0.25, whereas the
+correct one approaches 0 for probabilities near 0 or 1; so updates for extreme probabilities were too large. This
+changes the predictions of `BinomialFilter` models (and any model with a sigmoid `measure_fun`). In simulations the
+effect on held-out likelihood was negligible with the default `do_post_hoc_correction=True`.
+
+To compare against the previous behavior: `my_model.measure_funs['my_measure'].legacy_jacobian = True`. Models
+pickled with an earlier version keep the previous behavior automatically when loaded (models created with this
+version don't). `legacy_jacobian` will be removed in a future version.
+
+### Other bug fixes
+
+- Adaptive scaling (`adaptive_scaling=True`) raised an `IndexError` when a measure without a measure-variance (e.g. a
+  binary measure in `BinomialFilter`) was listed before one with a measure-variance.
+- `Predictions.covs` for nonlinear models now warns (once) that no closed-form covariance is available; previously the
+  warning never fired.
+
+## v1.1.2 (2026-06-08)
 
 ### New Features
 
