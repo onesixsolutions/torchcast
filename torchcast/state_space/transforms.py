@@ -203,8 +203,8 @@ class SmearingTransform(Transform):
             residuals, weights = residuals[order], weights[order]
             cdf = weights.cumsum(0) - weights / 2
             probs = (np.arange(num_nodes) + .5) / num_nodes
-            residuals = torch.as_tensor(np.interp(probs, cdf.numpy(), residuals.numpy()))
-            weights = torch.full((num_nodes,), 1 / num_nodes, dtype=torch.float64)
+            residuals = torch.as_tensor(np.interp(probs, cdf.cpu().numpy(), residuals.cpu().numpy()), device=residuals.device)
+            weights = torch.full((num_nodes,), 1 / num_nodes, dtype=torch.float64, device=residuals.device)
         self.register_buffer('residuals', residuals.to(torch.get_default_dtype()))
         self.register_buffer('weights', weights.to(torch.get_default_dtype()))
 
