@@ -847,9 +847,9 @@ def test_joseph_form_option():
     calls = {}
 
     def record(name, fun):
-        def wrapped(cov, *args, **kwargs):
-            calls.setdefault(name, set()).add(cov.shape[0])
-            return fun(cov, *args, **kwargs)
+        def wrapped(cov, K, *args, **kwargs):
+            calls.setdefault(name, set()).add(K.shape[:-2].numel())  # (number of combos x groups)
+            return fun(cov, K, *args, **kwargs)
         return wrapped
 
     kf._covariance_update = record('joseph', KalmanFilter._covariance_update)
@@ -872,3 +872,36 @@ def test_joseph_form_option():
     del kf.joseph_form, kf.mixture.joseph_form
     kf(_make_y(num_measures=2))
     assert calls == {'joseph': {12}}
+
+
+@torch.no_grad()
+def test_kalman_update_broadcasts():
+    """
+    `_kalman_update` with a leading (combo) batch-dimension on some tensors, broadcasting against the others, is the same
+    as running it for each slice separately. (In particular, `measured_cov` -- `(G, S, M)` -- has one fewer dim than
+    `system_cov` -- `(E, G, M, M)`; when its (transposed) shape happens to equal `(E, G, M)`, i.e. E == G == M == S,
+    as here, `torch.linalg.solve` would silently read it as a batch of vectors unless the batch-dims are broadcast
+    first.)
+    """
+    torch.manual_seed(0)
+    kf = _make_kf(['y1', 'y2'], ['y1'])
+    E, G, S, M = 2, 2, 2, 2
+    A = torch.randn(G, S, S)
+    cov = A @ A.transpose(-1, -2) + torch.eye(S)
+    mean, H = torch.randn(G, S), torch.randn(G, M, S)
+    measure_cov = torch.eye(M) * .3 + torch.diag_embed(torch.rand(E, 1, M))  # (E, 1, M, M)
+    input = torch.randn(E, G, M)
+    measured_cov = cov @ H.transpose(-1, -2)
+    for joseph in (True, False):
+        batched = kf._kalman_update(
+            input=input, mean=mean, cov=cov, measured_mean=mean[:, :M], measure_mat=H, measure_cov=measure_cov,
+            measured_cov=measured_cov, system_cov=H @ measured_cov + measure_cov, joseph=joseph
+        )
+        assert batched.mean.shape == (E, G, S) and batched.cov.shape == (E, G, S, S)
+        for e in range(E):
+            single = kf._kalman_update(
+                input=input[e], mean=mean, cov=cov, measured_mean=mean[:, :M], measure_mat=H,
+                measure_cov=measure_cov[e].expand(G, M, M), joseph=joseph
+            )
+            assert torch.allclose(batched.mean[e], single.mean, atol=1e-5)
+            assert torch.allclose(batched.cov[e], single.cov, atol=1e-5)

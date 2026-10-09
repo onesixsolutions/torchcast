@@ -150,10 +150,13 @@ class KalmanFilter(StateSpaceModel):
         passed if already computed. ``joseph=False`` uses the simpler covariance update ``P - K @ H @ P`` instead of
         the Joseph form: less memory and compute, but less numerically robust. Defaults to the model's
         ``joseph_form`` (the Joseph form, if not set).
+
+        The tensors can have any number of leading batch-dimensions (``(G, ...)`` as usual, or e.g. ``(E, G, ...)``
+        for the mixture update's regime-combos), and broadcast against each other.
         """
         resid = input - measured_mean
         if measured_cov is None:
-            measured_cov = cov @ measure_mat.permute(0, 2, 1)
+            measured_cov = cov @ measure_mat.transpose(-1, -2)
         if system_cov is None:
             system_cov = measure_mat @ measured_cov + measure_cov
         K = self._kalman_gain(measured_cov=measured_cov, system_cov=system_cov)
@@ -216,28 +219,21 @@ class KalmanFilter(StateSpaceModel):
         score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
         # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
-        # updated in one batch: stack them along the group dimension.
-        num_effective = len(effective)
+        # updated together, along a leading combo-dimension; tensors that don't depend on the combo broadcast.
         offsets = [self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective]
         shift = torch.stack([o[0] for o in offsets]).unsqueeze(1)  # (num_effective, 1, num_measures)
         extra_cov = torch.diag_embed(torch.stack([o[1] for o in offsets])).unsqueeze(1)  # (num_effective, 1, M, M)
-
-        def batched(x: torch.Tensor) -> torch.Tensor:
-            return x.unsqueeze(0).expand(num_effective, *x.shape)
-
-        measured_cov = cov @ measure_mat.permute(0, 2, 1)
-        system_cov = batched(measure_mat @ measured_cov + measure_cov) + extra_cov  # (num_effective, G, M, M)
-        input_e = batched(input) - shift
-        flat = lambda x: x.reshape(num_effective * num_groups, *x.shape[2:])  # noqa: E731
+        measured_cov = cov @ measure_mat.transpose(-1, -2)
+        system_cov = measure_mat @ measured_cov + measure_cov + extra_cov  # (num_effective, G, M, M)
         update_kwargs = dict(
-            input=flat(input_e),
-            mean=flat(batched(mean)),
-            cov=flat(batched(cov)),
-            measured_mean=flat(batched(measured_mean)),
-            measure_mat=flat(batched(measure_mat)),
-            measure_cov=flat(batched(measure_cov) + extra_cov),
-            measured_cov=flat(batched(measured_cov)),
-            system_cov=flat(system_cov),
+            input=input - shift,
+            mean=mean,
+            cov=cov,
+            measured_mean=measured_mean,
+            measure_mat=measure_mat,
+            measure_cov=measure_cov + extra_cov,
+            measured_cov=measured_cov,
+            system_cov=system_cov,
         )
         # the standard combo (the first) uses the model's covariance-update; the others, the mixture's:
         standard_joseph = getattr(self, 'joseph_form', True)
@@ -245,23 +241,24 @@ class KalmanFilter(StateSpaceModel):
         if standard_joseph == mixture_joseph:
             states = self._kalman_update(**update_kwargs, joseph=standard_joseph)
         else:
-            standard = self._kalman_update(**{k: v[:num_groups] for k, v in update_kwargs.items()},
-                                           joseph=standard_joseph)
-            others = self._kalman_update(**{k: v[num_groups:] for k, v in update_kwargs.items()},
-                                         joseph=mixture_joseph)
+            def combos(idx: slice) -> dict:
+                combo_dependent = ('input', 'measure_cov', 'system_cov')
+                return {k: (v[idx] if k in combo_dependent else v) for k, v in update_kwargs.items()}
+
+            standard = self._kalman_update(**combos(slice(0, 1)), joseph=standard_joseph)
+            others = self._kalman_update(**combos(slice(1, None)), joseph=mixture_joseph)
             states = StateTuple(torch.cat([standard.mean, others.mean]), torch.cat([standard.cov, others.cov]))
-        resid = (input_e - measured_mean)[..., score_idx]
         log_liks = mvnorm_log_prob(
-            resid=flat(resid),
-            cov=flat(system_cov[..., score_idx.unsqueeze(-1), score_idx.unsqueeze(0)])
-        ).view(num_effective, num_groups).T  # (G, num_effective)
+            resid=(input - shift - measured_mean)[..., score_idx],
+            cov=system_cov[..., score_idx.unsqueeze(-1), score_idx.unsqueeze(0)]
+        ).T  # (G, num_effective)
 
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + log_liks[:, mapping]
         regime_post = torch.softmax(log_post, -1)
         return self._mix_updates(
-            means=states.mean.view(num_effective, num_groups, mean.shape[-1]),
-            covs=states.cov.view(num_effective, num_groups, *cov.shape[1:]),
+            means=states.mean,
+            covs=states.cov,
             regime_post=regime_post,
             mapping=mapping,
         )
@@ -292,21 +289,24 @@ class KalmanFilter(StateSpaceModel):
 
     @staticmethod
     def _covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-        I = torch.eye(cov.shape[1], dtype=cov.dtype, device=cov.device).unsqueeze(0)
+        I = torch.eye(cov.shape[-1], dtype=cov.dtype, device=cov.device)
         ikh = I - K @ H
-        return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
+        return ikh @ cov @ ikh.transpose(-1, -2) + K @ R @ K.transpose(-1, -2)
 
     @staticmethod
     def _simple_covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
         new_cov = cov - K @ (H @ cov)
-        return .5 * (new_cov + new_cov.permute(0, 2, 1))  # (symmetric in exact arithmetic)
+        return .5 * (new_cov + new_cov.transpose(-1, -2))  # (symmetric in exact arithmetic)
 
     @staticmethod
     def _kalman_gain(measured_cov: torch.Tensor, system_cov: torch.Tensor) -> torch.Tensor:
-        A = system_cov.permute(0, 2, 1)
-        B = measured_cov.permute(0, 2, 1)
-        Kt = torch.linalg.solve(A, B)
-        K = Kt.permute(0, 2, 1)
+        A = system_cov.transpose(-1, -2)
+        B = measured_cov.transpose(-1, -2)
+        # (broadcast the batch-dims explicitly: if B had one fewer dim than A, `solve` would treat it as a batch of
+        # vectors rather than of matrices)
+        batch_shape = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+        Kt = torch.linalg.solve(A.expand(*batch_shape, *A.shape[-2:]), B.expand(*batch_shape, *B.shape[-2:]))
+        K = Kt.transpose(-1, -2)
         return K
 
     def _parse_kwargs(self,
