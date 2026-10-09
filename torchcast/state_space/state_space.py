@@ -635,7 +635,8 @@ class StateSpaceModel(torch.nn.Module):
                     out[nm] = mat[m2d]
         return out
 
-    def _update_step(self,
+    @classmethod
+    def _update_step(cls,
                      input: torch.Tensor,
                      mean: torch.Tensor,
                      cov: torch.Tensor,

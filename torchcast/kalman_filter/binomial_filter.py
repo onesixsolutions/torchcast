@@ -345,6 +345,8 @@ class BinomialFilter(KalmanFilter):
 
 
 class BinomialPredictions(Predictions):
+    exact_joint = True
+
     def __init__(self,
                  measurement_model: 'MeasurementModel',
                  states: tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]],
@@ -447,34 +449,51 @@ class BinomialPredictions(Predictions):
         gaussian_measures = [m for m in measurement_model.measures if m not in self.binary_measures]
         group_idx = torch.arange(obs.shape[0], dtype=torch.long)
 
+        rao_blackwell_means = state_means
+        rao_blackwell_covs = state_covs
         if gauss_idx:
             gauss_idx = torch.as_tensor(gauss_idx, dtype=torch.long)
             mask2d = torch.meshgrid(group_idx, gauss_idx, gauss_idx, indexing='ij')
+            gaussian_measurement_model = measurement_model.subset(measures=gaussian_measures)
+            gaussian_measure_cov = measure_cov[mask2d]
             gaussian_lp = super()._log_prob(
                 obs=obs[..., gauss_idx],
                 state_means=state_means,
                 state_covs=state_covs,
-                measure_cov=measure_cov[mask2d],
-                measurement_model=measurement_model.subset(measures=gaussian_measures),
+                measure_cov=gaussian_measure_cov,
+                measurement_model=gaussian_measurement_model,
                 **kwargs
             )
+
+            # rao backwell marginalization:
+            if len(binary_idx) and self.exact_joint:
+                _partial_mmean, _partial_mmat = gaussian_measurement_model(state_means)
+                rao_blackwell_means, rao_blackwell_covs = KalmanFilter._update_step(  # noqa
+                    input=obs[..., gauss_idx],
+                    mean=state_means,
+                    cov=state_covs,
+                    measured_mean=_partial_mmean,
+                    measure_mat=_partial_mmat,
+                    measure_cov=measure_cov[mask2d]
+                )
         else:
             gaussian_lp = 0
 
         if len(binary_idx):
             if num_obs is None:
                 raise RuntimeError("num_obs should be set because there are binary measures")
+
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model.subset(measures=binary_measures),
-                state_means=state_means,
-                state_covs=state_covs,
+                state_means=rao_blackwell_means,
+                state_covs=rao_blackwell_covs,
             )
             binom = Binomial(total_count=num_obs.unsqueeze(0), probs=mmean_samples, validate_args=False)
             _obs = obs[..., binary_idx]
             if not self.observed_counts:  # multiply by total_count b/c `obs` are props, but Binomial expects counts:
                 _obs = _obs * num_obs
             mc_log_probs = binom.log_prob(_obs.unsqueeze(0))
-            binary_lp = torch.sum(torch.logsumexp(mc_log_probs, dim=0), -1) - log(mc_log_probs.shape[0])
+            binary_lp = torch.logsumexp(mc_log_probs.sum(-1), dim=0) - log(mc_log_probs.shape[0])
         else:
             binary_lp = 0
 
@@ -541,7 +560,7 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
     if TOTAL_COUNT != 1:
         _kwargs['num_obs'] = TOTAL_COUNT
     preds = bf(
-        dataset.tensors[0],
+        y,
         start_offsets=dataset.start_offsets,
         **_kwargs,
     )
@@ -563,7 +582,10 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
                 + ggtitle(g)
         ).show()
     # preds._white_noise = torch.zeros((1, len(binary_measures)))
-    # print(preds.log_prob(y).mean())
+    print(preds.log_prob(y).mean())
+    # tensor(-1.3298, grad_fn=<MeanBackward0>)
+    # tensor(-1.3299, grad_fn=<MeanBackward0>)
+
     # with correction tensor(-1.3281, grad_fn=<MeanBackward0>)
 
 

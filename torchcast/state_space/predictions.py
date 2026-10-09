@@ -302,7 +302,7 @@ class Predictions:
         # if MAP is requested, monte-carlo only used for intervals
         measured_mean = None
         if use_map:
-            measured_mean, _ = self.measurement_model_flat(self.state_means_flat, time=0)
+            measured_mean, _ = self.measurement_model_flat(self.state_means_flat)
         elif self.mc_white_noise.num_samples < 1000:
             warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
 
@@ -321,7 +321,7 @@ class Predictions:
         return by_measure
 
     def _get_pred_intervals(self, alpha: float) -> dict[str, torch.Tensor]:
-        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat)
         system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
 
         batch_shape = self.state_means.shape[0:2]
@@ -415,7 +415,7 @@ class Predictions:
             measured_mean = torch.mean(mmean_samples, dim=0)
             return measured_mean.view(*batch_shape, -1), None
         else:
-            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+            measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat)
             system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
             return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
 
@@ -553,7 +553,7 @@ class Predictions:
             # this is a numerically stable way to do that:
             return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
         else:
-            measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
+            measured_mean, measure_mat = measurement_model(mean=state_means)
             system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
             return torch.distributions.MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
 

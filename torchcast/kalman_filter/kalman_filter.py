@@ -68,7 +68,8 @@ class KalmanFilter(StateSpaceModel):
         new_cov = update_tensor(cov, new=(F @ cov[mask] @ F.permute(0, 2, 1) + Q), mask=mask)
         return new_cov
 
-    def _update_step(self,
+    @classmethod
+    def _update_step(cls,
                      input: torch.Tensor,
                      mean: torch.Tensor,
                      cov: torch.Tensor,
@@ -77,11 +78,11 @@ class KalmanFilter(StateSpaceModel):
                      measure_cov: torch.Tensor,
                      **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         if kwargs:
-            raise TypeError(f"`{type(self).__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
+            raise TypeError(f"`{cls.__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
         resid = input - measured_mean
-        K = self._kalman_gain(cov=cov, H=measure_mat, R=measure_cov)
-        new_mean = self._mean_update(mean=mean, K=K, resid=resid)
-        new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
+        K = cls._kalman_gain(cov=cov, H=measure_mat, R=measure_cov)
+        new_mean = cls._mean_update(mean=mean, K=K, resid=resid)
+        new_cov = cls._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
         return new_mean, new_cov
 
     @staticmethod

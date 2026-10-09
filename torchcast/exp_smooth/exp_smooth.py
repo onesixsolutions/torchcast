@@ -84,7 +84,8 @@ class ExpSmoother(StateSpaceModel):
 
         return predict_kwargs, update_kwargs, used_keys
 
-    def _update_step(self,
+    @classmethod
+    def _update_step(cls,
                      input: torch.Tensor,
                      mean: torch.Tensor,
                      cov: torch.Tensor,
@@ -94,9 +95,9 @@ class ExpSmoother(StateSpaceModel):
                      K: torch.Tensor,
                      **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         if kwargs:
-            raise TypeError(f"`{type(self).__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
+            raise TypeError(f"`{cls.__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
         resid = input - measured_mean
-        new_mean = self._mean_update(mean=mean, K=K, resid=resid)
+        new_mean = cls._mean_update(mean=mean, K=K, resid=resid)
         # this method doesn't waste compute creating new_cov; then in predict below, cov will be replaced by cov1step
         new_cov = torch.tensor(0.0, dtype=mean.dtype, device=mean.device)
         return new_mean, new_cov

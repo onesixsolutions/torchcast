@@ -9,7 +9,6 @@ import torch
 
 from torchcast.internals.utils import normalize_index, compute_index_result_shape
 
-
 if TYPE_CHECKING:
     from torchcast.process import Process
 
@@ -47,8 +46,14 @@ class MeasurementModel(DesignModel):
 
     def __call__(self,
                  mean: torch.Tensor,
-                 time: int,
+                 time: Optional[int] = None,
                  ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        if time is None:
+            if self.num_timesteps > 1:
+                raise ValueError("Must provide ``time`` unless measurement-model has only one timestep (flattened).")
+            time = 0
+
         measure_mat = self._get_linear_measure_mat(time)
         measured_mean = (measure_mat @ mean.unsqueeze(-1)).squeeze(-1)
 
