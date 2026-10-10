@@ -53,8 +53,8 @@ def _make_model(variant: str = 'kf') -> KalmanFilter:
     if variant == 'group_cov':
         measure_covariance = Covariance.from_measures(
             ['y1', 'y2'],
-            predict_variance=torch.nn.Sequential(torch.nn.Embedding(NUM_GROUPS, 2), torch.nn.Softplus()),
-            expected_kwargs=['group_ids'],
+            predict_std=torch.nn.Sequential(torch.nn.Embedding(NUM_GROUPS, 2), torch.nn.Softplus()),
+            predictor_kwargs=['group_ids'],
         )
     model = KalmanFilter(
         processes=processes,
@@ -180,13 +180,12 @@ def test_chunked_callable_kwargs():
 
 def test_subset_kwargs():
     num_groups, num_times = 6, 6  # equal, so shapes alone are ambiguous
-    model = _make_model()
-    model.measure_covariance.expected_kwargs = ['group_ids']
+    model = _make_model('group_cov')
     X = torch.randn(num_groups, num_times, 2)
     kwargs = {
         'X': X,  # ProcessKwarg -> always split
         'lm__X': X,  # per-process override of the same
-        'group_ids': torch.arange(num_groups),  # covariance kwarg -> split by shape
+        'group_ids': torch.arange(num_groups),  # covariance kwarg (group-indexed) -> always split
         'other': torch.arange(num_times),  # unknown -> never split, though its first dim equals num_groups
         'initial_state': (torch.zeros(num_groups, 5), torch.eye(5).unsqueeze(0)),  # cov broadcasts over groups
     }

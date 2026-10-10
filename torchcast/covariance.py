@@ -3,15 +3,15 @@ import math
 import sys
 import types
 
-from typing import List, Optional, Sequence, Dict, Union, Collection
+from typing import Any, List, Mapping, Optional, Sequence, Set, Dict, Tuple, Union, Collection
 from warnings import warn
 
 import torch
 from torch import Tensor, nn, jit
 from torch.nn import functional as F
 
-from torchcast.process.utils import Identity
-from torchcast.internals.utils import is_near_zero, validate_gt_shape
+from torchcast.process.utils import Identity, ProcessKwarg
+from torchcast.internals.utils import is_near_zero
 from torchcast.process.process import Process
 
 DEFAULT_MCOV_MULTI = 1.0
@@ -29,8 +29,19 @@ _METHOD_PARAMS = {
 class Covariance(nn.Module):
     """
     The :class:`.Covariance` can be used when you'd like more control over the covariance specification of a state-
-    space model. For example, if you're training on diverse time-serieses that vary in scale/behavior, you could use an
-    :class:`torch.nn.Embedding` to predict the variance of each series, with the group-ids as predictors:
+    space model. The covariance can be *predicted*, varying by group and/or time:
+
+    - ``predict_std``: a module whose output (strictly positive, e.g. via a softplus) multiplies each element's
+      std-deviation. E.g. if you're training on diverse time-serieses that vary in scale, you could use an
+      :class:`torch.nn.Embedding` with the group-ids as predictors.
+    - ``predict_corr``: a module whose output is *added* to the unconstrained correlation-parameters
+      (``corr_unconstrained``, see ``method='sd_corr'``), so correlations can vary too. Its output has one column per
+      pair of elements, in the order given by :func:`Covariance.off_diag_idx`. Initializing it to output zeros starts
+      it at the base correlations.
+
+    The modules are called with the ``predictor_kwargs``, which you pass to the model's ``forward()`` (and ``fit()``).
+    Their outputs have shape ``(num_groups, num_times, ...)``, or ``(num_groups, ...)`` if they only vary by group.
+    For example, a measurement-covariance whose std-devs vary by group and correlations vary by season:
 
     .. code-block:: python3
 
@@ -39,44 +50,38 @@ class Covariance(nn.Module):
             processes=processes,
             measure_covariance=Covariance.from_measures(
                 measures,
-                predict_variance=torch.nn.Sequential(
-                    torch.nn.Embedding(len(group_ids), len(measures), padding_idx=0),
+                predict_std=torch.nn.Sequential(
+                    torch.nn.Embedding(num_groups, len(measures)),
                     torch.nn.Softplus()
                 ),
-                expected_kwargs=['group_ids']
-            ),
-            process_covariance=Covariance.from_processes(
-                processes,
-                predict_variance=torch.nn.Sequential(
-                    torch.nn.Embedding(len(group_ids), Covariance.from_processes(processes).param_rank, padding_idx=0),
-                    torch.nn.Softplus()
-                ),
-                expected_kwargs=['group_ids']
+                predict_corr=SeasonalCorrelation(...),  # e.g. a linear model of fourier features
+                predictor_kwargs=['group_ids', 'season_X']
             )
         )
+        kf.fit(y, group_ids=group_ids, season_X=season_X)
 
+    Here both modules receive both kwargs (``module(group_ids, season_X)``): wrap a module to ignore what it doesn't
+    need. A kwarg named ``{id}__{name}`` (e.g. ``measure_covariance__season_X``) overrides ``name`` for this
+    covariance.
     """
 
     @classmethod
     def from_processes(cls,
                        processes: Sequence[Process],
                        cov_type: str = 'process',
-                       predict_variance: Union[bool, nn.Module] = None,
+                       predict_variance: Union[bool, nn.Module, None] = None,
                        **kwargs) -> 'Covariance':
         """
         :param processes: The ``processes`` used in your :class:`.StateSpaceModel`.
         :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process').
-        :param predict_variance: Will the variance be predicted upon calling ``forward()``? This is implemented as a
-         multiplier on the base variance given from the 'method'. You can either pass ``True`` in which case it is
-         expected you will pass multipliers as 'process_var_multi' when ``forward()`` is called; *or* you can pass a
-         :class:`torch.nn.Module` that will predict the multipliers, in which case you'll pass input(s) to this
-         module at forward. Either way please note these should output strictly positive values with shape
-         ``(num_groups, num_times, self.param_rank)``.
-        :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
+        :param predict_variance: Deprecated, use ``predict_std``.
+        :param kwargs: Other arguments passed to :func:`Covariance.__init__`, e.g. ``predict_std``,
+         ``predict_corr``, ``predictor_kwargs``. Note that the outputs of a ``predict_std`` module have
+         ``param_rank`` columns, i.e. one for each state-element with a variance (not ``empty_idx``).
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
-
-        assert cov_type in {'process', 'initial'}
+        if cov_type not in {'initial', 'process'}:
+            raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
         state_rank = 0
         no_cov_idx = []
         for p in processes:
@@ -88,37 +93,20 @@ class Covariance(nn.Module):
 
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
+        _deprecated_predict_variance(predict_variance, kwargs, default_kwarg=f'{cov_type}_var_multi')
 
-        if cov_type not in {'initial', 'process'}:
-            raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
-
-        if predict_variance is True:
-            predict_variance = Identity()
-            if 'expected_kwargs' not in kwargs:
-                kwargs['expected_kwargs'] = [f'{cov_type}_var_multi']
-
-        return cls(
-            rank=state_rank,
-            empty_idx=no_cov_idx,
-            id=f'{cov_type}_covariance',
-            predict_variance=predict_variance,
-            **kwargs
-        )
+        return cls(rank=state_rank, empty_idx=no_cov_idx, id=f'{cov_type}_covariance', **kwargs)
 
     @classmethod
     def from_measures(cls,
                       measures: Sequence[str],
-                      predict_variance: Union[bool, nn.Module] = None,
+                      predict_variance: Union[bool, nn.Module, None] = None,
                       **kwargs) -> 'Covariance':
         """
         :param measures: The ``measures`` used in your :class:`.StateSpaceModel`.
-        :param predict_variance: Will the variance be predicted upon calling ``forward()``? This is implemented as a
-         multiplier on the base variance given from the 'method'. You can either pass ``True`` in which case it is
-         expected you will pass multipliers as 'measure_var_multi' when ``forward()`` is called; *or* you can pass a
-         :class:`torch.nn.Module` that will predict the multipliers, in which case you'll pass input(s) to this
-         module at forward. Either way please note these should output strictly positive values with shape
-         ``(num_groups, num_times, len(measures))``.
-        :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
+        :param predict_variance: Deprecated, use ``predict_std``.
+        :param kwargs: Other arguments passed to :func:`Covariance.__init__`, e.g. ``predict_std``,
+         ``predict_corr``, ``predictor_kwargs``.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
         if isinstance(measures, str):
@@ -127,26 +115,28 @@ class Covariance(nn.Module):
         elif not isinstance(measures[0], str):
             # not good duck-typing, but too easy to accidentally pass dataset.measures instead of dataset.measures[0]
             raise RuntimeError(f"`measures[0]` is {type(measures[0])}, expected str")
-        if 'method' not in kwargs and len(measures) > 5:
-            kwargs['method'] = 'low_rank'
+        if 'method' not in kwargs:
+            if kwargs.get('predict_corr') is not None:
+                kwargs['method'] = 'sd_corr'
+            elif len(measures) > 5:
+                kwargs['method'] = 'low_rank'
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
+        _deprecated_predict_variance(predict_variance, kwargs, default_kwarg='measure_var_multi')
 
-        if predict_variance is True:
-            predict_variance = Identity()
-            if 'expected_kwargs' not in kwargs:
-                kwargs['expected_kwargs'] = [f'measure_var_multi']
-
-        return cls(rank=len(measures), id='measure_covariance', predict_variance=predict_variance, **kwargs)
+        return cls(rank=len(measures), id='measure_covariance', **kwargs)
 
     def __init__(self,
                  rank: int,
                  init_diag_multi: float,
-                 method: str = 'log_cholesky',
+                 method: Optional[str] = None,
                  empty_idx: List[int] = (),
+                 predict_std: Optional[nn.Module] = None,
+                 predict_corr: Optional[nn.Module] = None,
+                 predictor_kwargs: Sequence[Union[str, ProcessKwarg]] = (),
+                 id: Optional[str] = None,
                  predict_variance: Optional[nn.Module] = None,
-                 expected_kwargs: Optional[Sequence[str]] = None,
-                 id: Optional[str] = None):
+                 expected_kwargs: Optional[Sequence[str]] = None):
         """
         You should rarely call this directly. Instead, call :func:`Covariance.from_measures` and
         :func:`Covariance.from_processes`.
@@ -154,7 +144,8 @@ class Covariance(nn.Module):
         :param rank: The number of elements along the diagonal.
         :param init_diag_multi: A float that will be applied as a multiplier to the initial values along the diagonal.
          This can be useful to provide intelligent starting-values to speed up optimization.
-        :param method: The parameterization for the covariance. The default, "log_cholesky", parameterizes the
+        :param method: The parameterization for the covariance. The default, "log_cholesky" (or "sd_corr" if
+         ``predict_corr`` is passed), parameterizes the
          covariance using the cholesky factorization (which is itself split into two tensors: the log-transformed
          diagonal elements and the off-diagonal). The other currently supported option is "low_rank", which
          parameterizes the covariance with two tensors: (a) the log-transformed std-deviations, and (b) a 'low rank'
@@ -171,14 +162,37 @@ class Covariance(nn.Module):
          ``i`` is uncorrelated with all others when every entry in its row *and* column is zero. Existing modules
          can be converted with :func:`Covariance.to_method`.
         :param empty_idx: In some cases (e.g. process-covariance) we will have some elements with no variance.
-        :param predict_variance: For predicting variance, see :func:`Covariance.from_measures`.
-        :param expected_kwargs: If ``predict_variance`` is set, this allows you to set the keyword that will be passed
-         at ``forward()``.
+        :param predict_std: A module predicting (strictly positive) multipliers on the std-devs, with ``param_rank``
+         columns. See the class docstring.
+        :param predict_corr: A module predicting additive adjustments to ``corr_unconstrained``, with
+         ``param_rank * (param_rank - 1) / 2`` columns. Requires ``method='sd_corr'``. See the class docstring.
+        :param predictor_kwargs: The names of the keyword-arguments passed to the model's ``forward()`` that are
+         inputs to ``predict_std``/``predict_corr``. A string is a tensor whose first dimension is the group (e.g.
+         ``group_ids``, or a ``(num_groups, num_times, ...)`` tensor), which ``fit(chunk_size=...)`` splits into
+         chunks; for inputs that aren't group-indexed, pass ``ProcessKwarg(name, is_group_time_tensor=False)``.
         :param id: Identifier for this covariance. Typically left ``None`` and set when passed to the
          :class:`.StateSpaceModel`.
+        :param predict_variance: Deprecated, use ``predict_std``.
+        :param expected_kwargs: Deprecated, use ``predictor_kwargs``.
         """
 
         super().__init__()
+
+        if predict_variance is not None:
+            warn("``predict_variance`` is deprecated, use ``predict_std``.", DeprecationWarning, stacklevel=2)
+            if predict_std is not None:
+                raise TypeError("Pass ``predict_std`` or ``predict_variance`` (deprecated), not both.")
+            predict_std = predict_variance
+        if expected_kwargs is not None:
+            warn("``expected_kwargs`` is deprecated, use ``predictor_kwargs``.", DeprecationWarning, stacklevel=2)
+            if predictor_kwargs:
+                raise TypeError("Pass ``predictor_kwargs`` or ``expected_kwargs`` (deprecated), not both.")
+            predictor_kwargs = expected_kwargs
+
+        if method is None:
+            method = 'sd_corr' if predict_corr is not None else 'log_cholesky'
+        if predict_corr is not None and method != 'sd_corr':
+            raise ValueError(f"``predict_corr`` requires ``method='sd_corr'`` (got '{method}').")
 
         self.id = id
         self.rank = rank
@@ -191,13 +205,40 @@ class Covariance(nn.Module):
 
         self._set_params(method, init_diag_multi)
 
-        self.var_predict_module = predict_variance
+        self.predict_std = predict_std
+        self.predict_corr = predict_corr
+        if isinstance(predictor_kwargs, (str, ProcessKwarg)):
+            predictor_kwargs = [predictor_kwargs]
+        self.predictor_kwargs: List[ProcessKwarg] = [
+            k if isinstance(k, ProcessKwarg) else ProcessKwarg(name=k, is_group_time_tensor=True)
+            for k in predictor_kwargs
+        ]
+        if (predict_std is not None or predict_corr is not None) and not self.predictor_kwargs:
+            raise ValueError("Please specify ``predictor_kwargs`` if passing ``predict_std`` or ``predict_corr``.")
+        if self.predictor_kwargs and predict_std is None and predict_corr is None:
+            raise ValueError("``predictor_kwargs`` were passed, but no ``predict_std`` or ``predict_corr``.")
 
-        if self.var_predict_module and expected_kwargs is None:
-            raise ValueError("Please explicitly specify ``expected_kwargs`` if passing ``predict_variance``.")
-        if isinstance(expected_kwargs, str):
-            expected_kwargs = [expected_kwargs]
-        self.expected_kwargs: Optional[List[str]] = None if expected_kwargs is None else list(expected_kwargs)
+    @property
+    def expected_kwargs(self) -> Optional[List[str]]:
+        warn("``expected_kwargs`` is deprecated, use ``predictor_kwargs``.", DeprecationWarning, stacklevel=2)
+        return [k.name for k in self.predictor_kwargs] or None
+
+    @property
+    def is_predicted(self) -> bool:
+        return self.predict_std is not None or self.predict_corr is not None
+
+    def __setstate__(self, state: dict):
+        # unpickling a module saved by an older version (``var_predict_module``, ``expected_kwargs``):
+        modules = state.get('_modules', {})
+        if 'var_predict_module' in modules:
+            modules['predict_std'] = modules.pop('var_predict_module')
+        modules.setdefault('predict_std', None)
+        modules.setdefault('predict_corr', None)
+        if 'predictor_kwargs' not in state:
+            state['predictor_kwargs'] = [
+                ProcessKwarg(name=k, is_group_time_tensor=True) for k in (state.pop('expected_kwargs', None) or [])
+            ]
+        super().__setstate__(state)
 
     @property
     def non_empty_idx(self) -> List[int]:
@@ -237,6 +278,9 @@ class Covariance(nn.Module):
                               error_msgs):
         # a state-dict saved with a different ``method`` would otherwise fail with a generic missing/unexpected-keys
         # error (or, for ``log_std_devs``, which 'low_rank' and 'sd_corr' share, partially load):
+        # (older versions called ``predict_std`` ``var_predict_module``:)
+        for k in [k for k in state_dict if k.startswith(f'{prefix}var_predict_module.')]:
+            state_dict[k.replace(f'{prefix}var_predict_module.', f'{prefix}predict_std.', 1)] = state_dict.pop(k)
         present = {k[len(prefix):] for k in state_dict if k.startswith(prefix)}
         expected = set(_METHOD_PARAMS.get(self.method, ()))
         if not expected <= present:
@@ -383,6 +427,8 @@ class Covariance(nn.Module):
         ``empty_idx``, ``predict_variance``) are carried over. Note that a model's state-dict saved after converting
         can only be loaded into a model created with the new ``method``.
         """
+        if self.predict_corr is not None and method != 'sd_corr':
+            raise ValueError(f"``predict_corr`` requires ``method='sd_corr'`` (got '{method}').")
         out = copy.deepcopy(self)
         out._set_params(method, init_diag_multi=1.0)
         return out.set_matrix_(self._get_mini_cov().detach())
@@ -423,28 +469,116 @@ class Covariance(nn.Module):
             raise ValueError("``i`` and ``j`` must be different elements.")
         return row * (row - 1) // 2 + col
 
+    def base_cov(self) -> Tensor:
+        """
+        The ``(rank, rank)`` covariance, before any ``predict_std`` / ``predict_corr``.
+        """
+        return self._embed(self._get_mini_cov())
+
+    def _embed(self, mini_cov: Tensor) -> Tensor:
+        if self.param_rank == self.rank:
+            return mini_cov
+        return self.mask @ mini_cov @ self.mask.t()
+
+    def get_predictor_inputs(self, kwargs: Mapping[str, Any]) -> Tuple[List[Tensor], Set[str]]:
+        """
+        Pick out the inputs to ``predict_std`` / ``predict_corr`` from a model's ``forward()`` keyword-arguments.
+
+        :return: The inputs (in the order of ``predictor_kwargs``), and the set of keys that were used.
+        """
+        inputs, used = [], set()
+        for pkwarg in self.predictor_kwargs:
+            key = f'{self.id}__{pkwarg.name}'
+            if key not in kwargs:
+                key = pkwarg.name
+            if key not in kwargs:
+                raise TypeError(
+                    f"`{self.id}` expected a `{pkwarg.name}` (or `{self.id}__{pkwarg.name}`) keyword-argument."
+                )
+            inputs.append(kwargs[key])
+            used.add(key)
+        return inputs, used
+
+    def batch_cov(self, kwargs: Mapping[str, Any], num_groups: int, num_times: int) -> Tuple[Tensor, Set[str]]:
+        """
+        The covariance for a batch, given a model's ``forward()`` keyword-arguments (from which the
+        ``predictor_kwargs`` are picked out).
+
+        :return: A tensor with shape ``(G, T, rank, rank)``, where ``G`` is ``num_groups`` -- or 1, if the covariance
+         doesn't vary by group -- and ``T`` is ``num_times`` or 1 (see ``as_timestep_list()``); and the set of
+         keyword-arguments that were used.
+        """
+        if not self.is_predicted:
+            return self.base_cov()[None, None], set()
+        inputs, used = self.get_predictor_inputs(kwargs)
+        return self._predicted_cov(inputs, num_groups=num_groups, num_times=num_times), used
+
+    def _predicted_cov(self, inputs: Sequence[Tensor], num_groups: int, num_times: int) -> Tensor:
+        std_multi = corr_delta = None
+        if self.predict_std is not None:
+            std_multi = self._validate_prediction(
+                self.predict_std(*inputs), 'predict_std', self.param_rank, num_groups, num_times
+            )
+            if (std_multi < 0).any():
+                raise RuntimeError(f"{self.id}'s `predict_std` produced values <0; needs exp/softplus layer.")
+        if self.predict_corr is not None:
+            corr_delta = self._validate_prediction(
+                self.predict_corr(*inputs), 'predict_corr', num_off_diag(self.param_rank), num_groups, num_times
+            )
+
+        if corr_delta is None:
+            mini_cov = self._get_mini_cov() * std_multi.unsqueeze(-1) * std_multi.unsqueeze(-2)
+        else:
+            std = self.log_std_devs.exp()
+            if std_multi is not None:
+                std = std * std_multi
+            L = std.unsqueeze(-1) * corr_cholesky_from_unconstrained(
+                self.corr_unconstrained + corr_delta, rank=self.param_rank
+            )
+            mini_cov = L @ L.transpose(-1, -2)
+        return self._embed(mini_cov)
+
+    def _validate_prediction(self, pred: Tensor, name: str, num_cols: int, num_groups: int, num_times: int) -> Tensor:
+        """
+        Standardize a prediction to ``(G, T, num_cols)``, where ``G`` is ``num_groups`` or 1 and ``T`` is
+        ``num_times`` or 1.
+        """
+        if pred.shape[-1] != num_cols:
+            if pred.shape[-1] == 1:
+                pred = pred.expand(*pred.shape[:-1], num_cols)
+            else:
+                raise ValueError(f"`{self.id}`'s `{name}` should output {num_cols} columns, got shape {pred.shape}.")
+        if pred.ndim == 1:
+            pred = pred[None, None]
+        elif pred.ndim == 2:
+            pred = pred.unsqueeze(1)
+        if pred.ndim != 3 or pred.shape[0] not in (1, num_groups) or pred.shape[1] not in (1, num_times):
+            raise ValueError(
+                f"`{self.id}`'s `{name}` output should have shape (num_groups, num_times, {num_cols}) or "
+                f"(num_groups, {num_cols}), i.e. ({num_groups}, {num_times}, {num_cols}); got {tuple(pred.shape)}."
+            )
+        if torch.isnan(pred).any() or torch.isinf(pred).any():
+            raise RuntimeError(f"`{self.id}`'s `{name}` produced nans/infs")
+        return pred
+
     def forward(self,
-                inputs: Dict[str, Tensor],
-                num_groups: int,
-                num_times: int,
+                inputs: Optional[Dict[str, Tensor]] = None,
+                num_groups: int = 1,
+                num_times: int = 1,
                 _ignore_input: bool = False) -> Tensor:
-        mini_cov = self._get_mini_cov()
-        mini_cov = validate_gt_shape(
-            mini_cov, num_groups=num_groups, num_times=num_times, trailing_dim=[self.param_rank, self.param_rank]
-        )
-
-        if self.var_predict_module is not None and not _ignore_input:
-            pred = self.var_predict_module(*[inputs[x] for x in self.expected_kwargs])
-            if torch.isnan(pred).any() or torch.isinf(pred).any():
-                raise RuntimeError(f"{self.id}'s `predict_variance` produced nans/infs")
-            if (pred < 0).any():
-                raise RuntimeError(f"{self.id}'s `predict_variance` produced values <0; needs exp/softplus layer.")
-            pred = validate_gt_shape(pred, num_groups=num_groups, num_times=num_times, trailing_dim=[self.param_rank])
-            mini_cov = mini_cov * pred.unsqueeze(-2) * pred.unsqueeze(-1)
-
-        mask = self.mask.unsqueeze(0).unsqueeze(0)
-
-        return mask @ mini_cov @ mask.transpose(-1, -2)
+        """
+        :param inputs: A dictionary with the ``predictor_kwargs`` (if any).
+        :param num_groups: Number of groups.
+        :param num_times: Number of timesteps.
+        :return: A ``(num_groups, num_times, rank, rank)`` tensor. (The models use :func:`Covariance.batch_cov`,
+         which doesn't expand dimensions that don't vary.)
+        """
+        if self.is_predicted and not _ignore_input:
+            inputs, _ = self.get_predictor_inputs(inputs or {})
+            cov = self._predicted_cov(inputs, num_groups=num_groups, num_times=num_times)
+        else:
+            cov = self.base_cov()[None, None]
+        return cov.expand(num_groups, num_times, -1, -1)
 
 
 def num_off_diag(rank: int) -> int:
@@ -512,6 +646,19 @@ def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
             mask[r, c] = 1.
             c += 1
     return mask
+
+
+def _deprecated_predict_variance(predict_variance: Union[bool, nn.Module, None], kwargs: dict, default_kwarg: str):
+    if predict_variance is None:
+        return
+    warn("``predict_variance`` is deprecated, use ``predict_std``.", DeprecationWarning, stacklevel=3)
+    if 'predict_std' in kwargs:
+        raise TypeError("Pass ``predict_std`` or ``predict_variance`` (deprecated), not both.")
+    if predict_variance is True:
+        predict_variance = Identity()
+        if 'expected_kwargs' not in kwargs and 'predictor_kwargs' not in kwargs:
+            kwargs['predictor_kwargs'] = [default_kwarg]
+    kwargs['predict_std'] = predict_variance
 
 
 # backwards compat shim

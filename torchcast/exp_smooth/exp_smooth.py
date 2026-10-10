@@ -35,10 +35,10 @@ class ExpSmoother(StateSpaceModel):
             smoothing_matrix = SmoothingMatrix.from_measures_and_processes(measures=measures, processes=processes)
         self.smoothing_matrix = smoothing_matrix.set_id('smoothing_matrix')
 
-    def initial_covariance(self, inputs: dict, num_groups: int, num_times: int, _ignore_input: bool = False) -> Tensor:
+    def _default_initial_cov(self) -> Tensor:
         # initial covariance is always zero. this will be replaced by the 1-step covariance in the first call to predict
         m = list(self.processes.values())[0].initial_mean  # get a parameter, any parameter, to get device
-        return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=m.dtype, device=m.device)
+        return torch.zeros((1, self.state_rank, self.state_rank), dtype=m.dtype, device=m.device)
 
     def _mask_mats(self,
                    groups: torch.Tensor,

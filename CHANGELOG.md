@@ -128,6 +128,15 @@ A parameterization that separates scale from correlation: `diag(std) @ R @ diag(
 - Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
 - Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
 
+### New feature: predicted correlations; `Covariance` API cleanup
+
+A `Covariance` can now predict how *correlations* vary by group/time, not just variances: `Covariance(predict_corr=module)` adds the module's output to the unconstrained correlation-parameters (requires `method='sd_corr'`, which is the default when `predict_corr` is passed). E.g. in the air-quality example, the PM10/PM2.5 measurement-noise correlation is ~0.95 in summer but ~0.5 in spring (dust storms add coarse particles to PM10 only).
+
+- `predict_variance` is renamed `predict_std` (it always multiplied the std-devs), and `expected_kwargs` is renamed `predictor_kwargs`. The old names still work, with a `DeprecationWarning`, as do models saved by older versions (pickled, or state-dicts). `predictor_kwargs` are assumed to be group-indexed (first dimension = group), so `fit(chunk_size=...)` splits them; for one that isn't, pass `ProcessKwarg(name, is_group_time_tensor=False)`. As for processes, a kwarg named `{covariance_id}__{name}` (e.g. `measure_covariance__X`) overrides `name`.
+- Predictions that only vary by group (shape `(num_groups, ...)`) are no longer expanded over time inside the models, which is cheaper on the backward pass. The same goes for covariances without predictions.
+- `Covariance.base_cov()` returns the covariance before predictions; `Covariance.batch_cov(kwargs, num_groups, num_times)` is what the models use (it doesn't expand dimensions that don't vary). `forward()` is unchanged.
+- For `ExpSmoother` subclasses: the zero initial covariance is now provided by overriding `_default_initial_cov()`, rather than an `initial_covariance()` method.
+
 ## v1.1.3 (2026-10-07)
 
 ### Bug fix: covariance of `n_step > 1` predictions

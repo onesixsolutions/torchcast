@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian, mvnorm_from_hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
-from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
+from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, as_timestep_list
 from torchcast.covariance import Covariance
 from torchcast.state_space.newton import NewtonResult, newton_refine as _newton_refine
 from torchcast.process.regression import Process
@@ -196,11 +196,8 @@ class StateSpaceModel(torch.nn.Module):
             nan_groups = [None] * out_timesteps
         # # /
 
-        # todo: update Covariance class to make this less hacky:
-        mcov_kwargs = {}
-        if self.measure_covariance.expected_kwargs:
-            mcov_kwargs = {k: kwargs[k] for k in self.measure_covariance.expected_kwargs}
-        measure_covs = list(self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1))
+        measure_covs, mcov_keys = self.measure_covariance.batch_cov(kwargs, num_groups, out_timesteps)
+        measure_covs = as_timestep_list(measure_covs, num_groups, out_timesteps)
 
         # the adaptive-scaler's state, and the multiplier for the first step: continued from `initial_state` if it
         # carries them (e.g. from `get_state_at_times()`), otherwise fresh.
@@ -221,7 +218,7 @@ class StateSpaceModel(torch.nn.Module):
             measure_covs=measure_covs,
             **kwargs
         )
-        used_keys.update(mcov_kwargs)
+        used_keys.update(mcov_keys)
 
         transition_model = TransitionModel(
             processes=self.processes,
@@ -901,6 +898,11 @@ class StateSpaceModel(torch.nn.Module):
             for component in self.mixture.components:
                 if getattr(component, 'predictors', None):
                     out |= {component.kwarg_name, f'{component.id}__{component.kwarg_name}'}
+        for module in self.modules():
+            if isinstance(module, Covariance):
+                for pkwarg in module.predictor_kwargs:
+                    if pkwarg.is_group_time_tensor:
+                        out |= {pkwarg.name, f'{module.id}__{pkwarg.name}'}
         return out
 
     def _subset_kwargs(self, kwargs: dict, group_slice: Union[slice, torch.Tensor], num_groups: int) -> dict:
@@ -908,19 +910,10 @@ class StateSpaceModel(torch.nn.Module):
         Subset forward-kwargs to a chunk of groups (see ``fit(chunk_size=...)``).
         """
         group_kwargs = self._group_kwarg_names()
-        # todo: ``Covariance.expected_kwargs`` don't declare which are group-indexed (e.g. ``group_ids`` is, but in
-        #  general they're whatever the ``predict_variance`` module takes), so we infer it from their shape. Make this
-        #  explicit in the planned ``Covariance`` refactor.
-        cov_kwargs = set()
-        for module in self.modules():
-            cov_kwargs.update(getattr(module, 'expected_kwargs', None) or [])
-
         out = {}
         for k, v in kwargs.items():
             if k in group_kwargs:
                 out[k] = _subset_groups(v, group_slice, num_groups, strict=True, name=k)
-            elif k in cov_kwargs:
-                out[k] = _subset_groups(v, group_slice, num_groups)
             else:
                 out[k] = v
         return out
@@ -1179,11 +1172,11 @@ class StateSpaceModel(torch.nn.Module):
     def _default_initial_cov(self) -> torch.Tensor:
         # the initial covariance is parameterized relative to the measure-scale. note this scaling only applies to the
         # default: a user-supplied cov (e.g. from ``get_state_at_times()``) is already on the right scale.
-        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        init_cov = self.initial_covariance.base_cov().unsqueeze(0)
         return self._apply_cov_scaling(init_cov, scaling=self._get_measure_scaling(), is_process_cov=True)
 
     def _get_measure_scaling(self) -> torch.Tensor:
-        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+        mcov = self.measure_covariance.base_cov()
         # need unbind->modify->stack to avoid modified-inplace error
         measure_diag = list(mcov.diagonal(dim1=-2, dim2=-1).unbind(0))
         # replace 0 with 1 in empties:

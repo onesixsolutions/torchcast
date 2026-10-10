@@ -1,4 +1,6 @@
+import copy
 import math
+from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
@@ -8,7 +10,8 @@ import torch
 from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag
 from torchcast.kalman_filter import BinomialFilter, KalmanFilter
 from torchcast.process import LocalLevel
-from torchcast.process.utils import Identity
+from torchcast.internals.utils import as_timestep_list
+from torchcast.process.utils import Identity, ProcessKwarg
 
 
 @torch.no_grad()
@@ -92,7 +95,7 @@ def test_sd_corr_empty_idx(predict: bool):
 
     kwargs = {}
     if predict:
-        kwargs = {'predict_variance': Identity(), 'expected_kwargs': ['multi']}
+        kwargs = {'predict_std': Identity(), 'predictor_kwargs': ['multi']}
     lc = Covariance.from_matrix(cov, method='log_cholesky', empty_idx=empty_idx, **kwargs)
     sc = Covariance.from_matrix(cov, method='sd_corr', empty_idx=empty_idx, **kwargs)
     inputs = {'multi': torch.rand(2, 4, len(non_empty)) + .5} if predict else {}
@@ -281,3 +284,219 @@ def test_binomial_filter_accepts_covariance():
         measure_covariance=Covariance(rank=2, empty_idx=[0], init_diag_multi=1., method='sd_corr')
     )
     assert bf.measure_covariance.method == 'sd_corr'
+
+
+class _Linear(torch.nn.Module):
+    """A linear model of the predictors, zero-initialized (so it starts at the base covariance)."""
+
+    def __init__(self, num_in: int, num_out: int, positive: bool = False):
+        super().__init__()
+        self.linear = torch.nn.Linear(num_in, num_out, bias=False)
+        torch.nn.init.zeros_(self.linear.weight)
+        self.positive = positive
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        out = self.linear(X)
+        return out.exp() if self.positive else out
+
+
+def _cov_with_u(module: Covariance, u: torch.Tensor, std_multi: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The covariance ``module`` would have with ``corr_unconstrained=u`` (and std-devs multiplied by ``std_multi``)."""
+    out = module.to_method('sd_corr')
+    out.predict_corr = out.predict_std = None
+    out.predictor_kwargs = []
+    with torch.no_grad():
+        out.corr_unconstrained.copy_(u)
+        if std_multi is not None:
+            out.log_std_devs.add_(std_multi.log())
+    return out.base_cov()
+
+
+@torch.no_grad()
+def test_predict_std():
+    module = Covariance(rank=3, init_diag_multi=1., method='sd_corr', predict_std=Identity(), predictor_kwargs=['m'])
+    m = torch.rand(2, 4, 3) + .5
+    _assert_close(module({'m': m}, 2, 4), module.base_cov() * m.unsqueeze(-1) * m.unsqueeze(-2))
+    with pytest.raises(RuntimeError, match='<0'):
+        module({'m': -m}, 2, 4)
+    with pytest.raises(ValueError, match='3 columns'):
+        module({'m': m[..., :2]}, 2, 4)
+
+
+@torch.no_grad()
+def test_predict_corr():
+    rank, empty_idx = 4, [1]
+    module = Covariance(
+        rank=rank, empty_idx=empty_idx, init_diag_multi=1., predict_corr=Identity(), predictor_kwargs=['d']
+    )
+    assert module.method == 'sd_corr'  # the default with predict_corr
+    module.corr_unconstrained.normal_()
+    delta = torch.randn(2, 4, num_off_diag(3))
+
+    out = module({'d': delta}, 2, 4)
+    assert out.shape == (2, 4, rank, rank)
+    assert (out[..., 1, :] == 0).all() and (out[..., :, 1] == 0).all()
+    for g, t in [(0, 0), (1, 3)]:
+        _assert_close(out[g, t], _cov_with_u(module, module.corr_unconstrained + delta[g, t]))
+    # variances are unchanged; zero adjustment is the base covariance:
+    _assert_close(out.diagonal(dim1=-2, dim2=-1), module.base_cov().diagonal().expand(2, 4, -1))
+    _assert_close(module({'d': torch.zeros_like(delta)}, 2, 4), module.base_cov().expand(2, 4, -1, -1))
+
+    # group-only predictions don't vary over time, and ``batch_cov`` doesn't expand them:
+    cov, used = module.batch_cov({'d': delta[:, 0]}, num_groups=2, num_times=4)
+    assert cov.shape == (2, 1, rank, rank) and used == {'d'}
+    _assert_close(cov[:, 0], out[:, 0])
+    # without predictions:
+    static, used = Covariance(rank=rank, init_diag_multi=1.).batch_cov({}, num_groups=2, num_times=4)
+    assert static.shape == (1, 1, rank, rank) and used == set()
+
+
+@torch.no_grad()
+def test_predict_std_and_corr():
+    class _Pick(torch.nn.Module):
+        def __init__(self, i: int):
+            super().__init__()
+            self.i = i
+
+        def forward(self, *args):
+            return args[self.i]
+
+    module = Covariance(
+        rank=3, init_diag_multi=1., predict_std=_Pick(0), predict_corr=_Pick(1), predictor_kwargs=['m', 'd']
+    )
+    module.corr_unconstrained.normal_()
+    m = torch.rand(2, 3) + .5  # by group
+    d = torch.randn(2, 5, 3)  # by group and time
+    out, _ = module.batch_cov({'m': m, 'd': d}, num_groups=2, num_times=5)
+    assert out.shape == (2, 5, 3, 3)
+    _assert_close(out[1, 2], _cov_with_u(module, module.corr_unconstrained + d[1, 2], std_multi=m[1]))
+
+
+def test_predict_corr_requires_sd_corr():
+    with pytest.raises(ValueError, match="requires ``method='sd_corr'``"):
+        Covariance(rank=3, init_diag_multi=1., method='log_cholesky', predict_corr=Identity(), predictor_kwargs=['d'])
+    # from_measures picks sd_corr, even with >5 measures (which would otherwise default to low_rank):
+    measures = list('abcdefg')
+    assert Covariance.from_measures(measures, predict_corr=Identity(), predictor_kwargs=['d']).method == 'sd_corr'
+    module = Covariance.from_measures(['a', 'b'], predict_corr=Identity(), predictor_kwargs=['d'])
+    with pytest.raises(ValueError, match="requires ``method='sd_corr'``"):
+        module.to_method('log_cholesky')
+    with pytest.raises(ValueError, match='predictor_kwargs'):
+        Covariance(rank=3, init_diag_multi=1., predict_corr=Identity())
+    with pytest.raises(ValueError, match='no ``predict_std`` or ``predict_corr``'):
+        Covariance(rank=3, init_diag_multi=1., predictor_kwargs=['d'])
+
+
+def test_as_timestep_list():
+    x = torch.randn(1, 1, 3, 3)
+    out = as_timestep_list(x, num_groups=4, num_times=5)
+    assert len(out) == 5 and all(o is out[0] for o in out) and out[0].shape == (4, 3, 3)
+    x = torch.randn(4, 5, 3, 3)
+    out = as_timestep_list(x, num_groups=4, num_times=5)
+    assert torch.equal(torch.stack(out, 1), x)
+    with pytest.raises(ValueError):
+        as_timestep_list(x, num_groups=4, num_times=6)
+
+
+def test_model_predictor_kwargs():
+    torch.manual_seed(0)
+    measures = ['a', 'b']
+    processes = [LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=measures,
+        measure_covariance=Covariance.from_measures(measures, predict_corr=_Linear(1, 1), predictor_kwargs=['X']),
+    )
+    y = torch.randn(3, 10, 2)
+    X = torch.randn(3, 10, 1)
+    with torch.no_grad():
+        kf.measure_covariance.predict_corr.linear.weight.fill_(1.)
+        pred = kf(y, X=X)
+        # a kwarg named ``{id}__{name}`` overrides ``name``:
+        pred2 = kf(y, measure_covariance__X=X)
+        assert torch.equal(pred.means, pred2.means)
+        with pytest.raises(TypeError, match='`X`'):
+            kf(y)
+        with pytest.raises(RuntimeError, match='Unexpected kwargs'):
+            kf(y, X=X, Z=X)
+        # time-varying measure-cov:
+        R = kf.measure_covariance({'X': X}, 3, 10)
+        assert not torch.allclose(R[0, 0], R[0, 1])
+    # covariance kwargs are declared as group-indexed (for ``fit(chunk_size=...)``), unless marked otherwise:
+    assert {'X', 'measure_covariance__X'} <= kf._group_kwarg_names()
+    kf.measure_covariance.predictor_kwargs = [ProcessKwarg('X', is_group_time_tensor=False)]
+    assert 'X' not in kf._group_kwarg_names()
+
+
+def test_fit_time_varying_correlation():
+    """
+    The noise-correlation between two measures flips between two regimes; a ``predict_corr`` linear in the regime
+    indicator recovers both.
+    """
+    torch.manual_seed(1)
+    measures = ['a', 'b']
+    num_groups, num_times = 10, 100
+    regime = (torch.arange(num_times) // 25 % 2).float()  # alternating blocks of 25 timesteps
+    corr = torch.where(regime.bool(), -.3, .8)
+    std = torch.tensor([1., .5])
+    z = torch.randn(num_groups, num_times, 2)
+    noise = torch.stack([z[..., 0], corr * z[..., 0] + (1 - corr ** 2).sqrt() * z[..., 1]], -1) * std
+    y = torch.randn(num_groups, 1, 2) + torch.randn(num_groups, num_times, 2).cumsum(1) * .05 + noise
+    X = torch.stack([1 - regime, regime], -1).expand(num_groups, -1, -1)
+
+    processes = [LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=measures,
+        measure_covariance=Covariance.from_measures(measures, predict_corr=_Linear(2, 1), predictor_kwargs=['X']),
+    )
+    kf.fit(y, X=X, verbose=0)
+    with torch.no_grad():
+        R = kf.measure_covariance({'X': X}, num_groups, num_times)[0]
+    learned_corr = R[:, 0, 1] / (R[:, 0, 0] * R[:, 1, 1]).sqrt()
+    assert abs(learned_corr[regime == 0].mean() - .8) < .1
+    assert abs(learned_corr[regime == 1].mean() + .3) < .1
+
+
+def test_deprecated_predict_variance():
+    with pytest.warns(DeprecationWarning, match='predict_variance'):
+        old = Covariance.from_measures(['a', 'b'], predict_variance=True)
+    assert [k.name for k in old.predictor_kwargs] == ['measure_var_multi']
+    with pytest.warns(DeprecationWarning, match='predict_variance'):
+        old = Covariance.from_processes([LocalLevel(id='level', measure='a')], predict_variance=True)
+    assert [k.name for k in old.predictor_kwargs] == ['process_var_multi']
+
+    with pytest.warns(DeprecationWarning):
+        old = Covariance.from_measures(['a', 'b'], predict_variance=Identity(), expected_kwargs=['m'])
+    new = Covariance.from_measures(['a', 'b'], predict_std=Identity(), predictor_kwargs=['m'])
+    new.load_state_dict(old.state_dict())
+    m = torch.rand(2, 3, 2) + .5
+    assert torch.equal(old({'m': m}, 2, 3), new({'m': m}, 2, 3))
+    with pytest.warns(DeprecationWarning):
+        assert old.expected_kwargs == ['m']
+
+
+def test_load_older_version():
+    new = Covariance.from_measures(
+        ['a', 'b'], predict_std=_Linear(1, 2, positive=True), predictor_kwargs=['X']
+    )
+    with torch.no_grad():
+        new.predict_std.linear.weight.normal_()
+
+    # a state-dict saved by an older version (``var_predict_module``):
+    old_state = {k.replace('predict_std.', 'var_predict_module.'): v for k, v in new.state_dict().items()}
+    loaded = Covariance.from_measures(['a', 'b'], predict_std=_Linear(1, 2, positive=True), predictor_kwargs=['X'])
+    loaded.load_state_dict(old_state)
+    assert torch.equal(loaded.predict_std.linear.weight, new.predict_std.linear.weight)
+
+    # an unpickled module from an older version:
+    state = copy.copy(new.__dict__)
+    state['_modules'] = OrderedDict(var_predict_module=new.predict_std)
+    state['expected_kwargs'] = ['X']
+    del state['predictor_kwargs']
+    unpickled = Covariance.__new__(Covariance)
+    unpickled.__setstate__(state)
+    assert unpickled.predict_std is new.predict_std and unpickled.predict_corr is None
+    assert [k.name for k in unpickled.predictor_kwargs] == ['X']
+    X = torch.randn(2, 3, 1)
+    assert torch.equal(unpickled({'X': X}, 2, 3), new({'X': X}, 2, 3))

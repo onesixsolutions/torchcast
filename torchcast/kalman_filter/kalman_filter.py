@@ -7,7 +7,7 @@ This class inherits most of its methods from :class:`torchcast.state_space.State
 from typing import Sequence
 
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor, mvnorm_log_prob
+from torchcast.internals.utils import update_tensor, mvnorm_log_prob, as_timestep_list
 from torchcast.process import Process
 
 from torchcast.state_space.mixture import MixtureComponent, MixtureModel
@@ -322,23 +322,10 @@ class KalmanFilter(StateSpaceModel):
         )
 
         # process-variance:
-        pcov_kwargs = {}
-        if self.process_covariance.expected_kwargs:
-            pcov_kwargs = {k: kwargs[k] for k in self.process_covariance.expected_kwargs}
-        used_keys |= set(pcov_kwargs)
-
-        measure_scaling = self._get_measure_scaling()
-
-        # todo: instead of branching here, clean up Covariance.forward():
-        if pcov_kwargs:
-            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
-            Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_scaling, is_process_cov=True)
-            predict_kwargs['Q'] = Qs.unbind(1)
-        else:
-            # faster if not time-varying
-            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=1).squeeze(1)
-            Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_scaling, is_process_cov=True)
-            predict_kwargs['Q'] = [Qs] * num_timesteps
+        pcov_raw, pcov_keys = self.process_covariance.batch_cov(kwargs, num_groups=num_groups, num_times=num_timesteps)
+        used_keys |= pcov_keys
+        Qs = self._apply_cov_scaling(pcov_raw, scaling=self._get_measure_scaling(), is_process_cov=True)
+        predict_kwargs['Q'] = as_timestep_list(Qs, num_groups=num_groups, num_times=num_timesteps)
 
         return predict_kwargs, update_kwargs, used_keys
 

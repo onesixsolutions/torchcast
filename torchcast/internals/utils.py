@@ -345,3 +345,17 @@ class class_or_instancemethod:
                 return self.method(owner, *args, **kwargs)
 
         return wrapped_method
+
+
+def as_timestep_list(x: torch.Tensor, num_groups: int, num_times: int) -> List[torch.Tensor]:
+    """
+    Convert a ``(G, T, ...)`` tensor, where ``G`` is ``num_groups`` or 1 and ``T`` is ``num_times`` or 1, into a list
+    of ``num_times`` tensors with shape ``(num_groups, ...)``. If ``T`` is 1, the same tensor is repeated (rather than
+    unbinding an expanded tensor), which is much cheaper on the backward pass.
+    """
+    x = x.expand(num_groups, *x.shape[1:])
+    if x.shape[1] == 1:
+        return [x[:, 0]] * num_times
+    if x.shape[1] != num_times:
+        raise ValueError(f"Expected `x.shape[1]` to be 1 or {num_times}, got {x.shape[1]}.")
+    return list(x.unbind(1))
