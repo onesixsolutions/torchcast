@@ -1469,7 +1469,7 @@ class Predictions:
 
     def __array__(self) -> np.ndarray:
         # for numpy.asarray
-        return self.means.detach().numpy()
+        return self.means.detach().cpu().numpy()
 
     def __getitem__(self, item) -> 'Predictions':
         kwargs = self._getitem_helper(item)
