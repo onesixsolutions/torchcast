@@ -86,6 +86,13 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 
 ### Other changes
 
+- `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of
+  computing intervals; `Predictions.get_means(transform=..., use_map=...)` returns them as a
+  `(num_groups, num_timesteps, num_measures)` tensor.
+- Monte-Carlo intervals (for measures with a nonlinear measured-mean) reuse the state-samples already drawn for the
+  means, adding each measure's observation-noise (and, for mixture components, a regime drawn per sample) on its
+  own, rather than a second, joint sampling pass. Much faster (e.g. ~11x for `to_dataframe()` of a `BinomialFilter`
+  with mixture components); the intervals change only by monte-carlo error.
 - `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
   tuple it replaces (unpacking, `len()`, indexing), and also carries the regime-probabilities of models with mixture
   components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks

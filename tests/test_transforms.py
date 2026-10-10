@@ -405,3 +405,58 @@ def test_smearing_from_predictions_missing():
         for t in ([smear] if mixture is None else [smear.standard, smear.components['low']]):
             assert t.residuals.shape == (18,)
             assert torch.isfinite(t.residuals).all() and torch.isfinite(t.weights).all()
+
+
+@pytest.mark.parametrize("use_map", [True, False])
+@torch.no_grad()
+def test_means_only(use_map: bool):
+    """
+    `to_dataframe(conf=False)` returns just the means -- the same as the default call's -- without any interval work;
+    `get_means()` returns them as a tensor, back-transforming every measure (incl. a linear one in a nonlinear model).
+    """
+    from torchcast.state_space import RegimeTransform
+
+    torch.manual_seed(0)
+    visit = (torch.rand(4, 12) > .3).float()
+    spend = torch.randn(4, 12).cumsum(1) * .2 + 3.
+    spend[visit == 0] = float('nan')
+    y = torch.stack([visit, spend, spend * .5], -1)
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend', 'other']],
+        measures=['visit', 'spend', 'other'],
+        binary_measures=['visit'],
+        mixture=[MixtureComponent(measure='spend', mean_init=-2., prob_init=.1, id='low')],
+    )
+    bf.mc_sampling = 200
+    pred = bf(y)
+    transform = {'spend': RegimeTransform(LogTransform(), {'low': LogTransform(bias_adjust=0)}), 'other': LogTransform()}
+
+    df = pred.to_dataframe(transform=transform, use_map=use_map)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("interval work was done")
+
+    pred._get_closed_form_intervals = pred._get_mc_intervals = pred.sample = fail
+    df_means = pred.to_dataframe(transform=transform, use_map=use_map, conf=False)
+    assert list(df_means.columns) == [c for c in df.columns if c not in ('lower', 'upper')]
+    assert np.array_equal(df_means['mean'].values, df['mean'].values)
+
+    means = pred.get_means(transform=transform, use_map=use_map)
+    assert means.shape == (4, 12, 3)
+    for j, m in enumerate(['visit', 'spend', 'other']):
+        assert np.allclose(df.query(f"measure == '{m}'")['mean'].values, means[..., j].reshape(-1).numpy())
+    # (back-transformed: e.g. 'other' -- linear, in a nonlinear model -- is on the original scale)
+    assert (means[..., 2] > 1.5).all()
+
+
+
+@torch.no_grad()
+def test_means_only_derived():
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'], measures=['a', 'b'])
+    pred = kf(torch.randn(2, 8, 2))
+    df = pred.to_dataframe(conf=False, derived={'total': lambda s: s['a'] + s['b']})
+    assert 'lower' not in df.columns and not df['mean'].isna().any()
+    assert set(df['measure']) == {'a', 'b', 'total'}
+    with pytest.raises(ValueError, match="only supported for"):
+        pred.to_dataframe(type='states', conf=False)
