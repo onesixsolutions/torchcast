@@ -119,6 +119,15 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 
 Models saved by older versions keep the old behavior, whether loaded by unpickling (`torch.load` of the whole model) or via `load_state_dict()` (state-dicts without the new `adaptive_scaling._extra_state` entry). Note that state-dicts saved by this version have that extra entry, so they can't be loaded with `strict=True` into older versions of torchcast.
 
+### New option: `Covariance(method='sd_corr')`
+
+A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.param_idx()`, `Covariance.off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
+
+- `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
+- `Covariance.corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
+- Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
+- Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
+
 ## v1.1.3 (2026-10-07)
 
 ### Bug fix: covariance of `n_step > 1` predictions
