@@ -158,6 +158,7 @@ class StateSpaceModel(torch.nn.Module):
         """
 
         init_regime_probs = getattr(initial_state, 'regime_probs', None)
+        init_scaling = getattr(initial_state, 'scaling', None)
         initial_state = self._prepare_initial_state(
             initial_state,
             start_offsets=start_offsets,
@@ -167,6 +168,8 @@ class StateSpaceModel(torch.nn.Module):
             initial_state = repeat(init_mean, simulate, dim=0), repeat(init_cov, simulate, dim=0)
             if init_regime_probs is not None:
                 init_regime_probs = repeat(init_regime_probs, simulate, dim=0)
+            if init_scaling is not None:
+                init_scaling = {k: repeat(v, simulate, dim=0) for k, v in init_scaling.items()}
             if start_offsets is not None:  # need to repeat for passing to predictions.set_metadata
                 start_offsets = repeat(np.asarray(start_offsets), simulate, dim=0)
 
@@ -199,8 +202,17 @@ class StateSpaceModel(torch.nn.Module):
             mcov_kwargs = {k: kwargs[k] for k in self.measure_covariance.expected_kwargs}
         measure_covs = list(self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1))
 
+        # the adaptive-scaler's state, and the multiplier for the first step: continued from `initial_state` if it
+        # carries them (e.g. from `get_state_at_times()`), otherwise fresh.
+        init_multiplier = None
         if self.adaptive_scaling:
             self.adaptive_scaling.reset()
+            if init_scaling is not None:
+                init_scaling = dict(init_scaling)
+                init_multiplier = init_scaling.pop('multiplier')
+                self.adaptive_scaling.set_state(init_scaling)
+        elif init_scaling is not None:
+            raise ValueError("`initial_state` has a `scaling` state, but this model has no `adaptive_scaling`.")
 
         #
         predict_kwargs, update_kwargs, used_keys = self._parse_kwargs(
@@ -252,8 +264,10 @@ class StateSpaceModel(torch.nn.Module):
             raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
 
         # first loop through to do predict -> update
-        scaling1step = None
+        scaling1step = init_multiplier
         scale1s = []
+        scaling_states1 = []  # the scaler's state (incl. the multiplier) before each step's update
+        scaling_statesu = []  # ... and after
         meanus = []
         covus = []
         mean1s = []
@@ -273,6 +287,7 @@ class StateSpaceModel(torch.nn.Module):
             mean1s.append(mean1step)
             cov1s.append(cov1step)
             scale1s.append(scaling1step)
+            scaling_states1.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
             regime1s.append(regime_prior)
 
             regime_post = regime_prior  # unless updated below
@@ -302,6 +317,7 @@ class StateSpaceModel(torch.nn.Module):
             meanus.append(meanu)
             covus.append(covu)
             regimeus.append(regime_post)
+            scaling_statesu.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
             if self.mixture is not None and t + 1 < out_timesteps:
                 regime_prior = self.mixture.transition(regime_post, base_probs[t + 1])
 
@@ -309,6 +325,7 @@ class StateSpaceModel(torch.nn.Module):
         meanps = {}
         covps = {}
         regimeps = {}
+        scalingps = {}  # (the state of the update each prediction was rolled forward from)
         for t1 in range(out_timesteps):
             # tu: time of update
             # t1: time of 1step
@@ -339,6 +356,7 @@ class StateSpaceModel(torch.nn.Module):
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp
                         regimeps[tu_h] = regimep
+                        scalingps[tu_h] = scaling_states1[t1]
                         measure_covs[tu_h] = self._apply_cov_scaling(measure_covs[tu_h], scaling)
                     else:
                         # n_step>1 generally should only assign to meanps when tu_h = tu + n_step;
@@ -347,11 +365,15 @@ class StateSpaceModel(torch.nn.Module):
                         assert every_step
 
         preds = [
-            StateTuple(meanps[t], covps[t], regime_probs=regimeps[t]) for t in range(out_timesteps)
+            StateTuple(meanps[t], covps[t], regime_probs=regimeps[t], scaling=scalingps[t])
+            for t in range(out_timesteps)
         ]
 
         if include_updates_in_output:
-            updates = [StateTuple(m, c, regime_probs=r) for m, c, r in zip(meanus, covus, regimeus)]
+            updates = [
+                StateTuple(m, c, regime_probs=r, scaling=s)
+                for m, c, r, s in zip(meanus, covus, regimeus, scaling_statesu)
+            ]
         else:
             updates = None
 
@@ -392,6 +414,23 @@ class StateSpaceModel(torch.nn.Module):
             # for measure-cov nothing extra to do
             assert cov.shape[-1] == len(self.measures)
         return cov * scaling.unsqueeze(-2) * scaling.unsqueeze(-1)
+
+    def _get_scaling_state(self,
+                           multiplier: Optional[torch.Tensor],
+                           num_groups: int,
+                           like: torch.Tensor) -> Optional[dict[str, torch.Tensor]]:
+        """
+        The adaptive-scaler's current state, plus the ``multiplier`` it produced for the next step -- for
+        ``StateTuple.scaling``. None without adaptive-scaling (or if the scaler doesn't support it).
+        """
+        if not self.adaptive_scaling:
+            return None
+        state = self.adaptive_scaling.get_state(num_groups, like=like)
+        if state is None:
+            return None
+        if multiplier is None:  # (no update yet: no scaling)
+            multiplier = torch.ones((num_groups, len(self.measures)), dtype=like.dtype, device=like.device)
+        return {**state, 'multiplier': multiplier}
 
     def _get_scaling_multi(self,
                            measured_mean: torch.Tensor,
@@ -1310,10 +1349,10 @@ def _subset_groups(value: Any,
         if strict and size != 1:
             raise ValueError(f"Expected `{name}` to have first dimension {num_groups} (num_groups), got {size}.")
         return value
-    if isinstance(value, StateTuple):  # e.g. ``initial_state`` with ``regime_probs``
+    if isinstance(value, StateTuple):  # e.g. ``initial_state`` with ``regime_probs`` / ``scaling``
         return StateTuple(*(
             None if v is None else _subset_groups(v, group_slice, num_groups, strict, name)
-            for v in (value.mean, value.cov, value.regime_probs)
+            for v in (value.mean, value.cov, value.regime_probs, value.scaling)
         ))
     if isinstance(value, tuple):
         return tuple(_subset_groups(v, group_slice, num_groups, strict, name) for v in value)

@@ -654,3 +654,61 @@ def test_joseph_form_option():
     del kf.joseph_form
     with pytest.raises(AssertionError, match="joseph-form"):
         kf(y[..., :1])
+
+
+@pytest.mark.parametrize("with_mixture", [False, True])
+@torch.no_grad()
+def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
+    """
+    With adaptive scaling, the scaler's state (and the multiplier for the next step) is carried in the `StateTuple`,
+    so forecasting from ``get_state_at_times()`` matches a single pass exactly -- including the first step.
+    """
+    from torchcast.state_space import MixtureComponent
+
+    torch.manual_seed(0)
+    measures = ['y1', 'y2']
+    kf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+        measures=measures,
+        adaptive_scaling=True,
+        mixture=[MixtureComponent(measure='y1', mean_init=-3., prob_init=.1, id='low')] if with_mixture else None,
+    )
+    with torch.no_grad():
+        kf.adaptive_scaling.weight.fill_(.8)  # (a strong effect, so a lost state would show)
+    # groups on very different scales:
+    y = torch.randn((3, 25, 2)).cumsum(1) * torch.tensor([.1, 1., 10.]).view(3, 1, 1)
+    y[1, 5:8, 0] = float('nan')
+    split = 15
+
+    full = kf(y, include_updates_in_output=True)
+    state = kf(y[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
+    assert set(state.scaling) == {'running', 'time', 'multiplier'}
+    # (recorded states aren't modified afterwards: the elapsed time grows over timesteps)
+    assert (full.update_scaling_states['time'][:, 10] > full.update_scaling_states['time'][:, 3]).all()
+    cont = kf(y[:, split:], initial_state=state, include_updates_in_output=True)
+    assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-5)
+    assert torch.allclose(cont.state_covs, full.state_covs[:, split:], rtol=1e-4, atol=1e-6)
+    assert torch.allclose(cont.measure_covs, full.measure_covs[:, split:], rtol=1e-4, atol=1e-6)
+    assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-4)
+    for k in state.scaling:
+        assert torch.allclose(cont.update_scaling_states[k], full.update_scaling_states[k][:, split:], atol=1e-5)
+    # (a fresh scaler -- the previous behavior -- would differ:)
+    fresh = kf(y[:, split:], initial_state=tuple(state))
+    assert not torch.allclose(fresh.state_covs, full.state_covs[:, split:], rtol=1e-2)
+
+    # prediction-states carry the state of the update they were rolled forward from:
+    pred_n = kf(y, n_step=3, include_updates_in_output=True)
+    for k in ('running', 'time', 'multiplier'):
+        assert torch.equal(pred_n.scaling_states[k][:, 10], pred_n.update_scaling_states[k][:, 7])
+
+    # chunked fitting subsets it with the rest of `initial_state`:
+    from torchcast.state_space.state_space import _subset_groups
+    sub = _subset_groups(state, slice(0, 2), num_groups=3)
+    assert all(v.shape[0] == 2 for v in sub.scaling.values())
+
+    # models without adaptive scaling don't produce it, and reject it:
+    kf_plain = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures], measures=measures)
+    plain_state = kf_plain(y, include_updates_in_output=True).get_state_at_times(split - 1)
+    assert plain_state.scaling is None
+    with pytest.raises(ValueError, match="no `adaptive_scaling`"):
+        kf_plain(y[:, split:], initial_state=state)

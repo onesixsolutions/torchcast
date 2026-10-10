@@ -74,6 +74,16 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
   `transform={'log_spend': LogTransform()}`.
 
+### Bug fix that changes predictions: adaptive scaling when forecasting from `initial_state`
+
+- With `adaptive_scaling`, a forward-pass started from `initial_state=pred.get_state_at_times(...)` used to start the
+  scaler from scratch, and applied no multiplier at the first step -- so a continued forecast silently differed from
+  the same forecast made in one pass. The `StateTuple` now also carries the scaler's state (`scaling`: the running
+  statistics, and the pending multiplier for the next step), and `forward()` continues from it. Prediction-type states
+  carry the state of the update they were rolled forward from. Plain `(mean, cov)` tuples still start fresh.
+- Custom `AdaptiveScaler`s can take part by implementing `get_state()` / `set_state()`; otherwise they start fresh, as
+  before.
+
 ### Other changes
 
 - `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`

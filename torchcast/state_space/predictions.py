@@ -55,15 +55,16 @@ class Predictions:
         :param mc_white_noise: Required if the measurement-model is nonlinear.
         :param mixture: The model's :class:`.MixtureModel`, if any.
         """
-        self.state_means, self.state_covs, self.regime_probs = _unpack_states(states)
+        self.state_means, self.state_covs, self.regime_probs, self.scaling_states = _unpack_states(states)
         self.measure_covs = _maybe_stack(measure_covs, 1)
 
         self.measurement_model = measurement_model
         self.measurement_model_flat = self.measurement_model.flattened()
 
-        self.update_means = self.update_covs = self.update_regime_probs = None
+        self.update_means = self.update_covs = self.update_regime_probs = self.update_scaling_states = None
         if updates is not None:
-            self.update_means, self.update_covs, self.update_regime_probs = _unpack_states(updates)
+            (self.update_means, self.update_covs, self.update_regime_probs,
+             self.update_scaling_states) = _unpack_states(updates)
 
         if mc_white_noise is None and self.measurement_model.is_nonlinear:
             raise ValueError(
@@ -1258,14 +1259,26 @@ class Predictions:
         from .state import StateTuple
 
         preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
+
+        def _squeeze(x):
+            return _map_states(x, lambda v: v.squeeze(1))
+
         if type_.startswith('pred'):
-            regime_probs = None if preds.regime_probs is None else preds.regime_probs.squeeze(1)
-            return StateTuple(preds.state_means.squeeze(1), preds.state_covs.squeeze(1), regime_probs=regime_probs)
+            return StateTuple(
+                preds.state_means.squeeze(1),
+                preds.state_covs.squeeze(1),
+                regime_probs=_squeeze(preds.regime_probs),
+                scaling=_squeeze(preds.scaling_states),
+            )
         elif type_.startswith('update'):
             if preds.update_means is None:
                 raise RuntimeError("No updates available; call the model with ``include_updates_in_output=True``.")
-            regime_probs = None if preds.update_regime_probs is None else preds.update_regime_probs.squeeze(1)
-            return StateTuple(preds.update_means.squeeze(1), preds.update_covs.squeeze(1), regime_probs=regime_probs)
+            return StateTuple(
+                preds.update_means.squeeze(1),
+                preds.update_covs.squeeze(1),
+                regime_probs=_squeeze(preds.update_regime_probs),
+                scaling=_squeeze(preds.update_scaling_states),
+            )
         else:
             raise ValueError("Unrecognized `type_`, expected 'prediction' or 'update'.")
 
@@ -1434,12 +1447,17 @@ class Predictions:
             item = (item,)
         from .state import StateTuple
 
-        def _slice(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            return None if x is None else x[item]
+        def _slice(x):
+            return _map_states(x, lambda v: v[item])
 
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
-            'states': StateTuple(self.state_means[item], self.state_covs[item], regime_probs=_slice(self.regime_probs)),
+            'states': StateTuple(
+                self.state_means[item],
+                self.state_covs[item],
+                regime_probs=_slice(self.regime_probs),
+                scaling=_slice(self.scaling_states),
+            ),
             'measure_covs': self.measure_covs[item],
             # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
             'mc_white_noise': self.mc_white_noise,
@@ -1447,7 +1465,10 @@ class Predictions:
         }
         if self.update_means is not None:
             kwargs['updates'] = StateTuple(
-                self.update_means[item], self.update_covs[item], regime_probs=_slice(self.update_regime_probs)
+                self.update_means[item],
+                self.update_covs[item],
+                regime_probs=_slice(self.update_regime_probs),
+                scaling=_slice(self.update_scaling_states),
             )
 
         return kwargs
@@ -1547,21 +1568,34 @@ def _quantile(x: torch.Tensor, q: float) -> torch.Tensor:
     return x[lo] + (pos - lo) * (x[hi] - x[lo])
 
 
-def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
     """
-    :return: Stacked (num_groups, num_timesteps, ...) means, covs, and regime-probs (or None).
+    :return: Stacked (num_groups, num_timesteps, ...) means, covs, regime-probs (or None), and adaptive-scaling states (a
+     dict of tensors, or None).
     """
     from .state import StateTuple
 
     if isinstance(states, StateTuple):  # already stacked
-        return states.mean, states.cov, states.regime_probs
+        return states.mean, states.cov, states.regime_probs, states.scaling
     if len(states) and all(isinstance(s, StateTuple) for s in states):
-        regime_probs = None
+        regime_probs = scaling = None
         if states[0].regime_probs is not None:
             regime_probs = torch.stack([s.regime_probs for s in states], 1)
-        return torch.stack([s.mean for s in states], 1), torch.stack([s.cov for s in states], 1), regime_probs
+        if states[0].scaling is not None:
+            scaling = {k: torch.stack([s.scaling[k] for s in states], 1) for k in states[0].scaling}
+        means, covs = torch.stack([s.mean for s in states], 1), torch.stack([s.cov for s in states], 1)
+        return means, covs, regime_probs, scaling
     means, covs = states
-    return _maybe_stack(means, 1), _maybe_stack(covs, 1), None
+    return _maybe_stack(means, 1), _maybe_stack(covs, 1), None, None
+
+
+def _map_states(x: Union[torch.Tensor, dict, None], fun: Callable) -> Union[torch.Tensor, dict, None]:
+    """Apply ``fun`` to a tensor, or to each tensor in a dict (e.g. adaptive-scaling states); None stays None."""
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return {k: fun(v) for k, v in x.items()}
+    return fun(x)
 
 
 def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> torch.Tensor:
