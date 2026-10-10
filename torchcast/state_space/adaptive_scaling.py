@@ -30,6 +30,24 @@ class AdaptiveScaler(nn.Module):
         """
         raise NotImplementedError
 
+    def get_state(self, num_groups: int, like: torch.Tensor) -> Optional[dict[str, torch.Tensor]]:
+        """
+        The internal state (e.g. running statistics), so a later forward-pass can continue from it (see
+        :class:`.StateTuple`). Returns None if the scaler doesn't support this -- forward-passes continued from an
+        ``initial_state`` then start from a fresh state.
+
+        :param num_groups: The number of groups (for the state before any residuals have been seen).
+        :param like: A tensor whose dtype/device to use.
+        :return: A dict of ``(num_groups, ...)`` tensors (which aren't modified in place afterwards), or None.
+        """
+        return None
+
+    def set_state(self, state: dict[str, torch.Tensor]):
+        """
+        Restore a state returned by :func:`get_state` (after :func:`reset`).
+        """
+        raise NotImplementedError
+
     def forward(self,
                 residuals: torch.Tensor,
                 skip_mask: torch.Tensor,
@@ -124,6 +142,19 @@ class EWMAdaptiveScaler(AdaptiveScaler):
             warnings.warn("Consider calling adaptive scaler's `initialize()` method before use.")
             self._called_initialize = False  # only warn once
 
+    def get_state(self, num_groups: int, like: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self._running is None:
+            shape = (num_groups, self._taus.shape[0])
+            return {
+                'running': torch.full(shape, self._running_init, dtype=like.dtype, device=like.device),
+                'time': torch.zeros(shape, dtype=like.dtype, device=like.device),
+            }
+        return {'running': self._running, 'time': self._time}
+
+    def set_state(self, state: dict[str, torch.Tensor]):
+        self._running = state['running']
+        self._time = state['time']
+
     def forward(self,
                 residuals: torch.Tensor,
                 skip_mask: torch.Tensor,
@@ -131,8 +162,9 @@ class EWMAdaptiveScaler(AdaptiveScaler):
         if self._running is None:
             self._running = torch.full_like(residuals, self._running_init)
             self._time = torch.zeros_like(residuals)
+        # (not in-place: states returned by `get_state()` must stay as they were)
         if weights is None:
-            self._time += (~skip_mask).int()
+            self._time = self._time + (~skip_mask).int()
         else:
             # a partially-weighted observation only partially counts towards the elapsed time:
             self._time = self._time + weights * (~skip_mask)
