@@ -486,6 +486,36 @@ def test_nonlinear_covs_warns_once():
     assert len([w for w in caught if 'no closed-form covariance' in str(w.message)]) == 1
 
 
+@torch.no_grad()
+def test_predictions_state_formats():
+    from torchcast.state_space import Predictions, StateTuple
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    y = torch.randn(2, 6, 1)
+    pred = kf(y)
+    kwargs = dict(measurement_model=pred.measurement_model, measure_covs=pred.measure_covs)
+    for states in [
+        (pred.state_means, pred.state_covs),  # tuple of stacked tensors
+        (list(pred.state_means.unbind(1)), list(pred.state_covs.unbind(1))),  # tuple of per-timestep lists
+        StateTuple(pred.state_means, pred.state_covs),  # stacked StateTuple
+        [StateTuple(m, c) for m, c in zip(pred.state_means.unbind(1), pred.state_covs.unbind(1))],  # per-timestep
+    ]:
+        pred2 = Predictions(states=states, **kwargs)
+        assert torch.equal(pred2.state_means, pred.state_means) and torch.equal(pred2.state_covs, pred.state_covs)
+        assert torch.allclose(pred2.log_prob(y), pred.log_prob(y))
+
+
+@torch.no_grad()
+def test_to_dataframe_std():
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(2, 6, 1))
+    df = pred.to_dataframe(conf=None)
+    _, cov = pred
+    assert np.allclose(df['std'].values, cov[..., 0, 0].sqrt().reshape(-1).numpy(), rtol=1e-5)
+
+
 @pytest.mark.parametrize("config", ['sigmoid', 'saturated', 'saturated+sigmoid'])
 def test_ekf_jacobian_matches_autograd(config: str):
     """
@@ -567,3 +597,118 @@ def test_sigmoid_legacy_jacobian_unpickling():
     del old_style.legacy_jacobian
     old_loaded = pickle.loads(pickle.dumps(old_style))
     assert not hasattr(old_loaded, 'legacy_jacobian') and torch.allclose(jacobian(old_loaded), legacy)
+
+
+@torch.no_grad()
+def test_joseph_form_option():
+    """`joseph_form=False` uses the simpler covariance update -- the same, in exact arithmetic."""
+    from torchcast.kalman_filter import BinomialFilter
+
+    torch.manual_seed(0)
+    y = torch.randn(4, 20, 2).cumsum(1) * .3
+    y[0, 3:6, 1] = float('nan')
+    preds = {}
+    for joseph_form in (True, False):
+        torch.manual_seed(1)
+        kf = KalmanFilter(
+            processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in ['a', 'b']],
+            measures=['a', 'b'],
+            joseph_form=joseph_form,
+        )
+        assert kf.joseph_form is joseph_form
+        preds[joseph_form] = kf(y, n_step=2)
+    assert torch.allclose(preds[True].state_means, preds[False].state_means, atol=1e-5)
+    assert torch.allclose(preds[True].state_covs, preds[False].state_covs, atol=1e-5)
+    assert torch.allclose(preds[True].log_prob(y), preds[False].log_prob(y), atol=1e-4)
+    # the simple update's output is exactly symmetric:
+    A = torch.randn(5, 4, 4)
+    cov = A @ A.transpose(-1, -2) + torch.eye(4)
+    H, R = torch.randn(5, 2, 4), torch.eye(2).expand(5, -1, -1)
+    measured_cov = cov @ H.transpose(-1, -2)
+    K = KalmanFilter._kalman_gain(measured_cov=measured_cov, system_cov=H @ measured_cov + R)
+    new_cov = KalmanFilter._simple_covariance_update(cov=cov, K=K, H=H)
+    assert torch.equal(new_cov, new_cov.transpose(-1, -2))
+    assert torch.allclose(new_cov, KalmanFilter._covariance_update(cov=cov, K=K, H=H, R=R), atol=1e-5)
+
+    # the binomial-filter passes it through:
+    visit = (torch.rand(3, 15, 1) > .4).float()
+    bf_preds = []
+    for joseph_form in (True, False):
+        torch.manual_seed(1)
+        bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['visit'], joseph_form=joseph_form)
+        assert bf.joseph_form is joseph_form
+        bf_preds.append(bf(visit))
+    assert torch.allclose(bf_preds[0].state_covs, bf_preds[1].state_covs, atol=1e-5)
+
+    # the setting selects the update:
+    def fail(*args, **kwargs):
+        raise AssertionError("joseph-form update was called")
+
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['a'], joseph_form=False)
+    kf._covariance_update = fail
+    kf(y[..., :1])
+    kf.joseph_form = True
+    with pytest.raises(AssertionError, match="joseph-form"):
+        kf(y[..., :1])
+    # older pickles (no attribute) use the joseph form:
+    del kf.joseph_form
+    with pytest.raises(AssertionError, match="joseph-form"):
+        kf(y[..., :1])
+
+
+@pytest.mark.parametrize("with_mixture", [False, True])
+@torch.no_grad()
+def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
+    """
+    With adaptive scaling, the scaler's state (and the multiplier for the next step) is carried in the `StateTuple`,
+    so forecasting from ``get_state_at_times()`` matches a single pass exactly -- including the first step.
+    """
+    from torchcast.state_space import MixtureComponent
+
+    torch.manual_seed(0)
+    measures = ['y1', 'y2']
+    kf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
+        measures=measures,
+        adaptive_scaling=True,
+        mixture=[MixtureComponent(measure='y1', mean_init=-3., prob_init=.1, id='low')] if with_mixture else None,
+    )
+    with torch.no_grad():
+        kf.adaptive_scaling.weight.fill_(.8)  # (a strong effect, so a lost state would show)
+    # groups on very different scales:
+    y = torch.randn((3, 25, 2)).cumsum(1) * torch.tensor([.1, 1., 10.]).view(3, 1, 1)
+    y[1, 5:8, 0] = float('nan')
+    split = 15
+
+    full = kf(y, include_updates_in_output=True)
+    state = kf(y[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
+    assert set(state.scaling) == {'running', 'time', 'multiplier'}
+    # (recorded states aren't modified afterwards: the elapsed time grows over timesteps)
+    assert (full.update_scaling_states['time'][:, 10] > full.update_scaling_states['time'][:, 3]).all()
+    cont = kf(y[:, split:], initial_state=state, include_updates_in_output=True)
+    assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-5)
+    assert torch.allclose(cont.state_covs, full.state_covs[:, split:], rtol=1e-4, atol=1e-6)
+    assert torch.allclose(cont.measure_covs, full.measure_covs[:, split:], rtol=1e-4, atol=1e-6)
+    assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-4)
+    for k in state.scaling:
+        assert torch.allclose(cont.update_scaling_states[k], full.update_scaling_states[k][:, split:], atol=1e-5)
+    # (a fresh scaler -- the previous behavior -- would differ:)
+    fresh = kf(y[:, split:], initial_state=tuple(state))
+    assert not torch.allclose(fresh.state_covs, full.state_covs[:, split:], rtol=1e-2)
+
+    # prediction-states carry the state of the update they were rolled forward from:
+    pred_n = kf(y, n_step=3, include_updates_in_output=True)
+    for k in ('running', 'time', 'multiplier'):
+        assert torch.equal(pred_n.scaling_states[k][:, 10], pred_n.update_scaling_states[k][:, 7])
+
+    # chunked fitting subsets it with the rest of `initial_state`:
+    from torchcast.state_space.state_space import _subset_groups
+    sub = _subset_groups(state, slice(0, 2), num_groups=3)
+    assert all(v.shape[0] == 2 for v in sub.scaling.values())
+
+    # models without adaptive scaling don't produce it, and reject it:
+    kf_plain = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures], measures=measures)
+    plain_state = kf_plain(y, include_updates_in_output=True).get_state_at_times(split - 1)
+    assert plain_state.scaling is None
+    with pytest.raises(ValueError, match="no `adaptive_scaling`"):
+        kf_plain(y[:, split:], initial_state=state)

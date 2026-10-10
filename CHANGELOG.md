@@ -2,11 +2,131 @@
 
 ## Unreleased
 
+### New feature: mixture components (experimental)
+
+A measure can now have one or more alternative *regimes* -- e.g. for outliers that shouldn't update the state or
+inflate the variance. See the new [mixture components example](https://docs.strong.io/torchcast/examples/mixture_components.html).
+
+- `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):
+  each `MixtureComponent` is an *offset* from the standard regime: a learned offset to the (state-dependent)
+  measured-mean, extra variance (added to the measurement-noise), and base-rate. E.g. a 'quick visit' component means
+  'spend well below *this* customer's usual level'. An observation in a component's regime updates the state as
+  usual, but accounting for the offset and the extra noise -- so it doesn't drag the state towards it. Components are supported on any measure with a gaussian likelihood, including the non-binary measures of a
+  `BinomialFilter`, and measures with a nonlinear measurement (a nonlinear process such as `SaturatedLinearModel`, or
+  a measure-function): for these, the update-step uses the linearized (EKF) measurement, while `log_prob()`, `means`,
+  and `to_dataframe()` use monte-carlo.
+- Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
+  a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
+  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
+- `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
+  only (an approximation, but cheaper). Binary measures never influence the regime-probabilities (their gaussian
+  approximation in the update-step is crude).
+- `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
+- Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
+  regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing. (For
+  a measure with a nonlinear measurement, the standard regime's mean and variance are the linearized approximation,
+  with a warning.)
+  `means`/`covs` are the mixture's exact moments (accessing `covs` warns, since it's easy to misuse), and
+  `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
+- With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
+- `MixtureModel(..., joseph_form=False)` uses the simpler covariance update (`P - K @ H @ P`) instead of the Joseph
+  form for the non-standard regime-combos (the update-step runs once per combo; the standard regime follows the
+  model's own covariance-update): less memory during training, and faster, but less numerically robust -- though the
+  non-standard combos are the better-conditioned ones. The default is the Joseph form.
+- A component's base-rate can depend on predictors: `MixtureComponent(..., predictors=['treated'])` learns a
+  coefficient for each (added to its logit), e.g. for a treatment that makes the regime more common. Pass them to
+  `forward()` as `X` (or `{component_id}__X`), as a `(num_groups, num_timesteps, num_predictors)` tensor covering the
+  forecast horizon. Custom `RegimeTransition`s then receive `base_probs` with shape `(num_groups, num_combos)`.
+
+### New feature: back-transforming predictions
+
+- `Predictions.to_dataframe(transform=...)` maps predictions of transformed measures back to the original scale,
+  e.g. `transform=LogTransform()` (for all measures) or `transform={'sales': LogTransform(base=10)}`. Intervals are
+  back-transformed exactly (quantiles pass through monotone transforms), and so is the mean: `E[inverse(Y)]` rather
+  than `inverse(E[Y])`, via closed form where available and gauss-hermite quadrature otherwise. For models with
+  mixture components, each regime is back-transformed and then mixed. Actuals are back-transformed too.
+- `Transform` is the base class: subclasses only need to implement `inverse()`. `LogTransform` and
+  `BoxCoxTransform` (with `lmbda >= 0`) are provided.
+  `bias_adjust` (0-1) controls how much bias-adjustment is applied to the back-transformed mean (0 = the
+  back-transformed median; default = the full mean); it doesn't affect intervals.
+- `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
+  `to_dataframe()`.
+- `SmearingTransform(base, residuals)` wraps a transform so that back-transformed means use the empirical
+  distribution of standardized residuals instead of assuming gaussian noise (Duan's smearing estimator); intervals
+  are unaffected. `SmearingTransform.from_predictions(base, predictions, y, measure)` builds one from a model's
+  residuals. For a measure with mixture components, it smears each regime with its own residuals, weighted by the
+  probability that each observation came from that regime -- so a component's back-transformed mean uses the
+  residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
+  variance. Custom transforms can override `Transform.expected_inverse()` (a closed form) or
+  `Transform.noise_nodes()` (a different noise distribution).
+- `RegimeTransform(standard, components={component_id: Transform})` chooses how each regime of a mixture measure is
+  back-transformed, e.g. `components={'quick': LogTransform(bias_adjust=0)}`.
+
+### New feature: sampling predictions, and derived quantities
+
+- `Predictions.sample(num_samples, observation_noise=True)` draws from the predictive distribution, jointly across
+  measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and
+  regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`,
+  observations are sampled too (binomial draws for binary measures). Returns a `PredictionSamples`.
+- `Predictions.to_dataframe(derived={'total': lambda s: s['a'] + s['b']})` adds quantities computed from several
+  measures, from joint samples (so correlations between measures are accounted for), on the scale given by
+  `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
+  `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
+  `transform={'log_spend': LogTransform()}`.
+
+### Bug fix that changes predictions: adaptive scaling when forecasting from `initial_state`
+
+- With `adaptive_scaling`, a forward-pass started from `initial_state=pred.get_state_at_times(...)` used to start the
+  scaler from scratch, and applied no multiplier at the first step -- so a continued forecast silently differed from
+  the same forecast made in one pass. The `StateTuple` now also carries the scaler's state (`scaling`: the running
+  statistics, and the pending multiplier for the next step), and `forward()` continues from it. Prediction-type states
+  carry the state of the update they were rolled forward from. Plain `(mean, cov)` tuples still start fresh.
+- Custom `AdaptiveScaler`s can take part by implementing `get_state()` / `set_state()`; otherwise they start fresh, as
+  before.
+
+### Other changes
+
+- `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of
+  computing intervals; `Predictions.get_means(transform=..., use_map=...)` returns them as a
+  `(num_groups, num_timesteps, num_measures)` tensor.
+- Monte-Carlo intervals (for measures with a nonlinear measured-mean) reuse the state-samples already drawn for the
+  means, adding each measure's observation-noise (and, for mixture components, a regime drawn per sample) on its
+  own, rather than a second, joint sampling pass. Much faster (e.g. ~11x for `to_dataframe()` of a `BinomialFilter`
+  with mixture components); the intervals change only by monte-carlo error.
+- `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
+  tuple it replaces (unpacking, `len()`, indexing), and also carries the regime-probabilities of models with mixture
+  components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks
+  `isinstance(..., tuple)` will need updating.)
+- `AdaptiveScaler.forward()` takes an optional `weights` argument. It's only passed for models with mixture
+  components, so custom subclasses only need to accept it to be used with mixtures.
+- For subclasses of `KalmanFilter`: the update-step is now split into `_prepare_update()` (a hook to adjust
+  inputs, called once per step), `_kalman_update()`, and `_mixture_update()`. Subclasses that previously overrode
+  `_update_step()` to adjust its inputs (as `BinomialFilter` did) should override `_prepare_update()` instead.
+- Adds `benchmarks/profile_simple_model.py`, for checking performance against other git refs.
+
+### Bug fix that changes predictions: `to_dataframe(conf=None)`
+
+- The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
+  uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
+  larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+### New option: `joseph_form`
+
+`KalmanFilter(joseph_form=False)` (and `BinomialFilter`) uses the simpler covariance update `P - K H P` (symmetrized) instead of the Joseph form `(I - K H) P (I - K H)' + K R K'`. It uses less memory during training (in a test with a state-size of 44: ~20-25% less peak memory for forward + backward) and is faster, but it's less numerically robust: errors in the kalman gain have a first-order (rather than second-order) effect on the covariance, which can lose positive-definiteness. The default is unchanged (`joseph_form=True`), as are models saved by older versions.
+
 ### Behavior change: adaptive scaling starts at "no adjustment"
 
 `EWMAdaptiveScaler` (used by `adaptive_scaling=True`) now starts its running mean of squared residuals at 1 instead of 0. Before, a group with no observations kept a running variance of `eps`, so its standard deviations were multiplied by `sqrt(eps) ** weight` (often ~0.2–0.3): its forecast intervals were arbitrarily narrow. And groups with only a few observations were shrunk towards zero variance unless the learned initial step-size (`rho`) was close to 1. Now a group with no observations gets a multiplier of exactly 1 (no adjustment), and a group with few observations is shrunk towards no adjustment.
 
 Models saved by older versions keep the old behavior, whether loaded by unpickling (`torch.load` of the whole model) or via `load_state_dict()` (state-dicts without the new `adaptive_scaling._extra_state` entry). Note that state-dicts saved by this version have that extra entry, so they can't be loaded with `strict=True` into older versions of torchcast.
+
+### New option: `Covariance(method='sd_corr')`
+
+A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.param_idx()`, `Covariance.off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
+
+- `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
+- `Covariance.corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
+- Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
+- Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
 
 ## v1.1.3 (2026-10-07)
 
