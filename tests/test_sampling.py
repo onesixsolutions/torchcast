@@ -394,3 +394,27 @@ def test_sample_shared_noise():
     s = pred.sample(50, generator=_gen())
     assert not is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)
     assert not is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)
+
+
+@torch.no_grad()
+def test_sample_binomial_measure_order():
+    """
+    Binary measures listed in a different order than `measures`, with a different `num_obs` each: each measure's
+    binomial draws use its own `num_obs` (proportions are multiples of 1 / num_obs).
+    """
+    torch.manual_seed(0)
+    num_obs = torch.tensor([3., 50.])  # (in the order of `binary_measures`: 'b', then 'a')
+    counts = torch.stack([torch.randint(0, 51, (2, 6)), torch.randint(0, 4, (2, 6))], -1).float()  # ('a', 'b')
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        binary_measures=['b', 'a'],
+        observed_counts=False,
+    )
+    bf.mc_sampling = 20
+    pred = bf(counts / torch.tensor([50., 3.]), num_obs=num_obs.expand(2, 6, 2))
+    s = pred.sample(200, generator=_gen())
+    for j, n in [(0, 50.), (1, 3.)]:  # ('a' has 50 trials, 'b' has 3)
+        x = s.observations[..., j] * n
+        assert torch.allclose(x, x.round(), atol=1e-4), f"measure {j} isn't a proportion out of {n}"
+    assert (s.observations[..., 0] * 3 % 1).abs().gt(1e-3).any()  # ('a' isn't out of 3)

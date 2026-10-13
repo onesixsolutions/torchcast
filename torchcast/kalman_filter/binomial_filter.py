@@ -425,7 +425,9 @@ class BinomialPredictions(Predictions):
         proportions. (The binomial draws are always independent across rows, even with ``shared_noise``.)
         """
         all_measures = list(self.measurement_model.measures)
-        gaussian_measures = [m for m in all_measures if m not in self.binary_measures]
+        if measures is None:
+            measures = all_measures
+        gaussian_measures = [m for m in all_measures if m not in self.binary_measures and m in measures]
 
         # sample the gaussian measures:
         observations = super()._sample_observations(
@@ -433,11 +435,14 @@ class BinomialPredictions(Predictions):
         )
 
         # sample the remaining (binary) measures:
-        if self.binary_measures:
-            idx = [all_measures.index(m) for m in self.binary_measures]
-            p = means[..., idx].clamp(0, 1)
-            num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype).expand_as(p)
-            observations[..., idx] = torch.binomial(num_obs.contiguous(), p.contiguous(), generator=generator) / num_obs
+        # (index both by the same list, so each measure's probabilities are paired with its own num_obs)
+        binary = [m for m in self.binary_measures if m in measures]
+        if binary:
+            bidx = [all_measures.index(m) for m in binary]
+            nobs_idx = [self.binary_measures.index(m) for m in binary]
+            p = means[..., bidx].clamp(0, 1)
+            nobs = self.num_obs[..., nobs_idx].reshape(1, -1, len(bidx)).to(p.dtype).expand_as(p)
+            observations[..., bidx] = torch.binomial(nobs.contiguous(), p.contiguous(), generator=generator) / nobs
 
         return observations
 
