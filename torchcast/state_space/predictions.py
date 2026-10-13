@@ -229,7 +229,7 @@ class Predictions:
         if overlap:
             raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
         samples = self.sample(num_samples, observation_noise=True, generator=self._output_generator())
-        values = {m: samples[m] for m in measures}
+        values = {m: samples[m] for m in measures}  # `samples` is a PredictionSamples, we just want a dict
         for m, t in transforms.items():
             _warn_bias_adjust_ignored(t)
             values[m] = t.inverse(values[m])
