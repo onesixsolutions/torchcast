@@ -345,3 +345,26 @@ def test_nonlinear_model_linear_measures_exact():
     df_states = pred.to_dataframe(type='states')
     df_states2 = pred.to_dataframe(type='states')
     assert np.array_equal(df_states[['lower', 'upper']].values, df_states2[['lower', 'upper']].values)
+
+
+@torch.no_grad()
+def test_measured_mean_samples_white_noise_shape():
+    """
+    `_get_measured_mean_samples(white_noise=...)` rejects noise of the wrong shape (rather than e.g. silently using
+    only the first columns of noise with too many).
+    """
+    kf = _correlated_kf()
+    pred = kf(torch.randn(2, 5, 2).cumsum(1))
+    kwargs = dict(
+        measurement_model=pred.measurement_model_flat,
+        state_means=pred.state_means_flat,
+        state_covs=pred.state_covs_flat,
+    )
+    dim = pred.measurement_model_flat.extended_measure_mat.shape[1]
+    rows = pred.state_means_flat.shape[0]
+    assert pred._get_measured_mean_samples(**kwargs, white_noise=torch.randn(7, dim)).shape == (7, rows, 2)
+    assert pred._get_measured_mean_samples(**kwargs, white_noise=torch.randn(7, rows, dim)).shape == (7, rows, 2)
+    bad_shapes = [(7, dim + 1), (7, rows + 1, dim), (7, rows, dim + 1), (dim,)]
+    for bad in map(torch.randn, bad_shapes):
+        with pytest.raises(ValueError, match="white_noise"):
+            pred._get_measured_mean_samples(**kwargs, white_noise=bad)

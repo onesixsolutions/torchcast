@@ -1245,6 +1245,13 @@ class Predictions:
         em_idx = [i for i in range(em_dim) if i not in missing_midx]
         if white_noise is None:
             white_noise = self.mc_white_noise(num_dim=em_dim, dtype=chol.dtype, device=chol.device)
+        elif white_noise.ndim not in (2, 3) or white_noise.shape[-1] != em_dim or (
+                white_noise.ndim == 3 and white_noise.shape[1] != state_means.shape[0]
+        ):
+            raise ValueError(
+                f"Expected `white_noise` to have shape (num_samples, {em_dim}) or (num_samples, "
+                f"{state_means.shape[0]}, {em_dim}), got {tuple(white_noise.shape)}."
+            )
         white_noise = white_noise[..., em_idx]
         # (einsum rather than a broadcasting matmul, which would materialize a (samples, rows, dim, dim) copy of chol)
         if white_noise.ndim == 2:
