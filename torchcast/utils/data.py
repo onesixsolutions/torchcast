@@ -15,6 +15,7 @@ from torchcast.internals.utils import ragged_cat, true1d_idx
 
 if TYPE_CHECKING:
     from pandas import DataFrame
+    from torchcast.state_space.transforms import Transform
 
 
 class TimeSeriesDataset(TensorDataset):
@@ -385,7 +386,8 @@ class TimeSeriesDataset(TensorDataset):
                        y_colnames: Optional[Sequence[str]] = None,
                        pad_X: Union[float, str, None] = 'ffill',
                        dtype: torch.dtype = torch.float32,
-                       device: Optional[torch.device] = None) -> 'TimeSeriesDataset':
+                       device: Optional[torch.device] = None,
+                       transform: Union['Transform', dict[str, 'Transform'], None] = None) -> 'TimeSeriesDataset':
         """
         :param dataframe: A pandas ``DataFrame``
         :param group_colname: Name for the group-column name.
@@ -401,6 +403,10 @@ class TimeSeriesDataset(TensorDataset):
         :param y_colnames: See above.
         :param pad_X: When stacking time-serieses of unequal length, we left-align them and so get trailing missings.
          Setting ``pad_X`` allows you to select the padding value for these. Default 0-padding.
+        :param transform: For measures to be transformed before modeling (e.g. log), a :class:`.Transform`: either a
+         single ``Transform`` for all of the time-series' measures (``y_colnames``, or all ``measure_colnames``; not
+         ``X_colnames``), or a dictionary of ``{measure: Transform}``. The same argument as for
+         :func:`Predictions.to_dataframe`, which maps predictions (and actuals) back to the original scale.
         :return: A :class:`TimeSeriesDataset`.
         """
 
@@ -432,6 +438,11 @@ class TimeSeriesDataset(TensorDataset):
         assert isinstance(group_colname, str)
         assert isinstance(time_colname, str)
         assert len(measure_colnames) == len(set(measure_colnames))
+
+        if transform is not None:
+            dataframe = _apply_transforms(
+                dataframe, transform, measures=measure_colnames if y_colnames is None else y_colnames
+            )
 
         # sort by time:
         dataframe = dataframe.sort_values(time_colname)
@@ -783,3 +794,28 @@ def complete_times(data: 'DataFrame',
              .loc[df_cj[time_colname].between(df_cj['_min'], df_cj['_max']), group_colnames + [time_colname]]
              .reset_index(drop=True))
     return df_cj.merge(data, how='left', on=group_colnames + [time_colname])
+
+
+def _apply_transforms(dataframe: 'DataFrame',
+                      transform: Union['Transform', dict[str, 'Transform']],
+                      measures: Sequence[str]) -> 'DataFrame':
+    """
+    Apply ``Transform.transform()`` to the columns of ``dataframe``: a single ``Transform`` to all of ``measures``, or a
+    ``{measure: Transform}`` dictionary (whose keys must be in ``measures``).
+    """
+    from torchcast.state_space.transforms import Transform
+
+    if isinstance(transform, Transform):
+        transforms = {m: transform for m in measures}
+    elif isinstance(transform, dict):
+        transforms = dict(transform)
+        unknown = set(transforms) - set(measures)
+        if unknown:
+            raise ValueError(f"`transform` has measures not in the time-series' measures ({list(measures)}): {unknown}")
+    else:
+        raise TypeError(f"Expected `transform` to be a `Transform` or a dict of them, got {type(transform)}")
+    with torch.no_grad():
+        return dataframe.assign(**{
+            m: t.transform(torch.as_tensor(dataframe[m].values, dtype=torch.float64)).numpy()
+            for m, t in transforms.items()
+        })

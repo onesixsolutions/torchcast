@@ -429,7 +429,10 @@ def test_means_only(use_map: bool):
     )
     bf.mc_sampling = 200
     pred = bf(y)
-    transform = {'spend': RegimeTransform(LogTransform(), {'low': LogTransform(bias_adjust=0)}), 'other': LogTransform()}
+    transform = {
+        'spend': RegimeTransform(LogTransform(), {'low': LogTransform(bias_adjust=0)}),
+        'other': LogTransform(),
+    }
 
     df = pred.to_dataframe(transform=transform, use_map=use_map)
 
@@ -460,3 +463,61 @@ def test_means_only_derived():
     assert set(df['measure']) == {'a', 'b', 'total'}
     with pytest.raises(ValueError, match="only supported for"):
         pred.to_dataframe(type='states', conf=False)
+
+
+def test_transform_inverse_roundtrip():
+    from torchcast.state_space import SmearingTransform, RegimeTransform
+
+    x = torch.rand(20, dtype=torch.float64) * 10 + .1
+    for t in [
+        LogTransform(), LogTransform(base=10), BoxCoxTransform(0), BoxCoxTransform(.5),
+        SmearingTransform(LogTransform(base=10), torch.randn(5)), RegimeTransform(BoxCoxTransform(.5)),
+    ]:
+        assert torch.allclose(t.inverse(t.transform(x)), x), t
+    assert torch.allclose(LogTransform(base=10).transform(torch.tensor(100.)), torch.tensor(2.))
+
+
+def test_dataset_from_dataframe_transform():
+    """`TimeSeriesDataset.from_dataframe(transform=)` mirrors `Predictions.to_dataframe(transform=)`."""
+    import pandas as pd
+    from torchcast.utils import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    df = pd.DataFrame({
+        'group': np.repeat(['g0', 'g1'], 10),
+        'time': np.tile(np.arange(10), 2),
+        'a': np.random.RandomState(0).rand(20) * 10 + 1,
+        'b': np.random.RandomState(1).rand(20) * 10 + 1,
+        'x': np.random.RandomState(2).randn(20),
+    })
+    kwargs = dict(group_colname='group', time_colname='time', dt_unit=None)
+
+    # a single transform applies to the time-series' measures -- not the predictors:
+    cols = dict(y_colnames=['a', 'b'], X_colnames=['x'])
+    ds = TimeSeriesDataset.from_dataframe(df, **cols, transform=LogTransform(), **kwargs)
+    raw = TimeSeriesDataset.from_dataframe(df, **cols, **kwargs)
+    # (transformed in float64, then cast)
+    assert torch.allclose(ds.tensors[0], raw.tensors[0].log(), rtol=1e-4, atol=1e-6)
+    assert torch.equal(ds.tensors[1], raw.tensors[1])
+    # ... or all of `measure_colnames`; or a dict:
+    ds = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], transform={'b': LogTransform(10)}, **kwargs)
+    raw = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], **kwargs)
+    assert torch.equal(ds.tensors[0][..., 0], raw.tensors[0][..., 0])
+    assert torch.allclose(ds.tensors[0][..., 1], raw.tensors[0][..., 1].log10(), rtol=1e-4, atol=1e-6)
+    with pytest.raises(ValueError, match="not in the time-series"):
+        TimeSeriesDataset.from_dataframe(
+            df, y_colnames=['a'], X_colnames=['x'], transform={'x': LogTransform()}, **kwargs
+        )
+    # (the input dataframe is unchanged)
+    assert (df['a'] > 1).all()
+
+    # symmetric with `to_dataframe(transform=)`: the actuals come back on the original scale:
+    transform = {'a': LogTransform(), 'b': BoxCoxTransform(.5)}
+    ds = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], transform=transform, **kwargs)
+    kf = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'], measures=['a', 'b'])
+    with torch.no_grad():
+        out = kf(ds.tensors[0]).to_dataframe(ds, transform=transform)
+    merged = out.merge(df, on=['group', 'time'])
+    for m in 'ab':
+        rows = merged.query(f"measure == '{m}'")
+        assert np.allclose(rows['actual'].values, rows[m].values, rtol=1e-5)

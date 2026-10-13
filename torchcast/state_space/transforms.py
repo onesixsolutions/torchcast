@@ -16,7 +16,9 @@ class Transform(torch.nn.Module):
     Maps a measure from the scale it's modeled on back to its original scale, e.g. for
     ``Predictions.to_dataframe(transform=...)``.
 
-    Subclasses implement :func:`inverse`, which must be elementwise and monotonically increasing (so quantiles can be
+    Subclasses implement :func:`transform` (the transformation applied before modeling -- e.g. by
+    ``TimeSeriesDataset.from_dataframe(transform=...)``) and its inverse, :func:`inverse`, which must be elementwise and
+    monotonically increasing (so quantiles can be
     back-transformed directly). The back-transformed mean, :func:`inverse_mean`, is ``E[inverse(Y)]`` where ``Y =
     mean + sqrt(var) * Z``, and ``Z`` is standard normal. This is computed by gauss-hermite quadrature by default;
     subclasses can override :func:`expected_inverse` with a closed form, or :func:`noise_nodes` to use a different
@@ -38,6 +40,13 @@ class Transform(torch.nn.Module):
     @property
     def _var_multi(self) -> float:
         return 1. if self.bias_adjust is None else self.bias_adjust
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        :param x: Values on the original scale.
+        :return: Values on the modeled (transformed) scale.
+        """
+        raise NotImplementedError
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -112,6 +121,9 @@ class LogTransform(Transform):
     def _log_base(self) -> float:
         return math.log(self.base)
 
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.log(x) / self._log_base
+
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x * self._log_base)
 
@@ -135,6 +147,11 @@ class BoxCoxTransform(Transform):
         if lmbda < 0:
             raise ValueError("`lmbda` must be non-negative.")
         self.lmbda = lmbda
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        if self.lmbda == 0:
+            return torch.log(x)
+        return (x ** self.lmbda - 1) / self.lmbda
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         if self.lmbda == 0:
@@ -272,6 +289,9 @@ class SmearingTransform(Transform):
         standard = by_regime.pop(mix.labels[0])
         return RegimeTransform(standard=standard, components=by_regime)
 
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base.transform(x)
+
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return self.base.inverse(x)
 
@@ -306,6 +326,9 @@ class RegimeTransform(Transform):
         super().__init__(bias_adjust=standard.bias_adjust)
         self.standard = standard
         self.components = torch.nn.ModuleDict(dict(components or {}))
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return self.standard.transform(x)
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return self.standard.inverse(x)
