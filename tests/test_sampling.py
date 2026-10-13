@@ -24,12 +24,13 @@ def _gen(seed: int = 0) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
+@pytest.mark.parametrize('shared_noise', [False, True])
 @torch.no_grad()
-def test_sample_moments():
+def test_sample_moments(shared_noise: bool):
     kf = _correlated_kf()
     pred = kf(torch.randn(3, 12, 2).cumsum(1))
     n = 20_000
-    s = pred.sample(n, generator=_gen())
+    s = pred.sample(n, generator=_gen(), shared_noise=shared_noise)
     assert s.observations.shape == (n, 3, 12, 2) and s.means.shape == (n, 3, 12, 2) and s.covs.shape == (n, 3, 12, 2, 2)
     mean, cov = pred
     sd = cov.diagonal(dim1=-2, dim2=-1).sqrt()
@@ -50,8 +51,9 @@ def test_sample_moments():
     assert torch.equal(pred.sample(5, generator=_gen(1)).observations, pred.sample(5, generator=_gen(1)).observations)
 
 
+@pytest.mark.parametrize('shared_noise', [False, True])
 @torch.no_grad()
-def test_sample_mixture():
+def test_sample_mixture(shared_noise: bool):
     torch.manual_seed(0)
     kf = KalmanFilter(
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
@@ -61,7 +63,7 @@ def test_sample_mixture():
     component = kf.mixture.components[0]
     pred = kf(torch.randn(2, 8, 2))
     n = 40_000
-    s = pred.sample(n, generator=_gen())
+    s = pred.sample(n, generator=_gen(), shared_noise=shared_noise)
     mix = pred.get_mixture('a')
 
     # in the 'low' regime, 'a' has the component's variance added to its measurement-noise (which identifies the
@@ -74,7 +76,7 @@ def test_sample_mixture():
     assert torch.allclose(s.covs[..., 0, 1], R[0, 1].expand_as(s.covs[..., 0, 1]))  # (correlation is unchanged)
     # the same state-draws (`sample()` draws this white-noise first), without the regimes:
     num_rows = pred.state_means_flat.shape[0]
-    white_noise = torch.randn((n, num_rows, 2), generator=_gen())
+    white_noise = torch.randn((n, 2) if shared_noise else (n, num_rows, 2), generator=_gen())
     standard_means = pred._get_measured_mean_samples(
         pred.measurement_model_flat, pred.state_means_flat, pred.state_covs_flat, white_noise=white_noise
     ).view(n, 2, 8, 2)
@@ -86,8 +88,9 @@ def test_sample_mixture():
         assert ((emp_cdf_at_quantile - q).abs() < 5 * math.sqrt(q * (1 - q) / n)).all()
 
 
+@pytest.mark.parametrize('shared_noise', [False, True])
 @torch.no_grad()
-def test_sample_binomial():
+def test_sample_binomial(shared_noise: bool):
     torch.manual_seed(1)
     visit = (torch.rand(3, 12) > .4).float()
     spend = torch.randn(3, 12).cumsum(1) * .2 + 3.
@@ -100,7 +103,7 @@ def test_sample_binomial():
     bf.mc_sampling = 100
     pred = bf(torch.stack([visit, spend], -1))
     n = 20_000
-    s = pred.sample(n, generator=_gen())
+    s = pred.sample(n, generator=_gen(), shared_noise=shared_noise)
     assert set(torch.unique(s['visit']).tolist()) <= {0., 1.}
     prob = s.means[..., 0]
     assert ((prob > 0) & (prob < 1)).all()
@@ -368,3 +371,26 @@ def test_measured_mean_samples_white_noise_shape():
     for bad in map(torch.randn, bad_shapes):
         with pytest.raises(ValueError, match="white_noise"):
             pred._get_measured_mean_samples(**kwargs, white_noise=bad)
+
+
+
+@torch.no_grad()
+def test_sample_shared_noise():
+    """With `shared_noise=True`, every row uses the same underlying standard-normal draws."""
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(3, 6, 1).cumsum(1))
+    mean, cov = pred
+    measure_sd = pred.measure_covs[..., 0, 0].sqrt()
+    state_sd = (cov[..., 0, 0] - pred.measure_covs[..., 0, 0]).sqrt()
+
+    def is_shared(z):
+        return torch.allclose(z, z[:, :1, :1].expand_as(z), atol=1e-4)
+
+    s = pred.sample(50, generator=_gen(), shared_noise=True)
+    assert is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)  # the state's noise
+    assert is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)  # the observation-noise
+    # vs. independent by default:
+    s = pred.sample(50, generator=_gen())
+    assert not is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)
+    assert not is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)

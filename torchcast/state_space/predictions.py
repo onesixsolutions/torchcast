@@ -255,12 +255,14 @@ class Predictions:
     def sample(self,
                num_samples: int,
                observation_noise: bool = True,
-               generator: Optional[torch.Generator] = None) -> 'PredictionSamples':
+               generator: Optional[torch.Generator] = None,
+               shared_noise: bool = False) -> 'PredictionSamples':
         """
         Draw samples from the predictive distribution: jointly across measures, independently for each group and
-        timestep. (Note that these are *not* trajectories -- samples for different timesteps are independent -- so
-        quantities that combine timesteps shouldn't be computed from them; see :func:`StateSpaceModel.simulate` for
-        that.)
+        timestep (unless ``shared_noise=True``). Groups are independent in the model, so e.g. samples can be summed
+        across groups. But these are *not* trajectories -- the model's timesteps are correlated (via the state), while
+        samples for different timesteps are independent -- so quantities that combine timesteps shouldn't be computed
+        from them; see :func:`StateSpaceModel.simulate` for that.
 
         Each sample is a draw of the state (and, for models with mixture components, of the regime), giving a
         conditional distribution for the measures: ``means`` and ``covs``. These capture uncertainty about the state,
@@ -270,6 +272,11 @@ class Predictions:
         :param num_samples: The number of samples.
         :param observation_noise: If True (the default), also sample the observations.
         :param generator: An optional :class:`torch.Generator`, for reproducibility.
+        :param shared_noise: If True, the underlying random draws (the standard-normal noise for the state and for
+         the gaussian observation-noise, and the uniforms for the regime) are the same for every group and timestep
+         (binomial draws are still independent). Each row's distribution is still correct, so this is fine for
+         per-row summaries (means, quantiles), and it uses less memory. But samples are then correlated across rows,
+         so they can't be aggregated across groups (e.g. summed), which the default allows.
         :return: A :class:`PredictionSamples`.
         """
         batch_shape = self.state_means.shape[0:2]
@@ -277,10 +284,11 @@ class Predictions:
         num_rows = self.state_means_flat.shape[0]
         to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
 
-        # sample the measured-mean (via the state). independent noise for each row (unlike the fixed noise used for
-        # the monte-carlo log-prob, which is shared across rows):
+        # sample the measured-mean (via the state). by default, independent noise for each row (unlike the fixed noise
+        # used for the monte-carlo log-prob, which is shared across rows), so samples can be aggregated across rows:
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
-        white_noise = torch.randn((num_samples, num_rows, em_dim), generator=generator, **to)
+        noise_shape = (num_samples, em_dim) if shared_noise else (num_samples, num_rows, em_dim)
+        white_noise = torch.randn(noise_shape, generator=generator, **to)
         means = self._get_measured_mean_samples(
             measurement_model=self.measurement_model_flat,
             state_means=self.state_means_flat,
@@ -291,7 +299,7 @@ class Predictions:
 
         # sample the regime:
         if self.mixture is not None:
-            means, covs = self._sample_regimes(means, covs, generator=generator)
+            means, covs = self._sample_regimes(means, covs, generator=generator, shared_noise=shared_noise)
 
         observations = None
         if observation_noise:
@@ -299,7 +307,8 @@ class Predictions:
                 means,
                 covs,
                 generator=generator,
-                measures=list(self.measurement_model.measures)
+                measures=list(self.measurement_model.measures),
+                shared_noise=shared_noise,
             )
             observations = observations.view(num_samples, *batch_shape, len(measures))
         return PredictionSamples(
@@ -325,26 +334,38 @@ class Predictions:
     def _sample_regimes(self,
                         means: torch.Tensor,
                         covs: torch.Tensor,
-                        generator: Optional[torch.Generator]) -> tuple[torch.Tensor, torch.Tensor]:
+                        generator: Optional[torch.Generator],
+                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """
         For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
         their mean and its variance to their (conditional) variance.
+
+        :param shared_noise: If True, the draws use the same uniforms for every row (inverting each row's cdf of the
+         regime-probabilities); otherwise they're independent.
         """
         rm = self.mixture
         num_samples = means.shape[0]
         shift, extra_var = rm.combo_offsets(self.measurement_model.measures, like=means)  # (num_combos, num_measures)
         regime_probs = self.regime_probs.reshape(-1, rm.num_combos)
-        combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
+        if shared_noise:
+            uniforms = torch.rand(num_samples, generator=generator, dtype=means.dtype, device=means.device)
+            cdf = regime_probs.cumsum(-1)[:, :-1]  # (num_rows, num_combos - 1)
+            combo_idx = (uniforms[:, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
+        else:
+            combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
         return means + shift[combo_idx], covs + torch.diag_embed(extra_var[combo_idx])
 
     def _sample_observations(self,
                              means: torch.Tensor,
                              covs: torch.Tensor,
                              generator: Optional[torch.Generator],
-                             measures: Optional[Sequence[str]] = None) -> torch.Tensor:
+                             measures: Optional[Sequence[str]] = None,
+                             shared_noise: bool = False) -> torch.Tensor:
         """
         Samples gaussian observation-noise around ``means``, for the requested measures. All other measures returned
         as-is.
+
+        :param shared_noise: If True, the same standard-normal noise for every row; otherwise independent.
         """
         all_measures = list(self.measurement_model.measures)
         if measures is None:
@@ -361,14 +382,16 @@ class Predictions:
         if not idx:
             return observations
 
-        z = torch.randn((*means.shape[:-1], len(idx)), generator=generator, dtype=means.dtype, device=means.device)
+        z_shape = (means.shape[0], len(idx)) if shared_noise else (*means.shape[:-1], len(idx))
+        z = torch.randn(z_shape, generator=generator, dtype=means.dtype, device=means.device)
+        z_dims = 'nj' if shared_noise else 'nrj'
         if covs.stride(0) == 0:
             # the same covariance for every sample (an expanded view): only decompose it once
             chol = torch.linalg.cholesky(covs[0][:, idx][:, :, idx])
-            observations[..., idx] += torch.einsum('rij,nrj->nri', chol, z)
+            observations[..., idx] += torch.einsum(f'rij,{z_dims}->nri', chol, z)
         else:
             chol = torch.linalg.cholesky(covs[..., idx, :][..., idx])
-            observations[..., idx] += torch.einsum('nrij,nrj->nri', chol, z)
+            observations[..., idx] += torch.einsum(f'nrij,{z_dims}->nri', chol, z)
 
         return observations
 
