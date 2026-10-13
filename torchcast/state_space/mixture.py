@@ -333,8 +333,9 @@ class MixtureModel(torch.nn.Module):
         return effective, torch.as_tensor(mapping, dtype=torch.long)
 
     @staticmethod
-    def effective_offsets(effective_combo: tuple, num_measures: int, like: torch.Tensor
-                          ) -> tuple[torch.Tensor, torch.Tensor]:
+    def effective_offsets(effective_combo: tuple,
+                          num_measures: int,
+                          like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         :param effective_combo: An entry from :func:`effective_combos`: ``(measure_idx, component)`` pairs.
         :param num_measures: The number of (observed) measures that ``measure_idx`` indexes.
@@ -356,7 +357,7 @@ class MixtureModel(torch.nn.Module):
          measured-mean, and the variance to add to its measurement-noise (zero for measures in the standard regime).
         """
         measures = list(measures)
-        offsets = [
+        offsets = (
             self.effective_offsets(
                 tuple(
                     (measures.index(m), c) for m, c in zip(self.mixture_measures, combo)
@@ -366,8 +367,9 @@ class MixtureModel(torch.nn.Module):
                 like=like,
             )
             for combo in self.combos
-        ]
-        return torch.stack([o[0] for o in offsets]), torch.stack([o[1] for o in offsets])
+        )
+        shift, extra_var = zip(*offsets)
+        return torch.stack(shift), torch.stack(extra_var)
 
     def standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
         """
