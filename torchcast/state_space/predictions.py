@@ -2,7 +2,7 @@ import math
 from math import log
 
 from dataclasses import dataclass, fields
-from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable
+from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator
 from warnings import warn
 
 import torch
@@ -177,7 +177,7 @@ class Predictions:
             use_map=self._resolve_use_map(use_map), transforms=self._standardize_transforms(transform)
         )
 
-    def __iter__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def __iter__(self) -> Iterator[Optional[torch.Tensor]]:
         # so that we can do ``mean, cov = predictions``
         yield self.means
         yield self.covs
