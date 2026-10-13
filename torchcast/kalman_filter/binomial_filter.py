@@ -402,20 +402,22 @@ class BinomialPredictions(Predictions):
 
         return out
 
-    def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
-        covs = super()._conditional_measure_covs(means).clone()
+    def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
+        extra_vars = super()._conditional_measure_vars(means)
         all_measures = list(self.measurement_model.measures)
         idx = [all_measures.index(m) for m in self.binary_measures]
-        if idx:
-            # binomial variance of the proportion, given the (sampled) probability:
-            p = means[..., idx].clamp(0, 1)
-            num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype)
-            covs[..., idx, idx] = p * (1 - p) / num_obs
-        return covs
+        if not idx:
+            return extra_vars
+        extra_vars = torch.zeros_like(means) if extra_vars is None else extra_vars.clone()
+        # binomial variance of the proportion, given the (sampled) probability:
+        p = means[..., idx].clamp(0, 1)
+        num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype)
+        extra_vars[..., idx] = extra_vars[..., idx] + p * (1 - p) / num_obs
+        return extra_vars
 
     def _sample_observations(self,
                              means: torch.Tensor,
-                             covs: torch.Tensor,
+                             extra_vars: Optional[torch.Tensor],
                              generator: Optional[torch.Generator],
                              measures: Optional[Sequence[str]] = None,
                              shared_noise: bool = False) -> torch.Tensor:
@@ -431,7 +433,7 @@ class BinomialPredictions(Predictions):
 
         # sample the gaussian measures:
         observations = super()._sample_observations(
-            means, covs, measures=gaussian_measures, generator=generator, shared_noise=shared_noise
+            means, extra_vars, measures=gaussian_measures, generator=generator, shared_noise=shared_noise
         )
 
         # sample the remaining (binary) measures:

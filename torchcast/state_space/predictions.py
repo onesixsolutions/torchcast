@@ -1034,17 +1034,20 @@ class Predictions:
             state_covs=self.state_covs_flat,
             white_noise=white_noise,
         )
-        covs = self._conditional_measure_covs(means)
+        # the observations' covariance given the sampled state is `measure_covs` plus a per-sample diagonal (e.g. a
+        # binary measure's binomial variance; a regime's extra variance) -- tracked as just that diagonal, rather
+        # than a (num_samples, num_rows, num_measures, num_measures) tensor:
+        extra_vars = self._conditional_measure_vars(means)
 
         # sample the regime:
         if self.mixture is not None:
-            means, covs = self._sample_regimes(means, covs, generator=generator, shared_noise=shared_noise)
+            means, extra_vars = self._sample_regimes(means, extra_vars, generator=generator, shared_noise=shared_noise)
 
         observations = None
         if observation_noise:
             observations = self._sample_observations(
                 means,
-                covs,
+                extra_vars,
                 generator=generator,
                 measures=list(self.measurement_model.measures),
                 shared_noise=shared_noise,
@@ -1053,31 +1056,34 @@ class Predictions:
         return PredictionSamples(
             measures=measures,
             means=means.view(num_samples, *batch_shape, len(measures)),
-            covs=covs.view(num_samples, *batch_shape, len(measures), len(measures)),
+            measure_covs=self.measure_covs,
+            extra_vars=None if extra_vars is None else extra_vars.view(num_samples, *batch_shape, len(measures)),
             observations=observations,
         )
 
-    def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
+    def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
         """
-        The covariance of the observations given a sampled state. For gaussian measures this is just ``measure_covs``
-        (it doesn't depend on the state); subclasses whose observation-noise *does* depend on the state override this
-        (e.g. ``BinomialPredictions``: ``p * (1 - p) / num_obs`` for binary measures, whose ``measure_covs`` entries
-        are empty).
+        The covariance of the observations given a sampled state is ``measure_covs`` plus a per-sample diagonal; this
+        returns that diagonal. For gaussian measures there is none (their observation-noise doesn't depend on the
+        state); subclasses whose observation-noise *does* depend on the state override this (e.g.
+        ``BinomialPredictions``: ``p * (1 - p) / num_obs`` for binary measures, whose ``measure_covs`` entries are
+        empty).
 
         :param means: A ``(num_samples, num_rows, num_measures)`` tensor of measured means, each from a sampled state.
-        :return: A ``(num_samples, num_rows, num_measures, num_measures)`` tensor with the covariance of the measures
-         given the state.
+        :return: A ``(num_samples, num_rows, num_measures)`` tensor of variances to add to the diagonal of
+         ``measure_covs``, or None if there are none.
         """
-        return self.measure_covs_flat.expand(means.shape[0], -1, -1, -1)
+        return None
 
     def _sample_regimes(self,
                         means: torch.Tensor,
-                        covs: torch.Tensor,
+                        extra_vars: Optional[torch.Tensor],
                         generator: Optional[torch.Generator],
                         shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """
         For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
-        their mean and its variance to their (conditional) variance.
+        their mean and its variance to their (conditional) variance -- i.e. to ``extra_vars``, the per-sample diagonal
+        added to ``measure_covs`` (see ``_conditional_measure_vars``).
 
         :param shared_noise: If True, the draws use the same uniforms for every row (inverting each row's cdf of the
          regime-probabilities); otherwise they're independent.
@@ -1092,17 +1098,20 @@ class Predictions:
             combo_idx = (uniforms[:, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
         else:
             combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
-        return means + shift[combo_idx], covs + torch.diag_embed(extra_var[combo_idx])
+        extra = extra_var[combo_idx]  # (num_samples, num_rows, num_measures)
+        return means + shift[combo_idx], extra if extra_vars is None else extra_vars + extra
 
     def _sample_observations(self,
                              means: torch.Tensor,
-                             covs: torch.Tensor,
+                             extra_vars: Optional[torch.Tensor],
                              generator: Optional[torch.Generator],
                              measures: Optional[Sequence[str]] = None,
                              shared_noise: bool = False) -> torch.Tensor:
         """
         Samples gaussian observation-noise around ``means``, for the requested measures. All other measures returned
-        as-is.
+        as-is. The noise's covariance is ``measure_covs`` plus ``diag(extra_vars)`` (per-sample), drawn as the sum of
+        two independent terms -- ``chol(measure_covs) @ z1 + sqrt(extra_vars) * z2`` -- so it needs neither a
+        per-sample covariance nor a per-sample cholesky.
 
         :param shared_noise: If True, the same standard-normal noise for every row; otherwise independent.
         """
@@ -1122,15 +1131,13 @@ class Predictions:
             return observations
 
         z_shape = (means.shape[0], len(idx)) if shared_noise else (*means.shape[:-1], len(idx))
-        z = torch.randn(z_shape, generator=generator, dtype=means.dtype, device=means.device)
-        z_dims = 'nj' if shared_noise else 'nrj'
-        if covs.stride(0) == 0:
-            # the same covariance for every sample (an expanded view): only decompose it once
-            chol = torch.linalg.cholesky(covs[0][:, idx][:, :, idx])
-            observations[..., idx] += torch.einsum(f'rij,{z_dims}->nri', chol, z)
-        else:
-            chol = torch.linalg.cholesky(covs[..., idx, :][..., idx])
-            observations[..., idx] += torch.einsum(f'nrij,{z_dims}->nri', chol, z)
+        to = {'dtype': means.dtype, 'device': means.device}
+        chol = torch.linalg.cholesky(self.measure_covs_flat[:, idx][:, :, idx])  # (num_rows, len(idx), len(idx))
+        z = torch.randn(z_shape, generator=generator, **to)
+        observations[..., idx] += torch.einsum(f'rij,{"nj" if shared_noise else "nrj"}->nri', chol, z)
+        if extra_vars is not None:
+            z = torch.randn(z_shape, generator=generator, **to)
+            observations[..., idx] += extra_vars[..., idx].sqrt() * (z.unsqueeze(1) if shared_noise else z)
 
         return observations
 
@@ -1586,15 +1593,31 @@ class PredictionSamples:
     :param measures: The names of the measures (the last dimension of the tensors).
     :param means: A ``(num_samples, num_groups, num_timesteps, num_measures)`` tensor: for each sample (of the state,
      and regime if applicable), the mean of the measures.
-    :param covs: A ``(num_samples, num_groups, num_timesteps, num_measures, num_measures)`` tensor: the corresponding
-     covariance (i.e. the observation noise).
+    :param measure_covs: A ``(num_groups, num_timesteps, num_measures, num_measures)`` tensor: the observation-noise
+     covariance that's the same for every sample.
+    :param extra_vars: Optionally, a ``(num_samples, num_groups, num_timesteps, num_measures)`` tensor of per-sample
+     variances added to the diagonal of ``measure_covs`` (e.g. a binary measure's binomial variance, or a regime's
+     extra variance). See :attr:`covs`.
     :param observations: If ``observation_noise=True``, a ``(num_samples, num_groups, num_timesteps, num_measures)``
      tensor of sampled observations.
     """
     measures: list
     means: torch.Tensor
-    covs: torch.Tensor
+    measure_covs: torch.Tensor
+    extra_vars: Optional[torch.Tensor] = None
     observations: Optional[torch.Tensor] = None
+
+    @property
+    def covs(self) -> torch.Tensor:
+        """
+        A ``(num_samples, num_groups, num_timesteps, num_measures, num_measures)`` tensor: for each sample, the
+        covariance of the observations around ``means`` (i.e. the observation-noise). Computed on access (a view, if
+        there are no ``extra_vars``; otherwise a new, potentially large, tensor).
+        """
+        covs = self.measure_covs.expand(self.means.shape[0], *self.measure_covs.shape)
+        if self.extra_vars is not None:
+            covs = covs + torch.diag_embed(self.extra_vars)
+        return covs
 
     def __getitem__(self, measure: str) -> torch.Tensor:
         """

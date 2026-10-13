@@ -239,9 +239,9 @@ def test_sample_binomial_saturated_probability():
     pred = bf(y)
     # sampled means (num_samples, num_rows, num_measures), with the probability saturated at 1:
     means = torch.stack([torch.ones(20, 8), torch.randn(20, 8)], -1)
-    covs = pred._conditional_measure_covs(means)
-    assert (covs[..., 0, 0] == 0).all()
-    observations = pred._sample_observations(means, covs, generator=_gen())
+    extra_vars = pred._conditional_measure_vars(means)
+    assert (extra_vars[..., 0] == 0).all()
+    observations = pred._sample_observations(means, extra_vars, generator=_gen())
     assert (observations[..., 0] == 1).all()
     assert torch.isfinite(observations).all()
     assert (observations[..., 1] != means[..., 1]).all()  # (noise was added to the gaussian measure)
