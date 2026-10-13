@@ -402,13 +402,10 @@ class BinomialPredictions(Predictions):
 
         return out
 
-    def _binary_idx(self) -> list[int]:
-        measures = list(self.measurement_model.measures)
-        return [measures.index(m) for m in self.binary_measures]
-
     def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
         covs = super()._conditional_measure_covs(means).clone()
-        idx = self._binary_idx()
+        all_measures = list(self.measurement_model.measures)
+        idx = [all_measures.index(m) for m in self.binary_measures]
         if idx:
             # binomial variance of the proportion, given the (sampled) probability:
             p = means[..., idx].clamp(0, 1)
@@ -419,18 +416,26 @@ class BinomialPredictions(Predictions):
     def _sample_observations(self,
                              means: torch.Tensor,
                              covs: torch.Tensor,
-                             generator: Optional[torch.Generator]) -> torch.Tensor:
+                             generator: Optional[torch.Generator],
+                             measures: Optional[Sequence[str]] = None) -> torch.Tensor:
         """
         Gaussian measures are sampled as usual (their observation noise is uncorrelated with the binary measures');
         binary measures are sampled from a binomial, then (like the rest of ``BinomialPredictions``) returned as
         proportions.
         """
-        observations = super()._sample_observations(means, covs, generator=generator)
-        idx = self._binary_idx()
-        if idx:
+        all_measures = list(self.measurement_model.measures)
+        gaussian_measures = [m for m in all_measures if m not in self.binary_measures]
+
+        # sample the gaussian measures:
+        observations = super()._sample_observations(means, covs, measures=gaussian_measures, generator=generator)
+
+        # sample the remaining (binary) measures:
+        if self.binary_measures:
+            idx = [all_measures.index(m) for m in self.binary_measures]
             p = means[..., idx].clamp(0, 1)
             num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype).expand_as(p)
             observations[..., idx] = torch.binomial(num_obs.contiguous(), p.contiguous(), generator=generator) / num_obs
+
         return observations
 
     @property

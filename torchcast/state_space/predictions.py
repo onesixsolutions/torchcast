@@ -37,7 +37,6 @@ class Predictions:
     _means = None
     _covs = None
 
-
     def __init__(self,
                  measurement_model: 'MeasurementModel',
                  states: Union[Sequence['StateTuple'], 'StateTuple', tuple],
@@ -162,8 +161,7 @@ class Predictions:
          should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
          key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
          actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
-         that aren't in ``dataset`` are all-nan). Only for
-         ``type='predictions'``.
+         that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
         :param derived_num_samples: The number of samples used for ``derived``.
         """
         dataset = self._resolve_dataset(dataset)
@@ -297,7 +295,12 @@ class Predictions:
 
         observations = None
         if observation_noise:
-            observations = self._sample_observations(means, covs, generator=generator)
+            observations = self._sample_observations(
+                means,
+                covs,
+                generator=generator,
+                measures=list(self.measurement_model.measures)
+            )
             observations = observations.view(num_samples, *batch_shape, len(measures))
         return PredictionSamples(
             measures=measures,
@@ -337,16 +340,27 @@ class Predictions:
     def _sample_observations(self,
                              means: torch.Tensor,
                              covs: torch.Tensor,
-                             generator: Optional[torch.Generator]) -> torch.Tensor:
+                             generator: Optional[torch.Generator],
+                             measures: Optional[Sequence[str]] = None) -> torch.Tensor:
         """
-        Samples gaussian observation-noise around ``means``, for the gaussian measures. Non-gaussian measures (see
-        ``_non_gaussian_measures``) are left at their means, for subclasses to sample.
+        Samples gaussian observation-noise around ``means``, for the requested measures. All other measures returned
+        as-is.
         """
-        measures = list(self.measurement_model.measures)
-        idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        all_measures = list(self.measurement_model.measures)
+        if measures is None:
+            measures = all_measures
+
+        non_gaussian = set(measures).intersection(self._non_gaussian_measures)
+        if non_gaussian:
+            raise ValueError(
+                f"{type(self).__name__}._sample_observations() only works for gaussian measures, but got {non_gaussian}"
+            )
+
         observations = means.clone()
+        idx = [i for i, m in enumerate(all_measures) if m in measures]
         if not idx:
             return observations
+
         z = torch.randn((*means.shape[:-1], len(idx)), generator=generator, dtype=means.dtype, device=means.device)
         if covs.stride(0) == 0:
             # the same covariance for every sample (an expanded view): only decompose it once
@@ -355,6 +369,7 @@ class Predictions:
         else:
             chol = torch.linalg.cholesky(covs[..., idx, :][..., idx])
             observations[..., idx] += torch.einsum('nrij,nrj->nri', chol, z)
+
         return observations
 
     @torch.inference_mode()
@@ -547,8 +562,11 @@ class Predictions:
          regimes (see ``_regimes``): all ones for a measure without mixture components.
         """
         if self.mixture is None or measure not in self.mixture.mixture_measures:
-            return torch.ones((*self.state_means.shape[0:2], 1), dtype=self.state_means.dtype,
-                              device=self.state_means.device)
+            return torch.ones(
+                (*self.state_means.shape[0:2], 1),
+                dtype=self.state_means.dtype,
+                device=self.state_means.device
+            )
         rm = self.mixture
         k = rm.mixture_measures.index(measure)
         probs = []
