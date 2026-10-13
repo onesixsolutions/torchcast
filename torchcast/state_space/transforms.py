@@ -13,16 +13,15 @@ if TYPE_CHECKING:
 
 class Transform(torch.nn.Module):
     """
-    Maps a measure from the scale it's modeled on back to its original scale, e.g. for
+    Maps a measure from its original to the scale it's modeled on (and vice versa), e.g. for
     ``Predictions.to_dataframe(transform=...)``.
 
     Subclasses implement :func:`transform` (the transformation applied before modeling -- e.g. by
     ``TimeSeriesDataset.from_dataframe(transform=...)``) and its inverse, :func:`inverse`, which must be elementwise and
-    monotonically increasing (so quantiles can be
-    back-transformed directly). The back-transformed mean, :func:`inverse_mean`, is ``E[inverse(Y)]`` where ``Y =
-    mean + sqrt(var) * Z``, and ``Z`` is standard normal. This is computed by gauss-hermite quadrature by default;
-    subclasses can override :func:`expected_inverse` with a closed form, or :func:`noise_nodes` to use a different
-    distribution for ``Z`` (see :class:`SmearingTransform`).
+    monotonically increasing (so quantiles can be back-transformed directly). The back-transformed mean,
+    :func:`inverse_mean`, is ``E[inverse(Y)]`` where ``Y = mean + sqrt(var) * Z``, and ``Z`` is standard normal. This
+    is computed by gauss-hermite quadrature by default; subclasses can override :func:`expected_inverse` with a closed
+    form, or :func:`noise_nodes` to use a different distribution for ``Z`` (see :class:`SmearingTransform`).
 
     :param bias_adjust: How much bias-adjustment to apply when back-transforming the mean, between 0 and 1. The
      back-transformed mean is computed with the variance scaled by this: 1 (the default, ``None``) gives the mean of
@@ -75,11 +74,11 @@ class Transform(torch.nn.Module):
         :param var: A tensor with the same shape as ``mean``.
         :return: A tensor with the same shape as ``mean``.
         """
-        z, w = self.noise_nodes(dtype=mean.dtype, device=mean.device)
+        z, w = self._noise_nodes(dtype=mean.dtype, device=mean.device)
         nodes = mean.unsqueeze(-1) + var.sqrt().unsqueeze(-1) * z
         return (w * self.inverse(nodes)).sum(-1)
 
-    def noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """
         The distribution of the standardized noise ``Z`` (see :func:`expected_inverse`), as nodes and weights: by
         default, gauss-hermite quadrature for a standard normal.
@@ -295,7 +294,7 @@ class SmearingTransform(Transform):
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return self.base.inverse(x)
 
-    def noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         return self.residuals.to(dtype=dtype, device=device), self.weights.to(dtype=dtype, device=device)
 
     def for_regime(self, component_id: str) -> Transform:
@@ -339,8 +338,8 @@ class RegimeTransform(Transform):
     def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         return self.standard.expected_inverse(mean, var)
 
-    def noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.standard.noise_nodes(dtype=dtype, device=device)
+    def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.standard._noise_nodes(dtype=dtype, device=device)
 
     def for_regime(self, component_id: str) -> Transform:
         if component_id in self.components:
