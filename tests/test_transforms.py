@@ -521,3 +521,34 @@ def test_dataset_from_dataframe_transform():
     for m in 'ab':
         rows = merged.query(f"measure == '{m}'")
         assert np.allclose(rows['actual'].values, rows[m].values, rtol=1e-5)
+
+
+def test_dataloader_from_dataframe_transform():
+    """`TimeSeriesDataLoader.from_dataframe(transform=)` matches `TimeSeriesDataset.from_dataframe(transform=)`."""
+    import pandas as pd
+    from torchcast.utils import TimeSeriesDataset, TimeSeriesDataLoader
+
+    rs = np.random.RandomState(0)
+    df = pd.DataFrame({
+        'group': np.repeat(['g0', 'g1', 'g2'], 10),
+        'time': np.tile(np.arange(10), 3),
+        'a': rs.rand(30) * 10 + 1,
+        'b': rs.rand(30) * 10 + 1,
+        'x': rs.randn(30),
+    })
+    kwargs = dict(group_colname='group', time_colname='time', dt_unit=None)
+    transform = {'a': LogTransform(), 'b': BoxCoxTransform(.5)}
+    expected = TimeSeriesDataset.from_dataframe(
+        df, y_colnames=['a', 'b'], X_colnames=['x'], transform=transform, **kwargs
+    )
+    # (`X_colnames` as a function: predictors are never transformed)
+    for X_colnames in (['x'], lambda d: d[['x']]):
+        loader = TimeSeriesDataLoader.from_dataframe(
+            df, y_colnames=['a', 'b'], X_colnames=X_colnames, transform=transform, batch_size=2, **kwargs
+        )
+        batches = list(loader)
+        assert len(batches) == 2
+        for batch in batches:
+            idx = [list(expected.group_names).index(g) for g in batch.group_names]
+            assert torch.equal(batch.tensors[0], expected.tensors[0][idx])
+            assert torch.equal(batch.tensors[1], expected.tensors[1][idx])

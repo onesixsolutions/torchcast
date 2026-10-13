@@ -655,6 +655,7 @@ class TimeSeriesDataLoader(DataLoader):
                        pad_X: Union[float, str, None] = 'ffill',
                        dtype: torch.dtype = torch.float32,
                        device: Optional[torch.device] = None,
+                       transform: Union['Transform', dict[str, 'Transform'], None] = None,
                        **kwargs) -> 'TimeSeriesDataLoader':
         """
         :param dataframe: A pandas ``DataFrame``
@@ -675,8 +676,12 @@ class TimeSeriesDataLoader(DataLoader):
         :param dtype: The dtype for returned tensors.
         :param device: The device for returned tensors. Note that if you are working with a GPU, it may be more
          efficient to leave this parameter as-is, then send each batch to the GPU within your training loop.
+        :param transform: For measures to be transformed before modeling (e.g. log): see
+         :func:`TimeSeriesDataset.from_dataframe`. Applied once, to the whole dataframe (not per batch).
         :return: An iterable that yields :class:`TimeSeriesDataset`.
         """
+        if transform is not None:
+            dataframe = _apply_transforms(dataframe, transform, measures=list(measure_colnames or y_colnames))
 
         return cls(
             dataset=_DataFrameGroupByDataset(
