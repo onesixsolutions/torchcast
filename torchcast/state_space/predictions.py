@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 
 from scipy import stats
-from torch.distributions import MultivariateNormal
 
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
@@ -387,72 +386,63 @@ class Predictions:
             m in measurement_model.measures for m in self.mixture.mixture_measures
         )
 
+        mmean_samples = None
         if measurement_model.is_nonlinear:
+            # monte-carlo: samples of the measured-mean, each with the measurement-noise:
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
                 state_covs=state_covs,
             )
-            if has_mixture:
-                def combo_log_lik(shift: torch.Tensor, extra_var: torch.Tensor) -> torch.Tensor:
-                    # the monte-carlo marginal likelihood:
-                    mc_log_probs = _mc_mvnorm_log_prob(
-                        resid=obs - mmean_samples - shift,
-                        cov=measure_cov + torch.diag(extra_var)
-                    )
-                    return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
+            resid, cov = obs - mmean_samples, measure_cov
+        else:
+            measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
+            resid, cov = obs - measured_mean, measure_mat @ state_covs @ measure_mat.transpose(-1, -2) + measure_cov
 
-                return self._mixture_log_prob(obs=obs, measures=measurement_model.measures,
-                                              combo_log_lik=combo_log_lik, log_prior=regime_log_prior)
+        # with mixture components: the log-lik under each (effective) regime-combo. these all share the predicted
+        # state, so each just offsets the mean and adds to the diagonal:
+        regimes = [(None, None, None)]
+        if has_mixture:
+            regimes = self._regime_terms(measurement_model.measures, log_prior=regime_log_prior, like=obs)
+        terms = []
+        for shift, extra_var, log_prior in regimes:
+            if shift is None:
+                regime_resid, regime_cov = resid, cov
+            else:
+                regime_resid, regime_cov = resid - shift, cov + torch.diag(extra_var)
+            if mmean_samples is None:
+                log_lik = mvnorm_log_prob(regime_resid, regime_cov)
+            else:
+                # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log(); numerically stable version:
+                mc_log_probs = _mc_mvnorm_log_prob(regime_resid, regime_cov)
+                log_lik = torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
+            terms.append(log_lik if log_prior is None else log_prior + log_lik)
+        if len(terms) == 1:
+            return terms[0]
+        return torch.logsumexp(torch.stack(terms, -1), -1)
 
-            # evaluate the log-prob of the observations under each sampled measured-mean:
-            mc_log_probs = MultivariateNormal(
-                loc=mmean_samples,
-                covariance_matrix=measure_cov.unsqueeze(0),
-                validate_args=False
-            ).log_prob(obs)
-            # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
-            # this is a numerically stable way to do that:
-            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
-
-        measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
-        system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
-        if not has_mixture:
-            return MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
-
-        def combo_log_lik(shift: torch.Tensor, extra_var: torch.Tensor) -> torch.Tensor:
-            # all regime-combos share the same predicted state, so this just offsets the mean and adds to the diagonal:
-            return mvnorm_log_prob(resid=obs - measured_mean - shift, cov=system_cov + torch.diag(extra_var))
-
-        return self._mixture_log_prob(obs=obs, measures=measurement_model.measures,
-                                      combo_log_lik=combo_log_lik, log_prior=regime_log_prior)
-
-    def _mixture_log_prob(self,
-                          obs: torch.Tensor,
-                          measures: Sequence[str],
-                          combo_log_lik: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-                          log_prior: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _regime_terms(self,
+                      measures: Sequence[str],
+                      like: torch.Tensor,
+                      log_prior: Optional[torch.Tensor] = None
+                      ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
-        The marginal log-likelihood under the mixture: ``logsumexp_c(log_prior_c + log_lik_c)``.
+        For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
+        are distinguishable given ``measures`` (see ``MixtureModel.effective_combos``).
 
-        :param combo_log_lik: A function that takes two ``(len(measures),)`` tensors -- the offset to each measure's
-         measured-mean, and the variance to add to its measurement-noise -- and returns the ``(batch,)``
-         log-likelihood.
+        :param like: A ``(batch, ...)`` tensor, for the number of rows, dtype and device.
         :param log_prior: A ``(batch, num_combos)`` tensor of log prior regime-probabilities. Defaults to the
          regime-model's base-probs.
+        :return: For each effective combo, two ``(len(measures),)`` tensors -- the offset to each measure's
+         measured-mean and the variance to add to its measurement-noise -- and the ``(batch,)`` log prior probability
+         (pooled over the combos that are indistinguishable given ``measures``).
         """
-        num_rows = obs.shape[0]
         if log_prior is None:
-            log_prior = self.mixture.log_base_probs().expand(num_rows, -1)
-
+            log_prior = self.mixture.log_base_probs().expand(like.shape[0], -1)
         effective, mapping = self.mixture.effective_combos(measures)
-        out = []
         for e, eff in enumerate(effective):
-            log_lik = combo_log_lik(*self.mixture.effective_offsets(eff, len(measures), like=obs))
-            # combos that are indistinguishable given `measures` pool their prior probability:
-            log_prior_e = torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
-            out.append(log_prior_e + log_lik)
-        return torch.logsumexp(torch.stack(out, -1), -1)
+            shift, extra_var = self.mixture.effective_offsets(eff, len(measures), like=like)
+            yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
 
     # Dataframes & plotting --------------------------------------------------------------------------------------------
 
