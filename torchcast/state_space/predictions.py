@@ -1328,16 +1328,14 @@ class Predictions:
         from .state import StateTuple
 
         preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
-
-        def _squeeze(x):
-            return _map_states(x, lambda v: v.squeeze(1))
+        single_time = (slice(None), 0)  # (like `.squeeze(1)`)
 
         if type_.startswith('pred'):
             return StateTuple(
                 preds.state_means.squeeze(1),
                 preds.state_covs.squeeze(1),
-                regime_probs=_squeeze(preds.regime_probs),
-                scaling=_squeeze(preds.scaling_states),
+                regime_probs=_index_states(preds.regime_probs, single_time),
+                scaling=_index_states(preds.scaling_states, single_time),
             )
         elif type_.startswith('update'):
             if preds.update_means is None:
@@ -1345,8 +1343,8 @@ class Predictions:
             return StateTuple(
                 preds.update_means.squeeze(1),
                 preds.update_covs.squeeze(1),
-                regime_probs=_squeeze(preds.update_regime_probs),
-                scaling=_squeeze(preds.update_scaling_states),
+                regime_probs=_index_states(preds.update_regime_probs, single_time),
+                scaling=_index_states(preds.update_scaling_states, single_time),
             )
         else:
             raise ValueError("Unrecognized `type_`, expected 'prediction' or 'update'.")
@@ -1416,16 +1414,13 @@ class Predictions:
             item = (item,)
         from .state import StateTuple
 
-        def _slice(x):
-            return _map_states(x, lambda v: v[item])
-
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
             'states': StateTuple(
                 self.state_means[item],
                 self.state_covs[item],
-                regime_probs=_slice(self.regime_probs),
-                scaling=_slice(self.scaling_states),
+                regime_probs=_index_states(self.regime_probs, item),
+                scaling=_index_states(self.scaling_states, item),
             ),
             'measure_covs': self.measure_covs[item],
             # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
@@ -1436,8 +1431,8 @@ class Predictions:
             kwargs['updates'] = StateTuple(
                 self.update_means[item],
                 self.update_covs[item],
-                regime_probs=_slice(self.update_regime_probs),
-                scaling=_slice(self.update_scaling_states),
+                regime_probs=_index_states(self.update_regime_probs, item),
+                scaling=_index_states(self.update_scaling_states, item),
             )
 
         return kwargs
@@ -1750,13 +1745,13 @@ def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.T
     return _maybe_stack(means, 1), _maybe_stack(covs, 1), None, None
 
 
-def _map_states(x: Union[torch.Tensor, dict, None], fun: Callable) -> Union[torch.Tensor, dict, None]:
-    """Apply ``fun`` to a tensor, or to each tensor in a dict (e.g. adaptive-scaling states); None stays None."""
+def _index_states(x: Union[torch.Tensor, dict, None], item: tuple) -> Union[torch.Tensor, dict, None]:
+    """Index a tensor, or each tensor in a dict (e.g. adaptive-scaling states); None stays None."""
     if x is None:
         return None
     if isinstance(x, dict):
-        return {k: fun(v) for k, v in x.items()}
-    return fun(x)
+        return {k: v[item] for k, v in x.items()}
+    return x[item]
 
 
 def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> torch.Tensor:
