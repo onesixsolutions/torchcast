@@ -1129,8 +1129,9 @@ class Predictions:
         regime_probs = self.regime_probs.reshape(-1, rm.num_combos)
         if shared_noise:
             uniforms = torch.rand(num_samples, generator=generator, dtype=means.dtype, device=means.device)
-            cdf = regime_probs.cumsum(-1)[:, :-1]  # (num_rows, num_combos - 1)
-            combo_idx = (uniforms[:, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
+            cdf = regime_probs.cumsum(-1)[:, :-1].contiguous()  # (num_rows, num_combos - 1)
+            # (the number of cdf-values below each uniform)
+            combo_idx = torch.searchsorted(cdf, uniforms.expand(cdf.shape[0], -1).contiguous()).T  # (samples, rows)
         else:
             combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
         extra = extra_var[combo_idx]  # (num_samples, num_rows, num_measures)
@@ -1160,21 +1161,22 @@ class Predictions:
                 f"{type(self).__name__}._sample_observations() only works for gaussian measures, but got {non_gaussian}"
             )
 
-        observations = means.clone()
         idx = [i for i, m in enumerate(all_measures) if m in measures]
         if not idx:
-            return observations
+            return means.clone()
 
         z_shape = (means.shape[0], len(idx)) if shared_noise else (*means.shape[:-1], len(idx))
         to = {'dtype': means.dtype, 'device': means.device}
         chol = torch.linalg.cholesky(self.measure_covs_flat[:, idx][:, :, idx])  # (num_rows, len(idx), len(idx))
         z = torch.randn(z_shape, generator=generator, **to)
-        observations[..., idx] += torch.einsum(f'rij,{"nj" if shared_noise else "nrj"}->nri', chol, z)
+        noise = torch.einsum(f'rij,{"nj" if shared_noise else "nrj"}->nri', chol, z)
         if extra_vars is not None:
             z = torch.randn(z_shape, generator=generator, **to)
-            observations[..., idx] += extra_vars[..., idx].sqrt() * (z.unsqueeze(1) if shared_noise else z)
-
-        return observations
+            noise = noise + extra_vars[..., idx].sqrt() * (z.unsqueeze(1) if shared_noise else z)
+        if len(idx) == len(all_measures):
+            return means + noise
+        # (out-of-place; much faster than a clone plus in-place updates via advanced indexing)
+        return means.index_add(-1, torch.as_tensor(idx, device=means.device), noise)
 
     # Mixture components -----------------------------------------------------------------------------------------------
 
