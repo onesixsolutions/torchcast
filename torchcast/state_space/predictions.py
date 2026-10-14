@@ -222,11 +222,9 @@ class Predictions:
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
         batch_shape = self.state_means.shape[0:2]
-        measures = list(self.measurement_model.measures)
-        nonlinear = self._nonlinear_measures
         # exact for linear measures; the MAP for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
-        if mmean_samples is None and any(m in nonlinear and (not use_map or m in transforms) for m in measures):
+        if mmean_samples is None and self._mc_mean_measures(use_map, transforms):
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=self.measurement_model_flat,
                 state_means=self.state_means_flat,
@@ -234,33 +232,73 @@ class Predictions:
             )
 
         out = []
-        for j, measure in enumerate(measures):
-            t = transforms.get(measure)
-            regime_means = []
-            if measure not in nonlinear:
-                mean, var = measured_mean[:, j], system_cov[:, j, j]
-                for label, offset, extra in self._regimes(measure):
-                    if t is None:
-                        regime_means.append(mean + offset)
-                    else:
-                        regime_t = t if label is None else t.for_regime(label)
-                        regime_means.append(regime_t.inverse_mean(mean + offset, var + extra))
-            elif t is not None:
-                # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise
-                noise_var = self.measure_covs_flat[:, j, j]
-                for label, offset, extra in self._regimes(measure):
-                    regime_t = t if label is None else t.for_regime(label)
-                    _warn_bias_adjust_ignored(regime_t)
-                    regime_means.append(torch.stack([
-                        regime_t.expected_inverse(x + offset, noise_var + extra)
-                        for x in mmean_samples[..., j].unbind(0)
-                    ]).mean(0))
-            else:
-                mean = measured_mean[:, j] if use_map else mmean_samples[..., j].mean(0)
-                regime_means = [mean + offset for _, offset, _ in self._regimes(measure)]
+        for j, measure in enumerate(self.measurement_model.measures):
+            regime_means = self._regime_means(
+                j,
+                measure,
+                transform=transforms.get(measure),
+                use_map=use_map,
+                measured_mean=measured_mean[:, j],
+                measured_var=system_cov[:, j, j],
+                mmean_samples=None if mmean_samples is None else mmean_samples[..., j],
+            )
             regime_means = torch.stack(regime_means, -1).view(*batch_shape, -1)
             out.append((self._measure_regime_probs(measure) * regime_means).sum(-1))
         return torch.stack(out, -1)
+
+    def _regime_means(self,
+                      j: int,
+                      measure: str,
+                      transform: Optional['Transform'],
+                      use_map: bool,
+                      measured_mean: torch.Tensor,
+                      measured_var: torch.Tensor,
+                      mmean_samples: Optional[torch.Tensor]) -> list[torch.Tensor]:
+        """
+        Helper for ``_get_means``: the mean of each of ``measure``'s regimes (see ``_regimes``), back-transformed by
+        ``transform`` (each regime's ``Transform.for_regime``).
+
+        :param j: The measure's index.
+        :param measured_mean: The ``(num_rows,)`` measured-mean: exact for a linear measure, the MAP for a nonlinear
+         one.
+        :param measured_var: The ``(num_rows,)`` variance of the measured-mean plus observation-noise (only used for
+         linear measures).
+        :param mmean_samples: ``(num_samples, num_rows)`` samples of the measured-mean (only used for nonlinear
+         measures, see ``_mc_mean_measures``).
+        :return: A ``(num_rows,)`` tensor for each regime.
+        """
+        regimes = [
+            (transform if transform is None or label is None else transform.for_regime(label), offset, extra)
+            for label, offset, extra in self._regimes(measure)
+        ]
+        is_linear = measure not in self._nonlinear_measures
+
+        if transform is None:
+            # the mean of the measured-mean: exact, monte-carlo over the state, or the MAP:
+            if not (is_linear or use_map):
+                measured_mean = mmean_samples.mean(0)
+            return [measured_mean + offset for _, offset, _ in regimes]
+
+        if is_linear:
+            # closed form (or quadrature), given the mean and variance:
+            return [t.inverse_mean(measured_mean + offset, measured_var + extra) for t, offset, extra in regimes]
+
+        # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
+        noise_var = self.measure_covs_flat[:, j, j]
+        out = []
+        for t, offset, extra in regimes:
+            _warn_bias_adjust_ignored(t)
+            out.append(torch.stack([t.expected_inverse(x + offset, noise_var + extra) for x in mmean_samples]).mean(0))
+        return out
+
+    def _mc_mean_measures(self, use_map: bool, transforms: dict[str, 'Transform']) -> list[str]:
+        """
+        The (nonlinear) measures whose means are monte-carlo, over samples of the state: all of them -- unless
+        ``use_map``, in which case only those with a transform (the others use the measured-mean of the state-mean).
+        """
+        return [m for m in self.measurement_model.measures if m in self._nonlinear_measures and (
+            not use_map or m in transforms
+        )]
 
     # Log-probability --------------------------------------------------------------------------------------------------
 
@@ -664,10 +702,12 @@ class Predictions:
         use_map = self._resolve_use_map(use_map)
         measures = list(self.measurement_model.measures)
 
-        # samples of the state's measured-mean (fixed noise), shared by the means and the intervals -- only if needed:
+        # samples of the state's measured-mean (fixed noise), shared by the means and the intervals -- only if needed
+        # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
         nonlinear = [m for m in measures if m in self._nonlinear_measures]
-        if nonlinear and (alpha is not None or not use_map or any(m in transforms for m in nonlinear)):
+        needs_mc_intervals = alpha is not None and bool(nonlinear)
+        if self._mc_mean_measures(use_map, transforms) or needs_mc_intervals:
             if not use_map and self.mc_white_noise.num_samples < 1000:
                 warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
             mmean_samples = self._get_measured_mean_samples(
