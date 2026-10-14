@@ -561,7 +561,7 @@ class Predictions:
                     f"Expected `samples['{name}']` to have shape (num_samples, {self.num_groups}, {self.num_timesteps})"
                     f", got {tuple(x.shape)}"
                 )
-            by_name[name] = (x.mean(0), _quantile(x, alpha), _quantile(x, 1 - alpha))
+            by_name[name] = (x.mean(0), *_quantile_interval(x, alpha))
         return self._summaries_to_dataframe(
             by_name,
             actuals=actuals or {},
@@ -815,7 +815,7 @@ class Predictions:
             if measure in transforms:
                 _warn_bias_adjust_ignored(transforms[measure])
                 x = transforms[measure].inverse(x)
-            out[measure] = (_quantile(x, alpha).view(*batch_shape), _quantile(x, 1 - alpha).view(*batch_shape))
+            out[measure] = tuple(bound.view(*batch_shape) for bound in _quantile_interval(x, alpha))
         return out
 
     def _add_derived(self,
@@ -854,9 +854,7 @@ class Predictions:
             out = fun(values)
             if tuple(out.shape) != expected_shape:
                 raise ValueError(f"`derived['{name}']` returned shape {tuple(out.shape)}, expected {expected_shape}.")
-            by_measure[name] = (out.mean(0),) if alpha is None else (
-                out.mean(0), _quantile(out, alpha), _quantile(out, 1 - alpha)
-            )
+            by_measure[name] = (out.mean(0),) if alpha is None else (out.mean(0), *_quantile_interval(out, alpha))
             if measure_actuals:
                 actuals[name] = fun(measure_actuals).squeeze(0)
 
@@ -1713,16 +1711,12 @@ def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
     return -0.5 * (d * math.log(2 * math.pi) + logdet.unsqueeze(0) + (z ** 2).sum(1).T)
 
 
-def _quantile(x: torch.Tensor, q: float) -> torch.Tensor:
+def _quantile_interval(x: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantile along the first dimension, with linear interpolation (like ``torch.quantile``, which has an input-size
-    limit).
+    The ``alpha`` and ``1 - alpha`` quantiles along the first dimension (the samples), from a single sort.
     """
-    x = x.sort(0).values
-    pos = q * (x.shape[0] - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, x.shape[0] - 1)
-    return x[lo] + (pos - lo) * (x[hi] - x[lo])
+    lower, upper = torch.quantile(x, torch.tensor([alpha, 1 - alpha], dtype=x.dtype, device=x.device), dim=0)
+    return lower, upper
 
 
 def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict]]:

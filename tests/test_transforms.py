@@ -146,8 +146,6 @@ def test_to_dataframe_transform_nonlinear_gaussian():
 
 @torch.no_grad()
 def test_samples_to_dataframe():
-    from torchcast.state_space.predictions import _quantile
-
     torch.manual_seed(0)
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['a'])
     pred = kf(torch.randn(2, 5, 1))
@@ -158,8 +156,6 @@ def test_samples_to_dataframe():
     assert np.allclose(df['lower'].values, torch.quantile(samples, .1, dim=0).reshape(-1).numpy(), atol=1e-6)
     assert np.allclose(df['upper'].values, torch.quantile(samples, .9, dim=0).reshape(-1).numpy(), atol=1e-6)
     assert (df['actual'] == 0).all()
-    for q in (.025, .5, .975):
-        assert torch.allclose(_quantile(samples, q), torch.quantile(samples, q, dim=0), atol=1e-6)
     with pytest.raises(ValueError, match="shape"):
         pred.samples_to_dataframe({'thing': torch.randn(10, 2, 4)})
 
