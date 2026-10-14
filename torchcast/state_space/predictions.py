@@ -161,21 +161,6 @@ class Predictions:
             _warn_once['mixture_cov'] = True
         return self._covs
 
-    def get_means(self,
-                  transform: Union['Transform', dict[str, 'Transform'], None] = None,
-                  use_map: Optional[bool] = None) -> torch.Tensor:
-        """
-        The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform`` and
-        ``use_map`` -- without computing any intervals.
-
-        :param transform: See :func:`to_dataframe`.
-        :param use_map: See :func:`to_dataframe`.
-        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
-        """
-        return self._get_means(
-            use_map=self._resolve_use_map(use_map), transforms=self._standardize_transforms(transform)
-        )
-
     def __iter__(self) -> Iterator[Optional[torch.Tensor]]:
         # so that we can do ``mean, cov = predictions``
         yield self.means
@@ -200,6 +185,22 @@ class Predictions:
         else:
             measured_mean, system_cov = self._measured_moments_flat()
             return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
+
+    def get_means(self,
+                  transform: Union['Transform', dict[str, 'Transform'], None] = None,
+                  use_map: Optional[bool] = None) -> torch.Tensor:
+        """
+        The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform`` and
+        ``use_map`` -- without computing any intervals.
+
+        :param transform: See :func:`to_dataframe`.
+        :param use_map: See :func:`to_dataframe`.
+        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
+        """
+        return self._get_means(
+            use_map=self._resolve_use_map(use_map),
+            transforms=self._standardize_transforms(transform)
+        )
 
     def _get_means(self,
                    use_map: bool,
@@ -233,7 +234,6 @@ class Predictions:
         out = []
         for j, measure in enumerate(self.measurement_model.measures):
             regime_means = self._regime_means(
-                j,
                 measure,
                 transform=transforms.get(measure),
                 use_map=use_map,
@@ -246,7 +246,6 @@ class Predictions:
         return torch.stack(out, -1)
 
     def _regime_means(self,
-                      j: int,
                       measure: str,
                       transform: Optional['Transform'],
                       use_map: bool,
@@ -257,7 +256,6 @@ class Predictions:
         Helper for ``_get_means``: the mean of each of ``measure``'s regimes (see ``_regimes``), back-transformed by
         ``transform`` (each regime's ``Transform.for_regime``).
 
-        :param j: The measure's index.
         :param measured_mean: The ``(num_rows,)`` measured-mean: exact for a linear measure, the MAP for a nonlinear
          one.
         :param measured_var: The ``(num_rows,)`` variance of the measured-mean plus observation-noise (only used for
@@ -283,7 +281,8 @@ class Predictions:
             return [t.inverse_mean(measured_mean + offset, measured_var + extra) for t, offset, extra in regimes]
 
         # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
-        noise_var = self.measure_covs_flat[:, j, j]
+        midx = list(self.measurement_model.measures).index(measure)
+        noise_var = self.measure_covs_flat[:, midx, midx]
         out = []
         for t, offset, extra in regimes:
             _warn_bias_adjust_ignored(t)
@@ -296,7 +295,7 @@ class Predictions:
         ``use_map``, in which case only those with a transform (the others use the measured-mean of the state-mean).
         """
         return [m for m in self.measurement_model.measures if m in self._nonlinear_measures and (
-            not use_map or m in transforms
+                not use_map or m in transforms
         )]
 
     # Log-probability --------------------------------------------------------------------------------------------------
@@ -733,8 +732,14 @@ class Predictions:
                     f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
                 )
         if derived:
-            self._add_derived(derived, num_samples=derived_num_samples, alpha=alpha, transforms=transforms,
-                              by_measure=by_measure, actuals=actuals)
+            self._add_derived(
+                derived,
+                num_samples=derived_num_samples,
+                alpha=alpha,
+                transforms=transforms,
+                by_measure=by_measure,
+                actuals=actuals
+            )
         return self._summaries_to_dataframe(
             by_measure,
             actuals=actuals,
@@ -1085,11 +1090,16 @@ class Predictions:
                 shared_noise=shared_noise,
             )
             observations = observations.view(num_samples, *batch_shape, len(measures))
+
+        means = means.view(num_samples, *batch_shape, len(measures))
+        if extra_vars is not None:
+            extra_vars = extra_vars.view(num_samples, *batch_shape, len(measures))
+
         return PredictionSamples(
             measures=measures,
-            means=means.view(num_samples, *batch_shape, len(measures)),
+            means=means,
             measure_covs=self.measure_covs,
-            extra_vars=None if extra_vars is None else extra_vars.view(num_samples, *batch_shape, len(measures)),
+            extra_vars=extra_vars,
             observations=observations,
         )
 
