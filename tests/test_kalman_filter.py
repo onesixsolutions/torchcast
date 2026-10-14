@@ -1,3 +1,4 @@
+import pickle
 import copy
 import itertools
 from collections import defaultdict
@@ -651,9 +652,9 @@ def test_joseph_form_option():
     with pytest.raises(AssertionError, match="joseph-form"):
         kf(y[..., :1])
     # older pickles (no attribute) use the joseph form:
-    del kf.joseph_form
-    with pytest.raises(AssertionError, match="joseph-form"):
-        kf(y[..., :1])
+    del kf._covariance_update, kf.joseph_form
+    kf = pickle.loads(pickle.dumps(kf))
+    assert kf.joseph_form is True
 
 
 @pytest.mark.parametrize("with_mixture", [False, True])

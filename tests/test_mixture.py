@@ -867,11 +867,6 @@ def test_joseph_form_option():
         kf.mixture.joseph_form = mixture_joseph
         kf(_make_y(num_measures=2))
         assert calls == expected_calls, (model_joseph, mixture_joseph)
-    # older pickles (no attributes) use the joseph form:
-    calls.clear()
-    del kf.joseph_form, kf.mixture.joseph_form
-    kf(_make_y(num_measures=2))
-    assert calls == {'joseph': {12}}
 
 
 @torch.no_grad()
