@@ -803,7 +803,10 @@ class Predictions:
         overlap = set(derived) & set(measures)
         if overlap:
             raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
-        samples = self.sample(num_samples, observation_noise=True, generator=self._output_generator())
+        # summaries are per-row, so shared noise is fine (and uses less memory):
+        samples = self.sample(
+            num_samples, observation_noise=True, generator=self._output_generator(), shared_noise=True
+        )
         values = {m: samples[m] for m in measures}  # `samples` is a PredictionSamples, we just want a dict
         for m, t in transforms.items():
             _warn_bias_adjust_ignored(t)
@@ -995,13 +998,13 @@ class Predictions:
                num_samples: int,
                observation_noise: bool = True,
                generator: Optional[torch.Generator] = None,
-               shared_noise: bool = False) -> 'PredictionSamples':
+               *,
+               shared_noise: bool) -> 'PredictionSamples':
         """
-        Draw samples from the predictive distribution: jointly across measures, independently for each group and
-        timestep (unless ``shared_noise=True``). Groups are independent in the model, so e.g. samples can be summed
-        across groups. But these are *not* trajectories -- the model's timesteps are correlated (via the state), while
-        samples for different timesteps are independent -- so quantities that combine timesteps shouldn't be computed
-        from them; see :func:`StateSpaceModel.simulate` for that.
+        Draw samples from the predictive distribution: jointly across measures, for each group and timestep. These
+        are *not* trajectories -- the model's timesteps are correlated (via the state), while samples for different
+        timesteps are not -- so quantities that combine timesteps shouldn't be computed from them; see
+        :func:`StateSpaceModel.simulate` for that.
 
         Each sample is a draw of the state (and, for models with mixture components, of the regime), giving a
         conditional distribution for the measures: ``means`` and ``covs``. These capture uncertainty about the state,
@@ -1011,11 +1014,13 @@ class Predictions:
         :param num_samples: The number of samples.
         :param observation_noise: If True (the default), also sample the observations.
         :param generator: An optional :class:`torch.Generator`, for reproducibility.
-        :param shared_noise: If True, the underlying random draws (the standard-normal noise for the state and for
-         the gaussian observation-noise, and the uniforms for the regime) are the same for every group and timestep
-         (binomial draws are still independent). Each row's distribution is still correct, so this is fine for
-         per-row summaries (means, quantiles), and it uses less memory. But samples are then correlated across rows,
-         so they can't be aggregated across groups (e.g. summed), which the default allows.
+        :param shared_noise: Required. If True, the underlying random draws (the standard-normal noise for the state
+         and for the gaussian observation-noise, and the uniforms for the regime) are the same for every group and
+         timestep (binomial draws are still independent). Each row's distribution is still correct, so this is fine
+         for per-row summaries (means, quantiles, functions of several measures), and it uses less memory. But
+         samples are then correlated across rows. If False, samples are independent across rows, so they can be
+         aggregated across groups (e.g. summed), since groups are independent in the model -- but still not across
+         timesteps (see above).
         :return: A :class:`PredictionSamples`.
         """
         batch_shape = self.state_means.shape[0:2]

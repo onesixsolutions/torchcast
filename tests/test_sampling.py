@@ -43,12 +43,12 @@ def test_sample_moments(shared_noise: bool):
     assert torch.allclose(emp_corr, corr, atol=5 / math.sqrt(n))
 
     # without observation noise, the conditional covariance is the measure-covariance:
-    s2 = pred.sample(10, observation_noise=False, generator=_gen())
+    s2 = pred.sample(10, observation_noise=False, generator=_gen(), shared_noise=False)
     assert s2.observations is None
     assert torch.allclose(s2.covs, pred.measure_covs.expand(10, -1, -1, -1, -1))
     assert torch.equal(s2['a'], s2.means[..., 0])
     # reproducible given a generator:
-    assert torch.equal(pred.sample(5, generator=_gen(1)).observations, pred.sample(5, generator=_gen(1)).observations)
+    assert torch.equal(pred.sample(5, generator=_gen(1), shared_noise=False).observations, pred.sample(5, generator=_gen(1), shared_noise=False).observations)
 
 
 @pytest.mark.parametrize('shared_noise', [False, True])
@@ -197,7 +197,7 @@ def test_sample_nonlinear_independent_rows():
     kf.mc_sampling = 5000
     X = torch.randn(2, 6, 2)
     pred = kf(torch.randn(2, 6, 1), X=X)
-    samples = pred.sample(5000, observation_noise=False, generator=_gen())
+    samples = pred.sample(5000, observation_noise=False, generator=_gen(), shared_noise=False)
     means = samples.means[..., 0].reshape(5000, -1)  # (samples, rows)
     corr = np.corrcoef(means.T.numpy())
     off_diag = corr[~np.eye(corr.shape[0], dtype=bool)]
@@ -295,7 +295,7 @@ kf.mc_sampling = 10
 with torch.no_grad():
     pred = kf(torch.rand(20, 100, 1) * .5 + .25, start_offsets=[0] * 20)  # 2000 rows, state-rank 18
     before = peak_mb()
-    pred.sample(500)
+    pred.sample(500, shared_noise=False)
 print(peak_mb() - before)
 """
 
@@ -391,7 +391,7 @@ def test_sample_shared_noise():
     assert is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)  # the state's noise
     assert is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)  # the observation-noise
     # vs. independent by default:
-    s = pred.sample(50, generator=_gen())
+    s = pred.sample(50, generator=_gen(), shared_noise=False)
     assert not is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)
     assert not is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)
 
@@ -413,7 +413,7 @@ def test_sample_binomial_measure_order():
     )
     bf.mc_sampling = 20
     pred = bf(counts / torch.tensor([50., 3.]), num_obs=num_obs.expand(2, 6, 2))
-    s = pred.sample(200, generator=_gen())
+    s = pred.sample(200, generator=_gen(), shared_noise=False)
     for j, n in [(0, 50.), (1, 3.)]:  # ('a' has 50 trials, 'b' has 3)
         x = s.observations[..., j] * n
         assert torch.allclose(x, x.round(), atol=1e-4), f"measure {j} isn't a proportion out of {n}"
