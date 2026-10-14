@@ -1026,10 +1026,9 @@ class Predictions:
 
     def sample(self,
                num_samples: int,
+               shared_noise: bool,
                observation_noise: bool = True,
-               generator: Optional[torch.Generator] = None,
-               *,
-               shared_noise: bool) -> 'PredictionSamples':
+               generator: Optional[torch.Generator] = None) -> 'PredictionSamples':
         """
         Draw samples from the predictive distribution: jointly across measures, for each group and timestep. These
         are *not* trajectories -- the model's timesteps are correlated (via the state), while samples for different
@@ -1042,15 +1041,15 @@ class Predictions:
         the observations from that conditional distribution (for binary measures: binomial draws).
 
         :param num_samples: The number of samples.
-        :param observation_noise: If True (the default), also sample the observations.
-        :param generator: An optional :class:`torch.Generator`, for reproducibility.
-        :param shared_noise: Required. If True, the underlying random draws (the standard-normal noise for the state
-         and for the gaussian observation-noise, and the uniforms for the regime) are the same for every group and
-         timestep (binomial draws are still independent). Each row's distribution is still correct, so this is fine
+        :param shared_noise: If True, the underlying random draws (the standard-normal noise for the state and for
+         the gaussian observation-noise, and the uniforms for the regime) are the same for every group and timestep
+         (binomial draws are still independent). Each row's distribution is still correct, so this is fine
          for per-row summaries (means, quantiles, functions of several measures), and it uses less memory. But
          samples are then correlated across rows. If False, samples are independent across rows, so they can be
          aggregated across groups (e.g. summed), since groups are independent in the model -- but still not across
          timesteps (see above).
+        :param observation_noise: If True (the default), also sample the observations.
+        :param generator: An optional :class:`torch.Generator`, for reproducibility.
         :return: A :class:`PredictionSamples`.
         """
         batch_shape = self.state_means.shape[0:2]
