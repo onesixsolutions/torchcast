@@ -213,7 +213,7 @@ class Predictions:
 
         # exact for linear measures; the MAP for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
-        if mmean_samples is None and any(self._mc_mean_measures(use_map, transforms)):
+        if mmean_samples is None and self._needs_mc_means(use_map, transforms):
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=self.measurement_model_flat,
                 state_means=self.state_means_flat,
@@ -282,15 +282,13 @@ class Predictions:
         means_per_regime = torch.stack(means_per_regime, -1)
         return torch.sum(means_per_regime * probs_per_regime, -1)
 
-    def _mc_mean_measures(self, use_map: bool, transforms: dict[str, 'Transform']) -> list[str]:
+    def _needs_mc_means(self, use_map: bool, transforms: dict[str, 'Transform']) -> bool:
         """
-        The (nonlinear) measures whose means are monte-carlo, over samples of the state: all of them -- unless
+        Whether any measure's mean is monte-carlo, over samples of the state: that's all nonlinear measures -- unless
         ``use_map``, in which case only those with a transform (the others use the measured-mean of the state-mean).
         """
-        return [
-            m for m in self.measurement_model.measures
-            if m in self._nonlinear_measures and (not use_map or (m in transforms))
-        ]
+        return any(m in self._nonlinear_measures and (not use_map or m in transforms)
+                   for m in self.measurement_model.measures)
 
     # Log-probability --------------------------------------------------------------------------------------------------
 
@@ -690,7 +688,7 @@ class Predictions:
         mmean_samples = None
         nonlinear = [m for m in measures if m in self._nonlinear_measures]
         needs_mc_intervals = alpha is not None and bool(nonlinear)
-        if any(self._mc_mean_measures(use_map, transforms)) or needs_mc_intervals:
+        if self._needs_mc_means(use_map, transforms) or needs_mc_intervals:
             if not use_map and self.mc_white_noise.num_samples < 1000:
                 warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
             mmean_samples = self._get_measured_mean_samples(
