@@ -766,9 +766,12 @@ class Predictions:
         measured_mean, system_cov = self._measured_moments_flat()
         mixture_measures = self.mixture.mixture_measures if self.mixture is not None else []
 
-        if mmean_samples is not None:
-            # (for nonlinear measures)
-            to = {'dtype': mmean_samples.dtype, 'device': mmean_samples.device}
+        # for nonlinear measures: observation-noise and uniforms (for the regimes), shared across rows:
+        to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
+        noise = uniforms = None
+        if self.measurement_model.is_nonlinear:
+            if mmean_samples is None:
+                raise ValueError("`mmean_samples` are required for the intervals of nonlinear measures.")
             generator = self._output_generator(state=False)
             noise = torch.randn((mmean_samples.shape[0], len(measures)), generator=generator, **to)
             uniforms = torch.rand((mmean_samples.shape[0], len(measures)), generator=generator, **to)
