@@ -2,7 +2,7 @@
 Transforms for mapping predictions from the scale a measure is modeled on (e.g. log) back to its original scale.
 """
 import math
-from typing import Optional, TYPE_CHECKING, Mapping, Union
+from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -92,16 +92,6 @@ class Transform(torch.nn.Module):
             torch.as_tensor(w / math.sqrt(math.pi), dtype=dtype, device=device),
         )
 
-    def for_regime(self, component_id: str) -> 'Transform':
-        """
-        The transform to use for the back-transformed mean of a mixture component's regime (for measures with
-        mixture components). By default, this same transform -- with gaussian noise, since a component is gaussian by
-        definition (e.g. :class:`SmearingTransform` returns its base). See :class:`RegimeTransform` to choose.
-
-        :param component_id: The ``id`` of the :class:`.MixtureComponent`.
-        """
-        return self
-
 
 class _IdentityTransform(Transform):
     def transform(self, x: torch.Tensor) -> torch.Tensor:
@@ -187,9 +177,8 @@ class SmearingTransform(Transform):
     data. They're *not* re-standardized, so if the predicted variance is too small (large) on average, the smearing
     corrects for that too. See :func:`from_predictions`.
 
-    For a measure with mixture components, this applies to the standard regime only: by default, the components'
-    regimes use ``base`` (gaussian). To smear each regime with its own residuals, see :func:`from_predictions`; to
-    choose per regime, :class:`RegimeTransform`.
+    For a measure with mixture components, the same distribution is used for every regime, each with its own mean and
+    variance (a component's regime is the standard one, offset, with extra variance). See :func:`from_predictions`.
 
     :param base: The transform that was applied before modeling, e.g. :class:`LogTransform`. Its ``bias_adjust``
      (which scales ``var`` above) is used.
@@ -243,18 +232,14 @@ class SmearingTransform(Transform):
                          predictions: 'Predictions',
                          y: torch.Tensor,
                          measure: str,
-                         num_nodes: int = 100) -> Union['SmearingTransform', 'RegimeTransform']:
+                         num_nodes: int = 100) -> 'SmearingTransform':
         """
         Create from the standardized residuals of predictions for ``measure`` -- typically 1-step-ahead
         predictions on the training data.
 
-        For a measure with mixture components, each regime is smeared with its own residuals: standardized by that
-        regime's predicted mean and variance, and weighted by the probability (given the observation) that it came
-        from that regime. This returns a :class:`RegimeTransform`. So a component's back-transformed mean uses the
-        residuals attributed to it -- rather than e.g. a lognormal mean, which is sensitive to a large component
-        variance. (With few observations attributed to a component, this is correspondingly noisy. To use a
-        different transform for some regimes, e.g. ``LogTransform(bias_adjust=0)``, build a :class:`RegimeTransform`
-        from this one's ``standard``.)
+        For a measure with mixture components, the residuals of every regime are pooled: each observation's residual
+        is standardized by each regime's predicted mean and variance, and weighted by the probability (given the
+        observation) that it came from that regime.
 
         :param base: See :class:`SmearingTransform`.
         :param predictions: A :class:`.Predictions` object.
@@ -262,8 +247,7 @@ class SmearingTransform(Transform):
          num_measures)``); can have fewer timesteps than ``predictions``.
         :param measure: The measure.
         :param num_nodes: See :class:`SmearingTransform`.
-        :return: A :class:`SmearingTransform`; or for a measure with mixture components, a :class:`RegimeTransform`
-         of them.
+        :return: A :class:`SmearingTransform`.
         """
         measures = list(predictions.measurement_model.measures)
         j = measures.index(measure)
@@ -290,14 +274,7 @@ class SmearingTransform(Transform):
             log_liks = normal.log_prob(obs.unsqueeze(-1))
             weights = torch.softmax(probs.clamp_min(1e-30).log() + log_liks, -1)
             residuals = (obs.unsqueeze(-1) - means) / vars_.sqrt()
-            by_regime = {}
-            for k, label in enumerate(mix.labels):
-                if not (weights[..., k].nan_to_num() > 0).any():
-                    by_regime[label] = base  # (no observations attributed to this regime)
-                    continue
-                by_regime[label] = cls(base, residuals=residuals[..., k], weights=weights[..., k], num_nodes=num_nodes)
-        standard = by_regime.pop(mix.labels[0])
-        return RegimeTransform(standard=standard, components=by_regime)
+            return cls(base, residuals=residuals, weights=weights, num_nodes=num_nodes)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         return self.base.transform(x)
@@ -307,55 +284,3 @@ class SmearingTransform(Transform):
 
     def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         return self.residuals.to(dtype=dtype, device=device), self.weights.to(dtype=dtype, device=device)
-
-    def for_regime(self, component_id: Optional[str]) -> Transform:
-        if component_id is None:
-            return self
-        return self.base
-
-
-class RegimeTransform(Transform):
-    """
-    For a measure with mixture components: a different back-transformed mean for each regime. E.g.::
-
-        RegimeTransform(
-            standard=SmearingTransform(LogTransform(), residuals),
-            components={'quick': LogTransform(bias_adjust=0)}
-        )
-
-    All the transforms must have the same :func:`inverse` (here: exp) -- intervals are back-transformed with it --
-    and only differ in how each regime's mean is back-transformed.
-
-    :param standard: The transform for the standard regime. It's also used for everything that isn't
-     regime-specific: intervals, actuals, and measures without mixture components.
-    :param components: A dictionary of ``{component_id: Transform}``. Components that aren't listed use
-     ``standard.for_regime(component_id)``. So for example, if ``standard`` is SmearingTransform(), an unlisted
-     component will be handled as that class handles its components by default (i.e. not using smearing).
-    """
-
-    def __init__(self, standard: Transform, components: Optional[Mapping[str, Transform]] = None):
-        if isinstance(standard, RegimeTransform):
-            raise ValueError("`standard` can't itself be a `RegimeTransform`.")
-        super().__init__(bias_adjust=standard.bias_adjust)
-        self.standard = standard
-        self.components = torch.nn.ModuleDict(dict(components or {}))
-
-    def transform(self, x: torch.Tensor) -> torch.Tensor:
-        return self.standard.transform(x)
-
-    def inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return self.standard.inverse(x)
-
-    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
-        return self.standard._expected_inverse(mean, var)
-
-    def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.standard._noise_nodes(dtype=dtype, device=device)
-
-    def for_regime(self, component_id: Optional[str]) -> Transform:
-        if component_id in self.components:
-            return self.components[component_id]
-        if component_id is None:
-            return self
-        # see docstring for how unlisted ``components`` are handled
-        return self.standard.for_regime(component_id)

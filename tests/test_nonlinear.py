@@ -388,17 +388,17 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     expected_plugin = probs[:, 0] * torch.exp(p_map) + probs[:, 1] * torch.exp(p_map + _COMPONENT_OFFSET)
     assert np.allclose(df_plugin['mean'].values, expected_plugin.numpy(), rtol=1e-4)
 
-    # each regime's mean uses its own transform (`Transform.for_regime`): here, a component-transform whose noise is a
-    # single node at -10 (standard-deviations), so its back-transformed mean is
-    # E[exp(sigmoid(Z))] * exp(mu - 10 * sqrt(R + sigma^2)):
-    from torchcast.state_space import RegimeTransform, SmearingTransform
-    rt = RegimeTransform(LogTransform(), components={'low': SmearingTransform(LogTransform(), torch.tensor([-10.]))})
-    df_rt = pred.to_dataframe(conf=.9, transform=rt, use_map=False)
-    expected_rt = standard_exp * (
-        probs[:, 0] * torch.exp(r / 2) +
+    # the transform's noise-distribution is used for every regime, each with its own variance: here, a single node at
+    # -10 (standard-deviations), so each regime's back-transformed mean is
+    # E[exp(sigmoid(Z))] * exp(offset - 10 * sqrt(R + extra_var)):
+    from torchcast.state_space import SmearingTransform
+    smear = SmearingTransform(LogTransform(), torch.tensor([-10.]))
+    df_smear = pred.to_dataframe(conf=.9, transform=smear, use_map=False)
+    expected_smear = standard_exp * (
+        probs[:, 0] * torch.exp(-10 * r.sqrt()) +
         probs[:, 1] * torch.exp(_COMPONENT_OFFSET - 10 * (r + _COMPONENT_SD ** 2).sqrt())
     )
-    assert np.allclose(df_rt['mean'].values, expected_rt.numpy(), atol=.005)
+    assert np.allclose(df_smear['mean'].values, expected_smear.numpy(), atol=.005)
 
 
 @torch.no_grad()

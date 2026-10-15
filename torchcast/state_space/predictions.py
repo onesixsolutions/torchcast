@@ -260,19 +260,24 @@ class Predictions:
                 standard_mean=measured_mean[:, midx].view(*batch_shape),
                 standard_var=system_cov[:, midx, midx].view(*batch_shape),
             )
-            transform = transforms.get(measure, identity)
-            regime_means = [
-                transform.for_regime(label).inverse_mean(mixture.means[..., k], mixture.vars[..., k])
-                for k, (label, _, _) in enumerate(self._regimes(measure))
-            ]
-            out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
+            regime_means = transforms.get(measure, identity).inverse_mean(mixture.means, mixture.vars)
+            out[measure] = (mixture.probs * regime_means).sum(-1)
 
         # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
         # regime-probabilities (all ones without mixture components):
         if nonlinear_measures:
             mmean_samples = self._resolve_mmean_samples(mmean_samples)
-        # (for a transform's `bias_adjust`: samples from the state with its variance scaled by it -- see below)
-        samples_by_var_scale = {1.: mmean_samples}
+            # a transform's `bias_adjust` scales the variance in the back-transform, as for linear measures: here,
+            # both the noise's (by `inverse_mean`, below) and the state's -- with the same draws, but each measure's
+            # deviations from its mean scaled by sqrt(bias_adjust), before the nonlinearity (so `bias_adjust=0` gives
+            # the plug-in inverse(g(MAP) + offset), as with `use_map`):
+            var_scales = [transforms.get(m, identity).var_multi for m in all_measures]
+            if any(var_scales[all_measures.index(m)] != 1 for m in nonlinear_measures):
+                mmean_samples = self._get_output_samples(
+                    mmean_samples.shape[0],
+                    generator=self._output_generator(state=True),
+                    deviation_scales=[math.sqrt(v) for v in var_scales],
+                )
         for measure in nonlinear_measures:
             midx = all_measures.index(measure)
             # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra), and
@@ -284,25 +289,14 @@ class Predictions:
             #   x + offset)
             # (one sample at a time: the quadrature adds a dimension for its nodes, so all samples at once would be
             # (samples, rows, nodes) -- too much memory)
-            # `bias_adjust` scales the variance in the back-transform, as for linear measures: here, both parts. the
-            # noise's by `inverse_mean`; the state's by sampling it with its variance scaled -- the same noise as
-            # `mmean_samples`, scaled by sqrt(bias_adjust), before the nonlinearity (so `bias_adjust=0` gives the
-            # plug-in inverse(g(MAP) + offset), as with `use_map`).
             transform = transforms.get(measure, identity)
             noise_var = self.measure_covs_flat[:, midx, midx]
-            regime_means = []
-            for label, offset, extra in self._regimes(measure):
-                regime_transform = transform.for_regime(label)
-                if regime_transform.var_multi not in samples_by_var_scale:
-                    samples_by_var_scale[regime_transform.var_multi] = self._get_output_samples(
-                        mmean_samples.shape[0],
-                        generator=self._output_generator(state=True),
-                        noise_scale=math.sqrt(regime_transform.var_multi),
-                    )
-                regime_means.append(torch.stack([
-                    regime_transform.inverse_mean(x + offset, noise_var + extra)
-                    for x in samples_by_var_scale[regime_transform.var_multi][..., midx]
-                ]).mean(0))
+            regime_means = [
+                torch.stack([
+                    transform.inverse_mean(x + offset, noise_var + extra) for x in mmean_samples[..., midx]
+                ]).mean(0)
+                for _, offset, extra in self._regimes(measure)
+            ]
             probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
             out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
 
@@ -1534,13 +1528,6 @@ class Predictions:
                 f"`transform` is not supported for measures with a non-gaussian likelihood (e.g. binary measures): "
                 f"{non_gaussian}. To transform only some measures, pass a dict of `{{measure: Transform}}`."
             )
-        from .transforms import RegimeTransform
-        for measure, t in transforms.items():
-            if isinstance(t, RegimeTransform):
-                ids = {c.id for c in self.mixture.components if c.measure == measure} if self.mixture else set()
-                unknown = set(t.components) - ids
-                if unknown:
-                    raise ValueError(f"`RegimeTransform` for '{measure}' has components that aren't its: {unknown}")
         return transforms
 
     @property
@@ -1572,7 +1559,8 @@ class Predictions:
                                    measurement_model: 'MeasurementModel',
                                    state_means: torch.Tensor,
                                    state_covs: torch.Tensor,
-                                   white_noise: torch.Tensor) -> torch.Tensor:
+                                   white_noise: torch.Tensor,
+                                   deviation_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Samples of the measured-mean, from samples of the state. Rather than sampling the full state, this samples a
         lower-dimensional gaussian: the measured-mean of the linear processes, concatenated with the state-elements of
@@ -1586,6 +1574,8 @@ class Predictions:
         :param white_noise: Standard-normal noise for ``measurement_model``'s extended dimensions, either
          ``(num_samples, dim)`` -- the same draws for every row -- or ``(num_samples, num_rows, dim)``. E.g.
          ``_log_prob_white_noise()`` (fixed, for the log-prob), or ``_get_output_samples()``'s.
+        :param deviation_scale: Optional scales for the sampled deviations from the mean, one per extended dimension
+         (before any nonlinearity; see ``_extended_dim_scale``).
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         nmeasures = len(measurement_model.measures)
@@ -1616,7 +1606,10 @@ class Predictions:
                 f"Expected `white_noise` to have shape (num_samples, {em_dim}) or (num_samples, "
                 f"{state_means.shape[0]}, {em_dim}), got {tuple(white_noise.shape)}."
             )
-        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _matmul_per_row(chol, white_noise)
+        deviations = _matmul_per_row(chol, white_noise)
+        if deviation_scale is not None:
+            deviations = deviations * deviation_scale
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + deviations
 
         # each of these samples is a draw of (1) the measured-mean of the linear processes, concatenated with (2) the
         # nonlinear processes' state-means. use (2) to add the nonlinear processes' contributions to (1):
@@ -1683,7 +1676,7 @@ class Predictions:
                             num_samples: int,
                             generator: Optional[torch.Generator],
                             shared_noise: bool = True,
-                            noise_scale: float = 1.) -> torch.Tensor:
+                            deviation_scales: Optional[Sequence[float]] = None) -> torch.Tensor:
         """
         Samples of the measured-mean, from ``num_samples`` draws of the state: for everything that produces samples
         for users -- :func:`sample`, and sample-based outputs (monte-carlo means and intervals, ``derived``). (The
@@ -1692,8 +1685,9 @@ class Predictions:
         :param generator: For the noise: e.g. ``_output_generator(state=True)`` (a fixed seed, so that repeated calls
          agree), or :func:`sample`'s (None: torch's global random state).
         :param shared_noise: If True (the default), the same noise for every row; otherwise independent.
-        :param noise_scale: Scales the noise, i.e. the state's deviations from its mean (before any nonlinearity):
-         samples from the state with its variance scaled by ``noise_scale ** 2``, from the same draws.
+        :param deviation_scales: One per measure: scales its (sampled) deviations from its mean, before any
+         nonlinearity -- so each measure's samples are from the state with that part of its variance scaled by the
+         square, from the same draws.
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
@@ -1708,8 +1702,23 @@ class Predictions:
             measurement_model=self.measurement_model_flat,
             state_means=self.state_means_flat,
             state_covs=self.state_covs_flat,
-            white_noise=white_noise * noise_scale,
+            white_noise=white_noise,
+            deviation_scale=None if deviation_scales is None else self._extended_dim_scale(deviation_scales),
         )
+
+    def _extended_dim_scale(self, measure_scales: Sequence[float]) -> torch.Tensor:
+        """
+        Per-measure scales, for each of the extended dimensions of ``_get_measured_mean_samples``: each measure's
+        own, then the state-elements of each nonlinear process, which get its measure's.
+        """
+        mm = self.measurement_model_flat
+        measures = list(mm.measures)
+        to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
+        scale = torch.ones(mm.extended_measure_mat.shape[1], **to)
+        scale[:len(measures)] = torch.as_tensor(measure_scales, **to)
+        for proc in mm.nonlinear_processes:
+            scale[mm.extended_mmat_slices[proc.id]] = measure_scales[measures.index(proc.measure)]
+        return scale
 
     @property
     def state_means_flat(self):

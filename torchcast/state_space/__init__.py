@@ -13,4 +13,4 @@ from .state import StateTuple
 from .predictions import Predictions, PredictionSamples
 from .newton import NewtonResult
 from .mixture import MixtureModel, MixtureComponent, RegimeTransition, StickyTransition, MixtureOfNormals
-from .transforms import Transform, LogTransform, BoxCoxTransform, SmearingTransform, RegimeTransform
+from .transforms import Transform, LogTransform, BoxCoxTransform, SmearingTransform
