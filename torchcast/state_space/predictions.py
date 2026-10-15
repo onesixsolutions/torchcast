@@ -24,10 +24,9 @@ if TYPE_CHECKING:
 
 # seed for sample-based outputs (``to_dataframe()``'s monte-carlo means and intervals, ``derived``, states), drawn at
 # import: repeated calls within a process give the same results. (Separate from the model's ``mc_sampling``, which is
-# only for the monte-carlo log-prob, fixed so that it's a deterministic function of the parameters.) Each kind of draw
-# has its own stream (see ``Predictions._output_generator``).
+# only for the monte-carlo log-prob, fixed so that it's a deterministic function of the parameters.) Draws of the
+# state, and draws given the state, use separate seeds (see ``Predictions._output_generator``).
 _OUTPUT_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
-_OUTPUT_STREAMS = {'state': 0, 'intervals': 1, 'derived': 2, 'components': 3}
 # the default number of samples for sample-based outputs:
 _DEFAULT_NUM_SAMPLES = 1000
 
@@ -763,7 +762,7 @@ class Predictions:
         if mmean_samples is not None:
             # (for nonlinear measures)
             to = {'dtype': mmean_samples.dtype, 'device': mmean_samples.device}
-            generator = self._output_generator('intervals')
+            generator = self._output_generator(state=False)
             noise = torch.randn((mmean_samples.shape[0], len(measures)), generator=generator, **to)
             uniforms = torch.rand((mmean_samples.shape[0], len(measures)), generator=generator, **to)
 
@@ -772,18 +771,19 @@ class Predictions:
             transform = transforms.get(measure)
             if measure in self._nonlinear_measures:
                 x = mmean_samples[..., j]  # (num_samples, num_rows)
-                if measure not in self._non_gaussian_measures:
-                    noise_var = self.measure_covs_flat[:, j, j]
-                    regimes = self._regimes(measure)
-                    if len(regimes) > 1:
-                        # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
-                        cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
-                        regime = (uniforms[:, j, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
-                        offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
-                        extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
-                        x = x + offsets[regime]
-                        noise_var = noise_var + extras[regime]
-                    x = x + noise_var.sqrt() * noise[:, j, None]
+                # (a non-gaussian measure, e.g. binary, has no gaussian observation-noise -- its `measure_covs` entry is
+                # zero -- and no mixture components, so its interval is for the mean, e.g. the probability)
+                noise_var = self.measure_covs_flat[:, j, j]
+                regimes = self._regimes(measure)
+                if len(regimes) > 1:
+                    # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
+                    cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
+                    regime = (uniforms[:, j, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
+                    offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
+                    extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
+                    x = x + offsets[regime]
+                    noise_var = noise_var + extras[regime]
+                x = x + noise_var.sqrt() * noise[:, j, None]
                 if transform is not None:
                     _warn_bias_adjust_ignored(transform)
                     x = transform.inverse(x)
@@ -823,7 +823,10 @@ class Predictions:
         # summaries are per-row, so shared noise is fine (and uses less memory):
         num_samples = mmean_samples.shape[0]
         _, _, observations = self._sample_given_state(
-            mmean_samples, generator=self._output_generator('derived'), shared_noise=True, observation_measures=measures
+            mmean_samples,
+            generator=self._output_generator(state=False),
+            shared_noise=True,
+            observation_measures=measures,
         )
         observations = observations.view(num_samples, self.num_groups, self.num_timesteps, len(measures))
         values = {m: observations[..., j] for j, m in enumerate(measures)}
@@ -906,7 +909,7 @@ class Predictions:
             chol = torch.linalg.cholesky(self.state_covs_flat)
             white_noise = torch.randn(
                 (num_samples, *self.state_means_flat.shape),
-                generator=self._output_generator('components'),
+                generator=self._output_generator(state=True),
                 dtype=chol.dtype,
                 device=chol.device,
             )
@@ -1595,14 +1598,15 @@ class Predictions:
             mmean_samples = measurement_model.get_measure_wide_adjustments(mmean_samples)
         return mmean_samples
 
-    def _output_generator(self, stream: str) -> torch.Generator:
+    def _output_generator(self, state: bool) -> torch.Generator:
         """
-        A generator with a fixed seed, so that sample-based outputs are the same on repeated calls. Each kind of draw
-        (``stream``, see ``_OUTPUT_STREAMS``) has its own seed, so that they're independent of each other (with one
-        seed, e.g. the state's noise and the observation-noise would be the same draws).
+        A generator with a fixed seed, so that sample-based outputs are the same on repeated calls.
+
+        :param state: True for draws of the state; False for draws given the state (regimes, observation-noise). These
+         use different seeds, so they're independent (with one seed, e.g. the observation-noise would be the first of
+         the state's noise draws).
         """
-        seed = _OUTPUT_SEED + _OUTPUT_STREAMS[stream]
-        return torch.Generator(device=self.state_means.device).manual_seed(seed)
+        return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED + (0 if state else 1))
 
     def _get_output_samples(self, num_samples: int) -> torch.Tensor:
         """
@@ -1615,7 +1619,7 @@ class Predictions:
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         white_noise = torch.randn(
             (num_samples, em_dim),
-            generator=self._output_generator('state'),
+            generator=self._output_generator(state=True),
             dtype=self.state_means.dtype,
             device=self.state_means.device,
         )
