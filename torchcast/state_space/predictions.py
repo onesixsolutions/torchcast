@@ -178,7 +178,8 @@ class Predictions:
 
         if self.measurement_model.is_nonlinear:
             # monte-carlo for the means of nonlinear measures; there's no closed form cov
-            mean = self._get_means(use_map=False, mmean_samples=self._get_output_samples(_DEFAULT_NUM_SAMPLES))
+            mmean_samples = self._get_output_samples(_DEFAULT_NUM_SAMPLES, generator=self._output_generator(state=True))
+            mean = self._get_means(use_map=False, mmean_samples=mmean_samples)
             return mean, None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
@@ -209,7 +210,7 @@ class Predictions:
         transforms = self._standardize_transforms(transform)
         mmean_samples = None
         if self._needs_mc_means(use_map, transforms):
-            mmean_samples = self._get_output_samples(num_samples)
+            mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
         return self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
 
     def _get_means(self,
@@ -698,7 +699,7 @@ class Predictions:
         mmean_samples = None
         needs_mc_intervals = alpha is not None and self.measurement_model.is_nonlinear
         if self._needs_mc_means(use_map, transforms) or needs_mc_intervals or derived:
-            mmean_samples = self._get_output_samples(num_samples)
+            mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
 
         means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
         by_measure = {m: (means[..., j],) for j, m in enumerate(measures)}
@@ -1050,20 +1051,9 @@ class Predictions:
         """
         batch_shape = self.state_means.shape[0:2]
         measures = list(self.measurement_model.measures)
-        num_rows = self.state_means_flat.shape[0]
-        to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
-
-        # sample the measured-mean (via the state). by default, independent noise for each row (unlike the fixed noise
-        # used for the monte-carlo log-prob, which is shared across rows), so samples can be aggregated across rows:
-        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
-        noise_shape = (num_samples, em_dim) if shared_noise else (num_samples, num_rows, em_dim)
-        white_noise = torch.randn(noise_shape, generator=generator, **to)
-        means = self._get_measured_mean_samples(
-            measurement_model=self.measurement_model_flat,
-            state_means=self.state_means_flat,
-            state_covs=self.state_covs_flat,
-            white_noise=white_noise,
-        )
+        # sample the measured-mean (via the state), then the rest given it (the same generator draws the state's noise
+        # first, then the regimes and observations):
+        means = self._get_output_samples(num_samples, generator=generator, shared_noise=shared_noise)
         means, extra_vars, observations = self._sample_given_state(
             means,
             generator=generator,
@@ -1545,7 +1535,7 @@ class Predictions:
         :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
         :param white_noise: Standard-normal noise for ``measurement_model``'s extended dimensions, either
          ``(num_samples, dim)`` -- the same draws for every row -- or ``(num_samples, num_rows, dim)``. E.g.
-         ``_log_prob_white_noise()`` (fixed, for the log-prob), ``_get_output_samples()``'s, or ``sample()``'s.
+         ``_log_prob_white_noise()`` (fixed, for the log-prob), or ``_get_output_samples()``'s.
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         nmeasures = len(measurement_model.measures)
@@ -1627,18 +1617,25 @@ class Predictions:
         missing_midx = {i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures}
         return white_noise[..., [i for i in range(em_dim) if i not in missing_midx]]
 
-    def _get_output_samples(self, num_samples: int) -> torch.Tensor:
+    def _get_output_samples(self,
+                            num_samples: int,
+                            generator: Optional[torch.Generator],
+                            shared_noise: bool = True) -> torch.Tensor:
         """
-        Samples of the measured-mean for sample-based outputs (monte-carlo means and intervals, ``derived``), from
-        ``num_samples`` draws of the state. The noise is fixed (see ``_output_generator``) and shared across rows, so
-        repeated calls agree. (The log-prob uses the model's ``mc_white_noise`` instead.)
+        Samples of the measured-mean, from ``num_samples`` draws of the state: for everything that produces samples
+        for users -- :func:`sample`, and sample-based outputs (monte-carlo means and intervals, ``derived``). (The
+        log-prob calls ``_get_measured_mean_samples`` directly, with the model's fixed ``mc_white_noise``.)
 
+        :param generator: For the noise: e.g. ``_output_generator(state=True)`` (a fixed seed, so that repeated calls
+         agree), or :func:`sample`'s (None: torch's global random state).
+        :param shared_noise: If True (the default), the same noise for every row; otherwise independent.
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        num_rows = self.state_means_flat.shape[0]
         white_noise = torch.randn(
-            (num_samples, em_dim),
-            generator=self._output_generator(state=True),
+            (num_samples, em_dim) if shared_noise else (num_samples, num_rows, em_dim),
+            generator=generator,
             dtype=self.state_means.dtype,
             device=self.state_means.device,
         )
