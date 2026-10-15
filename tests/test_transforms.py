@@ -388,6 +388,39 @@ def test_smearing_large_component_variance():
 
 
 @torch.no_grad()
+def test_regime_transform_unlisted_components():
+    """
+    A `RegimeTransform` needn't list all of a measure's components: the unlisted ones get what `standard` would give
+    them on its own (`standard.for_regime(component_id)`; for a `SmearingTransform`, its base).
+    """
+    from torchcast.state_space import SmearingTransform, RegimeTransform
+
+    y, _ = _smearing_mixture_y()
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level')],
+        measures=['y'],
+        mixture=[
+            MixtureComponent(measure='y', mean_init=-4., prob_init=.1, id='low'),
+            MixtureComponent(measure='y', mean_init=2., prob_init=.1, id='high'),
+        ],
+    )
+    pred = kf(y)
+    smear = SmearingTransform(LogTransform(), torch.randn(200) * 2)
+    rt = RegimeTransform(standard=smear, components={'low': LogTransform(bias_adjust=0)})
+    assert rt.for_regime('high') is smear.base
+
+    def means(transform: RegimeTransform) -> np.ndarray:
+        return pred.to_dataframe(transform=transform, conf=False)['mean'].values
+
+    # same as listing it explicitly:
+    explicit = RegimeTransform(standard=smear, components={'low': LogTransform(bias_adjust=0), 'high': smear.base})
+    assert np.allclose(means(rt), means(explicit))
+    # (which matters: smearing 'high' too would give different means)
+    smear_high = RegimeTransform(standard=smear, components={'low': LogTransform(bias_adjust=0), 'high': smear})
+    assert not np.allclose(means(rt), means(smear_high), rtol=1e-3)
+
+
+@torch.no_grad()
 def test_smearing_from_predictions_missing():
     """Missing observations are skipped (incl. for mixture measures, whose residuals are weighted)."""
     from torchcast.state_space import SmearingTransform

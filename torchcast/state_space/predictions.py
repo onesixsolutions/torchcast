@@ -207,24 +207,13 @@ class Predictions:
                    transforms: dict[str, 'Transform'],
                    mmean_samples: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        The predicted means of all measures, back-transformed by ``transforms``: the mean of each regime (just the
-        standard regime, for measures without mixture components), mixed by the regime-probabilities.
-
-        - Measures with a linear measured-mean: closed form (``Transform.inverse_mean``, so ``bias_adjust`` applies).
-        - Nonlinear measures: a monte-carlo mean over the (fixed) samples of the state, ``mmean_samples`` -- or, with
-          ``use_map`` (and no transform), the measured-mean of the state-mean. With a transform, each regime is
-          monte-carlo over the state x ``Transform.expected_inverse`` over the noise (``bias_adjust`` is ignored).
-
-        Each regime's mean on the modeled scale is the standard regime's plus the component's offset; its variance, the
-        standard regime's plus the component's.
-
         :param mmean_samples: Samples from ``_get_measured_mean_samples()``, if already computed.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
         batch_shape = self.state_means.shape[0:2]
         # exact for linear measures; the MAP for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
-        if mmean_samples is None and self._mc_mean_measures(use_map, transforms):
+        if mmean_samples is None and any(self._mc_mean_measures(use_map, transforms)):
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=self.measurement_model_flat,
                 state_means=self.state_means_flat,
@@ -242,7 +231,8 @@ class Predictions:
                 mmean_samples=None if mmean_samples is None else mmean_samples[..., j],
             )
             regime_means = torch.stack(regime_means, -1).view(*batch_shape, -1)
-            out.append((self._measure_regime_probs(measure) * regime_means).sum(-1))
+            regime_probs = self._measure_regime_probs(measure)
+            out.append((regime_probs * regime_means).sum(-1))
         return torch.stack(out, -1)
 
     def _regime_means(self,
@@ -264,18 +254,17 @@ class Predictions:
          measures, see ``_mc_mean_measures``).
         :return: A ``(num_rows,)`` tensor for each regime.
         """
-        regimes = [
-            (transform if transform is None or label is None else transform.for_regime(label), offset, extra)
-            for label, offset, extra in self._regimes(measure)
-        ]
         is_linear = measure not in self._nonlinear_measures
 
         if transform is None:
             # the mean of the measured-mean: exact, monte-carlo over the state, or the MAP:
             if not (is_linear or use_map):
                 measured_mean = mmean_samples.mean(0)
-            return [measured_mean + offset for _, offset, _ in regimes]
+            return [measured_mean + offset for _, offset, _ in self._regimes(measure)]
 
+        regimes = [
+            (transform.for_regime(label), offset, extra) for label, offset, extra in self._regimes(measure)
+        ]
         if is_linear:
             # closed form (or quadrature), given the mean and variance:
             return [t.inverse_mean(measured_mean + offset, measured_var + extra) for t, offset, extra in regimes]
@@ -294,9 +283,10 @@ class Predictions:
         The (nonlinear) measures whose means are monte-carlo, over samples of the state: all of them -- unless
         ``use_map``, in which case only those with a transform (the others use the measured-mean of the state-mean).
         """
-        return [m for m in self.measurement_model.measures if m in self._nonlinear_measures and (
-                not use_map or m in transforms
-        )]
+        return [
+            m for m in self.measurement_model.measures
+            if m in self._nonlinear_measures and (not use_map or (m in transforms))
+        ]
 
     # Log-probability --------------------------------------------------------------------------------------------------
 
@@ -696,7 +686,7 @@ class Predictions:
         mmean_samples = None
         nonlinear = [m for m in measures if m in self._nonlinear_measures]
         needs_mc_intervals = alpha is not None and bool(nonlinear)
-        if self._mc_mean_measures(use_map, transforms) or needs_mc_intervals:
+        if any(self._mc_mean_measures(use_map, transforms)) or needs_mc_intervals:
             if not use_map and self.mc_white_noise.num_samples < 1000:
                 warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
             mmean_samples = self._get_measured_mean_samples(

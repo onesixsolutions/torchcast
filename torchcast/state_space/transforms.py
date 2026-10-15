@@ -297,7 +297,9 @@ class SmearingTransform(Transform):
     def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         return self.residuals.to(dtype=dtype, device=device), self.weights.to(dtype=dtype, device=device)
 
-    def for_regime(self, component_id: str) -> Transform:
+    def for_regime(self, component_id: Optional[str]) -> Transform:
+        if component_id is None:
+            return self
         return self.base
 
 
@@ -307,7 +309,7 @@ class RegimeTransform(Transform):
 
         RegimeTransform(
             standard=SmearingTransform(LogTransform(), residuals),
-            components={'quick': LogTransform(bias_adjust=0)},
+            components={'quick': LogTransform(bias_adjust=0)}
         )
 
     All the transforms must have the same :func:`inverse` (here: exp) -- intervals are back-transformed with it --
@@ -316,7 +318,8 @@ class RegimeTransform(Transform):
     :param standard: The transform for the standard regime. It's also used for everything that isn't
      regime-specific: intervals, actuals, and measures without mixture components.
     :param components: A dictionary of ``{component_id: Transform}``. Components that aren't listed use
-     ``standard.for_regime(component_id)``.
+     ``standard.for_regime(component_id)``. So for example, if ``standard`` is SmearingTransform(), an unlisted
+     component will be handled as that class handles its components by default (i.e. not using smearing).
     """
 
     def __init__(self, standard: Transform, components: Optional[Mapping[str, Transform]] = None):
@@ -341,7 +344,10 @@ class RegimeTransform(Transform):
     def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         return self.standard._noise_nodes(dtype=dtype, device=device)
 
-    def for_regime(self, component_id: str) -> Transform:
+    def for_regime(self, component_id: Optional[str]) -> Transform:
         if component_id in self.components:
             return self.components[component_id]
+        if component_id is None:
+            return self
+        # see docstring for how unlisted ``components`` are handled
         return self.standard.for_regime(component_id)
