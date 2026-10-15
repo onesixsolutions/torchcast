@@ -363,7 +363,7 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(df_map['lower'].values, df['lower'].values)
 
     # with a transform, the draws are back-transformed (so the mean is E[exp(Y)] under the mixture):
-    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform())
+    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=False)
     standard_exp = _gauss_hermite_expectation(lambda z: torch.exp(torch.sigmoid(z.clamp(-8, 8))), z_mean, z_var)
     expected_exp = standard_exp * (
         probs[:, 0] * torch.exp(r / 2) +
@@ -372,12 +372,28 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(df_exp['mean'].values, expected_exp.numpy(), atol=.005)
     assert np.allclose(df_exp['lower'].values, np.exp(df['lower'].values), rtol=1e-5)
 
+    # ... with `use_map`, the measure is treated as linear, with the linearized moments: per regime, the lognormal
+    # mean exp(m + v/2), with m = sigmoid(z_mean) (+ offset) and v = sigmoid'(z_mean)^2 * z_var + r (+ component var):
+    p_map = torch.sigmoid(z_mean.double())
+    lin_var = (p_map * (1 - p_map)) ** 2 * z_var.double() + r
+    expected_map_exp = (
+        probs[:, 0] * torch.exp(p_map + lin_var / 2) +
+        probs[:, 1] * torch.exp(p_map + _COMPONENT_OFFSET + (lin_var + _COMPONENT_SD ** 2) / 2)
+    )
+    df_map_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=True)
+    assert np.allclose(df_map_exp['mean'].values, expected_map_exp.numpy(), rtol=1e-4)
+    assert np.array_equal(df_map_exp['lower'].values, df_exp['lower'].values)  # (intervals: monte-carlo either way)
+    # ... and `bias_adjust=0` gives the plug-in exp(MAP):
+    df_plugin = pred.to_dataframe(conf=False, transform=LogTransform(bias_adjust=0), use_map=True)
+    expected_plugin = probs[:, 0] * torch.exp(p_map) + probs[:, 1] * torch.exp(p_map + _COMPONENT_OFFSET)
+    assert np.allclose(df_plugin['mean'].values, expected_plugin.numpy(), rtol=1e-4)
+
     # each regime's mean uses its own transform (`Transform.for_regime`): here, a component-transform whose noise is a
     # single node at -10 (standard-deviations), so its back-transformed mean is
     # E[exp(sigmoid(Z))] * exp(mu - 10 * sqrt(R + sigma^2)):
     from torchcast.state_space import RegimeTransform, SmearingTransform
     rt = RegimeTransform(LogTransform(), components={'low': SmearingTransform(LogTransform(), torch.tensor([-10.]))})
-    df_rt = pred.to_dataframe(conf=.9, transform=rt)
+    df_rt = pred.to_dataframe(conf=.9, transform=rt, use_map=False)
     expected_rt = standard_exp * (
         probs[:, 0] * torch.exp(r / 2) +
         probs[:, 1] * torch.exp(_COMPONENT_OFFSET - 10 * (r + _COMPONENT_SD ** 2).sqrt())

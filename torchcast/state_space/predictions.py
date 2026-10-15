@@ -232,12 +232,14 @@ class Predictions:
         # (1) nonlinear-measures (mixture or not),
         # (2) mixture-but-linear-measures,
         # (3) everything else
-        nonlinear_measures = list(self._nonlinear_measures)
+        # with `use_map`, nonlinear measures are treated like linear ones, with the moments of the linearized
+        # measurement-model (the MAP measured-mean, and H P H^T + R) -- so there's no monte-carlo:
+        nonlinear_measures = [] if use_map else list(self._nonlinear_measures)
         _mix_measures = self.mixture.mixture_measures if self.mixture is not None else []
         mixture_measures = [m for m in _mix_measures if m not in nonlinear_measures]
         simple_measures = [m for m in all_measures if m not in nonlinear_measures and m not in mixture_measures]
 
-        # exact for linear measures; the MAP for nonlinear ones:
+        # exact for linear measures; the MAP and the linearized variance for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
 
         out = {}
@@ -251,7 +253,13 @@ class Predictions:
 
         # mixture measures: the same, for each regime, mixed by the regime-probabilities:
         for measure in mixture_measures:
-            mixture = self.get_mixture(measure)
+            midx = all_measures.index(measure)
+            # (not `get_mixture()`, which warns for nonlinear measures: here, with `use_map`, that's intended)
+            mixture = self._get_mixture(
+                measure,
+                standard_mean=measured_mean[:, midx].view(*batch_shape),
+                standard_var=system_cov[:, midx, midx].view(*batch_shape),
+            )
             transform = transforms.get(measure, identity)
             regime_means = [
                 transform.for_regime(label).inverse_mean(mixture.means[..., k], mixture.vars[..., k])
@@ -259,40 +267,34 @@ class Predictions:
             ]
             out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
 
-        # nonlinear measures: for each regime, monte-carlo over the state (or the MAP), mixed by the
+        # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
         # regime-probabilities (all ones without mixture components):
         if nonlinear_measures:
-            if not use_map or set(transforms).intersection(nonlinear_measures):
-                mmean_samples = self._resolve_mmean_samples(mmean_samples)
-
-            for measure in nonlinear_measures:
-                midx = all_measures.index(measure)
-                regimes = self._regimes(measure)
-                if use_map and measure not in transforms:
-                    # the MAP: the measured-mean of the state-mean
-                    regime_means = [measured_mean[:, midx] + offset for _, offset, _ in regimes]
-                else:
-                    # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra),
-                    # and the mean we want is E[inverse(y)] (inverse = the back-transform; the identity if there's
-                    # none). split the expectation in two:
-                    # - over the state: the average over the samples `x` of g(state) (`mmean_samples`)
-                    # - over the noise, given a sample: `expected_inverse(x + offset, var)`, i.e.
-                    #   E[inverse(x + offset + sqrt(var) * Z)], in closed form or by quadrature (for the identity:
-                    #   just x + offset)
-                    # (one sample at a time: the quadrature adds a dimension for its nodes, so all samples at once
-                    # would be (samples, rows, nodes) -- too much memory)
-                    transform = transforms.get(measure, identity)
-                    noise_var = self.measure_covs_flat[:, midx, midx]
-                    regime_means = []
-                    for label, offset, extra in regimes:
-                        regime_transform = transform.for_regime(label)
-                        _warn_bias_adjust_ignored(regime_transform)
-                        regime_means.append(torch.stack([
-                            regime_transform.expected_inverse(x + offset, noise_var + extra)
-                            for x in mmean_samples[..., midx]
-                        ]).mean(0))
-                probs = self._measure_regime_probs(measure).view(-1, len(regimes))
-                out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
+            mmean_samples = self._resolve_mmean_samples(mmean_samples)
+        for measure in nonlinear_measures:
+            midx = all_measures.index(measure)
+            regimes = self._regimes(measure)
+            # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra), and
+            # the mean we want is E[inverse(y)] (inverse = the back-transform; the identity if there's none). split
+            # the expectation in two:
+            # - over the state: the average over the samples `x` of g(state) (`mmean_samples`)
+            # - over the noise, given a sample: `expected_inverse(x + offset, var)`, i.e.
+            #   E[inverse(x + offset + sqrt(var) * Z)], in closed form or by quadrature (for the identity: just
+            #   x + offset)
+            # (one sample at a time: the quadrature adds a dimension for its nodes, so all samples at once would be
+            # (samples, rows, nodes) -- too much memory)
+            transform = transforms.get(measure, identity)
+            noise_var = self.measure_covs_flat[:, midx, midx]
+            regime_means = []
+            for label, offset, extra in regimes:
+                regime_transform = transform.for_regime(label)
+                _warn_bias_adjust_ignored(regime_transform)
+                regime_means.append(torch.stack([
+                    regime_transform.expected_inverse(x + offset, noise_var + extra)
+                    for x in mmean_samples[..., midx]
+                ]).mean(0))
+            probs = self._measure_regime_probs(measure).view(-1, len(regimes))
+            out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
 
         return torch.stack([out[m] for m in all_measures], -1)
 
@@ -456,10 +458,17 @@ class Predictions:
         :param conf: The confidence level for the confidence intervals, defaults to 0.95. ``None`` returns a ``std``
          column instead of the intervals; ``False`` returns only the means, skipping all of the work of computing
          intervals (for predictions; see also :func:`get_means`).
-        :param use_map: If the model requires MCMC, this controls whether the mean uses mcmc to marginalize over the
-         state distribution (``use_map=False``) or whether the MAP is used to apply any non-linearities to the
-         state-mean directly (``use_map=True``). The latter can sometimes exhibit better predictive performance on
-         traditional supervised learning metrics.
+        :param use_map: For measures with a nonlinear measured-mean (e.g. a measure-function, or nonlinear processes):
+         whether the mean averages over the state's uncertainty by monte-carlo (``use_map=False``), or plugs in the
+         state's mean (``use_map=True``; the MAP), treating the measure like a linear one, with the moments of the
+         linearized measurement-model. (The intervals are monte-carlo either way.) Reasons to use the MAP: for a
+         monotone measure-function (e.g. a sigmoid), it's the predictive *median* of the measured-mean rather than its
+         mean (better for e.g. absolute error); it doesn't depend on the state's variance, so it's robust to that
+         being miscalibrated (an overestimated variance pulls the monte-carlo mean of a sigmoid towards .5); and
+         it's cheap. With a ``transform``, the back-transformed mean then works as for linear measures: its
+         ``bias_adjust`` sets how much of the (linearized) variance is used -- e.g. ``bias_adjust=0`` gives the
+         plug-in ``inverse(MAP)``, a median-like forecast throughout. (The monte-carlo mean ignores ``bias_adjust``.)
+         Ignored for models without nonlinear measures, whose means are exact.
         :param transform: For measures that were transformed before modeling (e.g. log), a :class:`.Transform` to
          map the predictions (and actuals) back to the original scale: either a single ``Transform`` for all measures,
          or a dictionary of ``{measure: Transform}``. The mean is back-transformed exactly (not just the mean on the
@@ -690,7 +699,7 @@ class Predictions:
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
-        needs_mc_means = (not use_map) or set(transforms).intersection(self._nonlinear_measures)
+        needs_mc_means = not use_map
         needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
         if needs_mc_means or needs_mc_intervals:
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
