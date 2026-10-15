@@ -273,12 +273,11 @@ class Predictions:
             mmean_samples = self._resolve_mmean_samples(mmean_samples)
         for measure in nonlinear_measures:
             midx = all_measures.index(measure)
-            regimes = self._regimes(measure)
             # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra), and
             # the mean we want is E[inverse(y)] (inverse = the back-transform; the identity if there's none). split
             # the expectation in two:
             # - over the state: the average over the samples `x` of g(state) (`mmean_samples`)
-            # - over the noise, given a sample: `expected_inverse(x + offset, var)`, i.e.
+            # - over the noise, given a sample: `inverse_mean(x + offset, var)` (without `bias_adjust`), i.e.
             #   E[inverse(x + offset + sqrt(var) * Z)], in closed form or by quadrature (for the identity: just
             #   x + offset)
             # (one sample at a time: the quadrature adds a dimension for its nodes, so all samples at once would be
@@ -286,14 +285,14 @@ class Predictions:
             transform = transforms.get(measure, identity)
             noise_var = self.measure_covs_flat[:, midx, midx]
             regime_means = []
-            for label, offset, extra in regimes:
+            for label, offset, extra in self._regimes(measure):
                 regime_transform = transform.for_regime(label)
                 _warn_bias_adjust_ignored(regime_transform)
                 regime_means.append(torch.stack([
-                    regime_transform.expected_inverse(x + offset, noise_var + extra)
+                    regime_transform.inverse_mean(x + offset, noise_var + extra, adjust_bias=False)
                     for x in mmean_samples[..., midx]
                 ]).mean(0))
-            probs = self._measure_regime_probs(measure).view(-1, len(regimes))
+            probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
             out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
 
         return torch.stack([out[m] for m in all_measures], -1)
@@ -699,9 +698,8 @@ class Predictions:
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
-        needs_mc_means = not use_map
         needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
-        if needs_mc_means or needs_mc_intervals:
+        if (not use_map) or needs_mc_intervals:
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
 
         means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)

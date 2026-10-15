@@ -20,13 +20,14 @@ class Transform(torch.nn.Module):
     ``TimeSeriesDataset.from_dataframe(transform=...)``) and its inverse, :func:`inverse`, which must be elementwise and
     monotonically increasing (so quantiles can be back-transformed directly). The back-transformed mean,
     :func:`inverse_mean`, is ``E[inverse(Y)]`` where ``Y = mean + sqrt(var) * Z``, and ``Z`` is standard normal. This
-    is computed by gauss-hermite quadrature by default; subclasses can override :func:`expected_inverse` with a closed
-    form, or :func:`noise_nodes` to use a different distribution for ``Z`` (see :class:`SmearingTransform`).
+    is computed by gauss-hermite quadrature by default; subclasses can override ``_expected_inverse`` with a closed
+    form, or ``_noise_nodes`` to use a different distribution for ``Z`` (see :class:`SmearingTransform`).
 
     :param bias_adjust: How much bias-adjustment to apply when back-transforming the mean, between 0 and 1. The
      back-transformed mean is computed with the variance scaled by this: 1 (the default, ``None``) gives the mean of
      the back-transformed distribution; 0 gives no bias-adjustment (i.e. the back-transformed median). Doesn't affect
-     intervals. Ignored (with a warning) for monte-carlo predictions, where the mean is of back-transformed samples.
+     intervals. Ignored (with a warning) for monte-carlo means (e.g. ``use_map=False`` for nonlinear measures), which
+     average back-transformed samples.
     """
     num_nodes: int = 32
 
@@ -54,25 +55,23 @@ class Transform(torch.nn.Module):
         """
         raise NotImplementedError
 
-    def inverse_mean(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+    def inverse_mean(self, mean: torch.Tensor, var: torch.Tensor, adjust_bias: bool = True) -> torch.Tensor:
         """
         The mean on the original scale, ``E[inverse(Y)]``, for ``Y`` on the modeled scale with the given mean and
-        variance -- with the variance scaled by ``bias_adjust``.
+        variance -- with the variance scaled by ``bias_adjust``, unless ``adjust_bias=False``.
 
         :param mean: The mean of ``Y``.
-        :param var: The variance of ``Y``, same shape as ``mean``.
+        :param var: The variance of ``Y``, same shape as ``mean`` (or broadcastable to it).
+        :param adjust_bias: Whether to apply ``bias_adjust``. False, e.g., for monte-carlo means, where it doesn't
+         apply (``var`` is only the observation-noise's, given a sample of the state).
         :return: A tensor with the same shape as ``mean``.
         """
-        return self.expected_inverse(mean, var * self._var_multi)
+        return self._expected_inverse(mean, var * self._var_multi if adjust_bias else var)
 
-    def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         """
-        ``E[inverse(mean + sqrt(var) * Z)]``, with ``Z`` from :func:`noise_nodes`. Like :func:`inverse_mean`, but
-        without ``bias_adjust``. Subclasses can override this with a closed form.
-
-        :param mean: A tensor.
-        :param var: A tensor with the same shape as ``mean``.
-        :return: A tensor with the same shape as ``mean``.
+        ``E[inverse(mean + sqrt(var) * Z)]``, with ``Z`` from ``_noise_nodes``: by quadrature. The hook for
+        subclasses to override with a closed form (``inverse_mean`` applies ``bias_adjust``, so they needn't).
         """
         z, w = self._noise_nodes(dtype=mean.dtype, device=mean.device)
         nodes = mean.unsqueeze(-1) + var.sqrt().unsqueeze(-1) * z
@@ -80,7 +79,7 @@ class Transform(torch.nn.Module):
 
     def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        The distribution of the standardized noise ``Z`` (see :func:`expected_inverse`), as nodes and weights: by
+        The distribution of the standardized noise ``Z`` (see ``_expected_inverse``), as nodes and weights: by
         default, gauss-hermite quadrature for a standard normal.
 
         :return: A tuple of 1-D tensors: the nodes, and their weights (which sum to 1).
@@ -110,10 +109,7 @@ class _IdentityTransform(Transform):
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
-    def inverse_mean(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
-        return mean
-
-    def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         return mean
 
 
@@ -140,7 +136,7 @@ class LogTransform(Transform):
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return torch.exp(x * self._log_base)
 
-    def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         # closed-form (lognormal)
         return torch.exp(mean * self._log_base + var * self._log_base ** 2 / 2)
 
@@ -172,10 +168,10 @@ class BoxCoxTransform(Transform):
         # the inverse only exists where (lmbda * x + 1) > 0; clamp the (far-tail) region where it doesn't:
         return (self.lmbda * x + 1).clamp_min(0) ** (1 / self.lmbda)
 
-    def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         if self.lmbda == 0:
             return torch.exp(mean + var / 2)
-        return super().expected_inverse(mean, var)
+        return super()._expected_inverse(mean, var)
 
 
 class SmearingTransform(Transform):
@@ -349,11 +345,8 @@ class RegimeTransform(Transform):
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return self.standard.inverse(x)
 
-    def inverse_mean(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
-        return self.standard.inverse_mean(mean, var)
-
-    def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
-        return self.standard.expected_inverse(mean, var)
+    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+        return self.standard._expected_inverse(mean, var)
 
     def _noise_nodes(self, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         return self.standard._noise_nodes(dtype=dtype, device=device)

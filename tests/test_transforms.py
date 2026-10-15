@@ -12,7 +12,7 @@ from torchcast.state_space import Transform, LogTransform, BoxCoxTransform, Mixt
 
 class _QuadratureLog(LogTransform):
     # forces the (default) gauss-hermite path, for comparison with the closed-form
-    expected_inverse = Transform.expected_inverse
+    _expected_inverse = Transform._expected_inverse
 
 
 def test_inverse_mean():
@@ -172,6 +172,11 @@ def test_bias_adjust():
     assert torch.allclose(_QuadratureLog(bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
     assert torch.allclose(BoxCoxTransform(0, bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
     assert torch.allclose(BoxCoxTransform(.5, bias_adjust=0).inverse_mean(mean, var), BoxCoxTransform(.5).inverse(mean))
+    # `adjust_bias=False` ignores it (e.g. for monte-carlo means):
+    unadjusted = LogTransform(bias_adjust=0).inverse_mean(mean, var, adjust_bias=False)
+    assert torch.allclose(unadjusted, torch.exp(mean + var / 2))
+    assert torch.allclose(_QuadratureLog(bias_adjust=0).inverse_mean(mean, var, adjust_bias=False),
+                          torch.exp(mean + var / 2), rtol=1e-6)
     with pytest.raises(ValueError, match="between 0 and 1"):
         LogTransform(bias_adjust=1.5)
 
