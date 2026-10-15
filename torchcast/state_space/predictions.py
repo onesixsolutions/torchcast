@@ -178,15 +178,15 @@ class Predictions:
 
         if self.measurement_model.is_nonlinear:
             # monte-carlo for the means of nonlinear measures; there's no closed form cov
-            return self._get_means(
-                use_map=False, transforms={}, mmean_samples=self._get_output_samples(_DEFAULT_NUM_SAMPLES)
-            ), None
+            mean = self._get_means(use_map=False, mmean_samples=self._get_output_samples(_DEFAULT_NUM_SAMPLES))
+            return mean, None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
             _, probs, means, covs = self._get_regime_combos()
             mean = (probs.unsqueeze(-1) * means).sum(-2)
             second_moment = (probs[..., None, None] * (covs + means.unsqueeze(-1) * means.unsqueeze(-2))).sum(-3)
-            return mean, second_moment - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+            cov = second_moment - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+            return mean, cov
         else:
             measured_mean, system_cov = self._measured_moments_flat()
             return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
@@ -214,7 +214,7 @@ class Predictions:
 
     def _get_means(self,
                    use_map: bool,
-                   transforms: dict[str, 'Transform'],
+                   transforms: Optional[dict[str, 'Transform']] = None,
                    mmean_samples: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         The means, given already-resolved arguments and samples -- separate from :func:`get_means` so that callers
@@ -224,6 +224,7 @@ class Predictions:
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
          (handling mixtures if needed).
         """
+        transforms = transforms or {}
 
         assert mmean_samples is not None or not self._needs_mc_means(use_map, transforms)
         # exact for linear measures; the MAP for nonlinear ones:
