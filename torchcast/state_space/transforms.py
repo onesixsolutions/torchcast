@@ -113,6 +113,9 @@ class _IdentityTransform(Transform):
     def inverse_mean(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         return mean
 
+    def expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+        return mean
+
 
 class LogTransform(Transform):
     """
