@@ -540,6 +540,7 @@ class BinomialPredictions(Predictions):
                 measurement_model=measurement_model.subset(measures=binary_measures),
                 state_means=state_means,
                 state_covs=state_covs,
+                white_noise=self._log_prob_white_noise(),
             )
             binom = Binomial(total_count=num_obs.unsqueeze(0), probs=mmean_samples, validate_args=False)
             _obs = obs[..., binary_idx]

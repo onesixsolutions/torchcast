@@ -196,8 +196,9 @@ class Predictions:
                   use_map: Optional[bool] = None,
                   num_samples: int = _DEFAULT_NUM_SAMPLES) -> torch.Tensor:
         """
-        The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform`` and
-        ``use_map`` -- without computing any intervals.
+        The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform``,
+        ``use_map`` and ``num_samples`` -- without computing any intervals. (Resolves the arguments and draws any
+        monte-carlo samples, then calls ``_get_means``.)
 
         :param transform: See :func:`to_dataframe`.
         :param use_map: See :func:`to_dataframe`.
@@ -216,6 +217,9 @@ class Predictions:
                    transforms: dict[str, 'Transform'],
                    mmean_samples: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
+        The means, given already-resolved arguments and samples -- separate from :func:`get_means` so that callers
+        can share one set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
+
         :param mmean_samples: Samples from ``_get_output_samples()``; required if ``_needs_mc_means()``.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
          (handling mixtures if needed).
@@ -387,6 +391,7 @@ class Predictions:
                 measurement_model=measurement_model,
                 state_means=state_means,
                 state_covs=state_covs,
+                white_noise=self._log_prob_white_noise(),
             )
             resid = obs - mmean_samples
             ll_cov = measure_cov
@@ -1527,7 +1532,7 @@ class Predictions:
                                    measurement_model: 'MeasurementModel',
                                    state_means: torch.Tensor,
                                    state_covs: torch.Tensor,
-                                   white_noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+                                   white_noise: torch.Tensor) -> torch.Tensor:
         """
         Samples of the measured-mean, from samples of the state. Rather than sampling the full state, this samples a
         lower-dimensional gaussian: the measured-mean of the linear processes, concatenated with the state-elements of
@@ -1539,8 +1544,8 @@ class Predictions:
         :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
         :param white_noise: Standard-normal noise for the *full* model's extended dimensions (dims for measures that
          ``measurement_model`` drops are dropped here), either ``(num_samples, dim)`` -- the same draws for every row
-         -- or ``(num_samples, num_rows, dim)``. Defaults to ``mc_white_noise``, which is fixed (so that the
-         monte-carlo log-prob is a deterministic function of the parameters) and shared across rows.
+         -- or ``(num_samples, num_rows, dim)``. E.g. ``_log_prob_white_noise()`` (fixed, for the log-prob),
+         ``_get_output_samples()``'s, or ``sample()``'s.
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         nmeasures = len(measurement_model.measures)
@@ -1560,9 +1565,7 @@ class Predictions:
         missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         em_idx = [i for i in range(em_dim) if i not in missing_midx]
-        if white_noise is None:
-            white_noise = self.mc_white_noise(num_dim=em_dim, dtype=chol.dtype, device=chol.device)
-        elif white_noise.ndim not in (2, 3) or white_noise.shape[-1] != em_dim or (
+        if white_noise.ndim not in (2, 3) or white_noise.shape[-1] != em_dim or (
                 white_noise.ndim == 3 and white_noise.shape[1] != state_means.shape[0]
         ):
             raise ValueError(
@@ -1607,6 +1610,15 @@ class Predictions:
          the state's noise draws).
         """
         return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED + (0 if state else 1))
+
+    def _log_prob_white_noise(self) -> torch.Tensor:
+        """
+        The model's ``mc_white_noise`` for the monte-carlo log-prob: ``(num_samples, dim)``, fixed (so that the
+        log-prob is a deterministic function of the parameters) and shared across rows. See
+        ``_get_measured_mean_samples``.
+        """
+        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        return self.mc_white_noise(num_dim=em_dim, dtype=self.state_means.dtype, device=self.state_means.device)
 
     def _get_output_samples(self, num_samples: int) -> torch.Tensor:
         """
