@@ -39,7 +39,7 @@ class Transform(torch.nn.Module):
         self.bias_adjust = bias_adjust
 
     @property
-    def _var_multi(self) -> float:
+    def var_multi(self) -> float:
         return 1. if self.bias_adjust is None else self.bias_adjust
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
@@ -67,7 +67,7 @@ class Transform(torch.nn.Module):
          whatever ``bias_adjust`` is).
         :return: A tensor with the same shape as ``mean``.
         """
-        return self._expected_inverse(mean, var * self._var_multi if adjust_bias else var)
+        return self._expected_inverse(mean, var * (self.var_multi if adjust_bias else 1.))
 
     def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
         """

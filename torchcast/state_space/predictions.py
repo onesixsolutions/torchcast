@@ -293,16 +293,15 @@ class Predictions:
             regime_means = []
             for label, offset, extra in self._regimes(measure):
                 regime_transform = transform.for_regime(label)
-                var_scale = float(regime_transform.bias_adjust if regime_transform.bias_adjust is not None else 1.)
-                if var_scale not in samples_by_var_scale:
-                    samples_by_var_scale[var_scale] = self._get_output_samples(
+                if regime_transform.var_multi not in samples_by_var_scale:
+                    samples_by_var_scale[regime_transform.var_multi] = self._get_output_samples(
                         mmean_samples.shape[0],
                         generator=self._output_generator(state=True),
-                        noise_scale=math.sqrt(var_scale),
+                        noise_scale=math.sqrt(regime_transform.var_multi),
                     )
                 regime_means.append(torch.stack([
                     regime_transform.inverse_mean(x + offset, noise_var + extra)
-                    for x in samples_by_var_scale[var_scale][..., midx]
+                    for x in samples_by_var_scale[regime_transform.var_multi][..., midx]
                 ]).mean(0))
             probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
             out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
