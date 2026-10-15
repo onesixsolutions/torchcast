@@ -218,8 +218,8 @@ class Predictions:
         The means, given already-resolved arguments -- separate from :func:`get_means` so that callers can share one
         set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
 
-        :param mmean_samples: Only used if some means are monte-carlo (``_needs_mc_means()``): see
-         ``_resolve_mmean_samples``. Pass already-computed samples to save compute (and to share them).
+        :param mmean_samples: Pass already-computed samples to save compute (and to share them), otherwise will
+         compute if needed (or for the latter this can be an int for num_draws).
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
          (handling mixtures if needed).
         """
@@ -232,7 +232,7 @@ class Predictions:
         # (1) nonlinear-measures (mixture or not),
         # (2) mixture-but-linear-measures,
         # (3) everything else
-        nonlinear_measures = [m for m in all_measures if m in self._nonlinear_measures]
+        nonlinear_measures = list(self._nonlinear_measures)
         _mix_measures = self.mixture.mixture_measures if self.mixture is not None else []
         mixture_measures = [m for m in _mix_measures if m not in nonlinear_measures]
         simple_measures = [m for m in all_measures if m not in nonlinear_measures and m not in mixture_measures]
@@ -261,40 +261,32 @@ class Predictions:
 
         # nonlinear measures: for each regime, monte-carlo over the state (or the MAP), mixed by the
         # regime-probabilities (all ones without mixture components):
-        if self._needs_mc_means(use_map, transforms):
-            mmean_samples = self._resolve_mmean_samples(mmean_samples)
-        for measure in nonlinear_measures:
-            midx = all_measures.index(measure)
-            regimes = self._regimes(measure)
-            if use_map and measure not in transforms:
-                # the MAP: the measured-mean of the state-mean
-                regime_means = [measured_mean[:, midx] + offset for _, offset, _ in regimes]
-            else:
-                # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
-                transform = transforms.get(measure, identity)
-                noise_var = self.measure_covs_flat[:, midx, midx]
-                regime_means = []
-                for label, offset, extra in regimes:
-                    regime_transform = transform.for_regime(label)
-                    _warn_bias_adjust_ignored(regime_transform)
-                    regime_means.append(torch.stack([
-                        regime_transform.expected_inverse(x + offset, noise_var + extra)
-                        for x in mmean_samples[..., midx]
-                    ]).mean(0))
-            probs = self._measure_regime_probs(measure).view(-1, len(regimes))
-            out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
+        if nonlinear_measures:
+            if not use_map or set(transforms).intersection(nonlinear_measures):
+                mmean_samples = self._resolve_mmean_samples(mmean_samples)
+
+            for measure in nonlinear_measures:
+                midx = all_measures.index(measure)
+                regimes = self._regimes(measure)
+                if use_map and measure not in transforms:
+                    # the MAP: the measured-mean of the state-mean
+                    regime_means = [measured_mean[:, midx] + offset for _, offset, _ in regimes]
+                else:
+                    # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
+                    transform = transforms.get(measure, identity)
+                    noise_var = self.measure_covs_flat[:, midx, midx]
+                    regime_means = []
+                    for label, offset, extra in regimes:
+                        regime_transform = transform.for_regime(label)
+                        _warn_bias_adjust_ignored(regime_transform)
+                        regime_means.append(torch.stack([
+                            regime_transform.expected_inverse(x + offset, noise_var + extra)
+                            for x in mmean_samples[..., midx]
+                        ]).mean(0))
+                probs = self._measure_regime_probs(measure).view(-1, len(regimes))
+                out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
 
         return torch.stack([out[m] for m in all_measures], -1)
-
-    def _needs_mc_means(self, use_map: bool, transforms: dict[str, 'Transform']) -> bool:
-        """
-        Whether any measure's mean is monte-carlo, over samples of the state: that's all nonlinear measures -- unless
-        ``use_map``, in which case only those with a transform (the others use the measured-mean of the state-mean).
-        """
-        return any(
-            m in self._nonlinear_measures and (not use_map or m in transforms)
-            for m in self.measurement_model.measures
-        )
 
     # Log-probability --------------------------------------------------------------------------------------------------
 
@@ -690,8 +682,9 @@ class Predictions:
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
+        needs_mc_means = (not use_map) or set(transforms).intersection(self._nonlinear_measures)
         needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
-        if self._needs_mc_means(use_map, transforms) or needs_mc_intervals:
+        if needs_mc_means or needs_mc_intervals:
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
 
         means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
