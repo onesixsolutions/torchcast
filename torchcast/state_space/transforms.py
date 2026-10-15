@@ -31,6 +31,9 @@ class Transform(torch.nn.Module):
      samples.
     """
     num_nodes: int = 32
+    # the quadrature's intermediates have (number of elements) x (number of nodes) values: it's computed in chunks of
+    # elements, so they stay below about this many (e.g. for many monte-carlo samples x rows):
+    max_quadrature_size: int = 2 ** 24
 
     def __init__(self, bias_adjust: Optional[float] = None):
         super().__init__()
@@ -78,12 +81,20 @@ class Transform(torch.nn.Module):
 
     def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
         """
-        ``E[inverse(mean + sqrt(var) * Z)]``, with ``Z`` from ``_noise_nodes``: by quadrature. The hook for
-        subclasses to override with a closed form (``inverse_mean`` applies ``bias_adjust``, so they needn't).
+        ``E[inverse(mean + sqrt(var) * Z)]``, with ``Z`` from ``_noise_nodes``: by quadrature (in chunks, see
+        ``max_quadrature_size``). The hook for subclasses to override with a closed form (``inverse_mean`` applies
+        ``bias_adjust``, so they needn't).
         """
         z, w = self._noise_nodes(dtype=mean.dtype, device=mean.device, regime=regime)
-        nodes = mean.unsqueeze(-1) + var.sqrt().unsqueeze(-1) * z
-        return (w * self.inverse(nodes)).sum(-1)
+        mean, var = torch.broadcast_tensors(mean, var)
+        if not mean.numel():
+            return mean.clone()
+        chunk_size = max(1, self.max_quadrature_size // len(z))
+        out = [
+            (w * self.inverse(mean_chunk.unsqueeze(-1) + var_chunk.sqrt().unsqueeze(-1) * z)).sum(-1)
+            for mean_chunk, var_chunk in zip(mean.reshape(-1).split(chunk_size), var.reshape(-1).split(chunk_size))
+        ]
+        return torch.cat(out).view(mean.shape)
 
     def _noise_nodes(self,
                      dtype: torch.dtype,

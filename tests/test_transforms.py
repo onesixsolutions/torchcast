@@ -33,6 +33,15 @@ def test_inverse_mean():
     with pytest.raises(ValueError, match="non-negative"):
         BoxCoxTransform(-.1)
 
+    # the quadrature is computed in chunks (to bound memory), which doesn't change the result -- incl. for inputs that
+    # broadcast (here: (7, 4) means, (4,) variances):
+    means = mean + torch.randn(7, 4, dtype=torch.float64)
+    one_chunk = BoxCoxTransform(.5).inverse_mean(means, var)
+    many_chunks = BoxCoxTransform(.5)
+    many_chunks.max_quadrature_size = 3 * many_chunks.num_nodes  # (3 elements per chunk)
+    assert torch.equal(many_chunks.inverse_mean(means, var), one_chunk)
+    assert one_chunk.shape == (7, 4)
+
 
 @torch.no_grad()
 def test_to_dataframe_transform():

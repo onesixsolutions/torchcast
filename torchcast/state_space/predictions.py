@@ -287,16 +287,11 @@ class Predictions:
             # - over the state: the average over the samples `x` of g(state) (`mmean_samples`)
             # - over the noise, given a sample: `inverse_mean(x + offset, var)`, i.e.
             #   E[inverse(x + offset + sqrt(var) * Z)], in closed form or by quadrature (for the identity: just
-            #   x + offset)
-            # (one sample at a time: the quadrature adds a dimension for its nodes, so all samples at once would be
-            # (samples, rows, nodes) -- too much memory)
+            #   x + offset) -- for all samples at once
             transform = transforms.get(measure, identity)
             noise_var = self.measure_covs_flat[:, midx, midx]
             regime_means = [
-                torch.stack([
-                    transform.inverse_mean(x + offset, noise_var + extra, regime=label)
-                    for x in mmean_samples[..., midx]
-                ]).mean(0)
+                transform.inverse_mean(mmean_samples[..., midx] + offset, noise_var + extra, regime=label).mean(0)
                 for label, offset, extra in self._regimes(measure)
             ]
             probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
