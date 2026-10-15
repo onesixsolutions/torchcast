@@ -354,7 +354,7 @@ def test_nonlinear_model_linear_measures_exact():
 def test_measured_mean_samples_white_noise_shape():
     """
     `_get_measured_mean_samples(white_noise=...)` rejects noise of the wrong shape (rather than e.g. silently using
-    only the first columns of noise with too many).
+    only the first columns of noise with too many) -- and states whose rows don't match the measurement-model's.
     """
     kf = _correlated_kf()
     pred = kf(torch.randn(2, 5, 2).cumsum(1))
@@ -371,7 +371,12 @@ def test_measured_mean_samples_white_noise_shape():
     for bad in map(torch.randn, bad_shapes):
         with pytest.raises(ValueError, match="white_noise"):
             pred._get_measured_mean_samples(**kwargs, white_noise=bad)
-
+    # (a single row would otherwise broadcast against the measurement-model's rows)
+    with pytest.raises(ValueError, match="state_means"):
+        pred._get_measured_mean_samples(
+            **{**kwargs, 'state_means': kwargs['state_means'][:1], 'state_covs': kwargs['state_covs'][:1]},
+            white_noise=torch.randn(7, dim),
+        )
 
 
 @torch.no_grad()

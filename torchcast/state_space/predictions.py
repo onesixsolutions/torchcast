@@ -1539,7 +1539,8 @@ class Predictions:
         any nonlinear processes (see ``MeasurementModel.extended_measure_mat``). The nonlinear processes'
         contributions, then any measure-functions, are applied to those samples.
 
-        :param measurement_model: A flattened measurement-model (possibly a subset of the measures, for nans).
+        :param measurement_model: A flattened measurement-model (possibly a subset of the measures, for nans), with
+         ``num_rows`` groups.
         :param state_means: A ``(num_rows, state_rank)`` tensor.
         :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
         :param white_noise: Standard-normal noise for ``measurement_model``'s extended dimensions, either
@@ -1549,7 +1550,14 @@ class Predictions:
         """
         nmeasures = len(measurement_model.measures)
 
-        extended_measure_mat = measurement_model.extended_measure_mat
+        extended_measure_mat = measurement_model.extended_measure_mat  # (raises if not flattened)
+        num_rows, state_rank = measurement_model.num_groups, extended_measure_mat.shape[-1]
+        if state_means.shape != (num_rows, state_rank) or state_covs.shape != (num_rows, state_rank, state_rank):
+            raise ValueError(
+                f"Expected `state_means` with shape {(num_rows, state_rank)} and `state_covs` with shape "
+                f"{(num_rows, state_rank, state_rank)} (`measurement_model` has {num_rows} rows), got "
+                f"{tuple(state_means.shape)} and {tuple(state_covs.shape)}."
+            )
         partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
         partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
 
@@ -1610,8 +1618,14 @@ class Predictions:
         """
         The model's ``mc_white_noise`` for the monte-carlo log-prob (see ``_get_measured_mean_samples``):
         ``(num_samples, dim)``, fixed (so that the log-prob is a deterministic function of the parameters) and shared
-        across rows. It's drawn for the full model, then the dims of measures that ``measurement_model`` drops (for
-        nans) are dropped -- so each measure's draws are the same whichever other measures are missing.
+        across rows.
+
+        The noise has one column per extended dimension of the *full* model (each measure, then the nonlinear
+        processes' state-elements). For a ``measurement_model`` that's a subset of the measures (for nans), the
+        columns of the missing measures are dropped, so that each remaining dimension keeps its own column. This isn't
+        needed for correctness (any standard-normal noise of the right size gives a valid monte-carlo estimate), but
+        it keeps the draws consistent: each measure always uses the same column of the fixed draws, whichever other
+        measures are missing in a row.
         """
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         white_noise = self.mc_white_noise(num_dim=em_dim, dtype=self.state_means.dtype, device=self.state_means.device)
