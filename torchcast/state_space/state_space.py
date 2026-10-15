@@ -238,30 +238,14 @@ class StateSpaceModel(torch.nn.Module):
             **kwargs
         )
         used_keys = used_keys.union(measurement_model.used_keys)
-        component_X = {}
-        if self.mixture is not None:
-            component_X, mixture_keys = self.mixture.get_component_X(kwargs)
-            used_keys.update(mixture_keys)
+        # (None without mixture components)
+        regime_prior, base_probs, mixture_keys = self._prepare_regimes(
+            kwargs, init_regime_probs=init_regime_probs, num_groups=num_groups, num_timesteps=out_timesteps
+        )
+        used_keys.update(mixture_keys)
         unused_kwargs = set(kwargs) - used_keys
         if unused_kwargs:
             raise RuntimeError(f"Unexpected kwargs in {type(self).__name__}.forward(): {set(unused_kwargs)})")
-
-        # regime-probabilities (if mixture components). base_probs[t] are the base-rates for the regime-prior at t:
-        # time-varying if any components have predictors.
-        base_probs = regime_prior = None
-        if self.mixture is not None:
-            if component_X:
-                base_probs = self.mixture.base_probs(component_X).unbind(1)
-                if len(base_probs) < out_timesteps:
-                    raise ValueError(
-                        f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
-                        f"{out_timesteps}."
-                    )
-            else:
-                base_probs = [self.mixture.base_probs()] * out_timesteps
-            regime_prior = self._initial_regime_prior(init_regime_probs, base_probs[0], num_groups)
-        elif init_regime_probs is not None:
-            raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
 
         # first loop through to do predict -> update
         scaling1step = init_multiplier
@@ -791,6 +775,36 @@ class StateSpaceModel(torch.nn.Module):
             mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
             mixture=self.mixture,
         )
+
+    def _prepare_regimes(self,
+                         kwargs: dict,
+                         init_regime_probs: Optional[torch.Tensor],
+                         num_groups: int,
+                         num_timesteps: int) -> tuple[Optional[torch.Tensor], Optional[Sequence[torch.Tensor]], set]:
+        """
+        For models with mixture components: the regime-prior for the first timestep, and the base-rates for the
+        regime-prior at each timestep (``base_probs[t]``; time-varying if any components have predictors).
+
+        :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
+        :return: ``(regime_prior, base_probs, used_keys)``; ``(None, None, set())`` without mixture components.
+        """
+        if self.mixture is None:
+            if init_regime_probs is not None:
+                raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
+            return None, None, set()
+
+        component_X, used_keys = self.mixture.get_component_X(kwargs)
+        if component_X:
+            base_probs = self.mixture.base_probs(component_X).unbind(1)
+            if len(base_probs) < num_timesteps:
+                raise ValueError(
+                    f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
+                    f"{num_timesteps}."
+                )
+        else:
+            base_probs = [self.mixture.base_probs()] * num_timesteps
+        regime_prior = self._initial_regime_prior(init_regime_probs, base_probs[0], num_groups)
+        return regime_prior, base_probs, used_keys
 
     def _initial_regime_prior(self,
                               init_regime_probs: Optional[torch.Tensor],
