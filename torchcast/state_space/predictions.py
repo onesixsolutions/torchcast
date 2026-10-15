@@ -270,26 +270,23 @@ class Predictions:
         # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
         # regime-probabilities (all ones without mixture components):
         if nonlinear_measures:
-            # a transform's `bias_adjust` scales the variance in the back-transform, as for linear measures: here,
-            # both the noise's (by `inverse_mean`, below) and the state's -- with the same draws, but each measure's
-            # deviations from its mean scaled by sqrt(bias_adjust), before the nonlinearity (so `bias_adjust=0` gives
-            # the plug-in inverse(g(MAP) + offset), as with `use_map`). (only nonlinear measures' scales matter here.)
+            # to apply a transform with bias_adjust != 1, we need to rescale not just the measurement-var (easy)
+            # but also the state-var; but since we're sampling the state-var, we need to sample it with a scaling factor
             deviation_scales = [
                 math.sqrt(transforms.get(m, identity).var_multi) if m in nonlinear_measures else 1.
                 for m in all_measures
             ]
             mmean_samples = self._resolve_mmean_samples(mmean_samples, deviation_scales=deviation_scales)
+
         for measure in nonlinear_measures:
             midx = all_measures.index(measure)
-            # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra), and
-            # the mean we want is E[inverse(y)] (inverse = the back-transform; the identity if there's none). split
-            # the expectation in two:
-            # - over the state: the average over the samples `x` of g(state) (`mmean_samples`)
-            # - over the noise, given a sample: `inverse_mean(x + offset, var)`, i.e.
-            #   E[inverse(x + offset + sqrt(var) * Z)], in closed form or by quadrature (for the identity: just
-            #   x + offset) -- for all samples at once
             transform = transforms.get(measure, identity)
             noise_var = self.measure_covs_flat[:, midx, midx]
+            if not self._mixture_components(measure):
+                out[measure] = transform.inverse_mean(mmean_samples[..., midx], noise_var).mean(0).view(*batch_shape)
+                continue
+
+            # more complex logic for measures with mixture components:
             regime_means = [
                 transform.inverse_mean(mmean_samples[..., midx] + offset, noise_var + extra, regime=label).mean(0)
                 for label, offset, extra in self._regimes(measure)
