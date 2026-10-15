@@ -391,7 +391,7 @@ class Predictions:
                 measurement_model=measurement_model,
                 state_means=state_means,
                 state_covs=state_covs,
-                white_noise=self._log_prob_white_noise(),
+                white_noise=self._log_prob_white_noise(measurement_model),
             )
             resid = obs - mmean_samples
             ll_cov = measure_cov
@@ -1542,10 +1542,9 @@ class Predictions:
         :param measurement_model: A flattened measurement-model (possibly a subset of the measures, for nans).
         :param state_means: A ``(num_rows, state_rank)`` tensor.
         :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
-        :param white_noise: Standard-normal noise for the *full* model's extended dimensions (dims for measures that
-         ``measurement_model`` drops are dropped here), either ``(num_samples, dim)`` -- the same draws for every row
-         -- or ``(num_samples, num_rows, dim)``. E.g. ``_log_prob_white_noise()`` (fixed, for the log-prob),
-         ``_get_output_samples()``'s, or ``sample()``'s.
+        :param white_noise: Standard-normal noise for ``measurement_model``'s extended dimensions, either
+         ``(num_samples, dim)`` -- the same draws for every row -- or ``(num_samples, num_rows, dim)``. E.g.
+         ``_log_prob_white_noise()`` (fixed, for the log-prob), ``_get_output_samples()``'s, or ``sample()``'s.
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         nmeasures = len(measurement_model.measures)
@@ -1561,10 +1560,7 @@ class Predictions:
         chol = torch.zeros_like(partial_measured_cov)
         chol[m2d] = torch.linalg.cholesky(partial_measured_cov[m2d])
 
-        # take care to drop missing measures:
-        missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
-        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
-        em_idx = [i for i in range(em_dim) if i not in missing_midx]
+        em_dim = extended_measure_mat.shape[1]
         if white_noise.ndim not in (2, 3) or white_noise.shape[-1] != em_dim or (
                 white_noise.ndim == 3 and white_noise.shape[1] != state_means.shape[0]
         ):
@@ -1572,7 +1568,6 @@ class Predictions:
                 f"Expected `white_noise` to have shape (num_samples, {em_dim}) or (num_samples, "
                 f"{state_means.shape[0]}, {em_dim}), got {tuple(white_noise.shape)}."
             )
-        white_noise = white_noise[..., em_idx]
         # (einsum rather than a broadcasting matmul, which would materialize a (samples, rows, dim, dim) copy of chol)
         if white_noise.ndim == 2:
             offsets = torch.einsum('rij,nj->nri', chol, white_noise)
@@ -1611,14 +1606,17 @@ class Predictions:
         """
         return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED + (0 if state else 1))
 
-    def _log_prob_white_noise(self) -> torch.Tensor:
+    def _log_prob_white_noise(self, measurement_model: 'MeasurementModel') -> torch.Tensor:
         """
-        The model's ``mc_white_noise`` for the monte-carlo log-prob: ``(num_samples, dim)``, fixed (so that the
-        log-prob is a deterministic function of the parameters) and shared across rows. See
-        ``_get_measured_mean_samples``.
+        The model's ``mc_white_noise`` for the monte-carlo log-prob (see ``_get_measured_mean_samples``):
+        ``(num_samples, dim)``, fixed (so that the log-prob is a deterministic function of the parameters) and shared
+        across rows. It's drawn for the full model, then the dims of measures that ``measurement_model`` drops (for
+        nans) are dropped -- so each measure's draws are the same whichever other measures are missing.
         """
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
-        return self.mc_white_noise(num_dim=em_dim, dtype=self.state_means.dtype, device=self.state_means.device)
+        white_noise = self.mc_white_noise(num_dim=em_dim, dtype=self.state_means.dtype, device=self.state_means.device)
+        missing_midx = {i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures}
+        return white_noise[..., [i for i in range(em_dim) if i not in missing_midx]]
 
     def _get_output_samples(self, num_samples: int) -> torch.Tensor:
         """

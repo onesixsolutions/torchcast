@@ -536,11 +536,12 @@ class BinomialPredictions(Predictions):
         if len(binary_idx):
             if num_obs is None:
                 raise RuntimeError("num_obs should be set because there are binary measures")
+            binary_model = measurement_model.subset(measures=binary_measures)
             mmean_samples = self._get_measured_mean_samples(
-                measurement_model=measurement_model.subset(measures=binary_measures),
+                measurement_model=binary_model,
                 state_means=state_means,
                 state_covs=state_covs,
-                white_noise=self._log_prob_white_noise(),
+                white_noise=self._log_prob_white_noise(binary_model),
             )
             binom = Binomial(total_count=num_obs.unsqueeze(0), probs=mmean_samples, validate_args=False)
             _obs = obs[..., binary_idx]
