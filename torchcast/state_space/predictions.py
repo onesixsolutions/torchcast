@@ -287,8 +287,10 @@ class Predictions:
         Whether any measure's mean is monte-carlo, over samples of the state: that's all nonlinear measures -- unless
         ``use_map``, in which case only those with a transform (the others use the measured-mean of the state-mean).
         """
-        return any(m in self._nonlinear_measures and (not use_map or m in transforms)
-                   for m in self.measurement_model.measures)
+        return any(
+            m in self._nonlinear_measures and (not use_map or m in transforms)
+            for m in self.measurement_model.measures
+        )
 
     # Log-probability --------------------------------------------------------------------------------------------------
 
@@ -381,23 +383,29 @@ class Predictions:
                 state_means=state_means,
                 state_covs=state_covs,
             )
-            resid, cov = obs - mmean_samples, measure_cov
+            resid = obs - mmean_samples
+            ll_cov = measure_cov
         else:
             measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
-            resid, cov = obs - measured_mean, measure_mat @ state_covs @ measure_mat.transpose(-1, -2) + measure_cov
+            resid = obs - measured_mean
+            ll_cov = measure_mat @ state_covs @ measure_mat.transpose(-1, -2) + measure_cov
 
-        if self.mixture is None or not any(m in measurement_model.measures for m in self.mixture.mixture_measures):
-            return _log_lik(resid, cov, monte_carlo=monte_carlo)
+        if not self._is_mixture_model(measurement_model):
+            return _log_lik(resid, ll_cov, monte_carlo=monte_carlo)
 
         # the marginal log-lik over the (effective) regime-combos. these all share the predicted state, so each just
         # offsets the mean and adds to the diagonal:
         terms = [
-            log_prior + _log_lik(resid - shift, cov + torch.diag(extra_var), monte_carlo=monte_carlo)
-            for shift, extra_var, log_prior in self._regime_terms(
-                measurement_model.measures, log_prior=regime_log_prior, like=obs
-            )
+            log_prior + _log_lik(resid - shift, ll_cov + torch.diag(extra_var), monte_carlo=monte_carlo)
+            for shift, extra_var, log_prior
+            in self._regime_terms(measurement_model.measures, log_prior=regime_log_prior, like=obs)
         ]
         return torch.logsumexp(torch.stack(terms, -1), -1)
+
+    def _is_mixture_model(self, measurement_model: 'MeasurementModel') -> bool:
+        if self.mixture is None:
+            return False
+        return any(m in measurement_model.measures for m in self.mixture.mixture_measures)
 
     def _regime_terms(self,
                       measures: Sequence[str],
