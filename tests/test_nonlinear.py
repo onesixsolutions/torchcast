@@ -179,10 +179,10 @@ def test_mc_predictions_match_quadrature():
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
     # small measurement-noise, so that the monte-carlo error in the mean is dominated by the (pinned) state samples:
     kf.measure_covariance.cholesky_log_diag.fill_(math.log(.05))
-    kf.mc_sampling = _white_noise(20_000)
+    kf.mc_sampling = _white_noise(50)  # (only for the log-prob; outputs use `num_samples`)
     y = torch.rand(3, 8, 1) * .6 + .2
     pred = kf(y)
-    df = pred.to_dataframe(conf=.9, use_map=False)
+    df = pred.to_dataframe(conf=.9, use_map=False, num_samples=20_000)
 
     z_mean, z_var = _linear_moments(pred, 0)
     r = pred.measure_covs_flat[:, 0, 0].double()
@@ -484,3 +484,32 @@ def test_mixture_nonlinear_multivariate_negligible():
     lp_mix = kf_mix(y, X=X).log_prob(y)
     lp = kf(y, X=X).log_prob(y)
     assert torch.allclose(lp_mix, lp, atol=1e-4)
+
+
+@torch.no_grad()
+def test_output_samples_separate_from_mc_sampling():
+    """
+    Sample-based outputs use `num_samples` draws with a fixed seed -- not the model's `mc_sampling`, which is only for
+    the log-prob. `derived` doesn't depend on whether intervals are computed.
+    """
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        measure_funs={'a': 'sigmoid'},
+    )
+    y = torch.rand(3, 8, 2) * .6 + .2
+    derived = {'total': lambda s: s['a'] + s['b']}
+    dfs = {}
+    for mc in (50, 300):
+        kf.mc_sampling = _white_noise(mc)
+        pred = kf(y)
+        dfs[mc] = pred.to_dataframe(conf=.9, use_map=False, derived=derived)
+    for col in ('mean', 'lower', 'upper'):
+        assert np.array_equal(dfs[50][col].values, dfs[300][col].values)
+
+    df_small = pred.to_dataframe(conf=.9, use_map=False, derived=derived, num_samples=100)
+    assert not np.allclose(df_small['upper'].values, dfs[50]['upper'].values)
+
+    df_means = pred.to_dataframe(conf=False, use_map=False, derived=derived)
+    assert np.array_equal(df_means['mean'].values, dfs[50]['mean'].values)

@@ -12,7 +12,7 @@ from typing import Sequence, TYPE_CHECKING, Optional, Union
 
 from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
 from torchcast.kalman_filter import KalmanFilter
-from torchcast.state_space.predictions import Predictions, DatasetMetadata
+from torchcast.state_space.predictions import Predictions, DatasetMetadata, _DEFAULT_NUM_SAMPLES
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
@@ -460,7 +460,7 @@ class BinomialPredictions(Predictions):
                       use_map: bool,
                       transform: Optional[Union['Transform', dict]] = None,
                       derived: Optional[dict] = None,
-                      derived_num_samples: int = 1000) -> pd.DataFrame:
+                      num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
 
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
@@ -473,7 +473,7 @@ class BinomialPredictions(Predictions):
             use_map=use_map,
             transform=transform,
             derived=derived,
-            derived_num_samples=derived_num_samples,
+            num_samples=num_samples,
         )
 
     def _to_components_dataframe(self,
@@ -481,7 +481,8 @@ class BinomialPredictions(Predictions):
                                  group_colname: str,
                                  time_colname: str,
                                  conf: float,
-                                 measured: bool) -> pd.DataFrame:
+                                 measured: bool,
+                                 num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
         return super()._to_components_dataframe(
@@ -490,6 +491,7 @@ class BinomialPredictions(Predictions):
             time_colname=time_colname,
             conf=conf,
             measured=measured,
+            num_samples=num_samples,
         )
 
     def _counts_to_props(self, dataset: 'TimeSeriesDataset') -> 'TimeSeriesDataset':
