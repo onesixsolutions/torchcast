@@ -1,4 +1,5 @@
 import math
+import numbers
 from math import log
 
 from dataclasses import dataclass, fields
@@ -12,11 +13,11 @@ import pandas as pd
 
 from scipy import stats
 
+from .transforms import Transform, _IdentityTransform
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
     from .mixture import MixtureModel, MixtureOfNormals
-    from .transforms import Transform
     from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
@@ -198,8 +199,7 @@ class Predictions:
                   num_samples: int = _DEFAULT_NUM_SAMPLES) -> torch.Tensor:
         """
         The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform``,
-        ``use_map`` and ``num_samples`` -- without computing any intervals. (Resolves the arguments and draws any
-        monte-carlo samples, then calls ``_get_means``.)
+        ``use_map`` and ``num_samples`` -- without computing any intervals.
 
         :param transform: See :func:`to_dataframe`.
         :param use_map: See :func:`to_dataframe`.
@@ -227,7 +227,7 @@ class Predictions:
         """
         transforms = transforms or {}
 
-        assert mmean_samples is not None or not self._needs_mc_means(use_map, transforms)
+        assert (mmean_samples is not None) or (not self._needs_mc_means(use_map, transforms))
         # exact for linear measures; the MAP for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
 
@@ -697,8 +697,8 @@ class Predictions:
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
-        needs_mc_intervals = alpha is not None and self.measurement_model.is_nonlinear
-        if self._needs_mc_means(use_map, transforms) or needs_mc_intervals or derived:
+        needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
+        if self._needs_mc_means(use_map, transforms) or needs_mc_intervals:
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
 
         means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
@@ -724,7 +724,10 @@ class Predictions:
                     f"The following measures in your model are not present in your dataset, please double-check that "
                     f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
                 )
+
         if derived:
+            if mmean_samples is None:
+                mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
             self._add_derived(
                 derived,
                 mmean_samples=mmean_samples,
@@ -733,6 +736,7 @@ class Predictions:
                 by_measure=by_measure,
                 actuals=actuals
             )
+
         return self._summaries_to_dataframe(
             by_measure,
             actuals=actuals,
@@ -744,7 +748,7 @@ class Predictions:
     def _get_intervals(self,
                        alpha: float,
                        transforms: dict[str, 'Transform'],
-                       mmean_samples: Optional[torch.Tensor]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+                       mmean_samples: Union[torch.Tensor, int, None]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """
         The ``alpha`` and ``1 - alpha`` quantiles of each measure's predictive distribution, back-transformed by
         ``transforms``:
@@ -758,58 +762,82 @@ class Predictions:
           repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
           probability), so there's no observation-noise.
 
-        :param mmean_samples: Samples from ``_get_output_samples()``; required if there are nonlinear measures.
+        :param mmean_samples: If sampling is required (e.g. nonlinear measures), this is used for sampling from the
+         state. This argument can be an int for number of samples (default 1000), or if the value was already computed
+         by ``_get_output_samples()`` that can be passed to save compute. Ignored with a warning if not required.
         :return: For each measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
         """
-        measures = list(self.measurement_model.measures)
+        all_measures = list(self.measurement_model.measures)
         batch_shape = self.state_means.shape[0:2]
-        measured_mean, system_cov = self._measured_moments_flat()
-        mixture_measures = self.mixture.mixture_measures if self.mixture is not None else []
+        no_op_transform = _IdentityTransform()
 
-        # for nonlinear measures: observation-noise and uniforms (for the regimes), shared across rows:
-        to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
-        noise = uniforms = None
-        if self.measurement_model.is_nonlinear:
-            if mmean_samples is None:
-                raise ValueError("`mmean_samples` are required for the intervals of nonlinear measures.")
-            generator = self._output_generator(state=False)
-            noise = torch.randn((mmean_samples.shape[0], len(measures)), generator=generator, **to)
-            uniforms = torch.rand((mmean_samples.shape[0], len(measures)), generator=generator, **to)
+        # divide measures into:
+        # (1) nonlinear-measures (mixture or not),
+        # (2) mixture-but-linear-measures,
+        # (3) everything else
+        nonlinear_measures = list(self._nonlinear_measures)
+        _mix_measures = self.mixture.mixture_measures if self.mixture is not None else []
+        mixture_measures = [m for m in _mix_measures if m not in nonlinear_measures]
+        simple_measures = [m for m in all_measures if m not in nonlinear_measures and m not in mixture_measures]
 
         out = {}
-        for j, measure in enumerate(measures):
-            transform = transforms.get(measure)
-            if measure in self._nonlinear_measures:
-                x = mmean_samples[..., j]  # (num_samples, num_rows)
+
+        # simple measures:
+        if simple_measures:
+            measured_mean, system_cov = self._measured_moments_flat()
+            multi = -stats.norm.ppf(alpha)
+            for measure in simple_measures:
+                midx = all_measures.index(measure)
+                mean = measured_mean[:, midx].view(*batch_shape)
+                std = system_cov[:, midx, midx].sqrt().view(*batch_shape)
+
+                transform = transforms.get(measure, no_op_transform)
+                lower = transform.inverse(mean - multi * std)
+                upper = transform.inverse(mean + multi * std)
+                out[measure] = (lower, upper)
+
+        # mixture measures:
+        for measure in mixture_measures:
+            mixture = self.get_mixture(measure)
+            transform = transforms.get(measure, no_op_transform)
+            lower = transform.inverse(mixture.quantile(alpha))
+            upper = transform.inverse(mixture.quantile(1 - alpha))
+            out[measure] = (lower, upper)
+
+        # for nonlinear measures: observation-noise and uniforms (for the regimes), shared across rows:
+        if nonlinear_measures:
+            if mmean_samples is None:
+                mmean_samples = _DEFAULT_NUM_SAMPLES
+            if isinstance(mmean_samples, numbers.Integral):
+                mmean_samples = self._get_output_samples(mmean_samples, generator=self._output_generator(state=True))
+            generator = self._output_generator(state=False)
+            to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
+            noise = torch.randn((mmean_samples.shape[0], len(all_measures)), generator=generator, **to)
+            uniforms = torch.rand((mmean_samples.shape[0], len(all_measures)), generator=generator, **to)
+
+            for measure in nonlinear_measures:
+                midx = all_measures.index(measure)
+                this_measure_samples = mmean_samples[..., midx]  # (num_samples, num_rows)
                 # (a non-gaussian measure, e.g. binary, has no gaussian observation-noise -- its `measure_covs` entry is
                 # zero -- and no mixture components, so its interval is for the mean, e.g. the probability)
-                noise_var = self.measure_covs_flat[:, j, j]
+                noise_var = self.measure_covs_flat[:, midx, midx]
                 regimes = self._regimes(measure)
                 if len(regimes) > 1:
                     # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
                     cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
-                    regime = (uniforms[:, j, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
+                    regime = (uniforms[:, midx, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
                     offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
                     extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
-                    x = x + offsets[regime]
+                    this_measure_samples = this_measure_samples + offsets[regime]
                     noise_var = noise_var + extras[regime]
-                x = x + noise_var.sqrt() * noise[:, j, None]
-                if transform is not None:
-                    _warn_bias_adjust_ignored(transform)
-                    x = transform.inverse(x)
-                out[measure] = tuple(bound.view(*batch_shape) for bound in _quantile_interval(x, alpha))
-                continue
+                this_measure_samples = this_measure_samples + noise_var.sqrt() * noise[:, midx, None]
 
-            if measure in mixture_measures:
-                mixture = self.get_mixture(measure)
-                lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
-            else:
-                multi = -stats.norm.ppf(alpha)
-                mean, std = measured_mean[:, j].view(*batch_shape), system_cov[:, j, j].sqrt().view(*batch_shape)
-                lower, upper = mean - multi * std, mean + multi * std
-            if transform is not None:
-                lower, upper = transform.inverse(lower), transform.inverse(upper)
-            out[measure] = (lower, upper)
+                transform = transforms.get(measure, no_op_transform)
+                _warn_bias_adjust_ignored(transform)
+                this_measure_samples = transform.inverse(this_measure_samples)
+                out[measure] = tuple(b.view(*batch_shape) for b in _quantile_interval(this_measure_samples, alpha))
+        elif mmean_samples is not None:
+            warn("`mmean_samples` argument to `_get_intervals()` ignored, no sampling needed.")
         return out
 
     def _add_derived(self,

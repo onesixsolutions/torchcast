@@ -103,6 +103,17 @@ class Transform(torch.nn.Module):
         return self
 
 
+class _IdentityTransform(Transform):
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def inverse_mean(self, mean: torch.Tensor, var: torch.Tensor) -> torch.Tensor:
+        return mean
+
+
 class LogTransform(Transform):
     """
     For a measure that was log-transformed before modeling.
