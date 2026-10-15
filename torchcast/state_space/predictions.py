@@ -373,13 +373,9 @@ class Predictions:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
         assert measurement_model.num_timesteps == 1
 
-        has_mixture = self.mixture is not None and any(
-            m in measurement_model.measures for m in self.mixture.mixture_measures
-        )
-
-        mmean_samples = None
-        if measurement_model.is_nonlinear:
-            # monte-carlo: samples of the measured-mean, each with the measurement-noise:
+        monte_carlo = measurement_model.is_nonlinear
+        if monte_carlo:
+            # samples of the measured-mean, each with the measurement-noise:
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
@@ -390,26 +386,17 @@ class Predictions:
             measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
             resid, cov = obs - measured_mean, measure_mat @ state_covs @ measure_mat.transpose(-1, -2) + measure_cov
 
-        # with mixture components: the log-lik under each (effective) regime-combo. these all share the predicted
-        # state, so each just offsets the mean and adds to the diagonal:
-        regimes = [(None, None, None)]
-        if has_mixture:
-            regimes = self._regime_terms(measurement_model.measures, log_prior=regime_log_prior, like=obs)
-        terms = []
-        for shift, extra_var, log_prior in regimes:
-            if shift is None:
-                regime_resid, regime_cov = resid, cov
-            else:
-                regime_resid, regime_cov = resid - shift, cov + torch.diag(extra_var)
-            if mmean_samples is None:
-                log_lik = mvnorm_log_prob(regime_resid, regime_cov)
-            else:
-                # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log(); numerically stable version:
-                mc_log_probs = _mc_mvnorm_log_prob(regime_resid, regime_cov)
-                log_lik = torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
-            terms.append(log_lik if log_prior is None else log_prior + log_lik)
-        if len(terms) == 1:
-            return terms[0]
+        if self.mixture is None or not any(m in measurement_model.measures for m in self.mixture.mixture_measures):
+            return _log_lik(resid, cov, monte_carlo=monte_carlo)
+
+        # the marginal log-lik over the (effective) regime-combos. these all share the predicted state, so each just
+        # offsets the mean and adds to the diagonal:
+        terms = [
+            log_prior + _log_lik(resid - shift, cov + torch.diag(extra_var), monte_carlo=monte_carlo)
+            for shift, extra_var, log_prior in self._regime_terms(
+                measurement_model.measures, log_prior=regime_log_prior, like=obs
+            )
+        ]
         return torch.logsumexp(torch.stack(terms, -1), -1)
 
     def _regime_terms(self,
@@ -1690,6 +1677,18 @@ def _warn_bias_adjust_ignored(transform: 'Transform') -> None:
     if transform.bias_adjust is not None:
         warn(f"`{type(transform).__name__}(bias_adjust=...)` is ignored for monte-carlo predictions (the mean is the "
              f"mean of back-transformed samples).")
+
+
+def _log_lik(resid: torch.Tensor, cov: torch.Tensor, monte_carlo: bool) -> torch.Tensor:
+    """
+    The gaussian log-likelihood of the residuals: exact; or, with ``monte_carlo``, averaged over the leading
+    dimension of ``resid`` (one residual per monte-carlo sample of the measured-mean).
+    """
+    if not monte_carlo:
+        return mvnorm_log_prob(resid, cov)
+    # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log(); numerically stable version:
+    mc_log_probs = _mc_mvnorm_log_prob(resid, cov)
+    return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
 
 
 def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
