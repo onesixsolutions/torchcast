@@ -690,9 +690,7 @@ class Predictions:
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
-        needs_mc_means = self.measurement_model.is_nonlinear and (
-            (not use_map) or set(transforms).intersection(self._nonlinear_measures)
-        )
+        needs_mc_means = (not use_map) or set(transforms).intersection(self._nonlinear_measures)
         needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
         if needs_mc_means or needs_mc_intervals:
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
@@ -1476,15 +1474,21 @@ class Predictions:
     # Shared internals (used by several of the above) ------------------------------------------------------------------
 
     def _resolve_use_map(self, use_map: Optional[bool]) -> bool:
-        if self.measurement_model.is_nonlinear:
-            if use_map is None:
-                warn(
-                    "Will use MCMC for intervals but MAP for mean; to keep this behavior and suppress this warning, "
-                    "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
-                )
-                use_map = True
-        elif use_map:
-            warn("``use_map`` disregarded, no monte-carlo")
+        """
+        :return: Whether the means of nonlinear measures use the MAP (the measured-mean of the state-mean) rather than
+         monte-carlo. Always True for a linear model, whose (closed-form) means are the MAP -- so ``not use_map``
+         implies there are nonlinear measures.
+        """
+        if not self.measurement_model.is_nonlinear:
+            if use_map:
+                warn("``use_map`` disregarded, no monte-carlo")
+            return True
+        if use_map is None:
+            warn(
+                "Will use MCMC for intervals but MAP for mean; to keep this behavior and suppress this warning, "
+                "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
+            )
+            return True
         return bool(use_map)
 
     def _standardize_transforms(self,
