@@ -284,7 +284,15 @@ class KalmanFilter(StateSpaceModel):
         to = {'dtype': regime_post.dtype, 'device': regime_post.device}
         weights = torch.zeros((regime_post.shape[0], means.shape[0]), **to)
         weights = weights.index_add(1, mapping.to(regime_post.device), regime_post)  # (G, num_effective)
+        # the mixture's mean is the probability-weighted average of the states' means:
+        #   new_mean[g] = sum over e of weights[g, e] * means[e, g]
+        # (einsum's notation: g = group, e = effective combo, s = state-element; e is summed over since it's not in
+        # the output. same as `(weights.T[..., None] * means).sum(0)`, without the (E, G, S) intermediate product.)
         new_mean = torch.einsum('ge,egs->gs', weights, means)
+        # its covariance is the weighted average of each state's covariance plus the outer product of its offset from
+        # the mixture's mean (the law of total variance):
+        #   new_cov[g] = sum over e of weights[g, e] * (covs[e, g] + diff[e, g] diff[e, g]^T)
+        # (here the einsum avoids a second (E, G, S, S) intermediate, which matters: this runs every update step.)
         diff = means - new_mean
         new_cov = torch.einsum('ge,egij->gij', weights, covs + diff.unsqueeze(-1) * diff.unsqueeze(-2))
         return StateTuple(mean=new_mean, cov=new_cov, regime_probs=regime_post)

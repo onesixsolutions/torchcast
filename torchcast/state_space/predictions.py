@@ -909,8 +909,7 @@ class Predictions:
         batch_shape = self.state_means.shape[0:2]
 
         if self.measurement_model.is_nonlinear:
-            # sample from the state distribution (einsum rather than a broadcasting matmul, which would materialize a
-            # (samples, rows, dim, dim) copy of the cholesky):
+            # sample from the state distribution:
             chol = torch.linalg.cholesky(self.state_covs_flat)
             white_noise = torch.randn(
                 (num_samples, *self.state_means_flat.shape),
@@ -918,7 +917,7 @@ class Predictions:
                 dtype=chol.dtype,
                 device=chol.device,
             )
-            state_mean_samples = self.state_means_flat + torch.einsum('rij,nrj->nri', chol, white_noise)
+            state_mean_samples = self.state_means_flat + _matmul_per_row(chol, white_noise)
 
             # pass each sample to the `get_components` function, organize by process:
             samples_by_proc = {}
@@ -1194,7 +1193,7 @@ class Predictions:
         to = {'dtype': means.dtype, 'device': means.device}
         chol = torch.linalg.cholesky(self.measure_covs_flat[:, idx][:, :, idx])  # (num_rows, len(idx), len(idx))
         z = torch.randn(z_shape, generator=generator, **to)
-        noise = torch.einsum(f'rij,{"nj" if shared_noise else "nrj"}->nri', chol, z)
+        noise = _matmul_per_row(chol, z)
         if extra_vars is not None:
             z = torch.randn(z_shape, generator=generator, **to)
             noise = noise + extra_vars[..., idx].sqrt() * (z.unsqueeze(1) if shared_noise else z)
@@ -1576,12 +1575,7 @@ class Predictions:
                 f"Expected `white_noise` to have shape (num_samples, {em_dim}) or (num_samples, "
                 f"{state_means.shape[0]}, {em_dim}), got {tuple(white_noise.shape)}."
             )
-        # (einsum rather than a broadcasting matmul, which would materialize a (samples, rows, dim, dim) copy of chol)
-        if white_noise.ndim == 2:
-            offsets = torch.einsum('rij,nj->nri', chol, white_noise)
-        else:
-            offsets = torch.einsum('rij,nrj->nri', chol, white_noise)
-        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + offsets
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + _matmul_per_row(chol, white_noise)
 
         # each of these samples is a draw of (1) the measured-mean of the linear processes, concatenated with (2) the
         # nonlinear processes' state-means. use (2) to add the nonlinear processes' contributions to (1):
@@ -1789,6 +1783,24 @@ def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
     z = torch.linalg.solve_triangular(L, resid.permute(1, 2, 0), upper=False)  # (batch, d, num_samples)
     logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
     return -0.5 * (d * math.log(2 * math.pi) + logdet.unsqueeze(0) + (z ** 2).sum(1).T)
+
+
+def _matmul_per_row(mats: torch.Tensor, vecs: torch.Tensor) -> torch.Tensor:
+    """
+    ``mats[r] @ vecs[n, r]`` for each sample ``n`` and row ``r`` (or ``mats[r] @ vecs[n]``, if ``vecs`` is shared
+    across rows) -- e.g. turning standard-normal noise into correlated noise with each row's cholesky factor.
+
+    Like ``mats @ vecs.unsqueeze(-1)``, but without that broadcast's copy of ``mats`` for every sample (which, for
+    many samples, can be much larger than the inputs or the output).
+
+    :param mats: A ``(num_rows, d, d)`` tensor.
+    :param vecs: A ``(num_samples, num_rows, d)`` tensor, or ``(num_samples, d)`` (the same for every row).
+    :return: A ``(num_samples, num_rows, d)`` tensor.
+    """
+    # (in einsum's notation, r = row, n = sample, i/j = the matrix's row/column; j is summed over)
+    if vecs.ndim == 2:
+        return torch.einsum('rij,nj->nri', mats, vecs)
+    return torch.einsum('rij,nrj->nri', mats, vecs)
 
 
 def _quantile_interval(x: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
