@@ -192,7 +192,11 @@ def test_bias_adjust():
 
 
 @torch.no_grad()
-def test_bias_adjust_warns_for_monte_carlo():
+def test_bias_adjust_monte_carlo():
+    """
+    `bias_adjust` also applies to monte-carlo means: it scales the variance of both the sampled state and the noise,
+    so 0 gives the plug-in inverse(g(MAP)) (like `use_map=True`), and 1 the usual monte-carlo mean.
+    """
     import warnings
 
     torch.manual_seed(1)
@@ -213,12 +217,24 @@ def test_bias_adjust_warns_for_monte_carlo():
     expected = torch.exp(mean[:, 1] + .5 * cov[:, 1, 1] / 2)
     assert np.allclose(df.query("measure == 'spend'")['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)
 
-    # a measure with a nonlinear measured-mean uses monte-carlo, where it's ignored:
+    # a nonlinear measure's mean is monte-carlo (with use_map=False), where it scales the state's variance too:
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
     kf.mc_sampling = 50
     pred = kf(torch.rand(2, 8, 1))
+
+    def means(bias_adjust, use_map=False) -> np.ndarray:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error', message='.*bias_adjust.*')
+            return pred.get_means(transform=LogTransform(bias_adjust=bias_adjust), use_map=use_map)[..., 0].numpy()
+
+    plug_in = torch.exp(pred._measured_moments_flat()[0][:, 0]).view(2, 8).numpy()  # exp(sigmoid(MAP))
+    assert np.allclose(means(0), plug_in, rtol=1e-6)
+    assert np.allclose(means(0, use_map=True), plug_in, rtol=1e-6)
+    assert np.array_equal(means(1), means(None))
+    assert (means(0) < means(.5)).all() and (means(.5) < means(1)).all()
+    # (`derived` back-transforms samples, so it's ignored there:)
     with pytest.warns(UserWarning, match="bias_adjust"):
-        pred.to_dataframe(transform=LogTransform(bias_adjust=.5), use_map=True)
+        pred.to_dataframe(transform=LogTransform(bias_adjust=.5), use_map=False, derived={'z': lambda s: s['y']})
 
 
 @torch.no_grad()

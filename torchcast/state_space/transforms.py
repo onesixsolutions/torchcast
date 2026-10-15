@@ -26,8 +26,9 @@ class Transform(torch.nn.Module):
     :param bias_adjust: How much bias-adjustment to apply when back-transforming the mean, between 0 and 1. The
      back-transformed mean is computed with the variance scaled by this: 1 (the default, ``None``) gives the mean of
      the back-transformed distribution; 0 gives no bias-adjustment (i.e. the back-transformed median). Doesn't affect
-     intervals. Ignored (with a warning) for monte-carlo means (e.g. ``use_map=False`` for nonlinear measures), which
-     average back-transformed samples.
+     intervals. For monte-carlo means (e.g. ``use_map=False`` for nonlinear measures), the variance of the sampled state
+     is scaled too. Ignored (with a warning) for ``Predictions.to_dataframe(derived=...)``, which back-transforms
+     samples.
     """
     num_nodes: int = 32
 
@@ -62,8 +63,8 @@ class Transform(torch.nn.Module):
 
         :param mean: The mean of ``Y``.
         :param var: The variance of ``Y``, same shape as ``mean`` (or broadcastable to it).
-        :param adjust_bias: Whether to apply ``bias_adjust``. False, e.g., for monte-carlo means, where it doesn't
-         apply (``var`` is only the observation-noise's, given a sample of the state).
+        :param adjust_bias: Whether to apply ``bias_adjust`` (False: the mean of the back-transformed distribution,
+         whatever ``bias_adjust`` is).
         :return: A tensor with the same shape as ``mean``.
         """
         return self._expected_inverse(mean, var * self._var_multi if adjust_bias else var)
