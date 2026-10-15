@@ -260,24 +260,25 @@ class Predictions:
                 standard_mean=measured_mean[:, midx].view(*batch_shape),
                 standard_var=system_cov[:, midx, midx].view(*batch_shape),
             )
-            regime_means = transforms.get(measure, identity).inverse_mean(mixture.means, mixture.vars)
-            out[measure] = (mixture.probs * regime_means).sum(-1)
+            transform = transforms.get(measure, identity)
+            regime_means = [
+                transform.inverse_mean(mixture.means[..., k], mixture.vars[..., k], regime=label)
+                for k, (label, _, _) in enumerate(self._regimes(measure))
+            ]
+            out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
 
         # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
         # regime-probabilities (all ones without mixture components):
         if nonlinear_measures:
-            mmean_samples = self._resolve_mmean_samples(mmean_samples)
             # a transform's `bias_adjust` scales the variance in the back-transform, as for linear measures: here,
             # both the noise's (by `inverse_mean`, below) and the state's -- with the same draws, but each measure's
             # deviations from its mean scaled by sqrt(bias_adjust), before the nonlinearity (so `bias_adjust=0` gives
-            # the plug-in inverse(g(MAP) + offset), as with `use_map`):
-            var_scales = [transforms.get(m, identity).var_multi for m in all_measures]
-            if any(var_scales[all_measures.index(m)] != 1 for m in nonlinear_measures):
-                mmean_samples = self._get_output_samples(
-                    mmean_samples.shape[0],
-                    generator=self._output_generator(state=True),
-                    deviation_scales=[math.sqrt(v) for v in var_scales],
-                )
+            # the plug-in inverse(g(MAP) + offset), as with `use_map`). (only nonlinear measures' scales matter here.)
+            deviation_scales = [
+                math.sqrt(transforms.get(m, identity).var_multi) if m in nonlinear_measures else 1.
+                for m in all_measures
+            ]
+            mmean_samples = self._resolve_mmean_samples(mmean_samples, deviation_scales=deviation_scales)
         for measure in nonlinear_measures:
             midx = all_measures.index(measure)
             # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra), and
@@ -293,9 +294,10 @@ class Predictions:
             noise_var = self.measure_covs_flat[:, midx, midx]
             regime_means = [
                 torch.stack([
-                    transform.inverse_mean(x + offset, noise_var + extra) for x in mmean_samples[..., midx]
+                    transform.inverse_mean(x + offset, noise_var + extra, regime=label)
+                    for x in mmean_samples[..., midx]
                 ]).mean(0)
-                for _, offset, extra in self._regimes(measure)
+                for label, offset, extra in self._regimes(measure)
             ]
             probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
             out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
@@ -1660,17 +1662,30 @@ class Predictions:
         missing_midx = {i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures}
         return white_noise[..., [i for i in range(em_dim) if i not in missing_midx]]
 
-    def _resolve_mmean_samples(self, mmean_samples: Union[torch.Tensor, int, None]) -> torch.Tensor:
+    def _resolve_mmean_samples(self,
+                               mmean_samples: Union[torch.Tensor, int, None],
+                               deviation_scales: Optional[Sequence[float]] = None) -> torch.Tensor:
         """
         For methods that take ``mmean_samples`` to save compute: already-computed samples from
         ``_get_output_samples()`` are returned as-is; otherwise they're drawn here -- an int is the number of samples,
         None the default number (with the fixed output seed, so they're the same draws as any computed elsewhere).
+
+        :param deviation_scales: See ``_get_output_samples``. If any aren't 1, the samples are drawn here (with the same
+         draws, and the same number of samples, as any passed), since passed samples are unscaled.
         """
+        if deviation_scales is not None and all(scale == 1 for scale in deviation_scales):
+            deviation_scales = None
         if mmean_samples is None:
             mmean_samples = _DEFAULT_NUM_SAMPLES
-        if isinstance(mmean_samples, numbers.Integral):
-            return self._get_output_samples(int(mmean_samples), generator=self._output_generator(state=True))
-        return mmean_samples
+        elif not isinstance(mmean_samples, numbers.Integral):
+            if deviation_scales is None:
+                return mmean_samples
+            mmean_samples = mmean_samples.shape[0]
+        return self._get_output_samples(
+            int(mmean_samples),
+            generator=self._output_generator(state=True),
+            deviation_scales=deviation_scales,
+        )
 
     def _get_output_samples(self,
                             num_samples: int,

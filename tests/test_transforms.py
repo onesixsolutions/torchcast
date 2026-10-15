@@ -337,8 +337,8 @@ def _smearing_mixture_y() -> tuple[torch.Tensor, torch.Tensor]:
 @torch.no_grad()
 def test_smearing_mixture():
     """
-    For a mixture measure, the residuals of every regime are pooled: each observation's residual standardized by each
-    regime's moments, weighted by P(regime | observation). The same distribution is used for every regime.
+    For a mixture measure, each regime is smeared with its own residuals: each observation's standardized by that
+    regime's moments, weighted by P(regime | observation).
     """
     from torchcast.state_space import SmearingTransform
 
@@ -346,35 +346,50 @@ def test_smearing_mixture():
     pred = _smearing_mixture_kf(component_sd=.1)(y)
     mix = pred.get_mixture('y')
     smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y', num_nodes=1000)
+    assert set(smear.component_residuals) == {'low'}
+    low = smear.component_residuals['low']
 
     # posterior regime-probabilities given each observation:
     obs = y[..., 0]
     lik = torch.distributions.Normal(mix.means, mix.vars.sqrt()).log_prob(obs.unsqueeze(-1)).exp()
     post = mix.probs * lik / (mix.probs * lik).sum(-1, keepdim=True)
-
-    # (fewer residuals than nodes, so they're used directly, in order: each observation's, for each regime)
     residuals = (obs.unsqueeze(-1) - mix.means) / mix.vars.sqrt()
-    assert torch.allclose(smear.residuals, residuals.reshape(-1), atol=1e-5)
-    assert torch.allclose(smear.weights, (post / post.sum()).reshape(-1), atol=1e-6)
-    # under the standard regime, the outliers get ~no weight in total, though they're ~15% of observations:
-    standard_weights = smear.weights.view(*residuals.shape)[..., 0]
-    assert standard_weights[is_low[..., 0]].sum() / standard_weights.sum() < .05
 
+    # standard regime: (fewer residuals than nodes, so they're used directly, in order)
+    assert torch.allclose(smear.residuals, residuals[..., 0].reshape(-1), atol=1e-5)
+    assert torch.allclose(smear.weights, (post[..., 0] / post[..., 0].sum()).reshape(-1), atol=1e-6)
+    # ...where the outliers get ~no weight in total, though they're ~15% of observations:
+    assert smear.weights[is_low.reshape(-1)].sum() < .05
+    # the component's regime: standardized by its own moments, and weighted by P(low | y):
+    assert torch.allclose(low.residuals, residuals[..., 1].reshape(-1), atol=1e-5)
+    assert torch.allclose(low.weights, (post[..., 1] / post[..., 1].sum()).reshape(-1), atol=1e-6)
+    # ...where the standard observations get ~no weight in total:
+    assert low.weights[~is_low.reshape(-1)].sum() < .05
+
+    # each regime's mean uses its own residuals:
     df = pred.to_dataframe(transform=smear)
-    expected = (mix.probs * smear.inverse_mean(mix.means, mix.vars)).sum(-1)
+    expected = (
+        mix.probs[..., 0] * smear.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
+        mix.probs[..., 1] * low.inverse_mean(mix.means[..., 1], mix.vars[..., 1])
+    )
     assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-4)
+    assert torch.equal(
+        smear.inverse_mean(mix.means[..., 1], mix.vars[..., 1], regime='low'),
+        low.inverse_mean(mix.means[..., 1], mix.vars[..., 1]),
+    )
+    # (a SmearingTransform without its own residuals for a component uses the standard ones:)
+    single = SmearingTransform(LogTransform(), torch.randn(50))
+    assert torch.equal(
+        single.inverse_mean(mix.means[..., 1], mix.vars[..., 1], regime='low'),
+        single.inverse_mean(mix.means[..., 1], mix.vars[..., 1]),
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="per-regime smearing was removed with RegimeTransform (2026-10-15; see CLAUDE.md future work): pooled "
-           "residuals don't tame a component with a large variance",
-)
 @torch.no_grad()
 def test_smearing_large_component_variance():
     """
     The motivating failure: a component with a large (learned) variance has a huge lognormal mean, which dominates the
-    mixed mean. Smearing should keep it near the observations attributed to it.
+    mixed mean. Smearing the component's regime with the residuals attributed to it keeps it near those observations.
     """
     from torchcast.state_space import SmearingTransform
 
@@ -385,9 +400,15 @@ def test_smearing_large_component_variance():
     assert (lognormal_low[:, 10:] > 20).all()  # (vs. 'quick visits' of ~exp(-1), and typical visits of ~exp(3))
 
     smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y')
-    smeared_low = smear.inverse_mean(mix.means[..., 1], mix.vars[..., 1])
+    smeared_low = smear.inverse_mean(mix.means[..., 1], mix.vars[..., 1], regime='low')
+    # (bounded by the observations; well above the quick visits' ~exp(-1) because this unfitted component is so broad
+    # that the standard observations get substantial posterior weight in it)
     assert (smeared_low < y.exp().max()).all()
     assert (smeared_low < lognormal_low / 3).all()
+    # vs. smearing every regime with the standard regime's residuals:
+    df_smear = pred.to_dataframe(transform=smear)
+    df_standard_only = pred.to_dataframe(transform=SmearingTransform(LogTransform(), smear.residuals, smear.weights))
+    assert (df_smear['mean'].values < df_standard_only['mean'].values).all()
 
 
 @torch.no_grad()
@@ -401,9 +422,10 @@ def test_smearing_from_predictions_missing():
     for mixture in (None, [MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')]):
         kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], mixture=mixture)
         smear = SmearingTransform.from_predictions(LogTransform(), kf(y), y, 'y')
-        # (18 observations; for a mixture measure, one residual per regime)
-        assert smear.residuals.shape == ((18,) if mixture is None else (36,))
-        assert torch.isfinite(smear.residuals).all() and torch.isfinite(smear.weights).all()
+        for t in [smear, *smear.component_residuals.values()]:
+            assert t.residuals.shape == (18,)
+            assert torch.isfinite(t.residuals).all() and torch.isfinite(t.weights).all()
+        assert len(smear.component_residuals) == (0 if mixture is None else 1)
 
 
 @pytest.mark.parametrize("use_map", [True, False])
