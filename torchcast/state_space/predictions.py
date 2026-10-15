@@ -179,9 +179,7 @@ class Predictions:
 
         if self.measurement_model.is_nonlinear:
             # monte-carlo for the means of nonlinear measures; there's no closed form cov
-            mmean_samples = self._get_output_samples(_DEFAULT_NUM_SAMPLES, generator=self._output_generator(state=True))
-            mean = self._get_means(use_map=False, mmean_samples=mmean_samples)
-            return mean, None
+            return self._get_means(use_map=False), None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
             _, probs, means, covs = self._get_regime_combos()
@@ -206,28 +204,31 @@ class Predictions:
         :param num_samples: See :func:`to_dataframe`.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
-        use_map = self._resolve_use_map(use_map)
-        transforms = self._standardize_transforms(transform)
-        mmean_samples = None
-        if self._needs_mc_means(use_map, transforms):
-            mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
-        return self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
+        return self._get_means(
+            use_map=self._resolve_use_map(use_map),
+            transforms=self._standardize_transforms(transform),
+            mmean_samples=num_samples,
+        )
 
     def _get_means(self,
                    use_map: bool,
                    transforms: Optional[dict[str, 'Transform']] = None,
-                   mmean_samples: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   mmean_samples: Union[torch.Tensor, int, None] = None) -> torch.Tensor:
         """
-        The means, given already-resolved arguments and samples -- separate from :func:`get_means` so that callers
-        can share one set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
+        The means, given already-resolved arguments -- separate from :func:`get_means` so that callers can share one
+        set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
 
-        :param mmean_samples: Samples from ``_get_output_samples()``; required if ``_needs_mc_means()``.
+        :param mmean_samples: Only used if some means are monte-carlo (``_needs_mc_means()``): see
+         ``_resolve_mmean_samples``. Pass already-computed samples to save compute (and to share them).
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
          (handling mixtures if needed).
         """
         transforms = transforms or {}
 
-        assert (mmean_samples is not None) or (not self._needs_mc_means(use_map, transforms))
+        if self._needs_mc_means(use_map, transforms):
+            mmean_samples = self._resolve_mmean_samples(mmean_samples)
+        else:
+            mmean_samples = None
         # exact for linear measures; the MAP for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
 
@@ -762,9 +763,8 @@ class Predictions:
           repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
           probability), so there's no observation-noise.
 
-        :param mmean_samples: If sampling is required (e.g. nonlinear measures), this is used for sampling from the
-         state. This argument can be an int for number of samples (default 1000), or if the value was already computed
-         by ``_get_output_samples()`` that can be passed to save compute. Ignored with a warning if not required.
+        :param mmean_samples: Only used if there are nonlinear measures: see ``_resolve_mmean_samples``. Pass
+         already-computed samples to save compute (and to share them). Ignored with a warning if not needed.
         :return: For each measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
         """
         all_measures = list(self.measurement_model.measures)
@@ -806,10 +806,7 @@ class Predictions:
 
         # for nonlinear measures: observation-noise and uniforms (for the regimes), shared across rows:
         if nonlinear_measures:
-            if mmean_samples is None:
-                mmean_samples = _DEFAULT_NUM_SAMPLES
-            if isinstance(mmean_samples, numbers.Integral):
-                mmean_samples = self._get_output_samples(mmean_samples, generator=self._output_generator(state=True))
+            mmean_samples = self._resolve_mmean_samples(mmean_samples)
             generator = self._output_generator(state=False)
             to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
             noise = torch.randn((mmean_samples.shape[0], len(all_measures)), generator=generator, **to)
@@ -1647,6 +1644,18 @@ class Predictions:
         white_noise = self.mc_white_noise(num_dim=em_dim, dtype=self.state_means.dtype, device=self.state_means.device)
         missing_midx = {i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures}
         return white_noise[..., [i for i in range(em_dim) if i not in missing_midx]]
+
+    def _resolve_mmean_samples(self, mmean_samples: Union[torch.Tensor, int, None]) -> torch.Tensor:
+        """
+        For methods that take ``mmean_samples`` to save compute: already-computed samples from
+        ``_get_output_samples()`` are returned as-is; otherwise they're drawn here -- an int is the number of samples,
+        None the default number (with the fixed output seed, so they're the same draws as any computed elsewhere).
+        """
+        if mmean_samples is None:
+            mmean_samples = _DEFAULT_NUM_SAMPLES
+        if isinstance(mmean_samples, numbers.Integral):
+            return self._get_output_samples(int(mmean_samples), generator=self._output_generator(state=True))
+        return mmean_samples
 
     def _get_output_samples(self,
                             num_samples: int,
