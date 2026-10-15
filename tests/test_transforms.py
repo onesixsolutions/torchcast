@@ -468,7 +468,7 @@ def test_means_only(use_map: bool):
     def fail(*args, **kwargs):
         raise AssertionError("interval work was done")
 
-    pred._get_closed_form_intervals = pred._get_mc_intervals = pred.sample = fail
+    pred._get_intervals = pred.sample = fail
     df_means = pred.to_dataframe(transform=transform, use_map=use_map, conf=False)
     assert list(df_means.columns) == [c for c in df.columns if c not in ('lower', 'upper')]
     assert np.array_equal(df_means['mean'].values, df['mean'].values)

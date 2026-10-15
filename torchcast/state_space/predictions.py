@@ -695,10 +695,7 @@ class Predictions:
         means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
         by_measure = {m: (means[..., j],) for j, m in enumerate(measures)}
         if alpha is not None:
-            # closed-form for measures with a linear measured-mean; monte-carlo for the rest:
-            intervals = self._get_closed_form_intervals(alpha, transforms=transforms)
-            if nonlinear:
-                intervals.update(self._get_mc_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples))
+            intervals = self._get_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples)
             by_measure = {m: (*v, *intervals[m]) for m, v in by_measure.items()}
 
         from torchcast.utils import TimeSeriesDataset
@@ -735,79 +732,71 @@ class Predictions:
             time_colname=time_colname,
         )
 
-    def _get_closed_form_intervals(self,
-                                   alpha: float,
-                                   transforms: dict[str, 'Transform']) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    def _get_intervals(self,
+                       alpha: float,
+                       transforms: dict[str, 'Transform'],
+                       mmean_samples: Optional[torch.Tensor]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
         """
-        Intervals for measures with a linear measured-mean, whose predictive distribution is gaussian -- or a mixture
-        of gaussians, for measures with mixture components -- including in a model with other, nonlinear measures (see
-        ``_get_mc_intervals``).
+        The ``alpha`` and ``1 - alpha`` quantiles of each measure's predictive distribution, back-transformed by
+        ``transforms``:
 
-        :return: For each such measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
+        - Measures with a linear measured-mean (also in a model with other, nonlinear measures): closed form -- the
+          gaussian's quantiles, or the mixture's, for measures with mixture components.
+        - Nonlinear measures: quantiles of the (fixed) samples of the state's measured-mean, ``mmean_samples`` (the
+          same as for the means), plus observation-noise -- and, for measures with mixture components, the regime's
+          offset and extra variance, with the regime drawn per sample from its probability. Each measure is sampled on
+          its own (its marginal is all an interval needs), with noise shared across rows, drawn with a fixed seed so
+          repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
+          probability), so there's no observation-noise.
+
+        :param mmean_samples: Samples from ``_get_measured_mean_samples()``; required if there are nonlinear measures.
+        :return: For each measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
         """
-        measured_mean, system_cov = self._measured_moments_flat()
+        measures = list(self.measurement_model.measures)
         batch_shape = self.state_means.shape[0:2]
-        multi = -stats.norm.ppf(alpha)
+        measured_mean, system_cov = self._measured_moments_flat()
         mixture_measures = self.mixture.mixture_measures if self.mixture is not None else []
 
+        if mmean_samples is not None:
+            # (for nonlinear measures)
+            to = {'dtype': mmean_samples.dtype, 'device': mmean_samples.device}
+            generator = self._output_generator()
+            noise = torch.randn((mmean_samples.shape[0], len(measures)), generator=generator, **to)
+            uniforms = torch.rand((mmean_samples.shape[0], len(measures)), generator=generator, **to)
+
         out = {}
-        for j, measure in enumerate(self.measurement_model.measures):
+        for j, measure in enumerate(measures):
+            transform = transforms.get(measure)
             if measure in self._nonlinear_measures:
+                x = mmean_samples[..., j]  # (num_samples, num_rows)
+                if measure not in self._non_gaussian_measures:
+                    noise_var = self.measure_covs_flat[:, j, j]
+                    regimes = self._regimes(measure)
+                    if len(regimes) > 1:
+                        # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
+                        cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
+                        regime = (uniforms[:, j, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
+                        offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
+                        extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
+                        x = x + offsets[regime]
+                        noise_var = noise_var + extras[regime]
+                    x = x + noise_var.sqrt() * noise[:, j, None]
+                if transform is not None:
+                    _warn_bias_adjust_ignored(transform)
+                    x = transform.inverse(x)
+                out[measure] = tuple(bound.view(*batch_shape) for bound in _quantile_interval(x, alpha))
                 continue
+
             if measure in mixture_measures:
                 mixture = self.get_mixture(measure)
                 lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
             else:
+                multi = -stats.norm.ppf(alpha)
                 mean, std = measured_mean[:, j].view(*batch_shape), system_cov[:, j, j].sqrt().view(*batch_shape)
                 lower, upper = mean - multi * std, mean + multi * std
-            if measure in transforms:
-                lower, upper = transforms[measure].inverse(lower), transforms[measure].inverse(upper)
+            if transform is not None:
+                lower, upper = transform.inverse(lower), transform.inverse(upper)
             out[measure] = (lower, upper)
-        return out
-
-    def _get_mc_intervals(self,
-                          alpha: float,
-                          transforms: dict[str, 'Transform'],
-                          mmean_samples: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Intervals for measures with a nonlinear measured-mean: quantiles of the (fixed) samples of the state's
-        measured-mean, ``mmean_samples``, plus observation-noise -- and, for measures with mixture components, the
-        regime's offset and extra variance, with the regime drawn per sample from its probability. Each measure is
-        sampled on its own (its marginal is all an interval needs), with noise shared across rows; drawn with a fixed
-        seed, so repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
-        probability), so there's no observation-noise.
-
-        :return: For each such measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
-        """
-        measures = list(self.measurement_model.measures)
-        batch_shape = self.state_means.shape[0:2]
-        num_samples = mmean_samples.shape[0]
-        to = {'dtype': mmean_samples.dtype, 'device': mmean_samples.device}
-        generator = self._output_generator()
-        noise = torch.randn((num_samples, len(measures)), generator=generator, **to)
-        uniforms = torch.rand((num_samples, len(measures)), generator=generator, **to)
-
-        out = {}
-        for j, measure in enumerate(measures):
-            if measure not in self._nonlinear_measures:
-                continue
-            x = mmean_samples[..., j]  # (num_samples, num_rows)
-            if measure not in self._non_gaussian_measures:
-                noise_var = self.measure_covs_flat[:, j, j]
-                regimes = self._regimes(measure)
-                if len(regimes) > 1:
-                    # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
-                    cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
-                    regime = (uniforms[:, j, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
-                    offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
-                    extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
-                    x = x + offsets[regime]
-                    noise_var = noise_var + extras[regime]
-                x = x + noise_var.sqrt() * noise[:, j, None]
-            if measure in transforms:
-                _warn_bias_adjust_ignored(transforms[measure])
-                x = transforms[measure].inverse(x)
-            out[measure] = tuple(bound.view(*batch_shape) for bound in _quantile_interval(x, alpha))
         return out
 
     def _add_derived(self,
