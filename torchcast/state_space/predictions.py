@@ -207,10 +207,10 @@ class Predictions:
                    transforms: dict[str, 'Transform'],
                    mmean_samples: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        :param mmean_samples: Samples from ``_get_measured_mean_samples()``, if already computed.
-        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
+        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
+         (handling mixtures if needed).
         """
-        batch_shape = self.state_means.shape[0:2]
+
         # exact for linear measures; the MAP for nonlinear ones:
         measured_mean, system_cov = self._measured_moments_flat()
         if mmean_samples is None and any(self._mc_mean_measures(use_map, transforms)):
@@ -222,7 +222,7 @@ class Predictions:
 
         out = []
         for j, measure in enumerate(self.measurement_model.measures):
-            regime_means = self._regime_means(
+            this_measure_mean = self._means_for_measure(
                 measure,
                 transform=transforms.get(measure),
                 use_map=use_map,
@@ -230,53 +230,57 @@ class Predictions:
                 measured_var=system_cov[:, j, j],
                 mmean_samples=None if mmean_samples is None else mmean_samples[..., j],
             )
-            regime_means = torch.stack(regime_means, -1).view(*batch_shape, -1)
-            regime_probs = self._measure_regime_probs(measure)
-            out.append((regime_probs * regime_means).sum(-1))
-        return torch.stack(out, -1)
+            out.append(this_measure_mean)
+        batch_shape = self.state_means.shape[0:2]
+        return torch.stack(out, -1).view(*batch_shape, len(out))
 
-    def _regime_means(self,
-                      measure: str,
-                      transform: Optional['Transform'],
-                      use_map: bool,
-                      measured_mean: torch.Tensor,
-                      measured_var: torch.Tensor,
-                      mmean_samples: Optional[torch.Tensor]) -> list[torch.Tensor]:
+    def _means_for_measure(self,
+                           measure: str,
+                           transform: Optional['Transform'],
+                           use_map: bool,
+                           measured_mean: torch.Tensor,
+                           measured_var: torch.Tensor,
+                           mmean_samples: Optional[torch.Tensor]) -> torch.Tensor:
         """
-        Helper for ``_get_means``: the mean of each of ``measure``'s regimes (see ``_regimes``), back-transformed by
-        ``transform`` (each regime's ``Transform.for_regime``).
+        :param measure: The measure
+        :param transform: An optional Transform
+        :use_map: Whether to use MAP for the mean (i.e. use measured_mean) or the posterior samples (mean of
+         mmean_samples)
+        :param measured_mean: The flattened measured_mean
+        :param measured_var: The flattened measured_var
+        :param mmean_samples: The posterior samples
+        :return: The back-transformed measured mean, handling mixtures if needed.
+        """
 
-        :param measured_mean: The ``(num_rows,)`` measured-mean: exact for a linear measure, the MAP for a nonlinear
-         one.
-        :param measured_var: The ``(num_rows,)`` variance of the measured-mean plus observation-noise (only used for
-         linear measures).
-        :param mmean_samples: ``(num_samples, num_rows)`` samples of the measured-mean (only used for nonlinear
-         measures, see ``_mc_mean_measures``).
-        :return: A ``(num_rows,)`` tensor for each regime.
-        """
         is_linear = measure not in self._nonlinear_measures
 
         if transform is None:
-            # the mean of the measured-mean: exact, monte-carlo over the state, or the MAP:
             if not (is_linear or use_map):
+                # have to use monte-carlo (nonlinear or use_map=false)
                 measured_mean = mmean_samples.mean(0)
-            return [measured_mean + offset for _, offset, _ in self._regimes(measure)]
+            means_per_regime = [measured_mean + offset for _, offset, _ in self._regimes(measure)]
+        else:
+            regimes = [
+                (transform.for_regime(label), offset, extra) for label, offset, extra in self._regimes(measure)
+            ]
+            if is_linear:
+                # closed form (or quadrature), given the mean and variance:
+                means_per_regime = [t.inverse_mean(measured_mean + o, measured_var + ex) for t, o, ex in regimes]
+            else:
+                # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
+                midx = list(self.measurement_model.measures).index(measure)
+                noise_var = self.measure_covs_flat[:, midx, midx]
+                means_per_regime = []
+                for t, offset, extra in regimes:
+                    _warn_bias_adjust_ignored(t)
+                    means_per_regime.append(
+                        torch.stack([t.expected_inverse(x + offset, noise_var + extra) for x in mmean_samples]).mean(0)
+                    )
 
-        regimes = [
-            (transform.for_regime(label), offset, extra) for label, offset, extra in self._regimes(measure)
-        ]
-        if is_linear:
-            # closed form (or quadrature), given the mean and variance:
-            return [t.inverse_mean(measured_mean + offset, measured_var + extra) for t, offset, extra in regimes]
-
-        # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
-        midx = list(self.measurement_model.measures).index(measure)
-        noise_var = self.measure_covs_flat[:, midx, midx]
-        out = []
-        for t, offset, extra in regimes:
-            _warn_bias_adjust_ignored(t)
-            out.append(torch.stack([t.expected_inverse(x + offset, noise_var + extra) for x in mmean_samples]).mean(0))
-        return out
+        probs_per_regime = self._measure_regime_probs(measure)
+        probs_per_regime = probs_per_regime.view(-1, probs_per_regime.shape[-1])
+        means_per_regime = torch.stack(means_per_regime, -1)
+        return torch.sum(means_per_regime * probs_per_regime, -1)
 
     def _mc_mean_measures(self, use_map: bool, transforms: dict[str, 'Transform']) -> list[str]:
         """
