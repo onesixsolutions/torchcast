@@ -423,3 +423,25 @@ def test_sample_binomial_measure_order():
         x = s.observations[..., j] * n
         assert torch.allclose(x, x.round(), atol=1e-4), f"measure {j} isn't a proportion out of {n}"
     assert (s.observations[..., 0] * 3 % 1).abs().gt(1e-3).any()  # ('a' isn't out of 3)
+
+
+@torch.no_grad()
+def test_linear_model_outputs_draw_no_samples():
+    """
+    A linear model's means and intervals are closed-form, so `to_dataframe()` draws no output samples (and doesn't warn
+    about unused ones) -- except once, for `derived`.
+    """
+    import warnings
+    from unittest import mock
+
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(2, 5, 1).cumsum(1))
+    with mock.patch.object(type(pred), '_get_output_samples', autospec=True,
+                           side_effect=type(pred)._get_output_samples) as spy:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', UserWarning)
+            warnings.filterwarnings('ignore', message='.*group-names.*')
+            pred.to_dataframe()
+            assert spy.call_count == 0
+            pred.to_dataframe(derived={'double': lambda s: s['y'] * 2})
+            assert spy.call_count == 1

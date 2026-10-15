@@ -272,7 +272,15 @@ class Predictions:
                     # the MAP: the measured-mean of the state-mean
                     regime_means = [measured_mean[:, midx] + offset for _, offset, _ in regimes]
                 else:
-                    # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise:
+                    # in this regime, the observation is y = g(state) + offset + noise, noise ~ N(0, noise_var + extra),
+                    # and the mean we want is E[inverse(y)] (inverse = the back-transform; the identity if there's
+                    # none). split the expectation in two:
+                    # - over the state: the average over the samples `x` of g(state) (`mmean_samples`)
+                    # - over the noise, given a sample: `expected_inverse(x + offset, var)`, i.e.
+                    #   E[inverse(x + offset + sqrt(var) * Z)], in closed form or by quadrature (for the identity:
+                    #   just x + offset)
+                    # (one sample at a time: the quadrature adds a dimension for its nodes, so all samples at once
+                    # would be (samples, rows, nodes) -- too much memory)
                     transform = transforms.get(measure, identity)
                     noise_var = self.measure_covs_flat[:, midx, midx]
                     regime_means = []
@@ -682,7 +690,9 @@ class Predictions:
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
-        needs_mc_means = (not use_map) or set(transforms).intersection(self._nonlinear_measures)
+        needs_mc_means = self.measurement_model.is_nonlinear and (
+            (not use_map) or set(transforms).intersection(self._nonlinear_measures)
+        )
         needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
         if needs_mc_means or needs_mc_intervals:
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
@@ -805,10 +815,15 @@ class Predictions:
                 noise_var = self.measure_covs_flat[:, midx, midx]
                 regimes = self._regimes(measure)
                 if len(regimes) > 1:
-                    # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
+                    # draw a regime for each sample and row, by "inverse-cdf sampling": e.g. with regime-probabilities
+                    # (.7, .2, .1), the cdf's boundaries are (.7, .9), and a uniform u is in regime 0 if u < .7, regime
+                    # 1 if .7 <= u < .9, else regime 2 -- i.e. the regime is the number of boundaries below u. (the
+                    # last boundary, 1, is dropped: u is always below it.)
                     cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
                     regime = (uniforms[:, midx, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
-                    offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
+                    # each draw then gets its regime's offset (added to the mean) and extra variance (added to the
+                    # noise's):
+                    offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])  # (num_regimes,)
                     extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
                     this_measure_samples = this_measure_samples + offsets[regime]
                     noise_var = noise_var + extras[regime]
