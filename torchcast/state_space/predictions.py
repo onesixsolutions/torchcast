@@ -1266,12 +1266,12 @@ class Predictions:
 
         if self.mixture is None or measure not in self.mixture.mixture_measures:
             raise ValueError(f"'{measure}' has no mixture components.")
-        regimes = self._regimes(measure)
+        labels, offsets, extravars = zip(*self._regimes(measure))
         return MixtureOfNormals(
-            labels=['standard' if label is None else label for label, _, _ in regimes],
+            labels=[(label or 'standard') for label in labels],
             probs=self._measure_regime_probs(measure),
-            means=torch.stack([standard_mean + offset for _, offset, _ in regimes], -1),
-            vars=torch.stack([standard_var + extra for _, _, extra in regimes], -1),
+            means=torch.stack([standard_mean + offset for offset in offsets], -1),
+            vars=torch.stack([standard_var + extra_var for extra_var in extravars], -1),
         )
 
     def _get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
