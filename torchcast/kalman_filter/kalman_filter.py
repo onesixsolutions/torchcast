@@ -224,9 +224,9 @@ class KalmanFilter(StateSpaceModel):
 
         # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
         # updated together, along a leading combo-dimension; tensors that don't depend on the combo broadcast.
-        offsets = [self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective]
-        shift = torch.stack([o[0] for o in offsets]).unsqueeze(1)  # (num_effective, 1, num_measures)
-        extra_cov = torch.diag_embed(torch.stack([o[1] for o in offsets])).unsqueeze(1)  # (num_effective, 1, M, M)
+        shifts, extra_vars = zip(*(self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective))
+        shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
+        extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)
         measured_cov = cov @ measure_mat.transpose(-1, -2)
         system_cov = measure_mat @ measured_cov + measure_cov + extra_cov  # (num_effective, G, M, M)
         combo_input = input - shift  # (num_effective, G, M)
@@ -258,9 +258,10 @@ class KalmanFilter(StateSpaceModel):
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + log_liks[:, mapping]
         regime_post = torch.softmax(log_post, -1)
+        means, covs = zip(*states)  # (a StateTuple iterates as (mean, cov))
         return self._collapse_states(
-            means=states[0].mean if len(states) == 1 else torch.cat([s.mean for s in states]),
-            covs=states[0].cov if len(states) == 1 else torch.cat([s.cov for s in states]),
+            means=means[0] if len(means) == 1 else torch.cat(means),
+            covs=covs[0] if len(covs) == 1 else torch.cat(covs),
             regime_post=regime_post,
             mapping=mapping,
         )

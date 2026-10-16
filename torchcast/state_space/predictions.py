@@ -727,15 +727,13 @@ class Predictions:
                 )
 
         if derived:
-            if mmean_samples is None:
-                mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
             self._add_derived(
                 derived,
-                mmean_samples=mmean_samples,
                 alpha=alpha,
                 transforms=transforms,
                 by_measure=by_measure,
-                actuals=actuals
+                actuals=actuals,
+                mmean_samples=num_samples if mmean_samples is None else mmean_samples,
             )
 
         return self._summaries_to_dataframe(
@@ -828,8 +826,9 @@ class Predictions:
                     regime = (uniforms[:, midx, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
                     # each draw then gets its regime's offset (added to the mean) and extra variance (added to the
                     # noise's):
-                    offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])  # (num_regimes,)
-                    extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
+                    _, offsets, extras = zip(*regimes)
+                    offsets = torch.stack([torch.as_tensor(o, **to) for o in offsets])  # (num_regimes,)
+                    extras = torch.stack([torch.as_tensor(e, **to) for e in extras])
                     this_measure_samples = this_measure_samples + offsets[regime]
                     noise_var = noise_var + extras[regime]
                 this_measure_samples = this_measure_samples + noise_var.sqrt() * noise[:, midx, None]
@@ -843,22 +842,24 @@ class Predictions:
 
     def _add_derived(self,
                      derived: dict[str, Callable],
-                     mmean_samples: torch.Tensor,
                      alpha: Optional[float],
                      transforms: dict[str, 'Transform'],
                      by_measure: dict,
-                     actuals: dict[str, torch.Tensor]) -> None:
+                     actuals: dict[str, torch.Tensor],
+                     mmean_samples: Union[torch.Tensor, int, None] = None) -> None:
         """
         Adds summaries of derived quantities to ``by_measure``, and (if there are any actuals, i.e. a dataset) the
         derived actuals to ``actuals``. Modifies both in place.
 
-        :param mmean_samples: Samples from ``_get_output_samples()`` (the same as the means and intervals use); the
-         rest of each sample (the regime, the observations) is drawn given these, as in :func:`sample`.
+        :param mmean_samples: Samples of the state's measured-mean (see ``_resolve_mmean_samples``): pass the ones the
+         means and intervals use, to save compute (and to share them). The rest of each sample (the regime, the
+         observations) is drawn given these, as in :func:`sample`.
         """
         measures = list(self.measurement_model.measures)
         overlap = set(derived) & set(measures)
         if overlap:
             raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
+        mmean_samples = self._resolve_mmean_samples(mmean_samples)
         # summaries are per-row, so shared noise is fine (and uses less memory):
         num_samples = mmean_samples.shape[0]
         _, _, observations = self._sample_given_state(
@@ -1905,7 +1906,7 @@ def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.T
             regime_probs = torch.stack([s.regime_probs for s in states], 1)
         if states[0].scaling is not None:
             scaling = {k: torch.stack([s.scaling[k] for s in states], 1) for k in states[0].scaling}
-        means, covs = torch.stack([s.mean for s in states], 1), torch.stack([s.cov for s in states], 1)
+        means, covs = (torch.stack(x, 1) for x in zip(*states))  # (a StateTuple iterates as (mean, cov))
         return means, covs, regime_probs, scaling
     means, covs = states
     return _maybe_stack(means, 1), _maybe_stack(covs, 1), None, None
