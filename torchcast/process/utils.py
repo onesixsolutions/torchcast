@@ -116,6 +116,7 @@ class Bounded(nn.Module):
 
     def __init__(self, lower: float, upper: float):
         super().__init__()
+        # TODO: should this be a scalar?
         self.raw = torch.nn.Parameter(torch.randn(1) * 0.1)
         self.lower = lower
         self.upper = upper

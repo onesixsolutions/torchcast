@@ -12,11 +12,14 @@ from typing import Sequence, TYPE_CHECKING, Optional, Union
 
 from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
 from torchcast.kalman_filter import KalmanFilter
-from torchcast.state_space.predictions import Predictions, DatasetMetadata
+from torchcast.state_space.predictions import Predictions, DatasetMetadata, _DEFAULT_NUM_SAMPLES
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
     from torchcast.process import Process
+    from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+    from torchcast.state_space import StateTuple
+    from torchcast.state_space.transforms import Transform
     from torchcast.utils import TimeSeriesDataset
 
 
@@ -34,6 +37,9 @@ class BinomialFilter(KalmanFilter):
     :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
+    :param joseph_form: See :class:`.KalmanFilter`. (Binary measures whose probability is near 0 or 1 have a small
+     variance, which makes the update less well-conditioned -- where the Joseph form helps most.)
+    :param mixture: Experimental. See :class:`.KalmanFilter`. Only supported for non-binary measures.
     """
 
     def __init__(self,
@@ -45,7 +51,9 @@ class BinomialFilter(KalmanFilter):
                  measure_covariance: Optional[Union[Covariance, dict]] = None,
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
-                 adaptive_scaling: bool = False):
+                 adaptive_scaling: bool = False,
+                 joseph_form: bool = True,
+                 mixture: Union['MixtureModel', Sequence['MixtureComponent'], None] = None):
 
         if binary_measures is None:
             binary_measures = list(measures)
@@ -66,6 +74,8 @@ class BinomialFilter(KalmanFilter):
             initial_covariance=initial_covariance,
             adaptive_scaling=adaptive_scaling,
             measure_funs={m: 'ilogit' for m in binary_measures},
+            joseph_form=joseph_form,
+            mixture=mixture,
         )
 
         if do_post_hoc_correction:
@@ -75,6 +85,10 @@ class BinomialFilter(KalmanFilter):
                 self.post_correction_module.weight.normal_(std=.1)
         else:
             self.post_correction_module = None
+
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        return self.binary_measures
 
     @classmethod
     def _validate_measure_cov(cls,
@@ -97,7 +111,7 @@ class BinomialFilter(KalmanFilter):
             measure_covariance['id'] = 'measure_covariance'
             measure_covariance['rank'] = len(measures)
             measure_covariance['empty_idx'] = mcov_empty_idx
-        measure_covariance['init_diag_multi'] = measure_covariance.get('init_diag_multi', DEFAULT_MCOV_MULTI)
+            measure_covariance['init_diag_multi'] = measure_covariance.get('init_diag_multi', DEFAULT_MCOV_MULTI)
 
         if isinstance(measure_covariance, Covariance):  # todo: we should be able to eliminate this mess
             if set(measure_covariance.empty_idx) != set(mcov_empty_idx):
@@ -114,8 +128,8 @@ class BinomialFilter(KalmanFilter):
         return measure_covariance
 
     def _generate_predictions(self,
-                              preds: tuple[list[torch.Tensor], list[torch.Tensor]],
-                              updates: Optional[tuple[list[torch.Tensor], list[torch.Tensor]]],
+                              preds: Sequence['StateTuple'],
+                              updates: Optional[Sequence['StateTuple']],
                               measure_covs: torch.Tensor,
                               measurement_model: 'MeasurementModel',
                               num_obs: Sequence[torch.Tensor],
@@ -132,6 +146,7 @@ class BinomialFilter(KalmanFilter):
             mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
             num_obs=num_obs,
             observed_counts=observed_counts,
+            mixture=self.mixture,
         )
 
     def _mask_mats(self,
@@ -169,6 +184,9 @@ class BinomialFilter(KalmanFilter):
             measure=measure,
             **kwargs
         )
+
+    def _group_kwarg_names(self) -> set[str]:
+        return super()._group_kwarg_names() | {'num_obs'}
 
     def _parse_kwargs(self,
                       num_groups: int,
@@ -210,16 +228,19 @@ class BinomialFilter(KalmanFilter):
             **kwargs
         )
 
-    def _update_step(self,
-                     input: torch.Tensor,
-                     mean: torch.Tensor,
-                     cov: torch.Tensor,
-                     measured_mean: torch.Tensor,
-                     measure_mat: torch.Tensor,
-                     measure_cov: torch.Tensor,
-                     num_obs: Optional[torch.Tensor],
-                     binary_idx: Sequence[int],
-                     **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_update(self,
+                        input: torch.Tensor,
+                        measured_mean: torch.Tensor,
+                        measure_cov: torch.Tensor,
+                        num_obs: Optional[torch.Tensor],
+                        binary_idx: Sequence[int],
+                        **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input, measured_mean, measure_cov = super()._prepare_update(
+            input=input,
+            measured_mean=measured_mean,
+            measure_cov=measure_cov,
+            **kwargs
+        )
 
         # validate input:
         if (input[:, binary_idx] < 0).any():
@@ -254,7 +275,7 @@ class BinomialFilter(KalmanFilter):
         measure_cov = measure_cov + bin_measure_cov
 
         if self.do_post_hoc_correction:
-            # super takes input and mean, not resid.
+            # the update takes input and mean, not resid.
             # we want to multiply the resid, so we'll just do that then apply that adjustment to the measured-mean:
             raw_resid = input - measured_mean
 
@@ -269,15 +290,7 @@ class BinomialFilter(KalmanFilter):
                 resid[..., other_idx] = raw_resid[..., other_idx]
             measured_mean = input - resid
 
-        return super()._update_step(
-            input=input,
-            mean=mean,
-            cov=cov,
-            measured_mean=measured_mean,
-            measure_mat=measure_mat,
-            measure_cov=measure_cov,
-            **kwargs
-        )
+        return input, measured_mean, measure_cov
 
     @property
     def do_post_hoc_correction(self) -> bool:
@@ -389,12 +402,65 @@ class BinomialPredictions(Predictions):
 
         return out
 
+    def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
+        extra_vars = super()._conditional_measure_vars(means)
+        all_measures = list(self.measurement_model.measures)
+        idx = [all_measures.index(m) for m in self.binary_measures]
+        if not idx:
+            return extra_vars
+        extra_vars = torch.zeros_like(means) if extra_vars is None else extra_vars.clone()
+        # binomial variance of the proportion, given the (sampled) probability:
+        p = means[..., idx].clamp(0, 1)
+        num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype)
+        extra_vars[..., idx] = extra_vars[..., idx] + p * (1 - p) / num_obs
+        return extra_vars
+
+    def _sample_observations(self,
+                             means: torch.Tensor,
+                             extra_vars: Optional[torch.Tensor],
+                             generator: Optional[torch.Generator],
+                             measures: Optional[Sequence[str]] = None,
+                             shared_noise: bool = False) -> torch.Tensor:
+        """
+        Gaussian measures are sampled as usual (their observation noise is uncorrelated with the binary measures');
+        binary measures are sampled from a binomial, then (like the rest of ``BinomialPredictions``) returned as
+        proportions. (The binomial draws are always independent across rows, even with ``shared_noise``.)
+        """
+        all_measures = list(self.measurement_model.measures)
+        if measures is None:
+            measures = all_measures
+        gaussian_measures = [m for m in all_measures if m not in self.binary_measures and m in measures]
+
+        # sample the gaussian measures:
+        observations = super()._sample_observations(
+            means, extra_vars, measures=gaussian_measures, generator=generator, shared_noise=shared_noise
+        )
+
+        # sample the remaining (binary) measures:
+        # (index both by the same list, so each measure's probabilities are paired with its own num_obs)
+        binary = [m for m in self.binary_measures if m in measures]
+        if binary:
+            bidx = [all_measures.index(m) for m in binary]
+            nobs_idx = [self.binary_measures.index(m) for m in binary]
+            p = means[..., bidx].clamp(0, 1)
+            nobs = self.num_obs[..., nobs_idx].reshape(1, -1, len(bidx)).to(p.dtype).expand_as(p)
+            observations[..., bidx] = torch.binomial(nobs.contiguous(), p.contiguous(), generator=generator) / nobs
+
+        return observations
+
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        return self.binary_measures
+
     def _to_dataframe(self,
                       dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
                       group_colname: str,
                       time_colname: str,
                       conf: float,
-                      use_map: bool) -> pd.DataFrame:
+                      use_map: bool,
+                      transform: Optional[Union['Transform', dict]] = None,
+                      derived: Optional[dict] = None,
+                      num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
 
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
@@ -404,7 +470,10 @@ class BinomialPredictions(Predictions):
             group_colname=group_colname,
             time_colname=time_colname,
             conf=conf,
-            use_map=use_map
+            use_map=use_map,
+            transform=transform,
+            derived=derived,
+            num_samples=num_samples,
         )
 
     def _to_components_dataframe(self,
@@ -412,7 +481,8 @@ class BinomialPredictions(Predictions):
                                  group_colname: str,
                                  time_colname: str,
                                  conf: float,
-                                 measured: bool) -> pd.DataFrame:
+                                 measured: bool,
+                                 num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
         return super()._to_components_dataframe(
@@ -421,6 +491,7 @@ class BinomialPredictions(Predictions):
             time_colname=time_colname,
             conf=conf,
             measured=measured,
+            num_samples=num_samples,
         )
 
     def _counts_to_props(self, dataset: 'TimeSeriesDataset') -> 'TimeSeriesDataset':
@@ -437,6 +508,7 @@ class BinomialPredictions(Predictions):
                   measure_cov: torch.Tensor,
                   measurement_model: 'MeasurementModel',
                   num_obs: Optional[torch.Tensor] = None,
+                  regime_log_prior: Optional[torch.Tensor] = None,
                   **kwargs) -> torch.Tensor:
         if kwargs:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
@@ -456,7 +528,7 @@ class BinomialPredictions(Predictions):
                 state_covs=state_covs,
                 measure_cov=measure_cov[mask2d],
                 measurement_model=measurement_model.subset(measures=gaussian_measures),
-                **kwargs
+                regime_log_prior=regime_log_prior,
             )
         else:
             gaussian_lp = 0
@@ -464,10 +536,12 @@ class BinomialPredictions(Predictions):
         if len(binary_idx):
             if num_obs is None:
                 raise RuntimeError("num_obs should be set because there are binary measures")
+            binary_model = measurement_model.subset(measures=binary_measures)
             mmean_samples = self._get_measured_mean_samples(
-                measurement_model=measurement_model.subset(measures=binary_measures),
+                measurement_model=binary_model,
                 state_means=state_means,
                 state_covs=state_covs,
+                white_noise=self._log_prob_white_noise(binary_model),
             )
             binom = Binomial(total_count=num_obs.unsqueeze(0), probs=mmean_samples, validate_args=False)
             _obs = obs[..., binary_idx]
