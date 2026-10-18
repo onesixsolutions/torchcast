@@ -134,7 +134,7 @@ def test_chunked_fit():
 
 
 def test_chunked_laplace(monkeypatch):
-    from torchcast.state_space import state_space
+    from torchcast.state_space import chunking  # (where the hessians are computed)
 
     hessians = []
 
@@ -142,8 +142,8 @@ def test_chunked_laplace(monkeypatch):
         hessians.append(hessian(*args, **kwargs))
         return hessians[-1]
 
-    hessian = state_space.hessian
-    monkeypatch.setattr(state_space, 'hessian', _hessian)
+    hessian = chunking.hessian
+    monkeypatch.setattr(chunking, 'hessian', _hessian)
 
     y, X, start_offsets, weights = _make_data()
     model = _make_model()

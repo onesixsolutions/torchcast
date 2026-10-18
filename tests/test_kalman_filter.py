@@ -703,7 +703,7 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
         assert torch.equal(pred_n.scaling_states[k][:, 10], pred_n.update_scaling_states[k][:, 7])
 
     # chunked fitting subsets it with the rest of `initial_state`:
-    from torchcast.state_space.state_space import _subset_groups
+    from torchcast.state_space.chunking import _subset_groups
     sub = _subset_groups(state, slice(0, 2), num_groups=3)
     assert all(v.shape[0] == 2 for v in sub.scaling.values())
 

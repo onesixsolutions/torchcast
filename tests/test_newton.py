@@ -90,7 +90,7 @@ def test_newton_chunked_matches_unchunked():
 
 
 def test_newton_hessian_matches_laplace(monkeypatch):
-    from torchcast.state_space import state_space
+    from torchcast.state_space import chunking  # (where the hessians are computed)
 
     y = _ar_data(num_groups=10, num_times=30)
     model = _ar_model()
@@ -103,8 +103,8 @@ def test_newton_hessian_matches_laplace(monkeypatch):
         hessians.append(hessian(*args, **kwargs))
         return hessians[-1]
 
-    hessian = state_space.hessian
-    monkeypatch.setattr(state_space, 'hessian', _hessian)
+    hessian = chunking.hessian
+    monkeypatch.setattr(chunking, 'hessian', _hessian)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')  # not necessarily PD
         mvnorm, names = model.get_laplace_mvnorm(y)

@@ -3,7 +3,7 @@ Newton refinement of a fitted model's parameters: see :func:`StateSpaceModel.new
 """
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Protocol
+from typing import Callable, List, Optional, Protocol, Union
 from warnings import warn
 
 import torch
@@ -14,7 +14,7 @@ from torchcast.internals.hessian import mvnorm_from_hessian
 class NewtonObjective(Protocol):
     """
     What :func:`newton_refine` needs from the objective: the (chunked) loss and its derivatives w.r.t. a flat vector of
-    parameters. Implemented by ``torchcast.state_space.state_space._ChunkedObjective``.
+    parameters. Implemented by ``torchcast.state_space.chunking._ChunkedObjective``.
     """
     param_names: List[str]
 
@@ -334,4 +334,46 @@ def _format_record(record: dict) -> str:
         f"decrement {record['decrement']:.3g}; "
         f"eigenvalues [{record['eig_min']:.3g}, {record['eig_max']:.3g}] ({record['num_negative']} negative){reused}; "
         f"line-search scale {record['ls_scale']}; max|step| {record['max_abs_step']:.3g}"
+    )
+
+
+class _HessianSampler:
+    """
+    Draws the subsample of groups for ``newton_refine(hessian_subsample=...)``: ``sampler(generator)`` returns
+    ``(group_idx, group_weights)``.
+    """
+
+    def __init__(self, fun: Callable, resample: bool, fraction: float):
+        self.fun = fun
+        self.resample = resample  # called for each hessian (rather than once)
+        self.fraction = fraction  # (expected) fraction of groups
+
+    def __call__(self, generator: torch.Generator) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        out = self.fun(generator)
+        idx, weights = out if isinstance(out, tuple) else (out, None)
+        return torch.as_tensor(idx, dtype=torch.long), weights
+
+
+def _hessian_sampler(subsample: Union[float, int, Callable, None], num_groups: int) -> Optional[_HessianSampler]:
+    if subsample is None:
+        return None
+    if callable(subsample):
+        # (fraction for reporting only; from one draw)
+        idx, _ = _HessianSampler(subsample, resample=True, fraction=1.)(torch.Generator().manual_seed(0))
+        return _HessianSampler(subsample, resample=True, fraction=len(idx) / num_groups)
+    if not isinstance(subsample, (float, int)) or isinstance(subsample, bool):
+        raise TypeError(
+            "`hessian_subsample` should be a fraction or number of groups, or a function returning group indices (or "
+            f"`(indices, weights)`); got {type(subsample)}."
+        )
+    if isinstance(subsample, float):
+        if not 0 < subsample <= 1:
+            raise ValueError("If `hessian_subsample` is a float, it should be in (0, 1].")
+        subsample = max(1, round(subsample * num_groups))
+    if subsample >= num_groups:
+        return None
+    return _HessianSampler(
+        lambda gen: torch.randperm(num_groups, generator=gen)[:subsample].sort().values,
+        resample=False,
+        fraction=subsample / num_groups,
     )
