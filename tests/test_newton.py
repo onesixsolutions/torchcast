@@ -193,7 +193,10 @@ def test_hessian_subsample_converges_to_same_optimum(resample: bool):
     model_sub = copy.deepcopy(model)
     result = model.newton_refine(y, max_steps=15, verbose=False)
     assert result.converged
-    result_sub = model_sub.newton_refine(y, max_steps=30, hessian_subsample=.3, hessian_resample=resample, verbose=False)
+    num_groups, n = y.shape[0], round(.3 * y.shape[0])
+    # (a fixed uniform subsample; or a new one for each hessian, via a function)
+    subsample = (lambda gen: torch.randperm(num_groups, generator=gen)[:n]) if resample else .3
+    result_sub = model_sub.newton_refine(y, max_steps=30, hessian_subsample=subsample, verbose=False)
     # (the decrement uses the estimated hessian, so isn't used by default; nor is the step criterion exact, so with a
     # fixed subsample this can be slow to declare convergence. but the loss and gradient are exact:)
     assert result_sub.stop_reason != 'decrement'
@@ -203,7 +206,7 @@ def test_hessian_subsample_converges_to_same_optimum(resample: bool):
 
 def test_hessian_subsample_weights():
     """
-    indices + weights: the hessian is that of the weighted mean of those groups' losses
+    A function returning (indices, weights): the hessian is that of the weighted mean of those groups' losses.
     """
     y, X, start_offsets, weights = _make_data()
     model = _make_model()
@@ -213,7 +216,7 @@ def test_hessian_subsample_weights():
     group_weights = torch.tensor([1., 3., 1., 2.])
 
     result = model.newton_refine(
-        y, get_loss=LossFun(weights=weights), hessian_subsample=idx, hessian_subsample_weights=group_weights, **kwargs
+        y, get_loss=LossFun(weights=weights), hessian_subsample=lambda gen: (idx, group_weights), **kwargs
     )
     # expected: the same groups, with LossFun weights multiplied by the (mean-1) group weights:
     w = group_weights * len(group_weights) / group_weights.sum()
@@ -223,14 +226,8 @@ def test_hessian_subsample_weights():
     )
     assert torch.allclose(result.hessian, expected.hessian, rtol=1e-4, atol=1e-5)
 
-    # a function returning (indices, weights) is the same:
-    result2 = model.newton_refine(
-        y, get_loss=LossFun(weights=weights), hessian_subsample=lambda gen: (idx, group_weights), **kwargs
-    )
-    assert torch.allclose(result.hessian, result2.hessian)
-
-    with pytest.raises(ValueError, match='hessian_resample'):
-        model.newton_refine(y, hessian_subsample=idx, hessian_resample=True, **kwargs)
+    with pytest.raises(TypeError, match='hessian_subsample'):
+        model.newton_refine(y, hessian_subsample=idx, **kwargs)
 
 
 def test_final_full_hessian_and_compare():
