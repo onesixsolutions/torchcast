@@ -256,13 +256,13 @@ def _sigmoid_mixture_kf(num_samples: int = 20_000, process_var_multi: Optional[f
         processes=[LocalLevel(id='level')],
         measures=['y'],
         measure_funs={'y': 'sigmoid'},
-        mixture=[MixtureComponent(measure='y', mean_init=_COMPONENT_OFFSET, prob_init=.2, id='low')],
+        mixture=[MixtureComponent(measure='y', offset_init=_COMPONENT_OFFSET, prob_init=.2, id='low')],
     )
     with torch.no_grad():
         kf.measure_covariance.cholesky_log_diag.fill_(math.log(.05))
         if process_var_multi is not None:
             kf.process_covariance.cholesky_log_diag.fill_(math.log(process_var_multi))
-        kf.mixture.components[0]._log_std.fill_(math.log(_COMPONENT_SD))
+        kf.mixture.components[0]._log_extra_std.fill_(math.log(_COMPONENT_SD))
     kf.mc_sampling = _white_noise(num_samples)
     return kf
 
@@ -311,7 +311,7 @@ def test_mixture_nonlinear_log_prob_matches_quadrature():
         pred = kf(y)
         pred.log_prob(y).sum().backward()
     component = kf.mixture.components[0]
-    for param in (component.mean, component._log_std, component.logit):
+    for param in (component.offset, component._log_extra_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
 
 
@@ -436,14 +436,14 @@ def test_binomial_mixture_with_nonlinear_process():
         ],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
-        mixture=MixtureModel([MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')]),
+        mixture=MixtureModel([MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')]),
     )
     bf.mc_sampling = _white_noise(50)
     pred = bf(y, X=X)
     lp = pred.log_prob(y)
     assert torch.isfinite(lp).all()
     lp.sum().backward()
-    assert bf.mixture.components[0].mean.grad.abs() > 0
+    assert bf.mixture.components[0].offset.grad.abs() > 0
 
     with torch.no_grad():
         df = pred.to_dataframe(conf=.9, transform={'spend': LogTransform()})
@@ -492,7 +492,7 @@ def test_mixture_nonlinear_multivariate_negligible():
         kf.mc_sampling = _white_noise(200)
         return kf
 
-    kf_mix = make([MixtureComponent(measure='b', mean_init=-3., prob_init=.1, id='low')])
+    kf_mix = make([MixtureComponent(measure='b', offset_init=-3., prob_init=.1, id='low')])
     with torch.no_grad():
         kf_mix.mixture.components[0].logit.fill_(-40.)
     kf = make(None)

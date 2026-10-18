@@ -1319,7 +1319,7 @@ class Predictions:
         The regimes of a measure: ``(component_id, offset, extra_var)`` for the standard regime (``(None, 0, 0)``),
         then each of its mixture components (if any).
         """
-        return [(None, 0., 0.)] + [(c.id, c.mean, c.var) for c in self._mixture_components(measure)]
+        return [(None, 0., 0.)] + [(c.id, c.offset, c.extra_var) for c in self._mixture_components(measure)]
 
     def _measure_regime_probs(self, measure: str) -> torch.Tensor:
         """

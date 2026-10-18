@@ -86,8 +86,8 @@ SPLIT_DT = START + np.timedelta64(SPLIT, 'W')
 # %% [markdown]
 # ### Models
 #
-# We fit a standard model and one with a mixture-component for 'quick visits'. The component's `mean_init` (its
-# offset) and `prob_init` are just starting values; they're learned during training (as is the component's variance, and how
+# We fit a standard model and one with a mixture-component for 'quick visits'. The component's `offset_init` and
+# `prob_init` are just starting values; they're learned during training (as is the component's variance, and how
 # "sticky" the regime is from one timestep to the next).
 
 # %%
@@ -102,7 +102,7 @@ torch.manual_seed(1)
 kf_mixture = KalmanFilter(
     processes=[LocalLevel(id='level')],
     measures=['log_spend'],
-    mixture=[MixtureComponent(measure='log_spend', mean_init=-2., prob_init=.05, id='quick')]
+    mixture=[MixtureComponent(measure='log_spend', offset_init=-2., prob_init=.05, id='quick')]
 )
 kf_mixture.fit(y_train, verbose=0);
 
@@ -115,8 +115,8 @@ kf_mixture.fit(y_train, verbose=0);
 # %%
 component = kf_mixture.mixture.components[0]
 pd.Series({
-    'component offset': component.mean.item(),
-    'component (extra) std': component.var.sqrt().item(),
+    'component offset': component.offset.item(),
+    'component (extra) std': component.extra_var.sqrt().item(),
     'component probability': kf_mixture.mixture.base_probs()[1].item(),
     'stickiness (standard, quick)': kf_mixture.mixture.transition.stay.detach().numpy().round(3),
     'measurement std (mixture model)': kf_mixture.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),

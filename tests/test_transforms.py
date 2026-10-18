@@ -92,7 +92,7 @@ def test_to_dataframe_transform_mixture():
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-3., prob_init=.1, id='low')]
+        mixture=[MixtureComponent(measure='y', offset_init=-3., prob_init=.1, id='low')]
     )
     y = torch.randn(3, 10, 1) * .3 + 2
     y[:, 4] = -3.
@@ -328,10 +328,10 @@ def _smearing_mixture_kf(component_sd: float) -> KalmanFilter:
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-4., prob_init=.1, id='low')],
+        mixture=[MixtureComponent(measure='y', offset_init=-4., prob_init=.1, id='low')],
     )
     with torch.no_grad():
-        kf.mixture.components[0]._log_std.fill_(math.log(component_sd))
+        kf.mixture.components[0]._log_extra_std.fill_(math.log(component_sd))
     return kf
 
 
@@ -428,7 +428,7 @@ def test_smearing_from_predictions_missing():
     torch.manual_seed(0)
     y = torch.randn(2, 10, 1).cumsum(1) * .1 + 3.
     y[0, 3] = y[1, 7] = float('nan')
-    for mixture in (None, [MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')]):
+    for mixture in (None, [MixtureComponent(measure='y', offset_init=-1., prob_init=.1, id='low')]):
         kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], mixture=mixture)
         smear = SmearingTransform.from_predictions(LogTransform(), kf(y), y, 'y')
         for t in [smear, *smear.component_residuals.values()]:
@@ -453,7 +453,7 @@ def test_means_only(use_map: bool):
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend', 'other']],
         measures=['visit', 'spend', 'other'],
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='spend', mean_init=-2., prob_init=.1, id='low')],
+        mixture=[MixtureComponent(measure='spend', offset_init=-2., prob_init=.1, id='low')],
     )
     bf.mc_sampling = 200
     pred = bf(y)

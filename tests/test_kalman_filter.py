@@ -672,7 +672,7 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         adaptive_scaling=True,
-        mixture=[MixtureComponent(measure='y1', mean_init=-3., prob_init=.1, id='low')] if with_mixture else None,
+        mixture=[MixtureComponent(measure='y1', offset_init=-3., prob_init=.1, id='low')] if with_mixture else None,
     )
     with torch.no_grad():
         kf.adaptive_scaling.weight.fill_(.8)  # (a strong effect, so a lost state would show)

@@ -22,11 +22,10 @@ import torch
 class MixtureComponent(torch.nn.Module):
     """
     An alternative ('weird') regime for a single measure: an offset from the standard regime's (state-dependent)
-    measured-mean, with a learnable mean (the offset), variance (added to the measurement-noise variance), and
-    base-rate.
+    measured-mean, with a learnable offset, extra variance (added to the measurement-noise variance), and base-rate.
 
     :param measure: The measure this component applies to.
-    :param mean_init: Initial value for the component's offset, relative to the standard regime's measured-mean.
+    :param offset_init: Initial value for the component's offset, relative to the standard regime's measured-mean.
     :param prob_init: Initial value for the component's base-rate, i.e. the long-run probability that an observation
      for ``measure`` comes from this component (exact when it's the only component for this measure). With
      ``predictors``, this is the base-rate when the predictors are zero.
@@ -41,7 +40,7 @@ class MixtureComponent(torch.nn.Module):
 
     def __init__(self,
                  measure: str,
-                 mean_init: float,
+                 offset_init: float,
                  prob_init: float,
                  id: str,
                  predictors: Optional[Sequence[str]] = None):
@@ -52,9 +51,9 @@ class MixtureComponent(torch.nn.Module):
             raise ValueError("`predictors` should be a list of strings, not a string.")
         self.predictors = list(predictors or [])
 
-        mean_init = torch.as_tensor(mean_init, dtype=torch.get_default_dtype())
-        self.mean = torch.nn.Parameter(mean_init)
-        self._log_std = torch.nn.Parameter(torch.zeros_like(mean_init))
+        offset_init = torch.as_tensor(offset_init, dtype=torch.get_default_dtype())
+        self.offset = torch.nn.Parameter(offset_init)
+        self._log_extra_std = torch.nn.Parameter(torch.zeros_like(offset_init))
 
         assert 0 < prob_init < 1
         prob_init = torch.as_tensor(prob_init, dtype=torch.get_default_dtype())
@@ -78,8 +77,9 @@ class MixtureComponent(torch.nn.Module):
         return self.logit + X @ self.coefs
 
     @property
-    def var(self) -> torch.Tensor:
-        return self._log_std.exp() ** 2
+    def extra_var(self) -> torch.Tensor:
+        """The variance this regime adds to the measurement-noise variance."""
+        return self._log_extra_std.exp() ** 2
 
     def __repr__(self) -> str:
         return f'{type(self).__name__}(id={repr(self.id)}, measure={repr(self.measure)})'
@@ -393,7 +393,7 @@ class MixtureModel(torch.nn.Module):
         zero = torch.zeros((), dtype=like.dtype, device=like.device)
         shift, extra_var = [zero] * num_measures, [zero] * num_measures
         for i, component in effective_combo:
-            shift[i], extra_var[i] = component.mean, component.var
+            shift[i], extra_var[i] = component.offset, component.extra_var
         return torch.stack(shift), torch.stack(extra_var)
 
     def combo_offsets(self, measures: Sequence[str], like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

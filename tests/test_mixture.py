@@ -15,7 +15,7 @@ def _make_kf(measures, mixture_measures, **mixture_kwargs) -> KalmanFilter:
     mixture = None
     if mixture_measures:
         mixture = MixtureModel(
-            [MixtureComponent(measure=m, mean_init=-4., prob_init=.2, id=f'{m}_low') for m in mixture_measures],
+            [MixtureComponent(measure=m, offset_init=-4., prob_init=.2, id=f'{m}_low') for m in mixture_measures],
             **mixture_kwargs
         )
     return KalmanFilter(
@@ -34,9 +34,9 @@ def _make_y(num_groups: int = 3, num_times: int = 15, num_measures: int = 2) -> 
 
 def test_mixture_model_combos():
     components = [
-        MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1'),
-        MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c1'),
-        MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c2'),
+        MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1'),
+        MixtureComponent(measure='c', offset_init=0., prob_init=.2, id='c1'),
+        MixtureComponent(measure='c', offset_init=0., prob_init=.2, id='c2'),
     ]
     rm = MixtureModel(components)
     assert rm.mixture_measures == ['a', 'c']
@@ -66,26 +66,26 @@ def test_mixture_model_validation():
         KalmanFilter(
             processes=[LocalLevel(id='lvl')],
             measures=['a'],
-            mixture=[MixtureComponent(measure='z', mean_init=0., prob_init=.1, id='z1')]
+            mixture=[MixtureComponent(measure='z', offset_init=0., prob_init=.1, id='z1')]
         )
     with pytest.raises(ValueError, match="unique ids"):
-        MixtureModel([MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='x') for _ in range(2)])
+        MixtureModel([MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='x') for _ in range(2)])
     with pytest.raises(ValueError, match="combos"):
         MixtureModel(
-            [MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1')],
+            [MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')],
             transition=StickyTransition(num_combos=3)
         )
     with pytest.raises(ValueError, match="not yet supported .* non-gaussian"):
         BinomialFilter(
             processes=[LocalLevel(id='lvl', measure='visit')],
             measures=['visit'],
-            mixture=[MixtureComponent(measure='visit', mean_init=0., prob_init=.1, id='v1')]
+            mixture=[MixtureComponent(measure='visit', offset_init=0., prob_init=.1, id='v1')]
         )
     # a list of components is shorthand for a MixtureModel:
     kf = KalmanFilter(
         processes=[LocalLevel(id='lvl')],
         measures=['a'],
-        mixture=[MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1')]
+        mixture=[MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')]
     )
     assert isinstance(kf.mixture, MixtureModel) and isinstance(kf.mixture.transition, StickyTransition)
 
@@ -133,7 +133,7 @@ class StaticTransition(RegimeTransition):
 def test_parameters_registered_and_get_grads():
     kf = _make_kf(['y1', 'y2'], ['y1'])
     names = {n for n, _ in kf.named_parameters()}
-    for expected in ('mixture.components.0.mean', 'mixture.components.0._log_std',
+    for expected in ('mixture.components.0.offset', 'mixture.components.0._log_extra_std',
                      'mixture.components.0.logit', 'mixture.transition._stay_logit'):
         assert expected in names
     assert any(k.startswith('mixture.') for k in kf.state_dict())
@@ -141,7 +141,7 @@ def test_parameters_registered_and_get_grads():
     y = _make_y()
     kf(y).log_prob(y).sum().backward()
     component = kf.mixture.components[0]
-    for param in (component.mean, component._log_std, component.logit):
+    for param in (component.offset, component._log_extra_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
     assert (kf.mixture.transition._stay_logit.grad.abs() > 0).all()
 
@@ -188,12 +188,12 @@ def test_update_step_univariate():
         K_n = cov / S_n
         mean_n = mean + K_n * (obs - mean)
         cov_n = (1 - K_n) * cov
-        S_w = cov + R + component.var
+        S_w = cov + R + component.extra_var
         K_w = cov / S_w
-        mean_w = mean + K_w * (obs - mean - component.mean)
+        mean_w = mean + K_w * (obs - mean - component.offset)
         cov_w = (1 - K_w) * cov
         lik_n = Normal(mean, S_n.sqrt()).log_prob(input).exp()
-        lik_w = Normal(mean + component.mean, S_w.sqrt()).log_prob(input).exp()
+        lik_w = Normal(mean + component.offset, S_w.sqrt()).log_prob(input).exp()
         w_w = prob * lik_w / (prob * lik_w + (1 - prob) * lik_n)
         w_n = 1 - w_w
         expected_mean = w_n * mean_n + w_w * mean_w
@@ -247,8 +247,8 @@ def test_log_prob_brute_force():
         total = 0.
         for combo, prob in zip(rm.combos, pred.regime_probs[g, t]):
             # each measure in a component's regime: offset mean, and extra variance
-            offset = torch.stack([torch.tensor(0.) if c is None else c.mean for c in combo])
-            extra = torch.stack([torch.tensor(0.) if c is None else c.var for c in combo])
+            offset = torch.stack([torch.tensor(0.) if c is None else c.offset for c in combo])
+            extra = torch.stack([torch.tensor(0.) if c is None else c.extra_var for c in combo])
             m_c, S_c = m + offset, S + torch.diag(extra)
             lik = MultivariateNormal(m_c[observed], S_c[observed][:, observed]).log_prob(obs[observed]).exp()
             total += prob * lik
@@ -275,7 +275,7 @@ def test_binomial_filter_with_mixture(univariate_prob: bool):
         measures=measures,
         binary_measures=['visit'],
         mixture=MixtureModel(
-            [MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+            [MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
             univariate_prob=univariate_prob
         ),
     )
@@ -285,7 +285,7 @@ def test_binomial_filter_with_mixture(univariate_prob: bool):
     assert torch.isfinite(lp).all()
     lp.sum().backward()
     component = bf.mixture.components[0]
-    for param in (component.mean, component._log_std, component.logit):
+    for param in (component.offset, component._log_extra_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
 
     # end-to-end training:
@@ -314,7 +314,7 @@ def test_binary_measures_excluded_from_responsibilities():
             measures=['visit', 'spend'],
             binary_measures=['visit'],
             mixture=MixtureModel(
-                [MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+                [MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
                 univariate_prob=univariate_prob
             ),
         )
@@ -437,7 +437,7 @@ def _make_kf_with_predictors(stay_logit: float = 1., coefs=(2., -.5)) -> KalmanF
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['y1', 'y2']],
         measures=['y1', 'y2'],
         mixture=[
-            MixtureComponent(measure='y1', mean_init=-4., prob_init=.2, id='y1_low', predictors=['treated', 'other'])
+            MixtureComponent(measure='y1', offset_init=-4., prob_init=.2, id='y1_low', predictors=['treated', 'other'])
         ],
     )
     with torch.no_grad():
@@ -528,14 +528,14 @@ def test_component_predictors_kwargs():
     with pytest.raises(ValueError, match="needs `X`"):
         kf.mixture.log_base_probs()
     with pytest.raises(ValueError, match="list of strings"):
-        MixtureComponent(measure='y1', mean_init=0., prob_init=.1, id='x', predictors='treated')
+        MixtureComponent(measure='y1', offset_init=0., prob_init=.1, id='x', predictors='treated')
 
     # a different `X` for a LinearModel, via the `{id}__X` override:
     torch.manual_seed(0)
     kf = KalmanFilter(
         processes=[LocalLevel(id='level', measure='y1'), LinearModel(id='lm', predictors=['a', 'b', 'c'], measure='y1')],
         measures=['y1'],
-        mixture=[MixtureComponent(measure='y1', mean_init=-4., prob_init=.2, id='low', predictors=['treated'])],
+        mixture=[MixtureComponent(measure='y1', offset_init=-4., prob_init=.2, id='low', predictors=['treated'])],
     )
     X_lm = torch.randn(3, 15, 3)
     pred = kf(y[..., :1], X=X_lm, low__X=X[..., :1])
@@ -557,7 +557,7 @@ def test_component_predictors_fit():
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-3., prob_init=.1, id='low', predictors=['treated'])],
+        mixture=[MixtureComponent(measure='y', offset_init=-3., prob_init=.1, id='low', predictors=['treated'])],
     )
     kf.fit(y.unsqueeze(-1), X=treated.unsqueeze(-1), stopping={'max_iter': 30}, verbose=0)
     component = kf.mixture.components[0]
@@ -570,9 +570,9 @@ def test_component_predictors_fit():
 
 def test_standard_probs():
     components = [
-        MixtureComponent(measure='a', mean_init=0., prob_init=.1, id='a1'),
-        MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c1'),
-        MixtureComponent(measure='c', mean_init=0., prob_init=.2, id='c2'),
+        MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1'),
+        MixtureComponent(measure='c', offset_init=0., prob_init=.2, id='c1'),
+        MixtureComponent(measure='c', offset_init=0., prob_init=.2, id='c2'),
     ]
     rm = MixtureModel(components)
     regime_probs = torch.softmax(torch.randn(4, rm.num_combos), -1)
@@ -640,12 +640,12 @@ def test_adaptive_scaling_ignores_explained_outliers():
             processes=[LocalLevel(id='level')],
             measures=['y'],
             adaptive_scaling=True,
-            mixture=[MixtureComponent('y', mean_init=-6., prob_init=.05, id='low')] if with_mixture else None
+            mixture=[MixtureComponent('y', offset_init=-6., prob_init=.05, id='low')] if with_mixture else None
         )
         kf.adaptive_scaling.initialize(30)
         kf.adaptive_scaling.weight.fill_(1.)
         if with_mixture:
-            kf.mixture.components[0]._log_std.fill_(-1.)
+            kf.mixture.components[0]._log_extra_std.fill_(-1.)
         return kf
 
     torch.manual_seed(1)
@@ -760,7 +760,7 @@ def test_binomial_prediction_outputs():
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+        mixture=[MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
     )
     bf.mc_sampling = 200
     pred = bf(y)
@@ -803,10 +803,10 @@ def test_components_are_offsets():
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-4., prob_init=.1, id='low')],
+        mixture=[MixtureComponent(measure='y', offset_init=-4., prob_init=.1, id='low')],
     )
     with torch.no_grad():
-        kf.mixture.components[0]._log_std.fill_(math.log(.3))
+        kf.mixture.components[0]._log_extra_std.fill_(math.log(.3))
         kf.measure_covariance.cholesky_log_diag.fill_(math.log(.1))
     pred = kf(y, include_updates_in_output=True)
     p_low = pred.update_regime_probs[..., 1]
@@ -835,7 +835,7 @@ def test_joseph_form_option():
         kf = _make_kf(['y1', 'y2'], ['y1', 'y2'], joseph_form=joseph_form)
         assert kf.mixture.joseph_form is joseph_form
         preds[joseph_form] = kf(y, include_updates_in_output=True)
-    assert MixtureModel([MixtureComponent(measure='y', mean_init=0., prob_init=.1, id='a')]).joseph_form
+    assert MixtureModel([MixtureComponent(measure='y', offset_init=0., prob_init=.1, id='a')]).joseph_form
     for attr in ('update_means', 'update_covs', 'update_regime_probs'):
         assert torch.allclose(getattr(preds[True], attr), getattr(preds[False], attr), atol=1e-5)
     assert torch.allclose(preds[True].log_prob(y), preds[False].log_prob(y), atol=1e-5)

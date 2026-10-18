@@ -58,7 +58,7 @@ def test_sample_mixture(shared_noise: bool):
     kf = KalmanFilter(
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
         measures=['a', 'b'],
-        mixture=[MixtureComponent(measure='a', mean_init=-3., prob_init=.2, id='low')]
+        mixture=[MixtureComponent(measure='a', offset_init=-3., prob_init=.2, id='low')]
     )
     component = kf.mixture.components[0]
     pred = kf(torch.randn(2, 8, 2))
@@ -69,10 +69,10 @@ def test_sample_mixture(shared_noise: bool):
     # in the 'low' regime, 'a' has the component's variance added to its measurement-noise (which identifies the
     # regime here), and is offset by the component's mean:
     R = pred.measure_covs[0, 0]
-    in_low = s.covs[..., 0, 0] > R[0, 0] + component.var / 2
+    in_low = s.covs[..., 0, 0] > R[0, 0] + component.extra_var / 2
     p = mix.probs[..., 1]
     assert ((in_low.float().mean(0) - p).abs() < 5 * (p * (1 - p) / n).sqrt()).all()
-    assert torch.allclose(s.covs[..., 0, 0][in_low], (R[0, 0] + component.var).expand(int(in_low.sum())))
+    assert torch.allclose(s.covs[..., 0, 0][in_low], (R[0, 0] + component.extra_var).expand(int(in_low.sum())))
     assert torch.allclose(s.covs[..., 0, 1], R[0, 1].expand_as(s.covs[..., 0, 1]))  # (correlation is unchanged)
     # the same state-draws (`sample()` draws this white-noise first), without the regimes:
     num_rows = pred.state_means_flat.shape[0]
@@ -81,7 +81,7 @@ def test_sample_mixture(shared_noise: bool):
         pred.measurement_model_flat, pred.state_means_flat, pred.state_covs_flat, white_noise=white_noise
     ).view(n, 2, 8, 2)
     offset = s.means[..., 0] - standard_means[..., 0]
-    assert torch.allclose(offset[in_low], component.mean.expand(int(in_low.sum())), atol=1e-5)
+    assert torch.allclose(offset[in_low], component.offset.expand(int(in_low.sum())), atol=1e-5)
     # the observations follow the mixture:
     for q in (.05, .5, .95):
         emp_cdf_at_quantile = (s['a'] <= mix.quantile(q)).float().mean(0)
@@ -260,7 +260,7 @@ def test_derived_binomial_spend():
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'log_spend']],
         measures=['visit', 'log_spend'],
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='log_spend', mean_init=1., prob_init=.1, id='quick')],
+        mixture=[MixtureComponent(measure='log_spend', offset_init=1., prob_init=.1, id='quick')],
     )
     bf.mc_sampling = 100
     pred = bf(torch.stack([visit, log_spend], -1))
@@ -330,7 +330,7 @@ def test_nonlinear_model_linear_measures_exact():
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+        mixture=[MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
     )
     bf.mc_sampling = 200
     pred = bf(y)

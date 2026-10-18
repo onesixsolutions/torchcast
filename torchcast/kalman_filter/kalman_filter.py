@@ -395,7 +395,7 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
         ,
         measures=measures,
         mixture=[
-            MixtureComponent(measure='dim1', mean_init=-5, prob_init=0.1, id='dim1_low'),
+            MixtureComponent(measure='dim1', offset_init=-5, prob_init=0.1, id='dim1_low'),
         ]
     )
 

@@ -62,8 +62,8 @@ def _make_model(variant: str = 'kf') -> KalmanFilter:
         measure_covariance=measure_covariance,
         adaptive_scaling=variant in ('adaptive', 'mixture_adaptive'),
         mixture=[
-            MixtureComponent(measure='y1', mean_init=-4., prob_init=.2, id='y1_low', predictors=['p1']),
-            MixtureComponent(measure='y2', mean_init=4., prob_init=.1, id='y2_high'),
+            MixtureComponent(measure='y1', offset_init=-4., prob_init=.2, id='y1_low', predictors=['p1']),
+            MixtureComponent(measure='y2', offset_init=4., prob_init=.1, id='y2_high'),
         ] if variant.startswith('mixture') else None,
         measure_funs={'y2': 'sigmoid'} if variant == 'sigmoid' else None,
     )
