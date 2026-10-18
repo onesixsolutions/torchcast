@@ -309,6 +309,53 @@ class MixtureModel(torch.nn.Module):
     def base_probs(self, component_X: Optional[Mapping[int, torch.Tensor]] = None) -> torch.Tensor:
         return self.log_base_probs(component_X).exp()
 
+    def prepare(self,
+                kwargs: Mapping,
+                init_regime_probs: Optional[torch.Tensor],
+                num_groups: int,
+                num_timesteps: int) -> tuple[torch.Tensor, Sequence[torch.Tensor], set[str]]:
+        """
+        For a model's ``forward()``: the regime-prior for the first timestep, and the base-rates for the regime-prior
+        at each timestep (``base_probs[t]``; time-varying if any components have predictors).
+
+        :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
+        :param init_regime_probs: The ``regime_probs`` of ``forward()``'s ``initial_state``, if any (see
+         ``initial_prior``).
+        :return: ``(regime_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
+        """
+        component_X, used_keys = self.get_component_X(kwargs)
+        if component_X:
+            base_probs = self.base_probs(component_X).unbind(1)
+            if len(base_probs) < num_timesteps:
+                raise ValueError(
+                    f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
+                    f"{num_timesteps}."
+                )
+        else:
+            base_probs = [self.base_probs()] * num_timesteps
+        regime_prior = self.initial_prior(init_regime_probs, base_probs[0], num_groups)
+        return regime_prior, base_probs, used_keys
+
+    def initial_prior(self,
+                      init_regime_probs: Optional[torch.Tensor],
+                      base_probs: torch.Tensor,
+                      num_groups: int) -> torch.Tensor:
+        """
+        The regime-prior for the first timestep. ``init_regime_probs`` (from ``initial_state``) are treated like the
+        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
+        transition. If not given, the transition's ``initial()`` is used.
+        """
+        if init_regime_probs is None:
+            return self.transition.initial(base_probs, num_groups)
+        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.num_combos:
+            raise ValueError(
+                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.num_combos}), "
+                f"got {tuple(init_regime_probs.shape)}"
+            )
+        if init_regime_probs.shape[0] not in (1, num_groups):
+            raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
+        return self.transition(init_regime_probs.expand(num_groups, -1), base_probs)
+
     def effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
         """
         When only a subset of measures is observed, combos that differ only in unobserved measures are

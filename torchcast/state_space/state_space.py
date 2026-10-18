@@ -782,50 +782,17 @@ class StateSpaceModel(torch.nn.Module):
                          num_groups: int,
                          num_timesteps: int) -> tuple[Optional[torch.Tensor], Optional[Sequence[torch.Tensor]], set]:
         """
-        For models with mixture components: the regime-prior for the first timestep, and the base-rates for the
-        regime-prior at each timestep (``base_probs[t]``; time-varying if any components have predictors).
+        For models with mixture components: see ``MixtureModel.prepare``.
 
-        :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
         :return: ``(regime_prior, base_probs, used_keys)``; ``(None, None, set())`` without mixture components.
         """
         if self.mixture is None:
             if init_regime_probs is not None:
                 raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
             return None, None, set()
-
-        component_X, used_keys = self.mixture.get_component_X(kwargs)
-        if component_X:
-            base_probs = self.mixture.base_probs(component_X).unbind(1)
-            if len(base_probs) < num_timesteps:
-                raise ValueError(
-                    f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
-                    f"{num_timesteps}."
-                )
-        else:
-            base_probs = [self.mixture.base_probs()] * num_timesteps
-        regime_prior = self._initial_regime_prior(init_regime_probs, base_probs[0], num_groups)
-        return regime_prior, base_probs, used_keys
-
-    def _initial_regime_prior(self,
-                              init_regime_probs: Optional[torch.Tensor],
-                              base_probs: torch.Tensor,
-                              num_groups: int) -> torch.Tensor:
-        """
-        The regime-prior for the first timestep. ``init_regime_probs`` (from ``initial_state``) are treated like the
-        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
-        transition. If not given, the transition's ``initial()`` is used.
-        """
-        transition = self.mixture.transition
-        if init_regime_probs is None:
-            return transition.initial(base_probs, num_groups)
-        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.mixture.num_combos:
-            raise ValueError(
-                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.mixture.num_combos}), "
-                f"got {tuple(init_regime_probs.shape)}"
-            )
-        if init_regime_probs.shape[0] not in (1, num_groups):
-            raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
-        return transition(init_regime_probs.expand(num_groups, -1), base_probs)
+        return self.mixture.prepare(
+            kwargs, init_regime_probs=init_regime_probs, num_groups=num_groups, num_timesteps=num_timesteps
+        )
 
     def _prepare_chunks(self,
                         y: torch.Tensor,
