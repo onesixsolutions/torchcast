@@ -70,6 +70,11 @@ class MixtureComponent(torch.nn.Module):
         if self.predictors:
             self.coefs = torch.nn.Parameter(torch.zeros(len(self.predictors)))
 
+    @property
+    def qualified_id(self) -> str:
+        """``'{measure}.{id}'``: unique across all of a model's components (``id`` is unique within a measure)."""
+        return f'{self.measure}.{self.id}'
+
     def get_logit(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         :param X: If the component has predictors, a ``(..., len(predictors))`` tensor.
@@ -259,16 +264,16 @@ class MixtureModel(torch.nn.Module):
     def num_combos(self) -> int:
         return len(self.combos)
 
-    def _get_component_X(self, kwargs: Mapping) -> tuple[dict[int, torch.Tensor], set[str]]:
+    def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
         """
         Pick out the predictors of components' base-rates from the model's ``forward()`` kwargs.
 
         :param kwargs: The keyword-arguments.
-        :return: A tuple of (1) a dictionary mapping the index (in ``self.components``) of each component with
-         predictors to its ``(num_groups, num_timesteps, num_predictors)`` tensor, and (2) the keys used.
+        :return: A tuple of (1) a dictionary mapping the ``qualified_id`` of each component with predictors to its
+         ``(num_groups, num_timesteps, num_predictors)`` tensor, and (2) the keys used.
         """
         out, used = {}, set()
-        for i, component in enumerate(self.components):
+        for component in self.components:
             if not component.predictors:
                 continue
             name = component.model_mat_kwarg_name
@@ -286,34 +291,42 @@ class MixtureModel(torch.nn.Module):
                     f"Expected `{key}` to have shape (num_groups, num_timesteps, {len(component.predictors)}) for "
                     f"MixtureComponent '{component.id}', got {tuple(X.shape)}."
                 )
-            out[i] = X
+            out[component.qualified_id] = X
             used.add(key)
         return out, used
 
-    def _log_base_probs(self, component_X: Optional[Mapping[int, torch.Tensor]] = None) -> torch.Tensor:
+    def _log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        :param component_X: Required if any components have predictors: the output of :func:`_get_component_X`, or
-         slices of it (e.g. for one timestep), all with the same leading dims.
+        :param component_X: Required if any components have predictors: the output of :func:`_get_component_X` (keyed
+         by ``qualified_id``), or slices of it (e.g. for one timestep), all with the same leading dims.
         :return: The log long-run probability of each combo: a ``(num_combos,)`` tensor, or with predictors
          ``(*leading_dims, num_combos)``. Regimes are independent across measures; within a measure, the standard
          regime has logit 0 and each component has its own logit.
         """
         component_X = component_X or {}
-        logits = [c.get_logit(component_X.get(i)) for i, c in enumerate(self.components)]
-        batch_shape = torch.broadcast_shapes(*(lg.shape for lg in logits))
-        logits = {id(c): lg.expand(batch_shape) for c, lg in zip(self.components, logits)}
+        logits = {c.qualified_id: c.get_logit(component_X.get(c.qualified_id)) for c in self.components}
+        batch_shape = torch.broadcast_shapes(*(lg.shape for lg in logits.values()))
+        to = {'dtype': self.components[0].logit.dtype, 'device': self.components[0].logit.device}
 
-        per_measure = {}
+        # per measure: the log-probability of each of its regimes (None = standard, then each component):
+        regime_log_probs = {}
         for measure, comps in self._by_measure.items():
-            standard = torch.zeros(batch_shape, dtype=comps[0].logit.dtype, device=comps[0].logit.device)
-            lps = torch.log_softmax(torch.stack([standard] + [logits[id(c)] for c in comps], -1), -1).unbind(-1)
-            per_measure[measure] = {None: lps[0], **{id(c): lp for c, lp in zip(comps, lps[1:])}}
-        return torch.stack([
-            sum(per_measure[m][None if c is None else id(c)] for m, c in zip(self.mixture_measures, combo))
-            for combo in self.combos
-        ], -1)
+            measure_logits = [torch.zeros(batch_shape, **to)]
+            measure_logits += [logits[c.qualified_id].expand(batch_shape) for c in comps]
+            log_probs = torch.log_softmax(torch.stack(measure_logits, -1), -1).unbind(-1)
+            regime_log_probs[measure] = dict(zip([None] + [c.qualified_id for c in comps], log_probs))
 
-    def base_probs(self, component_X: Optional[Mapping[int, torch.Tensor]] = None) -> torch.Tensor:
+        # per combo: regimes are independent across measures, so their log-probabilities add:
+        combo_log_probs = [
+            sum(
+                regime_log_probs[measure][None if c is None else c.qualified_id]
+                for measure, c in zip(self.mixture_measures, combo)
+            )
+            for combo in self.combos
+        ]
+        return torch.stack(combo_log_probs, -1)
+
+    def base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         return self._log_base_probs(component_X).exp()
 
     def _prepare(self,

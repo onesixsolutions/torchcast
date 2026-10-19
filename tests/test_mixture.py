@@ -481,7 +481,7 @@ def test_component_predictors_base_rates():
 
     # with stickiness, the base-probs for the current predictors are still the stationary distribution:
     kf = _make_kf_with_predictors()
-    base = kf.mixture.base_probs({0: X[:, 0]})  # (num_groups, num_combos)
+    base = kf.mixture.base_probs({kf.mixture.components[0].qualified_id: X[:, 0]})  # (num_groups, num_combos)
     assert torch.allclose(kf.mixture.transition(base, base), base, atol=1e-6)
     assert torch.allclose(kf(y, X=X).regime_probs[:, 0], base, atol=1e-6)
 
