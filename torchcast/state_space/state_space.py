@@ -880,7 +880,7 @@ class StateSpaceModel(torch.nn.Module):
         if self.mixture is not None:
             for component in self.mixture.components:
                 if getattr(component, 'predictors', None):
-                    out |= {component.kwarg_name, f'{component.id}__{component.kwarg_name}'}
+                    out |= {component.model_mat_kwarg_name, f'{component.id}__{component.model_mat_kwarg_name}'}
         return out
 
     def _subset_kwargs(self, kwargs: dict, group_slice: Union[slice, torch.Tensor], num_groups: int) -> dict:

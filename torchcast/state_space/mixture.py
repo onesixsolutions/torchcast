@@ -36,9 +36,11 @@ class MixtureComponent(torch.nn.Module):
     :param predictors: Optional names of predictors of the component's base-rate: each has a learned coefficient,
      added to the component's logit (vs. the standard regime). E.g. a treatment that makes this regime more common.
      The predictors are passed to the model's ``forward()`` as a ``(num_groups, num_timesteps, len(predictors))``
-     tensor ``X`` -- or, to use a different tensor than other consumers of ``X`` (e.g. a ``LinearModel``), as
-     ``{id}__X``. Like the predictors of a ``LinearModel``, they need to cover the forecast horizon too: the
-     regime-prior for each timestep uses that timestep's predictors.
+     tensor ``X`` (see ``model_mat_kwarg_name``) -- or, to use a different tensor than other consumers of ``X`` (e.g.
+     a ``LinearModel``), as ``{id}__X``. Like the predictors of a ``LinearModel``, they need to cover the forecast
+     horizon too: the regime-prior for each timestep uses that timestep's predictors.
+    :param model_mat_kwarg_name: The name of the ``forward()`` keyword-argument with the predictors (as for
+     ``LinearModel``). Default 'X'.
     """
 
     def __init__(self,
@@ -46,10 +48,12 @@ class MixtureComponent(torch.nn.Module):
                  offset_init: float,
                  prob_init: float,
                  id: str,
-                 predictors: Optional[Sequence[str]] = None):
+                 predictors: Optional[Sequence[str]] = None,
+                 model_mat_kwarg_name: str = 'X'):
         super().__init__()
         self.measure = measure
         self.id = id
+        self.model_mat_kwarg_name = model_mat_kwarg_name
         if isinstance(predictors, str):
             raise ValueError("`predictors` should be a list of strings, not a string.")
         self.predictors = list(predictors or [])
@@ -65,8 +69,6 @@ class MixtureComponent(torch.nn.Module):
         self.coefs = None
         if self.predictors:
             self.coefs = torch.nn.Parameter(torch.zeros(len(self.predictors)))
-
-    kwarg_name = 'X'  # the default name of the ``forward()`` keyword-argument with the predictors
 
     def get_logit(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -95,8 +97,8 @@ class RegimeTransition(torch.nn.Module):
     the current timestep).
 
     Both receive ``base_probs``, the long-run probability of each combo implied by the :class:`MixtureComponent`
-    base-rates; implementations may use or ignore it. It's a ``(num_combos,)`` tensor, or -- if any components have
-    predictors -- ``(num_groups, num_combos)``, for the timestep that the regime-prior is for.
+    base-rates: a ``(num_combos,)`` tensor (or, if any components have predictors, a ``(num_groups, num_combos)``
+    tensor, for the timestep that the regime-prior is for).
     """
 
     def __init__(self, num_combos: int):
@@ -143,29 +145,34 @@ class StickyTransition(RegimeTransition):
             (torch.log(stay_init) - torch.log1p(-stay_init)).expand(num_combos).clone()
         )
 
-    @property
-    def stay(self) -> torch.Tensor:
+    def get_stay_prob(self) -> torch.Tensor:
+        """
+        :return: A ``(num_combos,)`` tensor: the probability of persisting in each combo, ``stay``.
+        """
         return torch.sigmoid(self._stay_logit)
 
     def _jump_probs(self, base_probs: torch.Tensor) -> torch.Tensor:
-        b = base_probs * (1 - self.stay)
+        b = base_probs * (1 - self.get_stay_prob())
         return b / b.sum(-1, keepdim=True)
 
     def initial(self, base_probs: torch.Tensor, num_groups: int) -> torch.Tensor:
         return base_probs.expand(num_groups, -1)
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
-        stay = self.stay
+        stay = self.get_stay_prob()
         # equivalent to `posterior @ self.matrix(base_probs)`, without materializing the matrix:
         leave = (posterior * (1 - stay)).sum(-1, keepdim=True)
         return posterior * stay + leave * self._jump_probs(base_probs)
 
     def matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
         """
-        :param base_probs: A ``(num_combos,)`` tensor.
+        The transition-matrix, for inspection and testing (:func:`forward` applies it without building it).
+
+        :param base_probs: A ``(num_combos,)`` tensor (so not for components with predictors, whose base-rates vary
+         by group).
         :return: The ``(num_combos, num_combos)`` transition-matrix.
         """
-        stay = self.stay
+        stay = self.get_stay_prob()
         return torch.diag(stay) + (1 - stay).unsqueeze(-1) * self._jump_probs(base_probs).unsqueeze(0)
 
 
@@ -268,13 +275,14 @@ class MixtureModel(torch.nn.Module):
         for i, component in enumerate(self.components):
             if not component.predictors:
                 continue
-            key = f'{component.id}__{component.kwarg_name}'
+            name = component.model_mat_kwarg_name
+            key = f'{component.id}__{name}'
             if key not in kwargs:
-                key = component.kwarg_name
+                key = name
             if key not in kwargs:
                 raise TypeError(
-                    f"MixtureComponent '{component.id}' has predictors, so expected a `{component.kwarg_name}` (or "
-                    f"`{component.id}__{component.kwarg_name}`) keyword-argument."
+                    f"MixtureComponent '{component.id}' has predictors, so expected a `{name}` (or "
+                    f"`{component.id}__{name}`) keyword-argument."
                 )
             X = kwargs[key]
             if X.ndim != 3 or X.shape[-1] != len(component.predictors):

@@ -568,6 +568,27 @@ def test_component_predictors_fit():
     assert .25 < p_treated < .6
 
 
+@torch.no_grad()
+def test_component_predictors_kwarg_name():
+    """`MixtureComponent(model_mat_kwarg_name=...)` names the `forward()` keyword-argument with its predictors."""
+    torch.manual_seed(0)
+    y = torch.randn(3, 10, 1)
+    X = torch.randn(3, 10, 1)
+
+    def make(**kwargs):
+        torch.manual_seed(1)
+        component = MixtureComponent(measure='y', offset_init=-3., prob_init=.1, id='low', predictors=['p'], **kwargs)
+        kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], mixture=[component])
+        component.coefs.fill_(1.)
+        return kf
+
+    expected = make()(y, X=X).regime_probs
+    renamed = make(model_mat_kwarg_name='Z')
+    assert torch.equal(renamed(y, Z=X).regime_probs, expected)
+    with pytest.raises(TypeError, match="`Z`"):
+        renamed(y, X=X)
+
+
 def test_standard_probs():
     components = [
         MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1'),
