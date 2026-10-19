@@ -49,15 +49,15 @@ def test_mixture_model_combos():
     assert torch.isclose(base_probs[a_weird].sum(), torch.tensor(.1))
 
     # all observed: every combo is distinguishable
-    effective, mapping = rm.effective_combos(['a', 'b', 'c'])
+    effective, mapping = rm._effective_combos(['a', 'b', 'c'])
     assert len(effective) == 6
     assert effective[0] == ()
     # 'c' unobserved: combos collapse onto 'a' being standard or not
-    effective, mapping = rm.effective_combos(['a', 'b'])
+    effective, mapping = rm._effective_combos(['a', 'b'])
     assert len(effective) == 2
     assert (mapping == a_weird.long()).all()
     # measure-indices refer to the observed measures:
-    effective, _ = rm.effective_combos(['b', 'c'])
+    effective, _ = rm._effective_combos(['b', 'c'])
     assert {i for eff in effective for i, _ in eff} == {1}
 
 
@@ -526,7 +526,7 @@ def test_component_predictors_kwargs():
     with pytest.raises(ValueError, match="timesteps"):
         kf(y, X=X[:, :5])
     with pytest.raises(ValueError, match="needs `X`"):
-        kf.mixture.log_base_probs()
+        kf.mixture._log_base_probs()
     with pytest.raises(ValueError, match="list of strings"):
         MixtureComponent(measure='y1', offset_init=0., prob_init=.1, id='x', predictors='treated')
 
@@ -597,7 +597,7 @@ def test_standard_probs():
     ]
     rm = MixtureModel(components)
     regime_probs = torch.softmax(torch.randn(4, rm.num_combos), -1)
-    probs = rm.standard_probs(regime_probs, ['a', 'b', 'c'])
+    probs = rm._standard_probs(regime_probs, ['a', 'b', 'c'])
     for j, m in enumerate(['a', 'b', 'c']):
         if m == 'b':
             assert torch.allclose(probs[:, j], torch.ones(4))
@@ -606,7 +606,7 @@ def test_standard_probs():
         standard = torch.tensor([combo[k] is None for combo in rm.combos])
         assert torch.allclose(probs[:, j], regime_probs[:, standard].sum(-1))
     # at base-probs, matches the base-rate:
-    assert torch.allclose(rm.standard_probs(rm.base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
+    assert torch.allclose(rm._standard_probs(rm.base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
 
 
 @torch.no_grad()
