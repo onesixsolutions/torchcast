@@ -101,7 +101,7 @@ class StateSpaceModel(torch.nn.Module):
             mixture = MixtureModel(mixture)
         self.mixture: Optional[MixtureModel] = mixture
         if self.mixture is not None:
-            self.mixture._validate(measures, non_gaussian_measures=self._non_gaussian_measures)
+            self.mixture.validate(measures, non_gaussian_measures=self._non_gaussian_measures)
 
     @property
     def _non_gaussian_measures(self) -> Sequence[str]:
@@ -435,7 +435,7 @@ class StateSpaceModel(torch.nn.Module):
             if self.mixture is None or regime_probs is None:
                 multi = self.adaptive_scaling(resid, nan_mask)
             else:
-                weights = self.mixture._standard_probs(regime_probs, [self.measures[i] for i in idx])
+                weights = self.mixture.standard_probs(regime_probs, [self.measures[i] for i in idx])
                 multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
 
             # Handle empty measures (those not in the covariance structure)
@@ -781,7 +781,7 @@ class StateSpaceModel(torch.nn.Module):
                          num_groups: int,
                          num_timesteps: int) -> tuple[Optional[torch.Tensor], Optional[Sequence[torch.Tensor]], set]:
         """
-        For models with mixture components: see ``MixtureModel._prepare``.
+        For models with mixture components: see ``MixtureModel.prepare``.
 
         :return: ``(regime_prior, base_probs, used_keys)``; ``(None, None, set())`` without mixture components.
         """
@@ -789,7 +789,7 @@ class StateSpaceModel(torch.nn.Module):
             if init_regime_probs is not None:
                 raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
             return None, None, set()
-        return self.mixture._prepare(
+        return self.mixture.prepare(
             kwargs, init_regime_probs=init_regime_probs, num_groups=num_groups, num_timesteps=num_timesteps
         )
 

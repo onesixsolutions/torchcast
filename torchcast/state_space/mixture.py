@@ -240,7 +240,7 @@ class MixtureModel(torch.nn.Module):
             raise ValueError(f"`transition` has {transition.num_combos} combos, but expected {self.num_combos}")
         self.transition = transition
 
-    def _validate(self, measures: Sequence[str], non_gaussian_measures: Sequence[str] = ()) -> None:
+    def validate(self, measures: Sequence[str], non_gaussian_measures: Sequence[str] = ()) -> None:
         """
         Called by the :class:`.StateSpaceModel`. Mixture measures must be measures of the model, with a gaussian
         likelihood.
@@ -295,7 +295,7 @@ class MixtureModel(torch.nn.Module):
             used.add(key)
         return out, used
 
-    def _log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
+    def log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
         :param component_X: Required if any components have predictors: the output of :func:`_get_component_X` (keyed
          by ``qualified_id``), or slices of it (e.g. for one timestep), all with the same leading dims.
@@ -327,9 +327,9 @@ class MixtureModel(torch.nn.Module):
         return torch.stack(combo_log_probs, -1)
 
     def base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
-        return self._log_base_probs(component_X).exp()
+        return self.log_base_probs(component_X).exp()
 
-    def _prepare(self,
+    def prepare(self,
                 kwargs: Mapping,
                 init_regime_probs: Optional[torch.Tensor],
                 num_groups: int,
@@ -376,7 +376,7 @@ class MixtureModel(torch.nn.Module):
             raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
         return self.transition(init_regime_probs.expand(num_groups, -1), base_probs)
 
-    def _effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
+    def effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
         """
         When only a subset of measures is observed, combos that differ only in unobserved measures are
         indistinguishable (they imply the same likelihood and the same state-update).
@@ -400,11 +400,11 @@ class MixtureModel(torch.nn.Module):
         return effective, torch.as_tensor(mapping, dtype=torch.long)
 
     @staticmethod
-    def _effective_offsets(effective_combo: tuple,
+    def effective_offsets(effective_combo: tuple,
                           num_measures: int,
                           like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        :param effective_combo: An entry from :func:`_effective_combos`: ``(measure_idx, component)`` pairs.
+        :param effective_combo: An entry from :func:`effective_combos`: ``(measure_idx, component)`` pairs.
         :param num_measures: The number of (observed) measures that ``measure_idx`` indexes.
         :param like: A tensor whose dtype/device to use.
         :return: Two ``(num_measures,)`` tensors: the offset to the measured-mean, and the variance to add to the
@@ -416,7 +416,7 @@ class MixtureModel(torch.nn.Module):
             shift[i], extra_var[i] = component.offset, component.extra_var
         return torch.stack(shift), torch.stack(extra_var)
 
-    def _combo_offsets(self, measures: Sequence[str], like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def combo_offsets(self, measures: Sequence[str], like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         :param measures: The measures.
         :param like: A tensor whose dtype/device to use.
@@ -425,7 +425,7 @@ class MixtureModel(torch.nn.Module):
         """
         measures = list(measures)
         offsets = (
-            self._effective_offsets(
+            self.effective_offsets(
                 tuple(
                     (measures.index(m), c) for m, c in zip(self.mixture_measures, combo)
                     if c is not None and m in measures
@@ -438,7 +438,7 @@ class MixtureModel(torch.nn.Module):
         shift, extra_var = zip(*offsets)
         return torch.stack(shift), torch.stack(extra_var)
 
-    def _standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
+    def standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
         """
         :param regime_probs: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
         :param measures: The measures to return probabilities for.
