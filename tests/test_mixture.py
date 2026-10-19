@@ -665,7 +665,7 @@ def test_adaptive_scaling_ignores_explained_outliers():
 
 def test_mixture_of_normals():
     from scipy import stats
-    from torchcast.state_space.mixture import MixtureOfNormals
+    from torchcast.state_space import MixtureOfNormals
 
     # a single component is just a normal:
     single = MixtureOfNormals(['standard'], torch.ones(3, 1), torch.tensor([[0.], [1.], [-2.]]), torch.full((3, 1), 4.))

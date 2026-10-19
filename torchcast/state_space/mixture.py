@@ -4,16 +4,17 @@ Mixture-of-regimes support for state-space models.
 A measure can have one or more :class:`MixtureComponent` alternatives to its standard measurement model. Each
 component is an *offset* from the standard regime: in the component's regime, an observation is the usual
 (state-dependent) measured-mean plus the component's learned offset, with its learned variance added to the
-measurement-noise. So e.g. a "quick visit" component means "spend well below *this* player's usual level", rather
-than below some global level. Observations in a component's regime still update the state (accounting for the
-offset and the extra noise).
+measurement-noise. This is particularly useful for rare outliers with a clear data-generating process (e.g. forecasting
+the activity of customers who usually have long visits but occasionally have very short ones), especially when
+forecasting with data-transformations that make these outliers problematic in the back-transform (e.g. if the customer
+duration data was log1p transformed, an outlier will increase the variance and so lead to implausibly large
+back-transformed forecasts).
 
-The :class:`MixtureModel` owns the components and enumerates a fixed table of regime "combos" -- one entry per
-combination of regimes across the mixture measures (the standard regime, or one of that measure's components). Regime
-probabilities are tracked jointly over this table.
+The :class:`MixtureModel` owns the components. Multivariate support is accomplished by enumerating the possible "combos"
+ of regimes (e.g. [(measure1=standard, measure2=standard), (measure1=weird, measure2=standard), ...] and so on). Regime
+probabilities are tracked jointly over this table, allowing p(measure_x=weird) to vary over time and across groups.
 """
 import itertools
-from dataclasses import dataclass
 from typing import Optional, Sequence, Mapping
 
 import torch
@@ -21,11 +22,13 @@ import torch
 
 class MixtureComponent(torch.nn.Module):
     """
-    An alternative ('weird') regime for a single measure: an offset from the standard regime's (state-dependent)
-    measured-mean, with a learnable offset, extra variance (added to the measurement-noise variance), and base-rate.
+    An alternative ('weird') regime for a single measure: a learned offset from the usual state-mean, and a learned
+    increase in measurement noise.
 
     :param measure: The measure this component applies to.
-    :param offset_init: Initial value for the component's offset, relative to the standard regime's measured-mean.
+    :param offset_init: Initial value for the component's offset, relative to the standard regime's measured-mean. For
+     example, if you know you're tracking anomalously low values, you can pick a value several standard-deviations
+     below the global average).
     :param prob_init: Initial value for the component's base-rate, i.e. the long-run probability that an observation
      for ``measure`` comes from this component (exact when it's the only component for this measure). With
      ``predictors``, this is the base-rate when the predictors are zero.
@@ -431,49 +434,3 @@ class MixtureModel(torch.nn.Module):
                 k = self.mixture_measures.index(measure)
                 mask[:, j] = torch.as_tensor([float(combo[k] is None) for combo in self.combos])
         return regime_probs @ mask
-
-
-@dataclass
-class MixtureOfNormals:
-    """
-    A batch of univariate mixtures of normals: the predictive distribution of a single measure with mixture components.
-    The last dimension of each tensor indexes the mixture's components; the first is the standard regime. (Each
-    component's mean and variance are the standard regime's plus that component's offset and extra variance.)
-
-    For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
-    then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.
-
-    :param labels: A name for each component (``'standard'``, then the :class:`MixtureComponent` ids).
-    :param probs: The probability of each component.
-    :param means: The mean of each component.
-    :param vars: The variance of each component.
-    """
-    labels: list
-    probs: torch.Tensor
-    means: torch.Tensor
-    vars: torch.Tensor
-
-    def mean(self) -> torch.Tensor:
-        return (self.probs * self.means).sum(-1)
-
-    def var(self) -> torch.Tensor:
-        return (self.probs * (self.vars + self.means ** 2)).sum(-1) - self.mean() ** 2
-
-    def cdf(self, value: torch.Tensor) -> torch.Tensor:
-        z = (value.unsqueeze(-1) - self.means) / self.vars.sqrt()
-        return (self.probs * torch.special.ndtr(z)).sum(-1)
-
-    def quantile(self, q: float, num_iter: int = 60) -> torch.Tensor:
-        """
-        The ``q``-th quantile, found by bisection on the cdf.
-        """
-        assert 0 < q < 1
-        sd = self.vars.sqrt()
-        lower = (self.means - 10 * sd).min(-1).values
-        upper = (self.means + 10 * sd).max(-1).values
-        for _ in range(num_iter):
-            mid = (lower + upper) / 2
-            below = self.cdf(mid) < q
-            lower = torch.where(below, mid, lower)
-            upper = torch.where(below, upper, mid)
-        return (lower + upper) / 2

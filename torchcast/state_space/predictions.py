@@ -17,7 +17,7 @@ from .transforms import Transform, _IdentityTransform
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
-    from .mixture import MixtureModel, MixtureOfNormals
+    from .mixture import MixtureModel
     from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
@@ -871,7 +871,8 @@ class Predictions:
         observations = observations.view(num_samples, self.num_groups, self.num_timesteps, len(measures))
         values = {m: observations[..., j] for j, m in enumerate(measures)}
         for m, t in transforms.items():
-            _warn_bias_adjust_ignored(t)
+            if t.bias_adjust is not None:
+                warn(f"`{type(t).__name__}(bias_adjust=...)` is ignored for `derived`.")
             values[m] = t.inverse(values[m])
 
         # the functions are also applied to the actuals (as a batch of one sample), if there's a dataset. measures that
@@ -1263,7 +1264,6 @@ class Predictions:
         :param standard_mean: A ``(num_groups, num_timesteps)`` tensor with the mean of the standard regime.
         :param standard_var: A ``(num_groups, num_timesteps)`` tensor with the variance of the standard regime.
         """
-        from .mixture import MixtureOfNormals
 
         if self.mixture is None or measure not in self.mixture.mixture_measures:
             raise ValueError(f"'{measure}' has no mixture components.")
@@ -1805,6 +1805,52 @@ class PredictionSamples:
 
 
 @dataclass
+class MixtureOfNormals:
+    """
+    A batch of univariate mixtures of normals: the predictive distribution of a single measure with mixture components.
+    The last dimension of each tensor indexes the mixture's components; the first is the standard regime. (Each
+    component's mean and variance are the standard regime's plus that component's offset and extra variance.)
+
+    For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
+    then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.
+
+    :param labels: A name for each component (``'standard'``, then the :class:`MixtureComponent` ids).
+    :param probs: The probability of each component.
+    :param means: The mean of each component.
+    :param vars: The variance of each component.
+    """
+    labels: list
+    probs: torch.Tensor
+    means: torch.Tensor
+    vars: torch.Tensor
+
+    def mean(self) -> torch.Tensor:
+        return (self.probs * self.means).sum(-1)
+
+    def var(self) -> torch.Tensor:
+        return (self.probs * (self.vars + self.means ** 2)).sum(-1) - self.mean() ** 2
+
+    def cdf(self, value: torch.Tensor) -> torch.Tensor:
+        z = (value.unsqueeze(-1) - self.means) / self.vars.sqrt()
+        return (self.probs * torch.special.ndtr(z)).sum(-1)
+
+    def quantile(self, q: float, num_iter: int = 60) -> torch.Tensor:
+        """
+        The ``q``-th quantile, found by bisection on the cdf.
+        """
+        assert 0 < q < 1
+        sd = self.vars.sqrt()
+        lower = (self.means - 10 * sd).min(-1).values
+        upper = (self.means + 10 * sd).max(-1).values
+        for _ in range(num_iter):
+            mid = (lower + upper) / 2
+            below = self.cdf(mid) < q
+            lower = torch.where(below, mid, lower)
+            upper = torch.where(below, upper, mid)
+        return (lower + upper) / 2
+
+
+@dataclass
 class DatasetMetadata:
     group_names: Optional[Sequence[str]]
     start_offsets: Optional[np.ndarray]
@@ -1829,12 +1875,6 @@ class DatasetMetadata:
             group_colname=self.group_colname,
             time_colname=self.time_colname
         )
-
-
-def _warn_bias_adjust_ignored(transform: 'Transform') -> None:
-    if transform.bias_adjust is not None:
-        warn(f"`{type(transform).__name__}(bias_adjust=...)` is ignored for `derived` (the mean is the "
-             f"mean of back-transformed samples).")
 
 
 def _log_lik(resid: torch.Tensor, cov: torch.Tensor, monte_carlo: bool) -> torch.Tensor:
