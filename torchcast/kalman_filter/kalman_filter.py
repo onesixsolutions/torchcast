@@ -67,6 +67,10 @@ class KalmanFilter(StateSpaceModel):
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
         self.joseph_form = joseph_form
 
+    def __setstate__(self, state: dict):
+        state.setdefault('joseph_form', True)  # (missing in models pickled before it existed)
+        super().__setstate__(state)
+
     def _predict_cov(self,
                      cov: torch.Tensor,
                      transition_mat: torch.Tensor,
@@ -149,7 +153,7 @@ class KalmanFilter(StateSpaceModel):
         The kalman-filter update equations. ``measured_cov`` (P @ H.T) and ``system_cov`` (H @ P @ H.T + R) can be
         passed if already computed. ``joseph=False`` uses the simpler covariance update ``P - K @ H @ P`` instead of
         the Joseph form: less memory and compute, but less numerically robust. Defaults to the model's
-        ``joseph_form`` (the Joseph form, if not set).
+        ``joseph_form``.
 
         The tensors can have any number of leading batch-dimensions (``(G, ...)`` as usual, or e.g. ``(E, G, ...)``
         for the mixture update's regime-combos), and broadcast against each other.
@@ -162,7 +166,7 @@ class KalmanFilter(StateSpaceModel):
         K = self._kalman_gain(measured_cov=measured_cov, system_cov=system_cov)
         new_mean = self._mean_update(mean=mean, K=K, resid=resid)
         if joseph is None:
-            joseph = getattr(self, 'joseph_form', True)
+            joseph = self.joseph_form
         if joseph:
             new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
         else:
@@ -220,34 +224,34 @@ class KalmanFilter(StateSpaceModel):
 
         # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
         # updated together, along a leading combo-dimension; tensors that don't depend on the combo broadcast.
-        offsets = [self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective]
-        shift = torch.stack([o[0] for o in offsets]).unsqueeze(1)  # (num_effective, 1, num_measures)
-        extra_cov = torch.diag_embed(torch.stack([o[1] for o in offsets])).unsqueeze(1)  # (num_effective, 1, M, M)
+        shifts, extra_vars = zip(*(
+            self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective
+        ))
+        shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
+        extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)
         measured_cov = cov @ measure_mat.transpose(-1, -2)
         system_cov = measure_mat @ measured_cov + measure_cov + extra_cov  # (num_effective, G, M, M)
-        update_kwargs = dict(
-            input=input - shift,
-            mean=mean,
-            cov=cov,
-            measured_mean=measured_mean,
-            measure_mat=measure_mat,
-            measure_cov=measure_cov + extra_cov,
-            measured_cov=measured_cov,
-            system_cov=system_cov,
-        )
+        combo_input = input - shift  # (num_effective, G, M)
+        combo_measure_cov = measure_cov + extra_cov  # (num_effective, G, M, M)
         # the standard combo (the first) uses the model's covariance-update; the others, the mixture's:
-        standard_joseph = getattr(self, 'joseph_form', True)
-        mixture_joseph = getattr(self.mixture, 'joseph_form', True)  # (missing in older pickles)
-        if standard_joseph == mixture_joseph:
-            states = self._kalman_update(**update_kwargs, joseph=standard_joseph)
+        if self.joseph_form == self.mixture.joseph_form:
+            groups = [(slice(None), self.joseph_form)]
         else:
-            def combos(idx: slice) -> dict:
-                combo_dependent = ('input', 'measure_cov', 'system_cov')
-                return {k: (v[idx] if k in combo_dependent else v) for k, v in update_kwargs.items()}
-
-            standard = self._kalman_update(**combos(slice(0, 1)), joseph=standard_joseph)
-            others = self._kalman_update(**combos(slice(1, None)), joseph=mixture_joseph)
-            states = StateTuple(torch.cat([standard.mean, others.mean]), torch.cat([standard.cov, others.cov]))
+            groups = [(slice(0, 1), self.joseph_form), (slice(1, None), self.mixture.joseph_form)]
+        states = [
+            self._kalman_update(
+                input=combo_input[idx],
+                mean=mean,
+                cov=cov,
+                measured_mean=measured_mean,
+                measure_mat=measure_mat,
+                measure_cov=combo_measure_cov[idx],
+                measured_cov=measured_cov,
+                system_cov=system_cov[idx],
+                joseph=joseph,
+            )
+            for idx, joseph in groups
+        ]
         log_liks = mvnorm_log_prob(
             resid=(input - shift - measured_mean)[..., score_idx],
             cov=system_cov[..., score_idx.unsqueeze(-1), score_idx.unsqueeze(0)]
@@ -256,18 +260,19 @@ class KalmanFilter(StateSpaceModel):
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + log_liks[:, mapping]
         regime_post = torch.softmax(log_post, -1)
-        return self._mix_updates(
-            means=states.mean,
-            covs=states.cov,
+        means, covs = zip(*states)  # (a StateTuple iterates as (mean, cov))
+        return self._collapse_states(
+            means=means[0] if len(means) == 1 else torch.cat(means),
+            covs=covs[0] if len(covs) == 1 else torch.cat(covs),
             regime_post=regime_post,
             mapping=mapping,
         )
 
     @staticmethod
-    def _mix_updates(means: torch.Tensor,
-                     covs: torch.Tensor,
-                     regime_post: torch.Tensor,
-                     mapping: torch.Tensor) -> 'StateTuple':
+    def _collapse_states(means: torch.Tensor,
+                         covs: torch.Tensor,
+                         regime_post: torch.Tensor,
+                         mapping: torch.Tensor) -> 'StateTuple':
         """
         Collapse a mixture of gaussian states into a single gaussian via moment-matching.
 
@@ -282,7 +287,15 @@ class KalmanFilter(StateSpaceModel):
         to = {'dtype': regime_post.dtype, 'device': regime_post.device}
         weights = torch.zeros((regime_post.shape[0], means.shape[0]), **to)
         weights = weights.index_add(1, mapping.to(regime_post.device), regime_post)  # (G, num_effective)
+        # the mixture's mean is the probability-weighted average of the states' means:
+        #   new_mean[g] = sum over e of weights[g, e] * means[e, g]
+        # (einsum's notation: g = group, e = effective combo, s = state-element; e is summed over since it's not in
+        # the output. same as `(weights.T[..., None] * means).sum(0)`, without the (E, G, S) intermediate product.)
         new_mean = torch.einsum('ge,egs->gs', weights, means)
+        # its covariance is the weighted average of each state's covariance plus the outer product of its offset from
+        # the mixture's mean (the law of total variance):
+        #   new_cov[g] = sum over e of weights[g, e] * (covs[e, g] + diff[e, g] diff[e, g]^T)
+        # (here the einsum avoids a second (E, G, S, S) intermediate, which matters: this runs every update step.)
         diff = means - new_mean
         new_cov = torch.einsum('ge,egij->gij', weights, covs + diff.unsqueeze(-1) * diff.unsqueeze(-2))
         return StateTuple(mean=new_mean, cov=new_cov, regime_probs=regime_post)
@@ -371,7 +384,7 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
         ,
         measures=measures,
         mixture=[
-            MixtureComponent(measure='dim1', mean_init=-5, prob_init=0.1, id='dim1_low'),
+            MixtureComponent(measure='dim1', offset_init=-5, prob_init=0.1, id='dim1_low'),
         ]
     )
 

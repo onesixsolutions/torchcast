@@ -61,6 +61,9 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   `Transform.noise_nodes()` (a different noise distribution).
 - `RegimeTransform(standard, components={component_id: Transform})` chooses how each regime of a mixture measure is
   back-transformed, e.g. `components={'quick': LogTransform(bias_adjust=0)}`.
+- `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
+  `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`. `Transform` subclasses
+  now implement `transform()` (the forward transformation) as well as `inverse()`.
 
 ### New feature: sampling predictions, and derived quantities
 

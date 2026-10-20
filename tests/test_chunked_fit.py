@@ -62,8 +62,8 @@ def _make_model(variant: str = 'kf') -> KalmanFilter:
         measure_covariance=measure_covariance,
         adaptive_scaling=variant in ('adaptive', 'mixture_adaptive'),
         mixture=[
-            MixtureComponent(measure='y1', mean_init=-4., prob_init=.2, id='y1_low', predictors=['p1']),
-            MixtureComponent(measure='y2', mean_init=4., prob_init=.1, id='y2_high'),
+            MixtureComponent(measure='y1', offset_init=-4., prob_init=.2, id='y1_low', predictors=['p1']),
+            MixtureComponent(measure='y2', offset_init=4., prob_init=.1, id='y2_high'),
         ] if variant.startswith('mixture') else None,
         measure_funs={'y2': 'sigmoid'} if variant == 'sigmoid' else None,
     )
@@ -134,7 +134,7 @@ def test_chunked_fit():
 
 
 def test_chunked_laplace(monkeypatch):
-    from torchcast.state_space import state_space
+    from torchcast.state_space import chunking  # (where the hessians are computed)
 
     hessians = []
 
@@ -142,8 +142,8 @@ def test_chunked_laplace(monkeypatch):
         hessians.append(hessian(*args, **kwargs))
         return hessians[-1]
 
-    hessian = state_space.hessian
-    monkeypatch.setattr(state_space, 'hessian', _hessian)
+    hessian = chunking.hessian
+    monkeypatch.setattr(chunking, 'hessian', _hessian)
 
     y, X, start_offsets, weights = _make_data()
     model = _make_model()

@@ -179,10 +179,10 @@ def test_mc_predictions_match_quadrature():
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
     # small measurement-noise, so that the monte-carlo error in the mean is dominated by the (pinned) state samples:
     kf.measure_covariance.cholesky_log_diag.fill_(math.log(.05))
-    kf.mc_sampling = _white_noise(20_000)
+    kf.mc_sampling = _white_noise(50)  # (only for the log-prob; outputs use `num_samples`)
     y = torch.rand(3, 8, 1) * .6 + .2
     pred = kf(y)
-    df = pred.to_dataframe(conf=.9, use_map=False)
+    df = pred.to_dataframe(conf=.9, use_map=False, num_samples=20_000)
 
     z_mean, z_var = _linear_moments(pred, 0)
     r = pred.measure_covs_flat[:, 0, 0].double()
@@ -256,13 +256,13 @@ def _sigmoid_mixture_kf(num_samples: int = 20_000, process_var_multi: Optional[f
         processes=[LocalLevel(id='level')],
         measures=['y'],
         measure_funs={'y': 'sigmoid'},
-        mixture=[MixtureComponent(measure='y', mean_init=_COMPONENT_OFFSET, prob_init=.2, id='low')],
+        mixture=[MixtureComponent(measure='y', offset_init=_COMPONENT_OFFSET, prob_init=.2, id='low')],
     )
     with torch.no_grad():
         kf.measure_covariance.cholesky_log_diag.fill_(math.log(.05))
         if process_var_multi is not None:
             kf.process_covariance.cholesky_log_diag.fill_(math.log(process_var_multi))
-        kf.mixture.components[0]._log_std.fill_(math.log(_COMPONENT_SD))
+        kf.mixture.components[0]._log_extra_std.fill_(math.log(_COMPONENT_SD))
     kf.mc_sampling = _white_noise(num_samples)
     return kf
 
@@ -311,7 +311,7 @@ def test_mixture_nonlinear_log_prob_matches_quadrature():
         pred = kf(y)
         pred.log_prob(y).sum().backward()
     component = kf.mixture.components[0]
-    for param in (component.mean, component._log_std, component.logit):
+    for param in (component.offset, component._log_extra_std, component.logit):
         assert param.grad is not None and param.grad.abs() > 0
 
 
@@ -363,7 +363,7 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(df_map['lower'].values, df['lower'].values)
 
     # with a transform, the draws are back-transformed (so the mean is E[exp(Y)] under the mixture):
-    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform())
+    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=False)
     standard_exp = _gauss_hermite_expectation(lambda z: torch.exp(torch.sigmoid(z.clamp(-8, 8))), z_mean, z_var)
     expected_exp = standard_exp * (
         probs[:, 0] * torch.exp(r / 2) +
@@ -372,17 +372,33 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(df_exp['mean'].values, expected_exp.numpy(), atol=.005)
     assert np.allclose(df_exp['lower'].values, np.exp(df['lower'].values), rtol=1e-5)
 
-    # each regime's mean uses its own transform (`Transform.for_regime`): here, a component-transform whose noise is a
-    # single node at -10 (standard-deviations), so its back-transformed mean is
-    # E[exp(sigmoid(Z))] * exp(mu - 10 * sqrt(R + sigma^2)):
-    from torchcast.state_space import RegimeTransform, SmearingTransform
-    rt = RegimeTransform(LogTransform(), components={'low': SmearingTransform(LogTransform(), torch.tensor([-10.]))})
-    df_rt = pred.to_dataframe(conf=.9, transform=rt)
-    expected_rt = standard_exp * (
-        probs[:, 0] * torch.exp(r / 2) +
+    # ... with `use_map`, the measure is treated as linear, with the linearized moments: per regime, the lognormal
+    # mean exp(m + v/2), with m = sigmoid(z_mean) (+ offset) and v = sigmoid'(z_mean)^2 * z_var + r (+ component var):
+    p_map = torch.sigmoid(z_mean.double())
+    lin_var = (p_map * (1 - p_map)) ** 2 * z_var.double() + r
+    expected_map_exp = (
+        probs[:, 0] * torch.exp(p_map + lin_var / 2) +
+        probs[:, 1] * torch.exp(p_map + _COMPONENT_OFFSET + (lin_var + _COMPONENT_SD ** 2) / 2)
+    )
+    df_map_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=True)
+    assert np.allclose(df_map_exp['mean'].values, expected_map_exp.numpy(), rtol=1e-4)
+    assert np.array_equal(df_map_exp['lower'].values, df_exp['lower'].values)  # (intervals: monte-carlo either way)
+    # ... and `bias_adjust=0` gives the plug-in exp(MAP):
+    df_plugin = pred.to_dataframe(conf=False, transform=LogTransform(bias_adjust=0), use_map=True)
+    expected_plugin = probs[:, 0] * torch.exp(p_map) + probs[:, 1] * torch.exp(p_map + _COMPONENT_OFFSET)
+    assert np.allclose(df_plugin['mean'].values, expected_plugin.numpy(), rtol=1e-4)
+
+    # the transform's noise-distribution is used for every regime, each with its own variance: here, a single node at
+    # -10 (standard-deviations), so each regime's back-transformed mean is
+    # E[exp(sigmoid(Z))] * exp(offset - 10 * sqrt(R + extra_var)):
+    from torchcast.state_space import SmearingTransform
+    smear = SmearingTransform(LogTransform(), torch.tensor([-10.]))
+    df_smear = pred.to_dataframe(conf=.9, transform=smear, use_map=False)
+    expected_smear = standard_exp * (
+        probs[:, 0] * torch.exp(-10 * r.sqrt()) +
         probs[:, 1] * torch.exp(_COMPONENT_OFFSET - 10 * (r + _COMPONENT_SD ** 2).sqrt())
     )
-    assert np.allclose(df_rt['mean'].values, expected_rt.numpy(), atol=.005)
+    assert np.allclose(df_smear['mean'].values, expected_smear.numpy(), atol=.005)
 
 
 @torch.no_grad()
@@ -420,14 +436,14 @@ def test_binomial_mixture_with_nonlinear_process():
         ],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
-        mixture=MixtureModel([MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')]),
+        mixture=MixtureModel([MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')]),
     )
     bf.mc_sampling = _white_noise(50)
     pred = bf(y, X=X)
     lp = pred.log_prob(y)
     assert torch.isfinite(lp).all()
     lp.sum().backward()
-    assert bf.mixture.components[0].mean.grad.abs() > 0
+    assert bf.mixture.components[0].offset.grad.abs() > 0
 
     with torch.no_grad():
         df = pred.to_dataframe(conf=.9, transform={'spend': LogTransform()})
@@ -476,7 +492,7 @@ def test_mixture_nonlinear_multivariate_negligible():
         kf.mc_sampling = _white_noise(200)
         return kf
 
-    kf_mix = make([MixtureComponent(measure='b', mean_init=-3., prob_init=.1, id='low')])
+    kf_mix = make([MixtureComponent(measure='b', offset_init=-3., prob_init=.1, id='low')])
     with torch.no_grad():
         kf_mix.mixture.components[0].logit.fill_(-40.)
     kf = make(None)
@@ -484,3 +500,32 @@ def test_mixture_nonlinear_multivariate_negligible():
     lp_mix = kf_mix(y, X=X).log_prob(y)
     lp = kf(y, X=X).log_prob(y)
     assert torch.allclose(lp_mix, lp, atol=1e-4)
+
+
+@torch.no_grad()
+def test_output_samples_separate_from_mc_sampling():
+    """
+    Sample-based outputs use `num_samples` draws with a fixed seed -- not the model's `mc_sampling`, which is only for
+    the log-prob. `derived` doesn't depend on whether intervals are computed.
+    """
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        measure_funs={'a': 'sigmoid'},
+    )
+    y = torch.rand(3, 8, 2) * .6 + .2
+    derived = {'total': lambda s: s['a'] + s['b']}
+    dfs = {}
+    for mc in (50, 300):
+        kf.mc_sampling = _white_noise(mc)
+        pred = kf(y)
+        dfs[mc] = pred.to_dataframe(conf=.9, use_map=False, derived=derived)
+    for col in ('mean', 'lower', 'upper'):
+        assert np.array_equal(dfs[50][col].values, dfs[300][col].values)
+
+    df_small = pred.to_dataframe(conf=.9, use_map=False, derived=derived, num_samples=100)
+    assert not np.allclose(df_small['upper'].values, dfs[50]['upper'].values)
+
+    df_means = pred.to_dataframe(conf=False, use_map=False, derived=derived)
+    assert np.array_equal(df_means['mean'].values, dfs[50]['mean'].values)

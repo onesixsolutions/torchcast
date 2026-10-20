@@ -12,7 +12,7 @@ from torchcast.state_space import Transform, LogTransform, BoxCoxTransform, Mixt
 
 class _QuadratureLog(LogTransform):
     # forces the (default) gauss-hermite path, for comparison with the closed-form
-    expected_inverse = Transform.expected_inverse
+    _expected_inverse = Transform._expected_inverse
 
 
 def test_inverse_mean():
@@ -32,6 +32,15 @@ def test_inverse_mean():
     assert torch.allclose(BoxCoxTransform(.5).inverse_mean(mean, var), (.5 * mean + 1) ** 2 + .25 * var, rtol=1e-5)
     with pytest.raises(ValueError, match="non-negative"):
         BoxCoxTransform(-.1)
+
+    # the quadrature is computed in chunks (to bound memory), which doesn't change the result -- incl. for inputs that
+    # broadcast (here: (7, 4) means, (4,) variances):
+    means = mean + torch.randn(7, 4, dtype=torch.float64)
+    one_chunk = BoxCoxTransform(.5).inverse_mean(means, var)
+    many_chunks = BoxCoxTransform(.5)
+    many_chunks.max_quadrature_size = 3 * many_chunks.num_nodes  # (3 elements per chunk)
+    assert torch.equal(many_chunks.inverse_mean(means, var), one_chunk)
+    assert one_chunk.shape == (7, 4)
 
 
 @torch.no_grad()
@@ -83,7 +92,7 @@ def test_to_dataframe_transform_mixture():
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-3., prob_init=.1, id='low')]
+        mixture=[MixtureComponent(measure='y', offset_init=-3., prob_init=.1, id='low')]
     )
     y = torch.randn(3, 10, 1) * .3 + 2
     y[:, 4] = -3.
@@ -146,8 +155,6 @@ def test_to_dataframe_transform_nonlinear_gaussian():
 
 @torch.no_grad()
 def test_samples_to_dataframe():
-    from torchcast.state_space.predictions import _quantile
-
     torch.manual_seed(0)
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['a'])
     pred = kf(torch.randn(2, 5, 1))
@@ -158,8 +165,6 @@ def test_samples_to_dataframe():
     assert np.allclose(df['lower'].values, torch.quantile(samples, .1, dim=0).reshape(-1).numpy(), atol=1e-6)
     assert np.allclose(df['upper'].values, torch.quantile(samples, .9, dim=0).reshape(-1).numpy(), atol=1e-6)
     assert (df['actual'] == 0).all()
-    for q in (.025, .5, .975):
-        assert torch.allclose(_quantile(samples, q), torch.quantile(samples, q, dim=0), atol=1e-6)
     with pytest.raises(ValueError, match="shape"):
         pred.samples_to_dataframe({'thing': torch.randn(10, 2, 4)})
 
@@ -176,6 +181,11 @@ def test_bias_adjust():
     assert torch.allclose(_QuadratureLog(bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
     assert torch.allclose(BoxCoxTransform(0, bias_adjust=.5).inverse_mean(mean, var), torch.exp(mean + .25 * var))
     assert torch.allclose(BoxCoxTransform(.5, bias_adjust=0).inverse_mean(mean, var), BoxCoxTransform(.5).inverse(mean))
+    # `adjust_bias=False` ignores it (e.g. for monte-carlo means):
+    unadjusted = LogTransform(bias_adjust=0).inverse_mean(mean, var, adjust_bias=False)
+    assert torch.allclose(unadjusted, torch.exp(mean + var / 2))
+    assert torch.allclose(_QuadratureLog(bias_adjust=0).inverse_mean(mean, var, adjust_bias=False),
+                          torch.exp(mean + var / 2), rtol=1e-6)
     with pytest.raises(ValueError, match="between 0 and 1"):
         LogTransform(bias_adjust=1.5)
 
@@ -191,7 +201,11 @@ def test_bias_adjust():
 
 
 @torch.no_grad()
-def test_bias_adjust_warns_for_monte_carlo():
+def test_bias_adjust_monte_carlo():
+    """
+    `bias_adjust` also applies to monte-carlo means: it scales the variance of both the sampled state and the noise,
+    so 0 gives the plug-in inverse(g(MAP)) (like `use_map=True`), and 1 the usual monte-carlo mean.
+    """
     import warnings
 
     torch.manual_seed(1)
@@ -212,12 +226,32 @@ def test_bias_adjust_warns_for_monte_carlo():
     expected = torch.exp(mean[:, 1] + .5 * cov[:, 1, 1] / 2)
     assert np.allclose(df.query("measure == 'spend'")['mean'].values, expected.reshape(-1).numpy(), rtol=1e-5)
 
-    # a measure with a nonlinear measured-mean uses monte-carlo, where it's ignored:
+    # a nonlinear measure's mean is monte-carlo (with use_map=False), where it scales the state's variance too:
     kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], measure_funs={'y': 'sigmoid'})
     kf.mc_sampling = 50
     pred = kf(torch.rand(2, 8, 1))
+
+    def means(bias_adjust, use_map=False) -> np.ndarray:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error', message='.*bias_adjust.*')
+            return pred.get_means(transform=LogTransform(bias_adjust=bias_adjust), use_map=use_map)[..., 0].numpy()
+
+    plug_in = torch.exp(pred._measured_moments_flat()[0][:, 0]).view(2, 8).numpy()  # exp(sigmoid(MAP))
+    assert np.allclose(means(0), plug_in, rtol=1e-6)
+    assert np.allclose(means(0, use_map=True), plug_in, rtol=1e-6)
+    assert np.array_equal(means(1), means(None))
+    assert (means(0) < means(.5)).all() and (means(.5) < means(1)).all()
+    # each measure's own `bias_adjust` (only its own deviations are scaled):
+    kf2 = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'], measures=['a', 'b'],
+                       measure_funs={'a': 'sigmoid', 'b': 'sigmoid'})
+    kf2.mc_sampling = 50
+    pred2 = kf2(torch.rand(2, 8, 2))
+    both = pred2.get_means(transform={'a': LogTransform(bias_adjust=0), 'b': LogTransform()}, use_map=False)
+    assert torch.allclose(both[..., 0], torch.exp(pred2._measured_moments_flat()[0][:, 0]).view(2, 8), rtol=1e-6)
+    assert torch.equal(both[..., 1], pred2.get_means(transform=LogTransform(), use_map=False)[..., 1])
+    # (`derived` back-transforms samples, so it's ignored there:)
     with pytest.warns(UserWarning, match="bias_adjust"):
-        pred.to_dataframe(transform=LogTransform(bias_adjust=.5), use_map=True)
+        pred.to_dataframe(transform=LogTransform(bias_adjust=.5), use_map=False, derived={'z': lambda s: s['y']})
 
 
 @torch.no_grad()
@@ -294,10 +328,10 @@ def _smearing_mixture_kf(component_sd: float) -> KalmanFilter:
     kf = KalmanFilter(
         processes=[LocalLevel(id='level')],
         measures=['y'],
-        mixture=[MixtureComponent(measure='y', mean_init=-4., prob_init=.1, id='low')],
+        mixture=[MixtureComponent(measure='y', offset_init=-4., prob_init=.1, id='low')],
     )
     with torch.no_grad():
-        kf.mixture.components[0]._log_std.fill_(math.log(component_sd))
+        kf.mixture.components[0]._log_extra_std.fill_(math.log(component_sd))
     return kf
 
 
@@ -312,57 +346,52 @@ def _smearing_mixture_y() -> tuple[torch.Tensor, torch.Tensor]:
 @torch.no_grad()
 def test_smearing_mixture():
     """
-    For a mixture measure, each regime is smeared with its own residuals, weighted by P(regime | observation).
+    For a mixture measure, each regime is smeared with its own residuals: each observation's standardized by that
+    regime's moments, weighted by P(regime | observation).
     """
-    from torchcast.state_space import SmearingTransform, RegimeTransform
+    from torchcast.state_space import SmearingTransform
 
     y, is_low = _smearing_mixture_y()
     pred = _smearing_mixture_kf(component_sd=.1)(y)
     mix = pred.get_mixture('y')
     smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y', num_nodes=1000)
-    assert isinstance(smear, RegimeTransform)
-    standard, low = smear.standard, smear.components['low']
-    assert smear.for_regime('low') is low
+    assert set(smear.component_residuals) == {'low'}
+    low = smear.component_residuals['low']
 
     # posterior regime-probabilities given each observation:
     obs = y[..., 0]
     lik = torch.distributions.Normal(mix.means, mix.vars.sqrt()).log_prob(obs.unsqueeze(-1)).exp()
     post = mix.probs * lik / (mix.probs * lik).sum(-1, keepdim=True)
+    residuals = (obs.unsqueeze(-1) - mix.means) / mix.vars.sqrt()
 
     # standard regime: (fewer residuals than nodes, so they're used directly, in order)
-    assert torch.allclose(standard.residuals, ((obs - mix.means[..., 0]) / mix.vars[..., 0].sqrt()).reshape(-1),
-                          atol=1e-5)
-    assert torch.allclose(standard.weights, (post[..., 0] / post[..., 0].sum()).reshape(-1), atol=1e-6)
+    assert torch.allclose(smear.residuals, residuals[..., 0].reshape(-1), atol=1e-5)
+    assert torch.allclose(smear.weights, (post[..., 0] / post[..., 0].sum()).reshape(-1), atol=1e-6)
     # ...where the outliers get ~no weight in total, though they're ~15% of observations:
-    assert standard.weights[is_low.reshape(-1)].sum() < .05
-
-    # the component's regime: standardized by its own moments (the standard regime's plus the component's offset and
-    # extra variance), and weighted by P(low | y):
-    assert torch.allclose(low.residuals, ((obs - mix.means[..., 1]) / mix.vars[..., 1].sqrt()).reshape(-1), atol=1e-5)
+    assert smear.weights[is_low.reshape(-1)].sum() < .05
+    # the component's regime: standardized by its own moments, and weighted by P(low | y):
+    assert torch.allclose(low.residuals, residuals[..., 1].reshape(-1), atol=1e-5)
     assert torch.allclose(low.weights, (post[..., 1] / post[..., 1].sum()).reshape(-1), atol=1e-6)
     # ...where the standard observations get ~no weight in total:
     assert low.weights[~is_low.reshape(-1)].sum() < .05
 
+    # each regime's mean uses its own residuals:
     df = pred.to_dataframe(transform=smear)
     expected = (
-        mix.probs[..., 0] * standard.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
+        mix.probs[..., 0] * smear.inverse_mean(mix.means[..., 0], mix.vars[..., 0]) +
         mix.probs[..., 1] * low.inverse_mean(mix.means[..., 1], mix.vars[..., 1])
     )
     assert np.allclose(df['mean'].values, expected.reshape(-1).numpy(), rtol=1e-4)
-
-    # choosing per regime:
-    rt = RegimeTransform(standard=LogTransform(), components={'low': LogTransform(bias_adjust=0)})
-    df_rt = pred.to_dataframe(transform=rt)
-    expected_rt = (
-        mix.probs[..., 0] * torch.exp(mix.means[..., 0] + mix.vars[..., 0] / 2) +
-        mix.probs[..., 1] * torch.exp(mix.means[..., 1])
+    assert torch.equal(
+        smear.inverse_mean(mix.means[..., 1], mix.vars[..., 1], regime='low'),
+        low.inverse_mean(mix.means[..., 1], mix.vars[..., 1]),
     )
-    assert np.allclose(df_rt['mean'].values, expected_rt.reshape(-1).numpy(), rtol=1e-5)
-    with pytest.raises(ValueError, match="aren't its"):
-        pred.to_dataframe(transform=RegimeTransform(LogTransform(), components={'nope': LogTransform()}))
-    # a SmearingTransform on its own leaves components gaussian (its base):
+    # (a SmearingTransform without its own residuals for a component uses the standard ones:)
     single = SmearingTransform(LogTransform(), torch.randn(50))
-    assert single.for_regime('low') is single.base
+    assert torch.equal(
+        single.inverse_mean(mix.means[..., 1], mix.vars[..., 1], regime='low'),
+        single.inverse_mean(mix.means[..., 1], mix.vars[..., 1]),
+    )
 
 
 @torch.no_grad()
@@ -371,7 +400,7 @@ def test_smearing_large_component_variance():
     The motivating failure: a component with a large (learned) variance has a huge lognormal mean, which dominates the
     mixed mean. Smearing the component's regime with the residuals attributed to it keeps it near those observations.
     """
-    from torchcast.state_space import SmearingTransform, RegimeTransform
+    from torchcast.state_space import SmearingTransform
 
     y, is_low = _smearing_mixture_y()
     pred = _smearing_mixture_kf(component_sd=3.)(y)
@@ -380,14 +409,14 @@ def test_smearing_large_component_variance():
     assert (lognormal_low[:, 10:] > 20).all()  # (vs. 'quick visits' of ~exp(-1), and typical visits of ~exp(3))
 
     smear = SmearingTransform.from_predictions(LogTransform(), pred, y, 'y')
-    smeared_low = smear.for_regime('low').inverse_mean(mix.means[..., 1], mix.vars[..., 1])
+    smeared_low = smear.inverse_mean(mix.means[..., 1], mix.vars[..., 1], regime='low')
     # (bounded by the observations; well above the quick visits' ~exp(-1) because this unfitted component is so broad
     # that the standard observations get substantial posterior weight in it)
     assert (smeared_low < y.exp().max()).all()
     assert (smeared_low < lognormal_low / 3).all()
-    # vs. smearing only the standard regime (the component lognormal):
+    # vs. smearing every regime with the standard regime's residuals:
     df_smear = pred.to_dataframe(transform=smear)
-    df_standard_only = pred.to_dataframe(transform=RegimeTransform(smear.standard, components={'low': LogTransform()}))
+    df_standard_only = pred.to_dataframe(transform=SmearingTransform(LogTransform(), smear.residuals, smear.weights))
     assert (df_smear['mean'].values < df_standard_only['mean'].values).all()
 
 
@@ -399,12 +428,13 @@ def test_smearing_from_predictions_missing():
     torch.manual_seed(0)
     y = torch.randn(2, 10, 1).cumsum(1) * .1 + 3.
     y[0, 3] = y[1, 7] = float('nan')
-    for mixture in (None, [MixtureComponent(measure='y', mean_init=-1., prob_init=.1, id='low')]):
+    for mixture in (None, [MixtureComponent(measure='y', offset_init=-1., prob_init=.1, id='low')]):
         kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'], mixture=mixture)
         smear = SmearingTransform.from_predictions(LogTransform(), kf(y), y, 'y')
-        for t in ([smear] if mixture is None else [smear.standard, smear.components['low']]):
+        for t in [smear, *smear.component_residuals.values()]:
             assert t.residuals.shape == (18,)
             assert torch.isfinite(t.residuals).all() and torch.isfinite(t.weights).all()
+        assert len(smear.component_residuals) == (0 if mixture is None else 1)
 
 
 @pytest.mark.parametrize("use_map", [True, False])
@@ -414,8 +444,6 @@ def test_means_only(use_map: bool):
     `to_dataframe(conf=False)` returns just the means -- the same as the default call's -- without any interval work;
     `get_means()` returns them as a tensor, back-transforming every measure (incl. a linear one in a nonlinear model).
     """
-    from torchcast.state_space import RegimeTransform
-
     torch.manual_seed(0)
     visit = (torch.rand(4, 12) > .3).float()
     spend = torch.randn(4, 12).cumsum(1) * .2 + 3.
@@ -425,18 +453,21 @@ def test_means_only(use_map: bool):
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend', 'other']],
         measures=['visit', 'spend', 'other'],
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='spend', mean_init=-2., prob_init=.1, id='low')],
+        mixture=[MixtureComponent(measure='spend', offset_init=-2., prob_init=.1, id='low')],
     )
     bf.mc_sampling = 200
     pred = bf(y)
-    transform = {'spend': RegimeTransform(LogTransform(), {'low': LogTransform(bias_adjust=0)}), 'other': LogTransform()}
+    transform = {
+        'spend': LogTransform(bias_adjust=.5),
+        'other': LogTransform(),
+    }
 
     df = pred.to_dataframe(transform=transform, use_map=use_map)
 
     def fail(*args, **kwargs):
         raise AssertionError("interval work was done")
 
-    pred._get_closed_form_intervals = pred._get_mc_intervals = pred.sample = fail
+    pred._get_intervals = pred.sample = fail
     df_means = pred.to_dataframe(transform=transform, use_map=use_map, conf=False)
     assert list(df_means.columns) == [c for c in df.columns if c not in ('lower', 'upper')]
     assert np.array_equal(df_means['mean'].values, df['mean'].values)
@@ -460,3 +491,92 @@ def test_means_only_derived():
     assert set(df['measure']) == {'a', 'b', 'total'}
     with pytest.raises(ValueError, match="only supported for"):
         pred.to_dataframe(type='states', conf=False)
+
+
+def test_transform_inverse_roundtrip():
+    from torchcast.state_space import SmearingTransform
+
+    x = torch.rand(20, dtype=torch.float64) * 10 + .1
+    for t in [
+        LogTransform(), LogTransform(base=10), BoxCoxTransform(0), BoxCoxTransform(.5),
+        SmearingTransform(LogTransform(base=10), torch.randn(5)),
+    ]:
+        assert torch.allclose(t.inverse(t.transform(x)), x), t
+    assert torch.allclose(LogTransform(base=10).transform(torch.tensor(100.)), torch.tensor(2.))
+
+
+def test_dataset_from_dataframe_transform():
+    """`TimeSeriesDataset.from_dataframe(transform=)` mirrors `Predictions.to_dataframe(transform=)`."""
+    import pandas as pd
+    from torchcast.utils import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    df = pd.DataFrame({
+        'group': np.repeat(['g0', 'g1'], 10),
+        'time': np.tile(np.arange(10), 2),
+        'a': np.random.RandomState(0).rand(20) * 10 + 1,
+        'b': np.random.RandomState(1).rand(20) * 10 + 1,
+        'x': np.random.RandomState(2).randn(20),
+    })
+    kwargs = dict(group_colname='group', time_colname='time', dt_unit=None)
+
+    # a single transform applies to the time-series' measures -- not the predictors:
+    cols = dict(y_colnames=['a', 'b'], X_colnames=['x'])
+    ds = TimeSeriesDataset.from_dataframe(df, **cols, transform=LogTransform(), **kwargs)
+    raw = TimeSeriesDataset.from_dataframe(df, **cols, **kwargs)
+    # (transformed in float64, then cast)
+    assert torch.allclose(ds.tensors[0], raw.tensors[0].log(), rtol=1e-4, atol=1e-6)
+    assert torch.equal(ds.tensors[1], raw.tensors[1])
+    # ... or all of `measure_colnames`; or a dict:
+    ds = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], transform={'b': LogTransform(10)}, **kwargs)
+    raw = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], **kwargs)
+    assert torch.equal(ds.tensors[0][..., 0], raw.tensors[0][..., 0])
+    assert torch.allclose(ds.tensors[0][..., 1], raw.tensors[0][..., 1].log10(), rtol=1e-4, atol=1e-6)
+    with pytest.raises(ValueError, match="not in the time-series"):
+        TimeSeriesDataset.from_dataframe(
+            df, y_colnames=['a'], X_colnames=['x'], transform={'x': LogTransform()}, **kwargs
+        )
+    # (the input dataframe is unchanged)
+    assert (df['a'] > 1).all()
+
+    # symmetric with `to_dataframe(transform=)`: the actuals come back on the original scale:
+    transform = {'a': LogTransform(), 'b': BoxCoxTransform(.5)}
+    ds = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], transform=transform, **kwargs)
+    kf = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'], measures=['a', 'b'])
+    with torch.no_grad():
+        out = kf(ds.tensors[0]).to_dataframe(ds, transform=transform)
+    merged = out.merge(df, on=['group', 'time'])
+    for m in 'ab':
+        rows = merged.query(f"measure == '{m}'")
+        assert np.allclose(rows['actual'].values, rows[m].values, rtol=1e-5)
+
+
+def test_dataloader_from_dataframe_transform():
+    """`TimeSeriesDataLoader.from_dataframe(transform=)` matches `TimeSeriesDataset.from_dataframe(transform=)`."""
+    import pandas as pd
+    from torchcast.utils import TimeSeriesDataset, TimeSeriesDataLoader
+
+    rs = np.random.RandomState(0)
+    df = pd.DataFrame({
+        'group': np.repeat(['g0', 'g1', 'g2'], 10),
+        'time': np.tile(np.arange(10), 3),
+        'a': rs.rand(30) * 10 + 1,
+        'b': rs.rand(30) * 10 + 1,
+        'x': rs.randn(30),
+    })
+    kwargs = dict(group_colname='group', time_colname='time', dt_unit=None)
+    transform = {'a': LogTransform(), 'b': BoxCoxTransform(.5)}
+    expected = TimeSeriesDataset.from_dataframe(
+        df, y_colnames=['a', 'b'], X_colnames=['x'], transform=transform, **kwargs
+    )
+    # (`X_colnames` as a function: predictors are never transformed)
+    for X_colnames in (['x'], lambda d: d[['x']]):
+        loader = TimeSeriesDataLoader.from_dataframe(
+            df, y_colnames=['a', 'b'], X_colnames=X_colnames, transform=transform, batch_size=2, **kwargs
+        )
+        batches = list(loader)
+        assert len(batches) == 2
+        for batch in batches:
+            idx = [list(expected.group_names).index(g) for g in batch.group_names]
+            assert torch.equal(batch.tensors[0], expected.tensors[0][idx])
+            assert torch.equal(batch.tensors[1], expected.tensors[1][idx])

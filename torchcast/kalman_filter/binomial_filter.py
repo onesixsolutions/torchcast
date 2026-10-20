@@ -12,7 +12,7 @@ from typing import Sequence, TYPE_CHECKING, Optional, Union
 
 from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
 from torchcast.kalman_filter import KalmanFilter
-from torchcast.state_space.predictions import Predictions, DatasetMetadata
+from torchcast.state_space.predictions import Predictions, DatasetMetadata, _DEFAULT_NUM_SAMPLES
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
@@ -402,35 +402,50 @@ class BinomialPredictions(Predictions):
 
         return out
 
-    def _binary_idx(self) -> list[int]:
-        measures = list(self.measurement_model.measures)
-        return [measures.index(m) for m in self.binary_measures]
-
-    def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
-        covs = super()._conditional_measure_covs(means).clone()
-        idx = self._binary_idx()
-        if idx:
-            # binomial variance of the proportion, given the (sampled) probability:
-            p = means[..., idx].clamp(0, 1)
-            num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype)
-            covs[..., idx, idx] = p * (1 - p) / num_obs
-        return covs
+    def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
+        extra_vars = super()._conditional_measure_vars(means)
+        all_measures = list(self.measurement_model.measures)
+        idx = [all_measures.index(m) for m in self.binary_measures]
+        if not idx:
+            return extra_vars
+        extra_vars = torch.zeros_like(means) if extra_vars is None else extra_vars.clone()
+        # binomial variance of the proportion, given the (sampled) probability:
+        p = means[..., idx].clamp(0, 1)
+        num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype)
+        extra_vars[..., idx] = extra_vars[..., idx] + p * (1 - p) / num_obs
+        return extra_vars
 
     def _sample_observations(self,
                              means: torch.Tensor,
-                             covs: torch.Tensor,
-                             generator: Optional[torch.Generator]) -> torch.Tensor:
+                             extra_vars: Optional[torch.Tensor],
+                             generator: Optional[torch.Generator],
+                             measures: Optional[Sequence[str]] = None,
+                             shared_noise: bool = False) -> torch.Tensor:
         """
         Gaussian measures are sampled as usual (their observation noise is uncorrelated with the binary measures');
         binary measures are sampled from a binomial, then (like the rest of ``BinomialPredictions``) returned as
-        proportions.
+        proportions. (The binomial draws are always independent across rows, even with ``shared_noise``.)
         """
-        observations = super()._sample_observations(means, covs, generator=generator)
-        idx = self._binary_idx()
-        if idx:
-            p = means[..., idx].clamp(0, 1)
-            num_obs = self.num_obs.reshape(1, -1, len(self.binary_measures)).to(p.dtype).expand_as(p)
-            observations[..., idx] = torch.binomial(num_obs.contiguous(), p.contiguous(), generator=generator) / num_obs
+        all_measures = list(self.measurement_model.measures)
+        if measures is None:
+            measures = all_measures
+        gaussian_measures = [m for m in all_measures if m not in self.binary_measures and m in measures]
+
+        # sample the gaussian measures:
+        observations = super()._sample_observations(
+            means, extra_vars, measures=gaussian_measures, generator=generator, shared_noise=shared_noise
+        )
+
+        # sample the remaining (binary) measures:
+        # (index both by the same list, so each measure's probabilities are paired with its own num_obs)
+        binary = [m for m in self.binary_measures if m in measures]
+        if binary:
+            bidx = [all_measures.index(m) for m in binary]
+            nobs_idx = [self.binary_measures.index(m) for m in binary]
+            p = means[..., bidx].clamp(0, 1)
+            nobs = self.num_obs[..., nobs_idx].reshape(1, -1, len(bidx)).to(p.dtype).expand_as(p)
+            observations[..., bidx] = torch.binomial(nobs.contiguous(), p.contiguous(), generator=generator) / nobs
+
         return observations
 
     @property
@@ -445,7 +460,7 @@ class BinomialPredictions(Predictions):
                       use_map: bool,
                       transform: Optional[Union['Transform', dict]] = None,
                       derived: Optional[dict] = None,
-                      derived_num_samples: int = 1000) -> pd.DataFrame:
+                      num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
 
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
@@ -458,7 +473,7 @@ class BinomialPredictions(Predictions):
             use_map=use_map,
             transform=transform,
             derived=derived,
-            derived_num_samples=derived_num_samples,
+            num_samples=num_samples,
         )
 
     def _to_components_dataframe(self,
@@ -466,7 +481,8 @@ class BinomialPredictions(Predictions):
                                  group_colname: str,
                                  time_colname: str,
                                  conf: float,
-                                 measured: bool) -> pd.DataFrame:
+                                 measured: bool,
+                                 num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
         if self.observed_counts and not isinstance(dataset, DatasetMetadata):
             dataset = self._counts_to_props(dataset)
         return super()._to_components_dataframe(
@@ -475,6 +491,7 @@ class BinomialPredictions(Predictions):
             time_colname=time_colname,
             conf=conf,
             measured=measured,
+            num_samples=num_samples,
         )
 
     def _counts_to_props(self, dataset: 'TimeSeriesDataset') -> 'TimeSeriesDataset':
@@ -519,10 +536,12 @@ class BinomialPredictions(Predictions):
         if len(binary_idx):
             if num_obs is None:
                 raise RuntimeError("num_obs should be set because there are binary measures")
+            binary_model = measurement_model.subset(measures=binary_measures)
             mmean_samples = self._get_measured_mean_samples(
-                measurement_model=measurement_model.subset(measures=binary_measures),
+                measurement_model=binary_model,
                 state_means=state_means,
                 state_covs=state_covs,
+                white_noise=self._log_prob_white_noise(binary_model),
             )
             binom = Binomial(total_count=num_obs.unsqueeze(0), probs=mmean_samples, validate_args=False)
             _obs = obs[..., binary_idx]

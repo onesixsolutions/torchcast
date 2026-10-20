@@ -1,8 +1,9 @@
 import math
+import numbers
 from math import log
 
 from dataclasses import dataclass, fields
-from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable
+from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator
 from warnings import warn
 
 import torch
@@ -11,22 +12,24 @@ import numpy as np
 import pandas as pd
 
 from scipy import stats
-from torch.distributions import MultivariateNormal
 
+from .transforms import Transform, _IdentityTransform
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
-    from .mixture import MixtureModel, MixtureOfNormals
-    from .transforms import Transform
+    from .mixture import MixtureModel
     from .state import StateTuple
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise
 
-# seed for sample-based outputs (``to_dataframe()`` intervals for nonlinear measures, ``derived``, states), drawn at
-# import: repeated calls within a process give the same results. (Separate from the model's ``mc_sampling``,
-# which is fixed so that the monte-carlo log-prob -- and ``means`` -- are deterministic functions of the parameters.)
+# seed for sample-based outputs (``to_dataframe()``'s monte-carlo means and intervals, ``derived``, states), drawn at
+# import: repeated calls within a process give the same results. (Separate from the model's ``mc_sampling``, which is
+# only for the monte-carlo log-prob, fixed so that it's a deterministic function of the parameters.) Draws of the
+# state, and draws given the state, use separate seeds (see ``Predictions._output_generator``).
 _OUTPUT_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
+# the default number of samples for sample-based outputs:
+_DEFAULT_NUM_SAMPLES = 1000
 
 
 class Predictions:
@@ -37,6 +40,7 @@ class Predictions:
     _means = None
     _covs = None
 
+    # Construction & metadata ------------------------------------------------------------------------------------------
 
     def __init__(self,
                  measurement_model: 'MeasurementModel',
@@ -129,856 +133,7 @@ class Predictions:
             raise RuntimeError("Metadata not set. Pass the dataset or call `set_metadata()`.")
         return self._dataset_metadata
 
-    @torch.inference_mode()
-    def to_dataframe(self,
-                     dataset: Optional['TimeSeriesDataset'] = None,
-                     type: str = 'predictions',
-                     group_colname: Optional[str] = None,
-                     time_colname: Optional[str] = None,
-                     conf: Union[float, None, bool] = .95,
-                     use_map: Optional[bool] = None,
-                     transform: Union['Transform', dict[str, 'Transform'], None] = None,
-                     derived: Optional[dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]]] = None,
-                     derived_num_samples: int = 1000) -> pd.DataFrame:
-        """
-        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
-        :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
-        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
-        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
-        :param conf: The confidence level for the confidence intervals, defaults to 0.95. ``None`` returns a ``std``
-         column instead of the intervals; ``False`` returns only the means, skipping all of the work of computing
-         intervals (for predictions; see also :func:`get_means`).
-        :param use_map: If the model requires MCMC, this controls whether the mean uses mcmc to marginalize over the
-         state distribution (``use_map=False``) or whether the MAP is used to apply any non-linearities to the
-         state-mean directly (``use_map=True``). The latter can sometimes exhibit better predictive performance on
-         traditional supervised learning metrics.
-        :param transform: For measures that were transformed before modeling (e.g. log), a :class:`.Transform` to
-         map the predictions (and actuals) back to the original scale: either a single ``Transform`` for all measures,
-         or a dictionary of ``{measure: Transform}``. The mean is back-transformed exactly (not just the mean on the
-         modeled scale, back-transformed), as are the intervals. Only for ``type='predictions'``.
-        :param derived: Quantities computed from multiple measures, e.g. ``{'total': lambda s: s['a'] + s['b']}``.
-         Each function receives a dictionary of ``{measure: (num_samples, num_groups, num_timesteps)}`` samples from
-         the (joint) predictive distribution, including observation noise and on the scale given by ``transform``, and
-         should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
-         key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
-         actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
-         that aren't in ``dataset`` are all-nan). Only for
-         ``type='predictions'``.
-        :param derived_num_samples: The number of samples used for ``derived``.
-        """
-        dataset = self._resolve_dataset(dataset)
-        group_colname = group_colname or self.dataset_metadata.group_colname
-        time_colname = time_colname or self.dataset_metadata.time_colname
-
-        if conf is not None and conf is not False:
-            assert conf >= .50
-
-        type = type.casefold()
-        if conf is False and not type.startswith('pred'):
-            raise ValueError("`conf=False` is only supported for ``type='predictions'``.")
-        if (transform is not None or derived) and not type.startswith('pred'):
-            raise ValueError("`transform` and `derived` are only supported for ``type='predictions'``.")
-        if type.startswith('pred'):
-            return_std = False
-            if conf is None:
-                if transform is not None or derived:
-                    raise ValueError("`conf=None` (i.e. returning `std`) is not supported with `transform`/`derived`.")
-                # the conf-level for which upper - lower == 1 std-dev (i.e. +/- .5 std-devs):
-                conf = 1 - 2 * stats.norm.cdf(-.5)
-                return_std = True
-
-            df = self._to_dataframe(
-                dataset=dataset,
-                group_colname=group_colname,
-                time_colname=time_colname,
-                conf=conf,
-                use_map=use_map,
-                transform=transform,
-                derived=derived,
-                derived_num_samples=derived_num_samples,
-            )
-            if return_std:
-                df['std'] = df.pop('upper') - df.pop('lower')
-            return df
-        elif type in ('components', 'states', 'observed_states'):
-            if use_map:
-                raise NotImplementedError("``use_map=True`` not yet implemented for type!='predictions'")
-            if type == 'components':
-                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", DeprecationWarning)
-            return self._to_components_dataframe(
-                dataset=dataset,
-                group_colname=group_colname,
-                time_colname=time_colname,
-                conf=conf,
-                measured=type in ('observed_states', 'components')
-            )
-        else:
-            raise ValueError(f"Expected type to be 'predictions', 'states', or 'observed_states', got '{type}'.")
-
-    def _add_derived(self,
-                     derived: dict[str, Callable],
-                     num_samples: int,
-                     alpha: Optional[float],
-                     transforms: dict[str, 'Transform'],
-                     by_measure: dict,
-                     actuals: dict[str, torch.Tensor]) -> None:
-        """
-        Adds summaries of derived quantities to ``by_measure``, and (if there are any actuals, i.e. a dataset) the
-        derived actuals to ``actuals``. Modifies both in place.
-        """
-        measures = list(self.measurement_model.measures)
-        overlap = set(derived) & set(measures)
-        if overlap:
-            raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
-        samples = self.sample(num_samples, observation_noise=True, generator=self._output_generator())
-        values = {m: samples[m] for m in measures}
-        for m, t in transforms.items():
-            _warn_bias_adjust_ignored(t)
-            values[m] = t.inverse(values[m])
-
-        # the functions are also applied to the actuals (as a batch of one sample), if there's a dataset. measures that
-        # aren't in the dataset are nan, like missing values:
-        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
-        if measure_actuals:
-            nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
-            measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
-
-        expected_shape = (num_samples, self.num_groups, self.num_timesteps)
-        for name, fun in derived.items():
-            out = fun(values)
-            if tuple(out.shape) != expected_shape:
-                raise ValueError(f"`derived['{name}']` returned shape {tuple(out.shape)}, expected {expected_shape}.")
-            by_measure[name] = (out.mean(0),) if alpha is None else (
-                out.mean(0), _quantile(out, alpha), _quantile(out, 1 - alpha)
-            )
-            if measure_actuals:
-                actuals[name] = fun(measure_actuals).squeeze(0)
-
-    def sample(self,
-               num_samples: int,
-               observation_noise: bool = True,
-               generator: Optional[torch.Generator] = None) -> 'PredictionSamples':
-        """
-        Draw samples from the predictive distribution: jointly across measures, independently for each group and
-        timestep. (Note that these are *not* trajectories -- samples for different timesteps are independent -- so
-        quantities that combine timesteps shouldn't be computed from them; see :func:`StateSpaceModel.simulate` for
-        that.)
-
-        Each sample is a draw of the state (and, for models with mixture components, of the regime), giving a
-        conditional distribution for the measures: ``means`` and ``covs``. These capture uncertainty about the state,
-        but not the observation noise around it. With ``observation_noise=True``, each sample also includes a draw of
-        the observations from that conditional distribution (for binary measures: binomial draws).
-
-        :param num_samples: The number of samples.
-        :param observation_noise: If True (the default), also sample the observations.
-        :param generator: An optional :class:`torch.Generator`, for reproducibility.
-        :return: A :class:`PredictionSamples`.
-        """
-        batch_shape = self.state_means.shape[0:2]
-        measures = list(self.measurement_model.measures)
-        num_rows = self.state_means_flat.shape[0]
-        to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
-
-        # sample the measured-mean (via the state). independent noise for each row (unlike the fixed noise used for
-        # the monte-carlo log-prob, which is shared across rows):
-        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
-        white_noise = torch.randn((num_samples, num_rows, em_dim), generator=generator, **to)
-        means = self._get_measured_mean_samples(
-            measurement_model=self.measurement_model_flat,
-            state_means=self.state_means_flat,
-            state_covs=self.state_covs_flat,
-            white_noise=white_noise,
-        )
-        covs = self._conditional_measure_covs(means)
-
-        # sample the regime:
-        if self.mixture is not None:
-            means, covs = self._sample_regimes(means, covs, generator=generator)
-
-        observations = None
-        if observation_noise:
-            observations = self._sample_observations(means, covs, generator=generator)
-            observations = observations.view(num_samples, *batch_shape, len(measures))
-        return PredictionSamples(
-            measures=measures,
-            means=means.view(num_samples, *batch_shape, len(measures)),
-            covs=covs.view(num_samples, *batch_shape, len(measures), len(measures)),
-            observations=observations,
-        )
-
-    def _conditional_measure_covs(self, means: torch.Tensor) -> torch.Tensor:
-        """
-        The covariance of the observations given a sampled state. For gaussian measures this is just ``measure_covs``
-        (it doesn't depend on the state); subclasses whose observation-noise *does* depend on the state override this
-        (e.g. ``BinomialPredictions``: ``p * (1 - p) / num_obs`` for binary measures, whose ``measure_covs`` entries
-        are empty).
-
-        :param means: A ``(num_samples, num_rows, num_measures)`` tensor of measured means, each from a sampled state.
-        :return: A ``(num_samples, num_rows, num_measures, num_measures)`` tensor with the covariance of the measures
-         given the state.
-        """
-        return self.measure_covs_flat.expand(means.shape[0], -1, -1, -1)
-
-    def _sample_regimes(self,
-                        means: torch.Tensor,
-                        covs: torch.Tensor,
-                        generator: Optional[torch.Generator]) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
-        their mean and its variance to their (conditional) variance.
-        """
-        rm = self.mixture
-        num_samples = means.shape[0]
-        shift, extra_var = rm.combo_offsets(self.measurement_model.measures, like=means)  # (num_combos, num_measures)
-        regime_probs = self.regime_probs.reshape(-1, rm.num_combos)
-        combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
-        return means + shift[combo_idx], covs + torch.diag_embed(extra_var[combo_idx])
-
-    def _sample_observations(self,
-                             means: torch.Tensor,
-                             covs: torch.Tensor,
-                             generator: Optional[torch.Generator]) -> torch.Tensor:
-        """
-        Samples gaussian observation-noise around ``means``, for the gaussian measures. Non-gaussian measures (see
-        ``_non_gaussian_measures``) are left at their means, for subclasses to sample.
-        """
-        measures = list(self.measurement_model.measures)
-        idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
-        observations = means.clone()
-        if not idx:
-            return observations
-        z = torch.randn((*means.shape[:-1], len(idx)), generator=generator, dtype=means.dtype, device=means.device)
-        if covs.stride(0) == 0:
-            # the same covariance for every sample (an expanded view): only decompose it once
-            chol = torch.linalg.cholesky(covs[0][:, idx][:, :, idx])
-            observations[..., idx] += torch.einsum('rij,nrj->nri', chol, z)
-        else:
-            chol = torch.linalg.cholesky(covs[..., idx, :][..., idx])
-            observations[..., idx] += torch.einsum('nrij,nrj->nri', chol, z)
-        return observations
-
-    @torch.inference_mode()
-    def samples_to_dataframe(self,
-                             samples: dict[str, torch.Tensor],
-                             dataset: Optional['TimeSeriesDataset'] = None,
-                             conf: float = .95,
-                             actuals: Optional[dict[str, torch.Tensor]] = None,
-                             group_colname: Optional[str] = None,
-                             time_colname: Optional[str] = None) -> pd.DataFrame:
-        """
-        Summarize samples (e.g. of some quantity computed from ``sample()``) into a dataframe with the same format as
-        ``to_dataframe()``: the mean and the ``conf`` interval across samples, for each group and timestep.
-
-        :param samples: A dictionary with ``(num_samples, num_groups, num_timesteps)`` tensors. The keys become the
-         'measure' column of the output.
-        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
-        :param conf: The confidence level for the intervals.
-        :param actuals: Optionally, a dictionary with ``(num_groups, num_timesteps)`` tensors of actual values for some
-         keys of ``samples``.
-        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
-        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
-        """
-        assert .5 <= conf < 1
-        alpha = (1 - conf) / 2
-        by_name = {}
-        for name, x in samples.items():
-            if x.shape[1:] != (self.num_groups, self.num_timesteps):
-                raise ValueError(
-                    f"Expected `samples['{name}']` to have shape (num_samples, {self.num_groups}, {self.num_timesteps})"
-                    f", got {tuple(x.shape)}"
-                )
-            by_name[name] = (x.mean(0), _quantile(x, alpha), _quantile(x, 1 - alpha))
-        return self._summaries_to_dataframe(
-            by_name,
-            actuals=actuals or {},
-            dataset=self._resolve_dataset(dataset),
-            group_colname=group_colname or self.dataset_metadata.group_colname,
-            time_colname=time_colname or self.dataset_metadata.time_colname,
-        )
-
-    def _resolve_dataset(self,
-                         dataset: Optional['TimeSeriesDataset']) -> Union['TimeSeriesDataset', 'DatasetMetadata']:
-        if dataset is not None:
-            return dataset
-        dataset = self.dataset_metadata.copy()
-        if dataset.group_names is None:
-            warn(
-                "This ``Predictions`` object doesn't have access to the group-names, consider calling "
-                "``predictions.set_metadata()``."
-            )
-            dataset.group_names = [f"group_{i}" for i in range(self.num_groups)]
-        if dataset.start_offsets.dtype.name.startswith('date') and not dataset.dt_unit:
-            raise ValueError(
-                "Unable to infer `dt_unit`, please call ``predictions.set_metadata(dt_unit=X)``, or pass `dataset` "
-                "to ``predictions.to_dataframe()``"
-            )
-        if dataset.dt_unit and not dataset.start_offsets.dtype.name.startswith('date'):
-            raise ValueError(
-                "Expected `start_offsets` to be a datetime64 array, but got a different dtype. If you don't have "
-                "dates, then set `dt_unit=None`."
-            )
-        return dataset
-
-    @torch.inference_mode()
-    def _to_components_dataframe(self,
-                                 dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
-                                 group_colname: str,
-                                 time_colname: str,
-                                 conf: float,
-                                 measured: bool) -> pd.DataFrame:
-        alpha = (1 - conf) / 2
-        batch_shape = self.state_means.shape[0:2]
-
-        if self.mc_white_noise is not None:
-            # sample from the state distribution (einsum rather than a broadcasting matmul, which would materialize a
-            # (samples, rows, dim, dim) copy of the cholesky):
-            chol = torch.linalg.cholesky(self.state_covs_flat)
-            white_noise = torch.randn(
-                (self.mc_white_noise.num_samples, *self.state_means_flat.shape),
-                generator=self._output_generator(),
-                dtype=chol.dtype,
-                device=chol.device,
-            )
-            state_mean_samples = self.state_means_flat + torch.einsum('rij,nrj->nri', chol, white_noise)
-
-            # pass each sample to the `get_components` function, organize by process:
-            samples_by_proc = {}
-            for smean_samp in state_mean_samples:
-                for pid, se, comp_mean in self.measurement_model_flat.get_components(smean_samp, measured=measured):
-                    key = (pid, se)
-                    if key not in samples_by_proc:
-                        samples_by_proc[key] = []
-                    samples_by_proc[key].append(comp_mean)
-            # compute CIs:
-            cis_by_proc = {}
-            for key, samples in samples_by_proc.items():
-                stacked = torch.stack(samples, dim=0).view(self.mc_white_noise.num_samples, *batch_shape)
-                lower = torch.quantile(stacked, q=alpha, dim=0)
-                upper = torch.quantile(stacked, q=1 - alpha, dim=0)
-                cis_by_proc[key] = (lower, upper)
-        else:
-            cis_by_proc = {}
-            for q in (alpha, 1 - alpha):
-                multi = -stats.norm.ppf(q)
-                offset = self.state_means_flat + multi * torch.sqrt(self.state_covs_flat.diagonal(dim1=-2, dim2=-1))
-                for pid, se, comp_mean in self.measurement_model_flat.get_components(offset, measured=measured):
-                    key = (pid, se)
-                    if key not in cis_by_proc:
-                        cis_by_proc[key] = []
-                    cis_by_proc[key].append(comp_mean.view(*batch_shape))
-
-        from torchcast.utils import TimeSeriesDataset
-
-        # for each process, get mean/quantiles:
-        times = TimeSeriesDataset.get_dataset_times(
-            dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
-        )
-        out = []
-        for pid, se, comp_mean in self.measurement_model_flat.get_components(self.state_means_flat, measured=measured):
-            mean = comp_mean.view(*batch_shape)
-            lower, upper = cis_by_proc[(pid, se)]
-
-            # to dataframe:
-            _df = TimeSeriesDataset.tensor_to_dataframe(
-                tensor=torch.stack([mean, lower, upper], -1),
-                times=times,
-                group_names=dataset.group_names,
-                group_colname=group_colname,
-                time_colname=time_colname,
-                measures=['mean', 'lower', 'upper']
-            )
-
-            _df['process'] = pid
-            _df['state_element'] = se
-            _df['measure'] = self.measurement_model.processes[pid].measure
-            out.append(_df)
-
-        if isinstance(dataset, TimeSeriesDataset):
-            for mgroup, tens in zip(dataset.measures, dataset.tensors):
-                for m in mgroup:
-                    if m not in self.measurement_model.measures:
-                        continue
-                    actuals = tens[:, :, [mgroup.index(m)]]
-                    preds = self.means[:, 0:actuals.shape[1], [self.measurement_model.measures.index(m)]]
-                    _df = TimeSeriesDataset.tensor_to_dataframe(
-                        tensor=preds - actuals,
-                        times=times,
-                        group_names=dataset.group_names,
-                        group_colname=group_colname,
-                        time_colname=time_colname,
-                        measures=['mean'],
-                    )
-                    _df['measure'] = m
-                    _df['process'] = 'residuals'
-                    _df['state_element'] = 'residuals'
-                    out.append(_df)
-
-        out = pd.concat(out)
-        return out
-
-    def _output_generator(self) -> torch.Generator:
-        """
-        A generator with a fixed seed, so that sample-based outputs are the same on repeated calls.
-        """
-        return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED)
-
-    def _resolve_use_map(self, use_map: Optional[bool]) -> bool:
-        if self.mc_white_noise is not None:
-            if use_map is None:
-                warn(
-                    "Will use MCMC for intervals but MAP for mean; to keep this behavior and suppress this warning, "
-                    "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
-                )
-                use_map = True
-        elif use_map:
-            warn("``use_map`` disregarded, no monte-carlo")
-        return bool(use_map)
-
-    def _regimes(self, measure: str) -> list[tuple[Optional[str], Union[torch.Tensor, float], ...]]:
-        """
-        The regimes of a measure: ``(component_id, offset, extra_var)`` for the standard regime (``(None, 0, 0)``),
-        then each of its mixture components (if any).
-        """
-        return [(None, 0., 0.)] + [(c.id, c.mean, c.var) for c in self._mixture_components(measure)]
-
-    def _measure_regime_probs(self, measure: str) -> torch.Tensor:
-        """
-        :return: A ``(num_groups, num_timesteps, num_regimes)`` tensor with the probability of each of ``measure``'s
-         regimes (see ``_regimes``): all ones for a measure without mixture components.
-        """
-        if self.mixture is None or measure not in self.mixture.mixture_measures:
-            return torch.ones((*self.state_means.shape[0:2], 1), dtype=self.state_means.dtype,
-                              device=self.state_means.device)
-        rm = self.mixture
-        k = rm.mixture_measures.index(measure)
-        probs = []
-        for component in [None] + self._mixture_components(measure):
-            in_regime = torch.as_tensor([combo[k] is component for combo in rm.combos], device=self.regime_probs.device)
-            probs.append(self.regime_probs[..., in_regime].sum(-1))
-        return torch.stack(probs, -1)
-
-    def get_means(self,
-                  transform: Union['Transform', dict[str, 'Transform'], None] = None,
-                  use_map: Optional[bool] = None) -> torch.Tensor:
-        """
-        The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform`` and
-        ``use_map`` -- without computing any intervals.
-
-        :param transform: See :func:`to_dataframe`.
-        :param use_map: See :func:`to_dataframe`.
-        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
-        """
-        return self._get_means(
-            use_map=self._resolve_use_map(use_map), transforms=self._standardize_transforms(transform)
-        )
-
-    def _get_means(self,
-                   use_map: bool,
-                   transforms: dict[str, 'Transform'],
-                   mmean_samples: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        The predicted means of all measures, back-transformed by ``transforms``: the mean of each regime (just the
-        standard regime, for measures without mixture components), mixed by the regime-probabilities.
-
-        - Measures with a linear measured-mean: closed form (``Transform.inverse_mean``, so ``bias_adjust`` applies).
-        - Nonlinear measures: a monte-carlo mean over the (fixed) samples of the state, ``mmean_samples`` -- or, with
-          ``use_map`` (and no transform), the measured-mean of the state-mean. With a transform, each regime is
-          monte-carlo over the state x ``Transform.expected_inverse`` over the noise (``bias_adjust`` is ignored).
-
-        Each regime's mean on the modeled scale is the standard regime's plus the component's offset; its variance, the
-        standard regime's plus the component's.
-
-        :param mmean_samples: Samples from ``_get_measured_mean_samples()``, if already computed.
-        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
-        """
-        batch_shape = self.state_means.shape[0:2]
-        measures = list(self.measurement_model.measures)
-        nonlinear = self._nonlinear_measures
-        # exact for linear measures; the MAP for nonlinear ones:
-        measured_mean, system_cov = self._measured_moments_flat()
-        if mmean_samples is None and any(m in nonlinear and (not use_map or m in transforms) for m in measures):
-            mmean_samples = self._get_measured_mean_samples(
-                measurement_model=self.measurement_model_flat,
-                state_means=self.state_means_flat,
-                state_covs=self.state_covs_flat,
-            )
-
-        out = []
-        for j, measure in enumerate(measures):
-            t = transforms.get(measure)
-            regime_means = []
-            if measure not in nonlinear:
-                mean, var = measured_mean[:, j], system_cov[:, j, j]
-                for label, offset, extra in self._regimes(measure):
-                    if t is None:
-                        regime_means.append(mean + offset)
-                    else:
-                        regime_t = t if label is None else t.for_regime(label)
-                        regime_means.append(regime_t.inverse_mean(mean + offset, var + extra))
-            elif t is not None:
-                # E[inverse(g(state) + offset + noise)]: monte-carlo over the state, quadrature over the noise
-                noise_var = self.measure_covs_flat[:, j, j]
-                for label, offset, extra in self._regimes(measure):
-                    regime_t = t if label is None else t.for_regime(label)
-                    _warn_bias_adjust_ignored(regime_t)
-                    regime_means.append(torch.stack([
-                        regime_t.expected_inverse(x + offset, noise_var + extra)
-                        for x in mmean_samples[..., j].unbind(0)
-                    ]).mean(0))
-            else:
-                mean = measured_mean[:, j] if use_map else mmean_samples[..., j].mean(0)
-                regime_means = [mean + offset for _, offset, _ in self._regimes(measure)]
-            regime_means = torch.stack(regime_means, -1).view(*batch_shape, -1)
-            out.append((self._measure_regime_probs(measure) * regime_means).sum(-1))
-        return torch.stack(out, -1)
-
-    def _mixture_components(self, measure: str) -> list:
-        if self.mixture is None:
-            return []
-        return [c for c in self.mixture.components if c.measure == measure]
-
-    def _get_closed_form_intervals(self,
-                                   alpha: float,
-                                   transforms: dict[str, 'Transform']) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Intervals for measures with a linear measured-mean, whose predictive distribution is gaussian -- or a mixture
-        of gaussians, for measures with mixture components -- including in a model with other, nonlinear measures (see
-        ``_get_mc_intervals``).
-
-        :return: For each such measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
-        """
-        measured_mean, system_cov = self._measured_moments_flat()
-        batch_shape = self.state_means.shape[0:2]
-        multi = -stats.norm.ppf(alpha)
-        mixture_measures = self.mixture.mixture_measures if self.mixture is not None else []
-
-        out = {}
-        for j, measure in enumerate(self.measurement_model.measures):
-            if measure in self._nonlinear_measures:
-                continue
-            if measure in mixture_measures:
-                mixture = self.get_mixture(measure)
-                lower, upper = mixture.quantile(alpha), mixture.quantile(1 - alpha)
-            else:
-                mean, std = measured_mean[:, j].view(*batch_shape), system_cov[:, j, j].sqrt().view(*batch_shape)
-                lower, upper = mean - multi * std, mean + multi * std
-            if measure in transforms:
-                lower, upper = transforms[measure].inverse(lower), transforms[measure].inverse(upper)
-            out[measure] = (lower, upper)
-        return out
-
-    def _get_mc_intervals(self,
-                          alpha: float,
-                          transforms: dict[str, 'Transform'],
-                          mmean_samples: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Intervals for measures with a nonlinear measured-mean: quantiles of the (fixed) samples of the state's
-        measured-mean, ``mmean_samples``, plus observation-noise -- and, for measures with mixture components, the
-        regime's offset and extra variance, with the regime drawn per sample from its probability. Each measure is
-        sampled on its own (its marginal is all an interval needs), with noise shared across rows; drawn with a fixed
-        seed, so repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
-        probability), so there's no observation-noise.
-
-        :return: For each such measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
-        """
-        measures = list(self.measurement_model.measures)
-        batch_shape = self.state_means.shape[0:2]
-        num_samples = mmean_samples.shape[0]
-        to = {'dtype': mmean_samples.dtype, 'device': mmean_samples.device}
-        generator = self._output_generator()
-        noise = torch.randn((num_samples, len(measures)), generator=generator, **to)
-        uniforms = torch.rand((num_samples, len(measures)), generator=generator, **to)
-
-        out = {}
-        for j, measure in enumerate(measures):
-            if measure not in self._nonlinear_measures:
-                continue
-            x = mmean_samples[..., j]  # (num_samples, num_rows)
-            if measure not in self._non_gaussian_measures:
-                noise_var = self.measure_covs_flat[:, j, j]
-                regimes = self._regimes(measure)
-                if len(regimes) > 1:
-                    # draw a regime per sample and row, by inverting the cdf of the regime-probabilities:
-                    cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
-                    regime = (uniforms[:, j, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
-                    offsets = torch.stack([torch.as_tensor(o, **to) for _, o, _ in regimes])
-                    extras = torch.stack([torch.as_tensor(e, **to) for _, _, e in regimes])
-                    x = x + offsets[regime]
-                    noise_var = noise_var + extras[regime]
-                x = x + noise_var.sqrt() * noise[:, j, None]
-            if measure in transforms:
-                _warn_bias_adjust_ignored(transforms[measure])
-                x = transforms[measure].inverse(x)
-            out[measure] = (_quantile(x, alpha).view(*batch_shape), _quantile(x, 1 - alpha).view(*batch_shape))
-        return out
-
-    def _standardize_transforms(self,
-                                transform: Union['Transform', dict[str, 'Transform'], None]) -> dict[str, 'Transform']:
-        from .transforms import Transform
-
-        measures = list(self.measurement_model.measures)
-        if transform is None:
-            return {}
-        if isinstance(transform, Transform):
-            transforms = {m: transform for m in measures}
-        elif isinstance(transform, dict):
-            transforms = dict(transform)
-            unknown = set(transforms) - set(measures)
-            if unknown:
-                raise ValueError(f"`transform` has measures not in the model: {unknown}")
-        else:
-            raise TypeError(f"Expected `transform` to be a `Transform` or a dict of them, got {type(transform)}")
-        # note: measures with a nonlinear measurement (measure-fun or nonlinear process) are fine -- the model is
-        # `T(y) = g(state) + noise`, and the monte-carlo path back-transforms samples of `g(state) + noise`. but
-        # measures with a non-gaussian likelihood aren't:
-        non_gaussian = [m for m in transforms if m in self._non_gaussian_measures]
-        if non_gaussian:
-            raise ValueError(
-                f"`transform` is not supported for measures with a non-gaussian likelihood (e.g. binary measures): "
-                f"{non_gaussian}. To transform only some measures, pass a dict of `{{measure: Transform}}`."
-            )
-        from .transforms import RegimeTransform
-        for measure, t in transforms.items():
-            if isinstance(t, RegimeTransform):
-                ids = {c.id for c in self.mixture.components if c.measure == measure} if self.mixture else set()
-                unknown = set(t.components) - ids
-                if unknown:
-                    raise ValueError(f"`RegimeTransform` for '{measure}' has components that aren't its: {unknown}")
-        return transforms
-
-    @property
-    def _non_gaussian_measures(self) -> Sequence[str]:
-        """
-        Measures whose likelihood isn't gaussian (e.g. the binary measures of ``BinomialPredictions``).
-        """
-        return ()
-
-    @property
-    def _nonlinear_measures(self) -> set[str]:
-        """
-        Measures whose measured-mean is a nonlinear function of the state (via a measure-function or a nonlinear
-        process), so their predictive distribution isn't gaussian even with a gaussian likelihood.
-        """
-        mm = self.measurement_model
-        return set(mm.measure_funs) | {p.measure for p in mm.nonlinear_processes}
-
-    def _measured_moments_flat(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        :return: The (flattened) measured-mean and system-covariance of the (linearized) measurement model -- i.e.,
-         for models with mixture components, of the standard regime.
-        """
-        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
-        system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
-        return measured_mean, system_cov
-
-    def _get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        For models with mixture components: the predictive distribution as a mixture over regime-combos (see
-        :class:`.MixtureModel`). Within each combo the prediction is multivariate normal, with the usual
-        (state-dependent) mean and covariance -- plus, for measures in a mixture-component's regime, that component's
-        offset (to the mean) and variance (on the diagonal).
-
-        Note that for measures with a nonlinear measurement (a measure-function, e.g. binary measures, or nonlinear
-        processes), the standard-regime moments are from the linearized measurement-model, so are approximate (with a
-        warning, if any of these are mixture measures).
-
-        :return: A tuple of (1) a label for each combo: a tuple with the regime of each mixture measure ('standard' or
-         the component id), (2) a ``(num_groups, num_timesteps, num_combos)`` tensor of combo probabilities, (3) a
-         ``(num_groups, num_timesteps, num_combos, num_measures)`` tensor of means, and (4) a ``(num_groups,
-         num_timesteps, num_combos, num_measures, num_measures)`` tensor of covariances.
-        """
-        if self.mixture is None:
-            raise RuntimeError("This model has no mixture components.")
-        rm = self.mixture
-        nonlinear = [m for m in rm.mixture_measures if m in self._nonlinear_measures]
-        if nonlinear:
-            warn(
-                f"Mixture measures {nonlinear} have a nonlinear measurement, so the standard regime's moments are from "
-                f"the linearized measurement-model (approximate). The regime-probabilities are exact."
-            )
-        measures = list(self.measurement_model.measures)
-        measured_mean, system_cov = self._measured_moments_flat()
-        shift, extra_var = rm.combo_offsets(measures, like=measured_mean)  # (num_combos, num_measures)
-        means = [measured_mean + shift[c] for c in range(rm.num_combos)]
-        covs = [system_cov + torch.diag(extra_var[c]) for c in range(rm.num_combos)]
-        batch_shape = self.state_means.shape[0:2]
-        labels = [tuple('standard' if c is None else c.id for c in combo) for combo in rm.combos]
-        return (
-            labels,
-            self.regime_probs,
-            torch.stack(means, 1).view(*batch_shape, rm.num_combos, len(measures)),
-            torch.stack(covs, 1).view(*batch_shape, rm.num_combos, len(measures), len(measures)),
-        )
-
-    def get_mixture(self, measure: str) -> 'MixtureOfNormals':
-        """
-        For a measure with mixture components, the predictive distribution as a (univariate) mixture of normals: the
-        standard regime, then each of the measure's components.
-
-        For a measure with a nonlinear measurement (a measure-function or nonlinear processes), the standard regime
-        isn't actually normal: its mean and variance are from the linearized (EKF) measurement-model, so are
-        approximate (with a warning). The regime-probabilities are still exact. (``to_dataframe()`` and ``means`` use
-        monte-carlo for these measures instead.)
-
-        :param measure: The name of the measure.
-        :return: A :class:`.MixtureOfNormals` whose tensors have shape ``(num_groups, num_timesteps, num_components)``.
-        """
-        if measure in self._nonlinear_measures:
-            warn(
-                f"'{measure}' has a nonlinear measurement, so the standard regime's mean and variance are from the "
-                f"linearized measurement-model (approximate). The regime-probabilities are exact."
-            )
-        j = list(self.measurement_model.measures).index(measure)
-        measured_mean, system_cov = self._measured_moments_flat()
-        batch_shape = self.state_means.shape[0:2]
-        return self._get_mixture(
-            measure,
-            standard_mean=measured_mean[:, j].view(*batch_shape),
-            standard_var=system_cov[:, j, j].view(*batch_shape),
-        )
-
-    def _get_mixture(self,
-                     measure: str,
-                     standard_mean: torch.Tensor,
-                     standard_var: torch.Tensor) -> 'MixtureOfNormals':
-        """
-        :param standard_mean: A ``(num_groups, num_timesteps)`` tensor with the mean of the standard regime.
-        :param standard_var: A ``(num_groups, num_timesteps)`` tensor with the variance of the standard regime.
-        """
-        from .mixture import MixtureOfNormals
-
-        if self.mixture is None or measure not in self.mixture.mixture_measures:
-            raise ValueError(f"'{measure}' has no mixture components.")
-        regimes = self._regimes(measure)
-        return MixtureOfNormals(
-            labels=['standard' if label is None else label for label, _, _ in regimes],
-            probs=self._measure_regime_probs(measure),
-            means=torch.stack([standard_mean + offset for _, offset, _ in regimes], -1),
-            vars=torch.stack([standard_var + extra for _, _, extra in regimes], -1),
-        )
-
-    @torch.inference_mode()
-    def _to_dataframe(self,
-                      dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
-                      group_colname: str,
-                      time_colname: str,
-                      conf: float,
-                      use_map: bool,
-                      transform: Union['Transform', dict[str, 'Transform'], None] = None,
-                      derived: Optional[dict[str, Callable]] = None,
-                      derived_num_samples: int = 1000) -> pd.DataFrame:
-
-        alpha = None if conf is False else (1 - conf) / 2
-        transforms = self._standardize_transforms(transform)
-        use_map = self._resolve_use_map(use_map)
-        measures = list(self.measurement_model.measures)
-
-        # samples of the state's measured-mean (fixed noise), shared by the means and the intervals -- only if needed:
-        mmean_samples = None
-        nonlinear = [m for m in measures if m in self._nonlinear_measures]
-        if nonlinear and (alpha is not None or not use_map or any(m in transforms for m in nonlinear)):
-            if not use_map and self.mc_white_noise.num_samples < 1000:
-                warn("Consider at least ``my_model.mc_sampling = 1000`` if use_map=False")
-            mmean_samples = self._get_measured_mean_samples(
-                measurement_model=self.measurement_model_flat,
-                state_means=self.state_means_flat,
-                state_covs=self.state_covs_flat,
-            )
-
-        means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
-        by_measure = {m: (means[..., j],) for j, m in enumerate(measures)}
-        if alpha is not None:
-            # closed-form for measures with a linear measured-mean; monte-carlo for the rest:
-            intervals = self._get_closed_form_intervals(alpha, transforms=transforms)
-            if nonlinear:
-                intervals.update(self._get_mc_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples))
-            by_measure = {m: (*v, *intervals[m]) for m, v in by_measure.items()}
-
-        from torchcast.utils import TimeSeriesDataset
-
-        actuals = {}
-        if isinstance(dataset, TimeSeriesDataset):
-            for mgroup, tens in zip(dataset.measures, dataset.tensors):
-                for m in mgroup:
-                    if m not in by_measure:
-                        continue
-                    actuals[m] = tens[..., mgroup.index(m)]
-                    if m in transforms:
-                        actuals[m] = transforms[m].inverse(actuals[m])
-            missing = set(by_measure) - set(dataset.all_measures)
-            if missing:
-                warn(
-                    f"The following measures in your model are not present in your dataset, please double-check that "
-                    f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
-                )
-        if derived:
-            self._add_derived(derived, num_samples=derived_num_samples, alpha=alpha, transforms=transforms,
-                              by_measure=by_measure, actuals=actuals)
-        return self._summaries_to_dataframe(
-            by_measure,
-            actuals=actuals,
-            dataset=dataset,
-            group_colname=group_colname,
-            time_colname=time_colname,
-        )
-
-    def _summaries_to_dataframe(self,
-                                by_measure: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-                                actuals: dict[str, torch.Tensor],
-                                dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
-                                group_colname: str,
-                                time_colname: str) -> pd.DataFrame:
-        """
-        :param by_measure: For each measure (or other named quantity), a tuple of ``(num_groups, num_timesteps)``
-         tensors: mean, lower, upper -- or just mean.
-        :param actuals: Optionally, ``(num_groups, num_timesteps)`` actuals for some measures/quantities (can have
-         fewer timesteps).
-        :return: A long-format dataframe with columns for group, time, mean, lower, upper, (actual,) and measure.
-        """
-        from torchcast.utils import TimeSeriesDataset
-
-        out = []
-        times = TimeSeriesDataset.get_dataset_times(
-            dataset.start_offsets, num_timesteps=self.state_means.shape[1], dt_unit=dataset.dt_unit
-        )
-        for measure, (mean, *interval) in by_measure.items():
-            _to_stack = {'mean': mean.unsqueeze(-1)}
-            if interval:
-                lower, upper = interval
-                _to_stack.update(lower=lower.unsqueeze(-1), upper=upper.unsqueeze(-1))
-            mactuals = actuals.get(measure, None)
-            if mactuals is not None:
-                _to_stack['actual'] = mactuals.unsqueeze(-1)
-            out.append(
-                TimeSeriesDataset.tensor_to_dataframe(
-                    tensor=ragged_cat(list(_to_stack.values()), cat_dim=-1, ragged_dim=1),
-                    times=times,
-                    group_names=dataset.group_names,
-                    group_colname=group_colname,
-                    time_colname=time_colname,
-                    measures=list(_to_stack)
-                )
-            )
-            out[-1]['measure'] = measure
-        out = pd.concat(out)
-
-        return out
-
-    def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch_shape = self.state_means.shape[0:2]
-
-        if self.measurement_model.is_nonlinear:
-            # monte-carlo for the means of nonlinear measures; there's no closed form cov
-            return self._get_means(use_map=False, transforms={}), None
-        elif self.mixture is not None:
-            # the exact mean and covariance of the mixture over regime-combos:
-            _, probs, means, covs = self._get_regime_combos()
-            mean = (probs.unsqueeze(-1) * means).sum(-2)
-            second_moment = (probs[..., None, None] * (covs + means.unsqueeze(-1) * means.unsqueeze(-2))).sum(-3)
-            return mean, second_moment - mean.unsqueeze(-1) * mean.unsqueeze(-2)
-        else:
-            measured_mean, system_cov = self._measured_moments_flat()
-            return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
+    # Predicted means & covariances ------------------------------------------------------------------------------------
 
     @property
     def means(self) -> torch.Tensor:
@@ -1010,31 +165,138 @@ class Predictions:
             _warn_once['mixture_cov'] = True
         return self._covs
 
-    def _flatten(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        nmeasures = self.measure_covs.shape[-1]
-        state_rank = self.state_means.shape[-1]
-        state_means_flat = self.state_means.view(-1, state_rank)
-        state_covs_flat = self.state_covs.view(-1, state_rank, state_rank)
-        measure_covs_flat = self.measure_covs.view(-1, nmeasures, nmeasures)
-        return state_means_flat, state_covs_flat, measure_covs_flat
+    def __iter__(self) -> Iterator[Optional[torch.Tensor]]:
+        # so that we can do ``mean, cov = predictions``
+        yield self.means
+        yield self.covs
 
-    @property
-    def state_means_flat(self):
-        if self._state_means_flat is None:
-            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
-        return self._state_means_flat
+    def __array__(self) -> np.ndarray:
+        # for numpy.asarray
+        return self.means.detach().cpu().numpy()
 
-    @property
-    def state_covs_flat(self):
-        if self._state_covs_flat is None:
-            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
-        return self._state_covs_flat
+    def _observe(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_shape = self.state_means.shape[0:2]
 
-    @property
-    def measure_covs_flat(self) -> torch.Tensor:
-        if self._mcovs_flat is None:
-            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
-        return self._mcovs_flat
+        if self.measurement_model.is_nonlinear:
+            # monte-carlo for the means of nonlinear measures; there's no closed form cov
+            return self._get_means(use_map=False), None
+        elif self.mixture is not None:
+            # the exact mean and covariance of the mixture over regime-combos:
+            _, probs, means, covs = self._get_regime_combos()
+            mean = (probs.unsqueeze(-1) * means).sum(-2)
+            second_moment = (probs[..., None, None] * (covs + means.unsqueeze(-1) * means.unsqueeze(-2))).sum(-3)
+            cov = second_moment - mean.unsqueeze(-1) * mean.unsqueeze(-2)
+            return mean, cov
+        else:
+            measured_mean, system_cov = self._measured_moments_flat()
+            return measured_mean.view(*batch_shape, -1), system_cov.view(*batch_shape, *self.measure_covs.shape[-2:])
+
+    def get_means(self,
+                  transform: Union['Transform', dict[str, 'Transform'], None] = None,
+                  use_map: Optional[bool] = None,
+                  num_samples: int = _DEFAULT_NUM_SAMPLES) -> torch.Tensor:
+        """
+        The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform``,
+        ``use_map`` and ``num_samples`` -- without computing any intervals.
+
+        :param transform: See :func:`to_dataframe`.
+        :param use_map: See :func:`to_dataframe`.
+        :param num_samples: See :func:`to_dataframe`.
+        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
+        """
+        return self._get_means(
+            use_map=self._resolve_use_map(use_map),
+            transforms=self._standardize_transforms(transform),
+            mmean_samples=num_samples,
+        )
+
+    def _get_means(self,
+                   use_map: bool,
+                   transforms: Optional[dict[str, 'Transform']] = None,
+                   mmean_samples: Union[torch.Tensor, int, None] = None) -> torch.Tensor:
+        """
+        The means, given already-resolved arguments -- separate from :func:`get_means` so that callers can share one
+        set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
+
+        :param mmean_samples: Pass already-computed samples to save compute (and to share them), otherwise will
+         compute if needed (or for the latter this can be an int for num_draws).
+        :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
+         (handling mixtures if needed).
+        """
+        transforms = transforms or {}
+        identity = _IdentityTransform()
+        all_measures = list(self.measurement_model.measures)
+        batch_shape = self.state_means.shape[0:2]
+
+        # divide measures into (as in `_get_intervals`):
+        # (1) nonlinear-measures (mixture or not),
+        # (2) mixture-but-linear-measures,
+        # (3) everything else
+        # with `use_map`, nonlinear measures are treated like linear ones, with the moments of the linearized
+        # measurement-model (the MAP measured-mean, and H P H^T + R) -- so there's no monte-carlo:
+        nonlinear_measures = [] if use_map else list(self._nonlinear_measures)
+        _mix_measures = self.mixture.mixture_measures if self.mixture is not None else []
+        mixture_measures = [m for m in _mix_measures if m not in nonlinear_measures]
+        simple_measures = [m for m in all_measures if m not in nonlinear_measures and m not in mixture_measures]
+
+        # exact for linear measures; the MAP and the linearized variance for nonlinear ones:
+        measured_mean, system_cov = self._measured_moments_flat()
+
+        out = {}
+
+        # simple measures: closed form (or quadrature), given the mean and variance:
+        for measure in simple_measures:
+            midx = all_measures.index(measure)
+            transform = transforms.get(measure, identity)
+            mean = transform.inverse_mean(measured_mean[:, midx], system_cov[:, midx, midx])
+            out[measure] = mean.view(*batch_shape)
+
+        # mixture measures: the same, for each regime, mixed by the regime-probabilities:
+        for measure in mixture_measures:
+            midx = all_measures.index(measure)
+            # (not `get_mixture()`, which warns for nonlinear measures: here, with `use_map`, that's intended)
+            mixture = self._get_mixture(
+                measure,
+                standard_mean=measured_mean[:, midx].view(*batch_shape),
+                standard_var=system_cov[:, midx, midx].view(*batch_shape),
+            )
+            transform = transforms.get(measure, identity)
+            regime_means = [
+                transform.inverse_mean(mixture.means[..., k], mixture.vars[..., k], regime=label)
+                for k, (label, _, _) in enumerate(self._regimes(measure))
+            ]
+            out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
+
+        # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
+        # regime-probabilities (all ones without mixture components):
+        if nonlinear_measures:
+            # to apply a transform with bias_adjust != 1, we need to rescale not just the measurement-var (easy)
+            # but also the state-var; but since we're sampling the state-var, we need to sample it with a scaling factor
+            deviation_scales = [
+                math.sqrt(transforms.get(m, identity).var_multi) if m in nonlinear_measures else 1.
+                for m in all_measures
+            ]
+            mmean_samples = self._resolve_mmean_samples(mmean_samples, deviation_scales=deviation_scales)
+
+        for measure in nonlinear_measures:
+            midx = all_measures.index(measure)
+            transform = transforms.get(measure, identity)
+            noise_var = self.measure_covs_flat[:, midx, midx]
+            if not self._mixture_components(measure):
+                out[measure] = transform.inverse_mean(mmean_samples[..., midx], noise_var).mean(0).view(*batch_shape)
+                continue
+
+            # more complex logic for measures with mixture components:
+            regime_means = [
+                transform.inverse_mean(mmean_samples[..., midx] + offset, noise_var + extra, regime=label).mean(0)
+                for label, offset, extra in self._regimes(measure)
+            ]
+            probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
+            out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
+
+        return torch.stack([out[m] for m in all_measures], -1)
+
+    # Log-probability --------------------------------------------------------------------------------------------------
 
     def log_prob(self,
                  obs: torch.Tensor,
@@ -1117,244 +379,199 @@ class Predictions:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
         assert measurement_model.num_timesteps == 1
 
-        has_mixture = self.mixture is not None and any(
-            m in measurement_model.measures for m in self.mixture.mixture_measures
-        )
-
-        if measurement_model.is_nonlinear:
+        monte_carlo = measurement_model.is_nonlinear
+        if monte_carlo:
+            # samples of the measured-mean, each with the measurement-noise:
             mmean_samples = self._get_measured_mean_samples(
                 measurement_model=measurement_model,
                 state_means=state_means,
                 state_covs=state_covs,
+                white_noise=self._log_prob_white_noise(measurement_model),
             )
-            if has_mixture:
-                def combo_log_lik(shift: torch.Tensor, extra_var: torch.Tensor) -> torch.Tensor:
-                    # the monte-carlo marginal likelihood:
-                    mc_log_probs = _mc_mvnorm_log_prob(
-                        resid=obs - mmean_samples - shift,
-                        cov=measure_cov + torch.diag(extra_var)
-                    )
-                    return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
+            resid = obs - mmean_samples
+            ll_cov = measure_cov
+        else:
+            measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
+            resid = obs - measured_mean
+            ll_cov = measure_mat @ state_covs @ measure_mat.transpose(-1, -2) + measure_cov
 
-                return self._mixture_log_prob(obs=obs, measures=measurement_model.measures,
-                                              combo_log_lik=combo_log_lik, log_prior=regime_log_prior)
+        if not self._is_mixture_model(measurement_model):
+            return _log_lik(resid, ll_cov, monte_carlo=monte_carlo)
 
-            # evaluate the log-prob of the observations under each sampled measured-mean:
-            mc_log_probs = MultivariateNormal(
-                loc=mmean_samples,
-                covariance_matrix=measure_cov.unsqueeze(0),
-                validate_args=False
-            ).log_prob(obs)
-            # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log()
-            # this is a numerically stable way to do that:
-            return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
+        # the marginal log-lik over the (effective) regime-combos. these all share the predicted state, so each just
+        # offsets the mean and adds to the diagonal:
+        terms = [
+            log_prior + _log_lik(resid - shift, ll_cov + torch.diag(extra_var), monte_carlo=monte_carlo)
+            for shift, extra_var, log_prior
+            in self._regime_terms(measurement_model.measures, log_prior=regime_log_prior, like=obs)
+        ]
+        return torch.logsumexp(torch.stack(terms, -1), -1)
 
-        measured_mean, measure_mat = measurement_model(mean=state_means, time=0)
-        system_cov = measure_mat @ state_covs @ measure_mat.permute(0, 2, 1) + measure_cov
-        if not has_mixture:
-            return MultivariateNormal(measured_mean, system_cov, validate_args=False).log_prob(obs)
+    def _is_mixture_model(self, measurement_model: 'MeasurementModel') -> bool:
+        if self.mixture is None:
+            return False
+        return any(m in measurement_model.measures for m in self.mixture.mixture_measures)
 
-        def combo_log_lik(shift: torch.Tensor, extra_var: torch.Tensor) -> torch.Tensor:
-            # all regime-combos share the same predicted state, so this just offsets the mean and adds to the diagonal:
-            return mvnorm_log_prob(resid=obs - measured_mean - shift, cov=system_cov + torch.diag(extra_var))
-
-        return self._mixture_log_prob(obs=obs, measures=measurement_model.measures,
-                                      combo_log_lik=combo_log_lik, log_prior=regime_log_prior)
-
-    def _mixture_log_prob(self,
-                          obs: torch.Tensor,
-                          measures: Sequence[str],
-                          combo_log_lik: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-                          log_prior: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _regime_terms(self,
+                      measures: Sequence[str],
+                      like: torch.Tensor,
+                      log_prior: Optional[torch.Tensor] = None
+                      ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
-        The marginal log-likelihood under the mixture: ``logsumexp_c(log_prior_c + log_lik_c)``.
+        For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
+        are distinguishable given ``measures`` (see ``MixtureModel.effective_combos``).
 
-        :param combo_log_lik: A function that takes two ``(len(measures),)`` tensors -- the offset to each measure's
-         measured-mean, and the variance to add to its measurement-noise -- and returns the ``(batch,)``
-         log-likelihood.
+        :param like: A ``(batch, ...)`` tensor, for the number of rows, dtype and device.
         :param log_prior: A ``(batch, num_combos)`` tensor of log prior regime-probabilities. Defaults to the
          regime-model's base-probs.
+        :return: For each effective combo, two ``(len(measures),)`` tensors -- the offset to each measure's
+         measured-mean and the variance to add to its measurement-noise -- and the ``(batch,)`` log prior probability
+         (pooled over the combos that are indistinguishable given ``measures``).
         """
-        num_rows = obs.shape[0]
         if log_prior is None:
-            log_prior = self.mixture.log_base_probs().expand(num_rows, -1)
-
+            log_prior = self.mixture.log_base_probs().expand(like.shape[0], -1)
         effective, mapping = self.mixture.effective_combos(measures)
-        out = []
         for e, eff in enumerate(effective):
-            log_lik = combo_log_lik(*self.mixture.effective_offsets(eff, len(measures), like=obs))
-            # combos that are indistinguishable given `measures` pool their prior probability:
-            log_prior_e = torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
-            out.append(log_prior_e + log_lik)
-        return torch.logsumexp(torch.stack(out, -1), -1)
+            shift, extra_var = self.mixture.effective_offsets(eff, len(measures), like=like)
+            yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
 
-    def _get_measured_mean_samples(self,
-                                   measurement_model: 'MeasurementModel',
-                                   state_means: torch.Tensor,
-                                   state_covs: torch.Tensor,
-                                   white_noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # Dataframes & plotting --------------------------------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def to_dataframe(self,
+                     dataset: Optional['TimeSeriesDataset'] = None,
+                     type: str = 'predictions',
+                     group_colname: Optional[str] = None,
+                     time_colname: Optional[str] = None,
+                     conf: Union[float, None, bool] = .95,
+                     use_map: Optional[bool] = None,
+                     transform: Union['Transform', dict[str, 'Transform'], None] = None,
+                     derived: Optional[dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]]] = None,
+                     num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
         """
-        Samples of the measured-mean, from samples of the state. Rather than sampling the full state, this samples a
-        lower-dimensional gaussian: the measured-mean of the linear processes, concatenated with the state-elements of
-        any nonlinear processes (see ``MeasurementModel.extended_measure_mat``). The nonlinear processes'
-        contributions, then any measure-functions, are applied to those samples.
-
-        :param measurement_model: A flattened measurement-model (possibly a subset of the measures, for nans).
-        :param state_means: A ``(num_rows, state_rank)`` tensor.
-        :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
-        :param white_noise: Standard-normal noise for the *full* model's extended dimensions (dims for measures that
-         ``measurement_model`` drops are dropped here), either ``(num_samples, dim)`` -- the same draws for every row
-         -- or ``(num_samples, num_rows, dim)``. Defaults to ``mc_white_noise``, which is fixed (so that the
-         monte-carlo log-prob is a deterministic function of the parameters) and shared across rows.
-        :return: A ``(num_samples, num_rows, num_measures)`` tensor.
+        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
+        :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
+        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
+        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
+        :param conf: The confidence level for the confidence intervals, defaults to 0.95. ``None`` returns a ``std``
+         column instead of the intervals; ``False`` returns only the means, skipping all of the work of computing
+         intervals (for predictions; see also :func:`get_means`).
+        :param use_map: For measures with a nonlinear measured-mean (e.g. a measure-function, or nonlinear processes):
+         whether the mean averages over the state's uncertainty by monte-carlo (``use_map=False``), or plugs in the
+         state's mean (``use_map=True``; the MAP), treating the measure like a linear one, with the moments of the
+         linearized measurement-model. (The intervals are monte-carlo either way.) Reasons to use the MAP: for a
+         monotone measure-function (e.g. a sigmoid), it's the predictive *median* of the measured-mean rather than its
+         mean (better for e.g. absolute error); it doesn't depend on the state's variance, so it's robust to that
+         being miscalibrated (an overestimated variance pulls the monte-carlo mean of a sigmoid towards .5); and
+         it's cheap. With a ``transform``, the back-transformed mean then works as for linear measures: its
+         ``bias_adjust`` sets how much of the (linearized) variance is used -- e.g. ``bias_adjust=0`` gives the
+         plug-in ``inverse(MAP)``, a median-like forecast throughout. (``bias_adjust`` works the same way for the
+         monte-carlo mean, where it scales the state's variance too.)
+         Ignored for models without nonlinear measures, whose means are exact.
+        :param transform: For measures that were transformed before modeling (e.g. log), a :class:`.Transform` to
+         map the predictions (and actuals) back to the original scale: either a single ``Transform`` for all measures,
+         or a dictionary of ``{measure: Transform}``. The mean is back-transformed exactly (not just the mean on the
+         modeled scale, back-transformed), as are the intervals. Only for ``type='predictions'``.
+        :param derived: Quantities computed from multiple measures, e.g. ``{'total': lambda s: s['a'] + s['b']}``.
+         Each function receives a dictionary of ``{measure: (num_samples, num_groups, num_timesteps)}`` samples from
+         the (joint) predictive distribution, including observation noise and on the scale given by ``transform``, and
+         should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
+         key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
+         actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
+         that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
+        :param num_samples: The number of monte-carlo samples, for the outputs that need them: the means (with
+         ``use_map=False`` or a ``transform``) and intervals of measures with a nonlinear measured-mean, ``derived``,
+         and ``type='states'``/``'observed_states'`` for nonlinear models. Drawn with a fixed seed, so repeated calls
+         agree. (Separate from the model's ``mc_sampling``, which is only for the log-prob, in training.)
         """
-        nmeasures = len(measurement_model.measures)
+        dataset = self._resolve_dataset(dataset)
+        group_colname = group_colname or self.dataset_metadata.group_colname
+        time_colname = time_colname or self.dataset_metadata.time_colname
 
-        extended_measure_mat = measurement_model.extended_measure_mat
-        partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
-        partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
+        if conf is not None and conf is not False:
+            assert conf >= .50
 
-        # some dims might be all-zero (e.g. a measure with no linear processes), which means we can't take the
-        # cholesky for those, so only factorize the nonzero block:
-        nonzero = (extended_measure_mat != 0).any(0).any(1).cpu().nonzero(as_tuple=True)[0]
-        m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
-        chol = torch.zeros_like(partial_measured_cov)
-        chol[m2d] = torch.linalg.cholesky(partial_measured_cov[m2d])
+        type = type.casefold()
+        if conf is False and not type.startswith('pred'):
+            raise ValueError("`conf=False` is only supported for ``type='predictions'``.")
+        if (transform is not None or derived) and not type.startswith('pred'):
+            raise ValueError("`transform` and `derived` are only supported for ``type='predictions'``.")
+        if type.startswith('pred'):
+            return_std = False
+            if conf is None:
+                if transform is not None or derived:
+                    raise ValueError("`conf=None` (i.e. returning `std`) is not supported with `transform`/`derived`.")
+                # the conf-level for which upper - lower == 1 std-dev (i.e. +/- .5 std-devs):
+                conf = 1 - 2 * stats.norm.cdf(-.5)
+                return_std = True
 
-        # take care to drop missing measures:
-        missing_midx = [i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures]
-        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
-        em_idx = [i for i in range(em_dim) if i not in missing_midx]
-        if white_noise is None:
-            white_noise = self.mc_white_noise(num_dim=em_dim, dtype=chol.dtype, device=chol.device)
-        white_noise = white_noise[..., em_idx]
-        # (einsum rather than a broadcasting matmul, which would materialize a (samples, rows, dim, dim) copy of chol)
-        if white_noise.ndim == 2:
-            offsets = torch.einsum('rij,nj->nri', chol, white_noise)
+            df = self._to_dataframe(
+                dataset=dataset,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                conf=conf,
+                use_map=use_map,
+                transform=transform,
+                derived=derived,
+                num_samples=num_samples,
+            )
+            if return_std:
+                df['std'] = df.pop('upper') - df.pop('lower')
+            return df
+        elif type in ('components', 'states', 'observed_states'):
+            if use_map:
+                raise NotImplementedError("``use_map=True`` not yet implemented for type!='predictions'")
+            if type == 'components':
+                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", DeprecationWarning)
+            return self._to_components_dataframe(
+                dataset=dataset,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                conf=conf,
+                measured=type in ('observed_states', 'components'),
+                num_samples=num_samples,
+            )
         else:
-            offsets = torch.einsum('rij,nrj->nri', chol, white_noise)
-        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + offsets
+            raise ValueError(f"Expected type to be 'predictions', 'states', or 'observed_states', got '{type}'.")
 
-        # each of these samples is a draw of (1) the measured-mean of the linear processes, concatenated with (2) the
-        # nonlinear processes' state-means. use (2) to add the nonlinear processes' contributions to (1):
-        mmean_samples = sampled_pmmeans[..., 0:nmeasures]
-        if measurement_model.nonlinear_processes:
-            # (processes' measured-means aren't vectorized over samples, so loop)
-            mmean_samples = torch.stack([
-                measurement_model.apply_process_adjustments(
-                    sampled_pmean[..., 0:nmeasures],
-                    [
-                        (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
-                        for proc in measurement_model.nonlinear_processes
-                    ],
-                    time=0
+    @torch.inference_mode()
+    def samples_to_dataframe(self,
+                             samples: dict[str, torch.Tensor],
+                             dataset: Optional['TimeSeriesDataset'] = None,
+                             conf: float = .95,
+                             actuals: Optional[dict[str, torch.Tensor]] = None,
+                             group_colname: Optional[str] = None,
+                             time_colname: Optional[str] = None) -> pd.DataFrame:
+        """
+        Summarize samples (e.g. of some quantity computed from ``sample()``) into a dataframe with the same format as
+        ``to_dataframe()``: the mean and the ``conf`` interval across samples, for each group and timestep.
+
+        :param samples: A dictionary with ``(num_samples, num_groups, num_timesteps)`` tensors. The keys become the
+         'measure' column of the output.
+        :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
+        :param conf: The confidence level for the intervals.
+        :param actuals: Optionally, a dictionary with ``(num_groups, num_timesteps)`` tensors of actual values for some
+         keys of ``samples``.
+        :param group_colname: The name of the column to use for groups, defaults to the metadata's `group_colname`.
+        :param time_colname: The name of the column to use for time, defaults to the metadata's `time_colname`.
+        """
+        assert .5 <= conf < 1
+        alpha = (1 - conf) / 2
+        by_name = {}
+        for name, x in samples.items():
+            if x.shape[1:] != (self.num_groups, self.num_timesteps):
+                raise ValueError(
+                    f"Expected `samples['{name}']` to have shape (num_samples, {self.num_groups}, {self.num_timesteps})"
+                    f", got {tuple(x.shape)}"
                 )
-                for sampled_pmean in sampled_pmmeans.unbind(0)
-            ])
-        if measurement_model.measure_funs:
-            # (elementwise, so no need to loop)
-            mmean_samples = measurement_model.get_measure_wide_adjustments(mmean_samples)
-        return mmean_samples
-
-    def with_new_start_times(self,
-                             start_times: Union[np.ndarray, np.datetime64],
-                             n_timesteps: int,
-                             **kwargs) -> 'Predictions':
-        """
-        :param start_times: An array/sequence containing the start time for each group; or a single datetime to apply
-          to all groups. If the model/predictions are dateless (no dt_unit) then simply an array of indices.
-        :param n_timesteps: Each group will be sliced to this many timesteps, so times is start and times + n_timesteps
-          is end.
-        :return: A new ``Predictions`` object, with the state and measurement tensors sliced to the given times.
-        """
-        start_indices = self._standardize_times(times=start_times, *kwargs)
-        time_indices = np.arange(n_timesteps)[None, ...] + start_indices[:, None, ...]
-        return self[np.arange(self.num_groups)[:, None, ...], time_indices]
-
-    def get_state_at_times(self,
-                           times: Union[np.ndarray, np.datetime64],
-                           type_: str = 'update',
-                           **kwargs) -> 'StateTuple':
-        """
-        For each group, get the state (tuple of (mean, cov)) for a timepoint. This is often useful since predictions
-        are right-aligned and padded, so that the final prediction for each group is arbitrarily padded and does not
-        correspond to a timepoint of interest -- e.g. for simulation (i.e., calling
-        ``StateSpaceModel.simulate(initial_state=get_state_at_times(...))``).
-
-        :param times: An array/sequence containing the time for each group; or a single datetime to apply to all groups.
-          If the model/predictions are dateless (no dt_unit) then simply an array of indices
-        :param type_: What type of state? Since this method is typically used for getting an `initial_state` for
-         another call to :func:`StateSpaceModel.forward()`, this should generally be 'update' (the default); other
-         option is 'prediction'.
-        :return: A :class:`.StateTuple`, appropriate for forecasting by passing as `initial_state` for
-         :func:`StateSpaceModel.forward()`. This behaves like a tuple of ``(state_means, state_covs)``; if the model has
-         mixture components, it also carries the ``regime_probs`` at those times.
-        """
-        from .state import StateTuple
-
-        preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
-
-        def _squeeze(x):
-            return _map_states(x, lambda v: v.squeeze(1))
-
-        if type_.startswith('pred'):
-            return StateTuple(
-                preds.state_means.squeeze(1),
-                preds.state_covs.squeeze(1),
-                regime_probs=_squeeze(preds.regime_probs),
-                scaling=_squeeze(preds.scaling_states),
-            )
-        elif type_.startswith('update'):
-            if preds.update_means is None:
-                raise RuntimeError("No updates available; call the model with ``include_updates_in_output=True``.")
-            return StateTuple(
-                preds.update_means.squeeze(1),
-                preds.update_covs.squeeze(1),
-                regime_probs=_squeeze(preds.update_regime_probs),
-                scaling=_squeeze(preds.update_scaling_states),
-            )
-        else:
-            raise ValueError("Unrecognized `type_`, expected 'prediction' or 'update'.")
-
-    def _standardize_times(self,
-                           times: Union[np.ndarray, np.datetime64],
-                           start_offsets: Optional[np.ndarray] = None,
-                           dt_unit: Optional[str] = None) -> np.ndarray:
-        if start_offsets is not None:
-            warn(
-                "Passing `start_offsets` as an argument is deprecated, first call ``set_metadata()``",
-                DeprecationWarning
-            )
-        if dt_unit is not None:
-            warn(
-                "Passing `dt_unit` as an argument is deprecated, first call ``set_metadata()``",
-                DeprecationWarning
-            )
-        if self.dataset_metadata.start_offsets is not None:
-            start_offsets = self.dataset_metadata.start_offsets
-        if self.dataset_metadata.dt_unit is not None:
-            dt_unit = self.dataset_metadata.dt_unit
-
-        if not isinstance(times, (list, tuple, np.ndarray)):
-            times = [times] * self.num_groups
-        times = np.asanyarray(times, dtype='datetime64' if dt_unit else 'int')
-
-        if start_offsets is None:
-            if dt_unit is not None:
-                raise ValueError("If `dt_unit` is specified, then `start_offsets` must also be specified.")
-        else:
-            if isinstance(dt_unit, str):
-                dt_unit = np.timedelta64(1, dt_unit)
-            times = times - start_offsets
-            if dt_unit is not None:
-                times = times // dt_unit  # todo: validate int?
-            else:
-                assert times.dtype.name.startswith('int')
-
-        assert len(times.shape) == 1
-        assert times.shape[0] == self.num_groups
-
-        return times
+            by_name[name] = (x.mean(0), *_quantile_interval(x, alpha))
+        return self._summaries_to_dataframe(
+            by_name,
+            actuals=actuals or {},
+            dataset=self._resolve_dataset(dataset),
+            group_colname=group_colname or self.dataset_metadata.group_colname,
+            time_colname=time_colname or self.dataset_metadata.time_colname,
+        )
 
     @class_or_instancemethod
     def plot(cls,
@@ -1462,14 +679,771 @@ class Predictions:
 
         return plot + theme_bw() + theme(**kwargs)
 
-    def __iter__(self) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # so that we can do ``mean, cov = predictions``
-        yield self.means
-        yield self.covs
+    @torch.inference_mode()
+    def _to_dataframe(self,
+                      dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                      group_colname: str,
+                      time_colname: str,
+                      conf: float,
+                      use_map: bool,
+                      transform: Union['Transform', dict[str, 'Transform'], None] = None,
+                      derived: Optional[dict[str, Callable]] = None,
+                      num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
 
-    def __array__(self) -> np.ndarray:
-        # for numpy.asarray
-        return self.means.detach().cpu().numpy()
+        alpha = None if conf is False else (1 - conf) / 2
+        transforms = self._standardize_transforms(transform)
+        use_map = self._resolve_use_map(use_map)
+        measures = list(self.measurement_model.measures)
+
+        # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
+        # (intervals for nonlinear measures are always monte-carlo):
+        mmean_samples = None
+        needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
+        if (not use_map) or needs_mc_intervals:
+            mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
+
+        means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
+        by_measure = {m: (means[..., j],) for j, m in enumerate(measures)}
+        if alpha is not None:
+            intervals = self._get_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples)
+            by_measure = {m: (*v, *intervals[m]) for m, v in by_measure.items()}
+
+        from torchcast.utils import TimeSeriesDataset
+
+        actuals = {}
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in by_measure:
+                        continue
+                    actuals[m] = tens[..., mgroup.index(m)]
+                    if m in transforms:
+                        actuals[m] = transforms[m].inverse(actuals[m])
+            missing = set(by_measure) - set(dataset.all_measures)
+            if missing:
+                warn(
+                    f"The following measures in your model are not present in your dataset, please double-check that "
+                    f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
+                )
+
+        if derived:
+            self._add_derived(
+                derived,
+                alpha=alpha,
+                transforms=transforms,
+                by_measure=by_measure,
+                actuals=actuals,
+                mmean_samples=num_samples if mmean_samples is None else mmean_samples,
+            )
+
+        return self._summaries_to_dataframe(
+            by_measure,
+            actuals=actuals,
+            dataset=dataset,
+            group_colname=group_colname,
+            time_colname=time_colname,
+        )
+
+    def _get_intervals(self,
+                       alpha: float,
+                       transforms: dict[str, 'Transform'],
+                       mmean_samples: Union[torch.Tensor, int, None]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        The ``alpha`` and ``1 - alpha`` quantiles of each measure's predictive distribution, back-transformed by
+        ``transforms``:
+
+        - Measures with a linear measured-mean (also in a model with other, nonlinear measures): closed form -- the
+          gaussian's quantiles, or the mixture's, for measures with mixture components.
+        - Nonlinear measures: quantiles of the (fixed) samples of the state's measured-mean, ``mmean_samples`` (the
+          same as for the means), plus observation-noise -- and, for measures with mixture components, the regime's
+          offset and extra variance, with the regime drawn per sample from its probability. Each measure is sampled on
+          its own (its marginal is all an interval needs), with noise shared across rows, drawn with a fixed seed so
+          repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
+          probability), so there's no observation-noise.
+
+        :param mmean_samples: Only used if there are nonlinear measures: see ``_resolve_mmean_samples``. Pass
+         already-computed samples to save compute (and to share them). Ignored with a warning if not needed.
+        :return: For each measure, ``(num_groups, num_timesteps)`` lower and upper bounds.
+        """
+        all_measures = list(self.measurement_model.measures)
+        batch_shape = self.state_means.shape[0:2]
+        no_op_transform = _IdentityTransform()
+
+        # divide measures into:
+        # (1) nonlinear-measures (mixture or not),
+        # (2) mixture-but-linear-measures,
+        # (3) everything else
+        nonlinear_measures = list(self._nonlinear_measures)
+        _mix_measures = self.mixture.mixture_measures if self.mixture is not None else []
+        mixture_measures = [m for m in _mix_measures if m not in nonlinear_measures]
+        simple_measures = [m for m in all_measures if m not in nonlinear_measures and m not in mixture_measures]
+
+        out = {}
+
+        # simple measures:
+        if simple_measures:
+            measured_mean, system_cov = self._measured_moments_flat()
+            multi = -stats.norm.ppf(alpha)
+            for measure in simple_measures:
+                midx = all_measures.index(measure)
+                mean = measured_mean[:, midx].view(*batch_shape)
+                std = system_cov[:, midx, midx].sqrt().view(*batch_shape)
+
+                transform = transforms.get(measure, no_op_transform)
+                lower = transform.inverse(mean - multi * std)
+                upper = transform.inverse(mean + multi * std)
+                out[measure] = (lower, upper)
+
+        # mixture measures:
+        for measure in mixture_measures:
+            mixture = self.get_mixture(measure)
+            transform = transforms.get(measure, no_op_transform)
+            lower = transform.inverse(mixture.quantile(alpha))
+            upper = transform.inverse(mixture.quantile(1 - alpha))
+            out[measure] = (lower, upper)
+
+        # for nonlinear measures: observation-noise and uniforms (for the regimes), shared across rows:
+        if nonlinear_measures:
+            mmean_samples = self._resolve_mmean_samples(mmean_samples)
+            generator = self._output_generator(state=False)
+            to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
+            noise = torch.randn((mmean_samples.shape[0], len(all_measures)), generator=generator, **to)
+            uniforms = torch.rand((mmean_samples.shape[0], len(all_measures)), generator=generator, **to)
+
+            for measure in nonlinear_measures:
+                midx = all_measures.index(measure)
+                this_measure_samples = mmean_samples[..., midx]  # (num_samples, num_rows)
+                # (a non-gaussian measure, e.g. binary, has no gaussian observation-noise -- its `measure_covs` entry is
+                # zero -- and no mixture components, so its interval is for the mean, e.g. the probability)
+                noise_var = self.measure_covs_flat[:, midx, midx]
+                regimes = self._regimes(measure)
+                if len(regimes) > 1:
+                    # draw a regime for each sample and row, by "inverse-cdf sampling": e.g. with regime-probabilities
+                    # (.7, .2, .1), the cdf's boundaries are (.7, .9), and a uniform u is in regime 0 if u < .7, regime
+                    # 1 if .7 <= u < .9, else regime 2 -- i.e. the regime is the number of boundaries below u. (the
+                    # last boundary, 1, is dropped: u is always below it.)
+                    cdf = self._measure_regime_probs(measure).reshape(-1, len(regimes)).cumsum(-1)[:, :-1]
+                    regime = (uniforms[:, midx, None, None] > cdf).sum(-1)  # (num_samples, num_rows)
+                    # each draw then gets its regime's offset (added to the mean) and extra variance (added to the
+                    # noise's):
+                    _, offsets, extras = zip(*regimes)
+                    offsets = torch.stack([torch.as_tensor(o, **to) for o in offsets])  # (num_regimes,)
+                    extras = torch.stack([torch.as_tensor(e, **to) for e in extras])
+                    this_measure_samples = this_measure_samples + offsets[regime]
+                    noise_var = noise_var + extras[regime]
+                this_measure_samples = this_measure_samples + noise_var.sqrt() * noise[:, midx, None]
+
+                transform = transforms.get(measure, no_op_transform)
+                this_measure_samples = transform.inverse(this_measure_samples)
+                out[measure] = tuple(b.view(*batch_shape) for b in _quantile_interval(this_measure_samples, alpha))
+        elif mmean_samples is not None:
+            warn("`mmean_samples` argument to `_get_intervals()` ignored, no sampling needed.")
+        return out
+
+    def _add_derived(self,
+                     derived: dict[str, Callable],
+                     alpha: Optional[float],
+                     transforms: dict[str, 'Transform'],
+                     by_measure: dict,
+                     actuals: dict[str, torch.Tensor],
+                     mmean_samples: Union[torch.Tensor, int, None] = None) -> None:
+        """
+        Adds summaries of derived quantities to ``by_measure``, and (if there are any actuals, i.e. a dataset) the
+        derived actuals to ``actuals``. Modifies both in place.
+
+        :param mmean_samples: Samples of the state's measured-mean (see ``_resolve_mmean_samples``): pass the ones the
+         means and intervals use, to save compute (and to share them). The rest of each sample (the regime, the
+         observations) is drawn given these, as in :func:`sample`.
+        """
+        measures = list(self.measurement_model.measures)
+        overlap = set(derived) & set(measures)
+        if overlap:
+            raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
+        mmean_samples = self._resolve_mmean_samples(mmean_samples)
+        # summaries are per-row, so shared noise is fine (and uses less memory):
+        num_samples = mmean_samples.shape[0]
+        _, _, observations = self._sample_given_state(
+            mmean_samples,
+            generator=self._output_generator(state=False),
+            shared_noise=True,
+            observation_measures=measures,
+        )
+        observations = observations.view(num_samples, self.num_groups, self.num_timesteps, len(measures))
+        values = {m: observations[..., j] for j, m in enumerate(measures)}
+        for m, t in transforms.items():
+            if t.bias_adjust is not None:
+                warn(f"`{type(t).__name__}(bias_adjust=...)` is ignored for `derived`.")
+            values[m] = t.inverse(values[m])
+
+        # the functions are also applied to the actuals (as a batch of one sample), if there's a dataset. measures that
+        # aren't in the dataset are nan, like missing values:
+        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
+        if measure_actuals:
+            nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
+            measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
+
+        expected_shape = (num_samples, self.num_groups, self.num_timesteps)
+        for name, fun in derived.items():
+            out = fun(values)
+            if tuple(out.shape) != expected_shape:
+                raise ValueError(f"`derived['{name}']` returned shape {tuple(out.shape)}, expected {expected_shape}.")
+            by_measure[name] = (out.mean(0),) if alpha is None else (out.mean(0), *_quantile_interval(out, alpha))
+            if measure_actuals:
+                actuals[name] = fun(measure_actuals).squeeze(0)
+
+    def _summaries_to_dataframe(self,
+                                by_measure: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+                                actuals: dict[str, torch.Tensor],
+                                dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                                group_colname: str,
+                                time_colname: str) -> pd.DataFrame:
+        """
+        :param by_measure: For each measure (or other named quantity), a tuple of ``(num_groups, num_timesteps)``
+         tensors: mean, lower, upper -- or just mean.
+        :param actuals: Optionally, ``(num_groups, num_timesteps)`` actuals for some measures/quantities (can have
+         fewer timesteps).
+        :return: A long-format dataframe with columns for group, time, mean, lower, upper, (actual,) and measure.
+        """
+        from torchcast.utils import TimeSeriesDataset
+
+        out = []
+        times = TimeSeriesDataset.get_dataset_times(
+            dataset.start_offsets, num_timesteps=self.state_means.shape[1], dt_unit=dataset.dt_unit
+        )
+        for measure, (mean, *interval) in by_measure.items():
+            _to_stack = {'mean': mean.unsqueeze(-1)}
+            if interval:
+                lower, upper = interval
+                _to_stack.update(lower=lower.unsqueeze(-1), upper=upper.unsqueeze(-1))
+            mactuals = actuals.get(measure, None)
+            if mactuals is not None:
+                _to_stack['actual'] = mactuals.unsqueeze(-1)
+            out.append(
+                TimeSeriesDataset.tensor_to_dataframe(
+                    tensor=ragged_cat(list(_to_stack.values()), cat_dim=-1, ragged_dim=1),
+                    times=times,
+                    group_names=dataset.group_names,
+                    group_colname=group_colname,
+                    time_colname=time_colname,
+                    measures=list(_to_stack)
+                )
+            )
+            out[-1]['measure'] = measure
+        out = pd.concat(out)
+
+        return out
+
+    @torch.inference_mode()
+    def _to_components_dataframe(self,
+                                 dataset: Union['TimeSeriesDataset', 'DatasetMetadata'],
+                                 group_colname: str,
+                                 time_colname: str,
+                                 conf: float,
+                                 measured: bool,
+                                 num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
+        alpha = (1 - conf) / 2
+        batch_shape = self.state_means.shape[0:2]
+
+        if self.measurement_model.is_nonlinear:
+            # sample from the state distribution:
+            chol = torch.linalg.cholesky(self.state_covs_flat)
+            white_noise = torch.randn(
+                (num_samples, *self.state_means_flat.shape),
+                generator=self._output_generator(state=True),
+                dtype=chol.dtype,
+                device=chol.device,
+            )
+            state_mean_samples = self.state_means_flat + _matmul_per_row(chol, white_noise)
+
+            # pass each sample to the `get_components` function, organize by process:
+            samples_by_proc = {}
+            for smean_samp in state_mean_samples:
+                for pid, se, comp_mean in self.measurement_model_flat.get_components(smean_samp, measured=measured):
+                    key = (pid, se)
+                    if key not in samples_by_proc:
+                        samples_by_proc[key] = []
+                    samples_by_proc[key].append(comp_mean)
+            # compute CIs:
+            cis_by_proc = {}
+            for key, samples in samples_by_proc.items():
+                stacked = torch.stack(samples, dim=0).view(num_samples, *batch_shape)
+                lower = torch.quantile(stacked, q=alpha, dim=0)
+                upper = torch.quantile(stacked, q=1 - alpha, dim=0)
+                cis_by_proc[key] = (lower, upper)
+        else:
+            cis_by_proc = {}
+            for q in (alpha, 1 - alpha):
+                multi = -stats.norm.ppf(q)
+                offset = self.state_means_flat + multi * torch.sqrt(self.state_covs_flat.diagonal(dim1=-2, dim2=-1))
+                for pid, se, comp_mean in self.measurement_model_flat.get_components(offset, measured=measured):
+                    key = (pid, se)
+                    if key not in cis_by_proc:
+                        cis_by_proc[key] = []
+                    cis_by_proc[key].append(comp_mean.view(*batch_shape))
+
+        from torchcast.utils import TimeSeriesDataset
+
+        # for each process, get mean/quantiles:
+        times = TimeSeriesDataset.get_dataset_times(
+            dataset.start_offsets, num_timesteps=batch_shape[-1], dt_unit=dataset.dt_unit
+        )
+        out = []
+        for pid, se, comp_mean in self.measurement_model_flat.get_components(self.state_means_flat, measured=measured):
+            mean = comp_mean.view(*batch_shape)
+            lower, upper = cis_by_proc[(pid, se)]
+
+            # to dataframe:
+            _df = TimeSeriesDataset.tensor_to_dataframe(
+                tensor=torch.stack([mean, lower, upper], -1),
+                times=times,
+                group_names=dataset.group_names,
+                group_colname=group_colname,
+                time_colname=time_colname,
+                measures=['mean', 'lower', 'upper']
+            )
+
+            _df['process'] = pid
+            _df['state_element'] = se
+            _df['measure'] = self.measurement_model.processes[pid].measure
+            out.append(_df)
+
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in self.measurement_model.measures:
+                        continue
+                    actuals = tens[:, :, [mgroup.index(m)]]
+                    preds = self.means[:, 0:actuals.shape[1], [self.measurement_model.measures.index(m)]]
+                    _df = TimeSeriesDataset.tensor_to_dataframe(
+                        tensor=preds - actuals,
+                        times=times,
+                        group_names=dataset.group_names,
+                        group_colname=group_colname,
+                        time_colname=time_colname,
+                        measures=['mean'],
+                    )
+                    _df['measure'] = m
+                    _df['process'] = 'residuals'
+                    _df['state_element'] = 'residuals'
+                    out.append(_df)
+
+        out = pd.concat(out)
+        return out
+
+    def _resolve_dataset(self,
+                         dataset: Optional['TimeSeriesDataset']) -> Union['TimeSeriesDataset', 'DatasetMetadata']:
+        if dataset is not None:
+            return dataset
+        dataset = self.dataset_metadata.copy()
+        if dataset.group_names is None:
+            warn(
+                "This ``Predictions`` object doesn't have access to the group-names, consider calling "
+                "``predictions.set_metadata()``."
+            )
+            dataset.group_names = [f"group_{i}" for i in range(self.num_groups)]
+        if dataset.start_offsets.dtype.name.startswith('date') and not dataset.dt_unit:
+            raise ValueError(
+                "Unable to infer `dt_unit`, please call ``predictions.set_metadata(dt_unit=X)``, or pass `dataset` "
+                "to ``predictions.to_dataframe()``"
+            )
+        if dataset.dt_unit and not dataset.start_offsets.dtype.name.startswith('date'):
+            raise ValueError(
+                "Expected `start_offsets` to be a datetime64 array, but got a different dtype. If you don't have "
+                "dates, then set `dt_unit=None`."
+            )
+        return dataset
+
+    # Sampling ---------------------------------------------------------------------------------------------------------
+
+    def sample(self,
+               num_samples: int,
+               shared_noise: bool,
+               observation_noise: bool = True,
+               generator: Optional[torch.Generator] = None) -> 'PredictionSamples':
+        """
+        Draw samples from the predictive distribution: jointly across measures, for each group and timestep. These
+        are *not* trajectories -- the model's timesteps are correlated (via the state), while samples for different
+        timesteps are not -- so quantities that combine timesteps shouldn't be computed from them; see
+        :func:`StateSpaceModel.simulate` for that.
+
+        Each sample is a draw of the state (and, for models with mixture components, of the regime), giving a
+        conditional distribution for the measures: ``means`` and ``covs``. These capture uncertainty about the state,
+        but not the observation noise around it. With ``observation_noise=True``, each sample also includes a draw of
+        the observations from that conditional distribution (for binary measures: binomial draws).
+
+        :param num_samples: The number of samples.
+        :param shared_noise: If True, the underlying random draws (the standard-normal noise for the state and for
+         the gaussian observation-noise, and the uniforms for the regime) are the same for every group and timestep
+         (binomial draws are still independent). Each row's distribution is still correct, so this is fine
+         for per-row summaries (means, quantiles, functions of several measures), and it uses less memory. But
+         samples are then correlated across rows. If False, samples are independent across rows, so they can be
+         aggregated across groups (e.g. summed), since groups are independent in the model -- but still not across
+         timesteps (see above).
+        :param observation_noise: If True (the default), also sample the observations.
+        :param generator: An optional :class:`torch.Generator`, for reproducibility.
+        :return: A :class:`PredictionSamples`.
+        """
+        batch_shape = self.state_means.shape[0:2]
+        measures = list(self.measurement_model.measures)
+        # sample the measured-mean (via the state), then the rest given it (the same generator draws the state's noise
+        # first, then the regimes and observations):
+        means = self._get_output_samples(num_samples, generator=generator, shared_noise=shared_noise)
+        means, extra_vars, observations = self._sample_given_state(
+            means,
+            generator=generator,
+            shared_noise=shared_noise,
+            observation_measures=measures if observation_noise else None,
+        )
+        if observations is not None:
+            observations = observations.view(num_samples, *batch_shape, len(measures))
+
+        means = means.view(num_samples, *batch_shape, len(measures))
+        if extra_vars is not None:
+            extra_vars = extra_vars.view(num_samples, *batch_shape, len(measures))
+
+        return PredictionSamples(
+            measures=measures,
+            means=means,
+            measure_covs=self.measure_covs,
+            extra_vars=extra_vars,
+            observations=observations,
+        )
+
+    def _sample_given_state(self,
+                            means: torch.Tensor,
+                            generator: Optional[torch.Generator],
+                            shared_noise: bool,
+                            observation_measures: Optional[Sequence[str]]
+                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        The rest of a sample, given samples of the measured-mean (one per sample of the state): the regime (for
+        models with mixture components), then the observations.
+
+        :param means: A ``(num_samples, num_rows, num_measures)`` tensor of measured-means.
+        :param observation_measures: The measures whose observations to sample (the others' observations are their
+         means); or None to skip the observations.
+        :return: The means (with the regimes' offsets), the per-sample variances added to the diagonal of
+         ``measure_covs`` (or None), and the observations (or None).
+        """
+        # the observations' covariance given the sampled state is `measure_covs` plus a per-sample diagonal (e.g. a
+        # binary measure's binomial variance; a regime's extra variance) -- tracked as just that diagonal, rather
+        # than a (num_samples, num_rows, num_measures, num_measures) tensor:
+        extra_vars = self._conditional_measure_vars(means)
+
+        # sample the regime:
+        if self.mixture is not None:
+            means, extra_vars = self._sample_regimes(means, extra_vars, generator=generator, shared_noise=shared_noise)
+
+        observations = None
+        if observation_measures is not None:
+            observations = self._sample_observations(
+                means,
+                extra_vars,
+                generator=generator,
+                measures=observation_measures,
+                shared_noise=shared_noise,
+            )
+        return means, extra_vars, observations
+
+    def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        The covariance of the observations given a sampled state is ``measure_covs`` plus a per-sample diagonal; this
+        returns that diagonal. For gaussian measures there is none (their observation-noise doesn't depend on the
+        state); subclasses whose observation-noise *does* depend on the state override this (e.g.
+        ``BinomialPredictions``: ``p * (1 - p) / num_obs`` for binary measures, whose ``measure_covs`` entries are
+        empty).
+
+        :param means: A ``(num_samples, num_rows, num_measures)`` tensor of measured means, each from a sampled state.
+        :return: A ``(num_samples, num_rows, num_measures)`` tensor of variances to add to the diagonal of
+         ``measure_covs``, or None if there are none.
+        """
+        return None
+
+    def _sample_regimes(self,
+                        means: torch.Tensor,
+                        extra_vars: Optional[torch.Tensor],
+                        generator: Optional[torch.Generator],
+                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
+        their mean and its variance to their (conditional) variance -- i.e. to ``extra_vars``, the per-sample diagonal
+        added to ``measure_covs`` (see ``_conditional_measure_vars``).
+
+        :param shared_noise: If True, the draws use the same uniforms for every row (inverting each row's cdf of the
+         regime-probabilities); otherwise they're independent.
+        """
+        rm = self.mixture
+        num_samples = means.shape[0]
+        shift, extra_var = rm.combo_offsets(self.measurement_model.measures, like=means)  # (num_combos, num_measures)
+        regime_probs = self.regime_probs.reshape(-1, rm.num_combos)
+        if shared_noise:
+            uniforms = torch.rand(num_samples, generator=generator, dtype=means.dtype, device=means.device)
+            cdf = regime_probs.cumsum(-1)[:, :-1].contiguous()  # (num_rows, num_combos - 1)
+            # (the number of cdf-values below each uniform)
+            combo_idx = torch.searchsorted(cdf, uniforms.expand(cdf.shape[0], -1).contiguous()).T  # (samples, rows)
+        else:
+            combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
+        extra = extra_var[combo_idx]  # (num_samples, num_rows, num_measures)
+        return means + shift[combo_idx], extra if extra_vars is None else extra_vars + extra
+
+    def _sample_observations(self,
+                             means: torch.Tensor,
+                             extra_vars: Optional[torch.Tensor],
+                             generator: Optional[torch.Generator],
+                             measures: Optional[Sequence[str]] = None,
+                             shared_noise: bool = False) -> torch.Tensor:
+        """
+        Samples gaussian observation-noise around ``means``, for the requested measures. All other measures returned
+        as-is. The noise's covariance is ``measure_covs`` plus ``diag(extra_vars)`` (per-sample), drawn as the sum of
+        two independent terms -- ``chol(measure_covs) @ z1 + sqrt(extra_vars) * z2`` -- so it needs neither a
+        per-sample covariance nor a per-sample cholesky.
+
+        :param shared_noise: If True, the same standard-normal noise for every row; otherwise independent.
+        """
+        all_measures = list(self.measurement_model.measures)
+        if measures is None:
+            measures = all_measures
+
+        non_gaussian = set(measures).intersection(self._non_gaussian_measures)
+        if non_gaussian:
+            raise ValueError(
+                f"{type(self).__name__}._sample_observations() only works for gaussian measures, but got {non_gaussian}"
+            )
+
+        idx = [i for i, m in enumerate(all_measures) if m in measures]
+        if not idx:
+            return means.clone()
+
+        z_shape = (means.shape[0], len(idx)) if shared_noise else (*means.shape[:-1], len(idx))
+        to = {'dtype': means.dtype, 'device': means.device}
+        chol = torch.linalg.cholesky(self.measure_covs_flat[:, idx][:, :, idx])  # (num_rows, len(idx), len(idx))
+        z = torch.randn(z_shape, generator=generator, **to)
+        noise = _matmul_per_row(chol, z)
+        if extra_vars is not None:
+            z = torch.randn(z_shape, generator=generator, **to)
+            noise = noise + extra_vars[..., idx].sqrt() * (z.unsqueeze(1) if shared_noise else z)
+        if len(idx) == len(all_measures):
+            return means + noise
+        # (out-of-place; much faster than a clone plus in-place updates via advanced indexing)
+        return means.index_add(-1, torch.as_tensor(idx, device=means.device), noise)
+
+    # Mixture components -----------------------------------------------------------------------------------------------
+
+    def get_mixture(self, measure: str) -> 'MixtureOfNormals':
+        """
+        For a measure with mixture components, the predictive distribution as a (univariate) mixture of normals: the
+        standard regime, then each of the measure's components.
+
+        For a measure with a nonlinear measurement (a measure-function or nonlinear processes), the standard regime
+        isn't actually normal: its mean and variance are from the linearized (EKF) measurement-model, so are
+        approximate (with a warning). The regime-probabilities are still exact. (``to_dataframe()`` and ``means`` use
+        monte-carlo for these measures instead.)
+
+        :param measure: The name of the measure.
+        :return: A :class:`.MixtureOfNormals` whose tensors have shape ``(num_groups, num_timesteps, num_components)``.
+        """
+        if measure in self._nonlinear_measures:
+            warn(
+                f"'{measure}' has a nonlinear measurement, so the standard regime's mean and variance are from the "
+                f"linearized measurement-model (approximate). The regime-probabilities are exact."
+            )
+        j = list(self.measurement_model.measures).index(measure)
+        measured_mean, system_cov = self._measured_moments_flat()
+        batch_shape = self.state_means.shape[0:2]
+        return self._get_mixture(
+            measure,
+            standard_mean=measured_mean[:, j].view(*batch_shape),
+            standard_var=system_cov[:, j, j].view(*batch_shape),
+        )
+
+    def _get_mixture(self,
+                     measure: str,
+                     standard_mean: torch.Tensor,
+                     standard_var: torch.Tensor) -> 'MixtureOfNormals':
+        """
+        :param standard_mean: A ``(num_groups, num_timesteps)`` tensor with the mean of the standard regime.
+        :param standard_var: A ``(num_groups, num_timesteps)`` tensor with the variance of the standard regime.
+        """
+
+        if self.mixture is None or measure not in self.mixture.mixture_measures:
+            raise ValueError(f"'{measure}' has no mixture components.")
+        labels, offsets, extravars = zip(*self._regimes(measure))
+        return MixtureOfNormals(
+            labels=[(label or 'standard') for label in labels],
+            probs=self._measure_regime_probs(measure),
+            means=torch.stack([standard_mean + offset for offset in offsets], -1),
+            vars=torch.stack([standard_var + extra_var for extra_var in extravars], -1),
+        )
+
+    def _get_regime_combos(self) -> tuple[list[tuple[str, ...]], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        For models with mixture components: the predictive distribution as a mixture over regime-combos (see
+        :class:`.MixtureModel`). Within each combo the prediction is multivariate normal, with the usual
+        (state-dependent) mean and covariance -- plus, for measures in a mixture-component's regime, that component's
+        offset (to the mean) and variance (on the diagonal).
+
+        Note that for measures with a nonlinear measurement (a measure-function, e.g. binary measures, or nonlinear
+        processes), the standard-regime moments are from the linearized measurement-model, so are approximate (with a
+        warning, if any of these are mixture measures).
+
+        :return: A tuple of (1) a label for each combo: a tuple with the regime of each mixture measure ('standard' or
+         the component id), (2) a ``(num_groups, num_timesteps, num_combos)`` tensor of combo probabilities, (3) a
+         ``(num_groups, num_timesteps, num_combos, num_measures)`` tensor of means, and (4) a ``(num_groups,
+         num_timesteps, num_combos, num_measures, num_measures)`` tensor of covariances.
+        """
+        if self.mixture is None:
+            raise RuntimeError("This model has no mixture components.")
+        rm = self.mixture
+        nonlinear = [m for m in rm.mixture_measures if m in self._nonlinear_measures]
+        if nonlinear:
+            warn(
+                f"Mixture measures {nonlinear} have a nonlinear measurement, so the standard regime's moments are from "
+                f"the linearized measurement-model (approximate). The regime-probabilities are exact."
+            )
+        measures = list(self.measurement_model.measures)
+        measured_mean, system_cov = self._measured_moments_flat()
+        shift, extra_var = rm.combo_offsets(measures, like=measured_mean)  # (num_combos, num_measures)
+        means = [measured_mean + shift[c] for c in range(rm.num_combos)]
+        covs = [system_cov + torch.diag(extra_var[c]) for c in range(rm.num_combos)]
+        batch_shape = self.state_means.shape[0:2]
+        labels = [tuple('standard' if c is None else c.id for c in combo) for combo in rm.combos]
+        return (
+            labels,
+            self.regime_probs,
+            torch.stack(means, 1).view(*batch_shape, rm.num_combos, len(measures)),
+            torch.stack(covs, 1).view(*batch_shape, rm.num_combos, len(measures), len(measures)),
+        )
+
+    def _regimes(self, measure: str) -> list[tuple[Optional[str], Union[torch.Tensor, float], ...]]:
+        """
+        The regimes of a measure: ``(component_id, offset, extra_var)`` for the standard regime (``(None, 0, 0)``),
+        then each of its mixture components (if any).
+        """
+        return [(None, 0., 0.)] + [(c.id, c.offset, c.extra_var) for c in self._mixture_components(measure)]
+
+    def _measure_regime_probs(self, measure: str) -> torch.Tensor:
+        """
+        :return: A ``(num_groups, num_timesteps, num_regimes)`` tensor with the probability of each of ``measure``'s
+         regimes (see ``_regimes``): all ones for a measure without mixture components.
+        """
+        if self.mixture is None or measure not in self.mixture.mixture_measures:
+            return torch.ones(
+                (*self.state_means.shape[0:2], 1),
+                dtype=self.state_means.dtype,
+                device=self.state_means.device
+            )
+        rm = self.mixture
+        k = rm.mixture_measures.index(measure)
+        probs = []
+        for component in [None] + self._mixture_components(measure):
+            in_regime = torch.as_tensor([combo[k] is component for combo in rm.combos], device=self.regime_probs.device)
+            probs.append(self.regime_probs[..., in_regime].sum(-1))
+        return torch.stack(probs, -1)
+
+    def _mixture_components(self, measure: str) -> list:
+        if self.mixture is None:
+            return []
+        return [c for c in self.mixture.components if c.measure == measure]
+
+    # States at specific times, and indexing ---------------------------------------------------------------------------
+
+    def get_state_at_times(self,
+                           times: Union[np.ndarray, np.datetime64],
+                           type_: str = 'update',
+                           **kwargs) -> 'StateTuple':
+        """
+        For each group, get the state (tuple of (mean, cov)) for a timepoint. This is often useful since predictions
+        are right-aligned and padded, so that the final prediction for each group is arbitrarily padded and does not
+        correspond to a timepoint of interest -- e.g. for simulation (i.e., calling
+        ``StateSpaceModel.simulate(initial_state=get_state_at_times(...))``).
+
+        :param times: An array/sequence containing the time for each group; or a single datetime to apply to all groups.
+          If the model/predictions are dateless (no dt_unit) then simply an array of indices
+        :param type_: What type of state? Since this method is typically used for getting an `initial_state` for
+         another call to :func:`StateSpaceModel.forward()`, this should generally be 'update' (the default); other
+         option is 'prediction'.
+        :return: A :class:`.StateTuple`, appropriate for forecasting by passing as `initial_state` for
+         :func:`StateSpaceModel.forward()`. This behaves like a tuple of ``(state_means, state_covs)``; if the model has
+         mixture components, it also carries the ``regime_probs`` at those times.
+        """
+        from .state import StateTuple
+
+        preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
+        single_time = (slice(None), 0)  # (like `.squeeze(1)`)
+
+        if type_.startswith('pred'):
+            return StateTuple(
+                preds.state_means.squeeze(1),
+                preds.state_covs.squeeze(1),
+                regime_probs=_index_states(preds.regime_probs, single_time),
+                scaling=_index_states(preds.scaling_states, single_time),
+            )
+        elif type_.startswith('update'):
+            if preds.update_means is None:
+                raise RuntimeError("No updates available; call the model with ``include_updates_in_output=True``.")
+            return StateTuple(
+                preds.update_means.squeeze(1),
+                preds.update_covs.squeeze(1),
+                regime_probs=_index_states(preds.update_regime_probs, single_time),
+                scaling=_index_states(preds.update_scaling_states, single_time),
+            )
+        else:
+            raise ValueError("Unrecognized `type_`, expected 'prediction' or 'update'.")
+
+    def with_new_start_times(self,
+                             start_times: Union[np.ndarray, np.datetime64],
+                             n_timesteps: int,
+                             **kwargs) -> 'Predictions':
+        """
+        :param start_times: An array/sequence containing the start time for each group; or a single datetime to apply
+          to all groups. If the model/predictions are dateless (no dt_unit) then simply an array of indices.
+        :param n_timesteps: Each group will be sliced to this many timesteps, so times is start and times + n_timesteps
+          is end.
+        :return: A new ``Predictions`` object, with the state and measurement tensors sliced to the given times.
+        """
+        start_indices = self._standardize_times(times=start_times, *kwargs)
+        time_indices = np.arange(n_timesteps)[None, ...] + start_indices[:, None, ...]
+        return self[np.arange(self.num_groups)[:, None, ...], time_indices]
+
+    def _standardize_times(self,
+                           times: Union[np.ndarray, np.datetime64],
+                           start_offsets: Optional[np.ndarray] = None,
+                           dt_unit: Optional[str] = None) -> np.ndarray:
+        if start_offsets is not None:
+            warn(
+                "Passing `start_offsets` as an argument is deprecated, first call ``set_metadata()``",
+                DeprecationWarning
+            )
+        if dt_unit is not None:
+            warn(
+                "Passing `dt_unit` as an argument is deprecated, first call ``set_metadata()``",
+                DeprecationWarning
+            )
+        if self.dataset_metadata.start_offsets is not None:
+            start_offsets = self.dataset_metadata.start_offsets
+        if self.dataset_metadata.dt_unit is not None:
+            dt_unit = self.dataset_metadata.dt_unit
+
+        if not isinstance(times, (list, tuple, np.ndarray)):
+            times = [times] * self.num_groups
+        times = np.asanyarray(times, dtype='datetime64' if dt_unit else 'int')
+
+        if start_offsets is None:
+            if dt_unit is not None:
+                raise ValueError("If `dt_unit` is specified, then `start_offsets` must also be specified.")
+        else:
+            if isinstance(dt_unit, str):
+                dt_unit = np.timedelta64(1, dt_unit)
+            times = times - start_offsets
+            if dt_unit is not None:
+                times = times // dt_unit  # todo: validate int?
+            else:
+                assert times.dtype.name.startswith('int')
+
+        assert len(times.shape) == 1
+        assert times.shape[0] == self.num_groups
+
+        return times
 
     def __getitem__(self, item) -> 'Predictions':
         kwargs = self._getitem_helper(item)
@@ -1481,16 +1455,13 @@ class Predictions:
             item = (item,)
         from .state import StateTuple
 
-        def _slice(x):
-            return _map_states(x, lambda v: v[item])
-
         kwargs = {
             'measurement_model': self.measurement_model.subset(*item),
             'states': StateTuple(
                 self.state_means[item],
                 self.state_covs[item],
-                regime_probs=_slice(self.regime_probs),
-                scaling=_slice(self.scaling_states),
+                regime_probs=_index_states(self.regime_probs, item),
+                scaling=_index_states(self.scaling_states, item),
             ),
             'measure_covs': self.measure_covs[item],
             # indexing only can impact group/time (ensured by measurementModel.subset), so no impact:
@@ -1501,11 +1472,287 @@ class Predictions:
             kwargs['updates'] = StateTuple(
                 self.update_means[item],
                 self.update_covs[item],
-                regime_probs=_slice(self.update_regime_probs),
-                scaling=_slice(self.update_scaling_states),
+                regime_probs=_index_states(self.update_regime_probs, item),
+                scaling=_index_states(self.update_scaling_states, item),
             )
 
         return kwargs
+
+    # Shared internals (used by several of the above) ------------------------------------------------------------------
+
+    def _resolve_use_map(self, use_map: Optional[bool]) -> bool:
+        """
+        :return: Whether the means of nonlinear measures use the MAP (the measured-mean of the state-mean) rather than
+         monte-carlo. Always True for a linear model, whose (closed-form) means are the MAP -- so ``not use_map``
+         implies there are nonlinear measures.
+        """
+        if not self.measurement_model.is_nonlinear:
+            if use_map:
+                warn("``use_map`` disregarded, no monte-carlo")
+            return True
+        if use_map is None:
+            warn(
+                "Will use MCMC for intervals but MAP for mean; to keep this behavior and suppress this warning, "
+                "pass ``use_map=True``; to use MCMC for the mean as well pass ``use_map=False``."
+            )
+            return True
+        return bool(use_map)
+
+    def _standardize_transforms(self,
+                                transform: Union['Transform', dict[str, 'Transform'], None]) -> dict[str, 'Transform']:
+        from .transforms import Transform
+
+        measures = list(self.measurement_model.measures)
+        if transform is None:
+            return {}
+        if isinstance(transform, Transform):
+            transforms = {m: transform for m in measures}
+        elif isinstance(transform, dict):
+            transforms = dict(transform)
+            unknown = set(transforms) - set(measures)
+            if unknown:
+                raise ValueError(f"`transform` has measures not in the model: {unknown}")
+        else:
+            raise TypeError(f"Expected `transform` to be a `Transform` or a dict of them, got {type(transform)}")
+        # note: measures with a nonlinear measurement (measure-fun or nonlinear process) are fine -- the model is
+        # `T(y) = g(state) + noise`, and the monte-carlo path back-transforms samples of `g(state) + noise`. but
+        # measures with a non-gaussian likelihood aren't:
+        non_gaussian = [m for m in transforms if m in self._non_gaussian_measures]
+        if non_gaussian:
+            raise ValueError(
+                f"`transform` is not supported for measures with a non-gaussian likelihood (e.g. binary measures): "
+                f"{non_gaussian}. To transform only some measures, pass a dict of `{{measure: Transform}}`."
+            )
+        return transforms
+
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        """
+        Measures whose likelihood isn't gaussian (e.g. the binary measures of ``BinomialPredictions``).
+        """
+        return ()
+
+    @property
+    def _nonlinear_measures(self) -> set[str]:
+        """
+        Measures whose measured-mean is a nonlinear function of the state (via a measure-function or a nonlinear
+        process), so their predictive distribution isn't gaussian even with a gaussian likelihood.
+        """
+        mm = self.measurement_model
+        return set(mm.measure_funs) | {p.measure for p in mm.nonlinear_processes}
+
+    def _measured_moments_flat(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        :return: The (flattened) measured-mean and system-covariance of the (linearized) measurement model -- i.e.,
+         for models with mixture components, of the standard regime.
+        """
+        measured_mean, measure_mat = self.measurement_model_flat(self.state_means_flat, time=0)
+        system_cov = measure_mat @ self.state_covs_flat @ measure_mat.permute(0, 2, 1) + self.measure_covs_flat
+        return measured_mean, system_cov
+
+    def _get_measured_mean_samples(self,
+                                   measurement_model: 'MeasurementModel',
+                                   state_means: torch.Tensor,
+                                   state_covs: torch.Tensor,
+                                   white_noise: torch.Tensor,
+                                   deviation_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Samples of the measured-mean, from samples of the state. Rather than sampling the full state, this samples a
+        lower-dimensional gaussian: the measured-mean of the linear processes, concatenated with the state-elements of
+        any nonlinear processes (see ``MeasurementModel.extended_measure_mat``). The nonlinear processes'
+        contributions, then any measure-functions, are applied to those samples.
+
+        :param measurement_model: A flattened measurement-model (possibly a subset of the measures, for nans), with
+         ``num_rows`` groups.
+        :param state_means: A ``(num_rows, state_rank)`` tensor.
+        :param state_covs: A ``(num_rows, state_rank, state_rank)`` tensor.
+        :param white_noise: Standard-normal noise for ``measurement_model``'s extended dimensions, either
+         ``(num_samples, dim)`` -- the same draws for every row -- or ``(num_samples, num_rows, dim)``. E.g.
+         ``_log_prob_white_noise()`` (fixed, for the log-prob), or ``_get_output_samples()``'s.
+        :param deviation_scale: Optional scales for the sampled deviations from the mean, one per extended dimension
+         (before any nonlinearity; see ``_extended_dim_scale``).
+        :return: A ``(num_samples, num_rows, num_measures)`` tensor.
+        """
+        nmeasures = len(measurement_model.measures)
+
+        extended_measure_mat = measurement_model.extended_measure_mat  # (raises if not flattened)
+        num_rows, state_rank = measurement_model.num_groups, extended_measure_mat.shape[-1]
+        if state_means.shape != (num_rows, state_rank) or state_covs.shape != (num_rows, state_rank, state_rank):
+            raise ValueError(
+                f"Expected `state_means` with shape {(num_rows, state_rank)} and `state_covs` with shape "
+                f"{(num_rows, state_rank, state_rank)} (`measurement_model` has {num_rows} rows), got "
+                f"{tuple(state_means.shape)} and {tuple(state_covs.shape)}."
+            )
+        partial_measured_mean = (extended_measure_mat @ state_means.unsqueeze(-1)).squeeze(-1)
+        partial_measured_cov = extended_measure_mat @ state_covs @ extended_measure_mat.permute(0, 2, 1)
+
+        # some dims might be all-zero (e.g. a measure with no linear processes), which means we can't take the
+        # cholesky for those, so only factorize the nonzero block:
+        nonzero = (extended_measure_mat != 0).any(0).any(1).cpu().nonzero(as_tuple=True)[0]
+        m2d = torch.meshgrid(torch.arange(measurement_model.num_groups), nonzero, nonzero, indexing='ij')
+        chol = torch.zeros_like(partial_measured_cov)
+        chol[m2d] = torch.linalg.cholesky(partial_measured_cov[m2d])
+
+        em_dim = extended_measure_mat.shape[1]
+        if white_noise.ndim not in (2, 3) or white_noise.shape[-1] != em_dim or (
+                white_noise.ndim == 3 and white_noise.shape[1] != state_means.shape[0]
+        ):
+            raise ValueError(
+                f"Expected `white_noise` to have shape (num_samples, {em_dim}) or (num_samples, "
+                f"{state_means.shape[0]}, {em_dim}), got {tuple(white_noise.shape)}."
+            )
+        deviations = _matmul_per_row(chol, white_noise)
+        if deviation_scale is not None:
+            deviations = deviations * deviation_scale
+        sampled_pmmeans = partial_measured_mean.unsqueeze(0) + deviations
+
+        # each of these samples is a draw of (1) the measured-mean of the linear processes, concatenated with (2) the
+        # nonlinear processes' state-means. use (2) to add the nonlinear processes' contributions to (1):
+        mmean_samples = sampled_pmmeans[..., 0:nmeasures]
+        if measurement_model.nonlinear_processes:
+            # (processes' measured-means aren't vectorized over samples, so loop)
+            mmean_samples = torch.stack([
+                measurement_model.apply_process_adjustments(
+                    sampled_pmean[..., 0:nmeasures],
+                    [
+                        (proc, sampled_pmean[..., measurement_model.extended_mmat_slices[proc.id]])
+                        for proc in measurement_model.nonlinear_processes
+                    ],
+                    time=0
+                )
+                for sampled_pmean in sampled_pmmeans.unbind(0)
+            ])
+        if measurement_model.measure_funs:
+            # (elementwise, so no need to loop)
+            mmean_samples = measurement_model.get_measure_wide_adjustments(mmean_samples)
+        return mmean_samples
+
+    def _output_generator(self, state: bool) -> torch.Generator:
+        """
+        A generator with a fixed seed, so that sample-based outputs are the same on repeated calls.
+
+        :param state: True for draws of the state; False for draws given the state (regimes, observation-noise). These
+         use different seeds, so they're independent (with one seed, e.g. the observation-noise would be the first of
+         the state's noise draws).
+        """
+        return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED + (0 if state else 1))
+
+    def _log_prob_white_noise(self, measurement_model: 'MeasurementModel') -> torch.Tensor:
+        """
+        The model's ``mc_white_noise`` for the monte-carlo log-prob (see ``_get_measured_mean_samples``):
+        ``(num_samples, dim)``, fixed (so that the log-prob is a deterministic function of the parameters) and shared
+        across rows.
+
+        The noise has one column per extended dimension of the *full* model (each measure, then the nonlinear
+        processes' state-elements). For a ``measurement_model`` that's a subset of the measures (for nans), the
+        columns of the missing measures are dropped, so that each remaining dimension keeps its own column. This isn't
+        needed for correctness (any standard-normal noise of the right size gives a valid monte-carlo estimate), but
+        it keeps the draws consistent: each measure always uses the same column of the fixed draws, whichever other
+        measures are missing in a row.
+        """
+        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        white_noise = self.mc_white_noise(num_dim=em_dim, dtype=self.state_means.dtype, device=self.state_means.device)
+        missing_midx = {i for i, m in enumerate(self.measurement_model.measures) if m not in measurement_model.measures}
+        return white_noise[..., [i for i in range(em_dim) if i not in missing_midx]]
+
+    def _resolve_mmean_samples(self,
+                               mmean_samples: Union[torch.Tensor, int, None],
+                               deviation_scales: Optional[Sequence[float]] = None) -> torch.Tensor:
+        """
+        For methods that take ``mmean_samples`` to save compute: already-computed samples from
+        ``_get_output_samples()`` are returned as-is; otherwise they're drawn here -- an int is the number of samples,
+        None the default number (with the fixed output seed, so they're the same draws as any computed elsewhere).
+
+        :param deviation_scales: See ``_get_output_samples``. If any aren't 1, the samples are drawn here (with the same
+         draws, and the same number of samples, as any passed), since passed samples are unscaled.
+        """
+        if deviation_scales is not None and all(scale == 1 for scale in deviation_scales):
+            deviation_scales = None
+        if mmean_samples is None:
+            mmean_samples = _DEFAULT_NUM_SAMPLES
+        elif not isinstance(mmean_samples, numbers.Integral):
+            if deviation_scales is None:
+                return mmean_samples
+            mmean_samples = mmean_samples.shape[0]
+        return self._get_output_samples(
+            int(mmean_samples),
+            generator=self._output_generator(state=True),
+            deviation_scales=deviation_scales,
+        )
+
+    def _get_output_samples(self,
+                            num_samples: int,
+                            generator: Optional[torch.Generator],
+                            shared_noise: bool = True,
+                            deviation_scales: Optional[Sequence[float]] = None) -> torch.Tensor:
+        """
+        Samples of the measured-mean, from ``num_samples`` draws of the state: for everything that produces samples
+        for users -- :func:`sample`, and sample-based outputs (monte-carlo means and intervals, ``derived``). (The
+        log-prob calls ``_get_measured_mean_samples`` directly, with the model's fixed ``mc_white_noise``.)
+
+        :param generator: For the noise: e.g. ``_output_generator(state=True)`` (a fixed seed, so that repeated calls
+         agree), or :func:`sample`'s (None: torch's global random state).
+        :param shared_noise: If True (the default), the same noise for every row; otherwise independent.
+        :param deviation_scales: One per measure: scales its (sampled) deviations from its mean, before any
+         nonlinearity -- so each measure's samples are from the state with that part of its variance scaled by the
+         square, from the same draws.
+        :return: A ``(num_samples, num_rows, num_measures)`` tensor.
+        """
+        em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        num_rows = self.state_means_flat.shape[0]
+        white_noise = torch.randn(
+            (num_samples, em_dim) if shared_noise else (num_samples, num_rows, em_dim),
+            generator=generator,
+            dtype=self.state_means.dtype,
+            device=self.state_means.device,
+        )
+        return self._get_measured_mean_samples(
+            measurement_model=self.measurement_model_flat,
+            state_means=self.state_means_flat,
+            state_covs=self.state_covs_flat,
+            white_noise=white_noise,
+            deviation_scale=None if deviation_scales is None else self._extended_dim_scale(deviation_scales),
+        )
+
+    def _extended_dim_scale(self, measure_scales: Sequence[float]) -> torch.Tensor:
+        """
+        Per-measure scales, for each of the extended dimensions of ``_get_measured_mean_samples``: each measure's
+        own, then the state-elements of each nonlinear process, which get its measure's.
+        """
+        mm = self.measurement_model_flat
+        measures = list(mm.measures)
+        to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
+        scale = torch.ones(mm.extended_measure_mat.shape[1], **to)
+        scale[:len(measures)] = torch.as_tensor(measure_scales, **to)
+        for proc in mm.nonlinear_processes:
+            scale[mm.extended_mmat_slices[proc.id]] = measure_scales[measures.index(proc.measure)]
+        return scale
+
+    @property
+    def state_means_flat(self):
+        if self._state_means_flat is None:
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
+        return self._state_means_flat
+
+    @property
+    def state_covs_flat(self):
+        if self._state_covs_flat is None:
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
+        return self._state_covs_flat
+
+    @property
+    def measure_covs_flat(self) -> torch.Tensor:
+        if self._mcovs_flat is None:
+            self._state_means_flat, self._state_covs_flat, self._mcovs_flat = self._flatten()
+        return self._mcovs_flat
+
+    def _flatten(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        nmeasures = self.measure_covs.shape[-1]
+        state_rank = self.state_means.shape[-1]
+        state_means_flat = self.state_means.view(-1, state_rank)
+        state_covs_flat = self.state_covs.view(-1, state_rank, state_rank)
+        measure_covs_flat = self.measure_covs.view(-1, nmeasures, nmeasures)
+        return state_means_flat, state_covs_flat, measure_covs_flat
 
 
 @dataclass
@@ -1522,15 +1769,31 @@ class PredictionSamples:
     :param measures: The names of the measures (the last dimension of the tensors).
     :param means: A ``(num_samples, num_groups, num_timesteps, num_measures)`` tensor: for each sample (of the state,
      and regime if applicable), the mean of the measures.
-    :param covs: A ``(num_samples, num_groups, num_timesteps, num_measures, num_measures)`` tensor: the corresponding
-     covariance (i.e. the observation noise).
+    :param measure_covs: A ``(num_groups, num_timesteps, num_measures, num_measures)`` tensor: the observation-noise
+     covariance that's the same for every sample.
+    :param extra_vars: Optionally, a ``(num_samples, num_groups, num_timesteps, num_measures)`` tensor of per-sample
+     variances added to the diagonal of ``measure_covs`` (e.g. a binary measure's binomial variance, or a regime's
+     extra variance). See :attr:`covs`.
     :param observations: If ``observation_noise=True``, a ``(num_samples, num_groups, num_timesteps, num_measures)``
      tensor of sampled observations.
     """
     measures: list
     means: torch.Tensor
-    covs: torch.Tensor
+    measure_covs: torch.Tensor
+    extra_vars: Optional[torch.Tensor] = None
     observations: Optional[torch.Tensor] = None
+
+    @property
+    def covs(self) -> torch.Tensor:
+        """
+        A ``(num_samples, num_groups, num_timesteps, num_measures, num_measures)`` tensor: for each sample, the
+        covariance of the observations around ``means`` (i.e. the observation-noise). Computed on access (a view, if
+        there are no ``extra_vars``; otherwise a new, potentially large, tensor).
+        """
+        covs = self.measure_covs.expand(self.means.shape[0], *self.measure_covs.shape)
+        if self.extra_vars is not None:
+            covs = covs + torch.diag_embed(self.extra_vars)
+        return covs
 
     def __getitem__(self, measure: str) -> torch.Tensor:
         """
@@ -1539,6 +1802,52 @@ class PredictionSamples:
         """
         values = self.means if self.observations is None else self.observations
         return values[..., self.measures.index(measure)]
+
+
+@dataclass
+class MixtureOfNormals:
+    """
+    A batch of univariate mixtures of normals: the predictive distribution of a single measure with mixture components.
+    The last dimension of each tensor indexes the mixture's components; the first is the standard regime. (Each
+    component's mean and variance are the standard regime's plus that component's offset and extra variance.)
+
+    For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
+    then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.
+
+    :param labels: A name for each component (``'standard'``, then the :class:`MixtureComponent` ids).
+    :param probs: The probability of each component.
+    :param means: The mean of each component.
+    :param vars: The variance of each component.
+    """
+    labels: list
+    probs: torch.Tensor
+    means: torch.Tensor
+    vars: torch.Tensor
+
+    def mean(self) -> torch.Tensor:
+        return (self.probs * self.means).sum(-1)
+
+    def var(self) -> torch.Tensor:
+        return (self.probs * (self.vars + self.means ** 2)).sum(-1) - self.mean() ** 2
+
+    def cdf(self, value: torch.Tensor) -> torch.Tensor:
+        z = (value.unsqueeze(-1) - self.means) / self.vars.sqrt()
+        return (self.probs * torch.special.ndtr(z)).sum(-1)
+
+    def quantile(self, q: float, num_iter: int = 60) -> torch.Tensor:
+        """
+        The ``q``-th quantile, found by bisection on the cdf.
+        """
+        assert 0 < q < 1
+        sd = self.vars.sqrt()
+        lower = (self.means - 10 * sd).min(-1).values
+        upper = (self.means + 10 * sd).max(-1).values
+        for _ in range(num_iter):
+            mid = (lower + upper) / 2
+            below = self.cdf(mid) < q
+            lower = torch.where(below, mid, lower)
+            upper = torch.where(below, upper, mid)
+        return (lower + upper) / 2
 
 
 @dataclass
@@ -1568,10 +1877,16 @@ class DatasetMetadata:
         )
 
 
-def _warn_bias_adjust_ignored(transform: 'Transform') -> None:
-    if transform.bias_adjust is not None:
-        warn(f"`{type(transform).__name__}(bias_adjust=...)` is ignored for monte-carlo predictions (the mean is the "
-             f"mean of back-transformed samples).")
+def _log_lik(resid: torch.Tensor, cov: torch.Tensor, monte_carlo: bool) -> torch.Tensor:
+    """
+    The gaussian log-likelihood of the residuals: exact; or, with ``monte_carlo``, averaged over the leading
+    dimension of ``resid`` (one residual per monte-carlo sample of the measured-mean).
+    """
+    if not monte_carlo:
+        return mvnorm_log_prob(resid, cov)
+    # we don't want log_prob(x).mean(0), we want prob(x).mean(0).log(); numerically stable version:
+    mc_log_probs = _mc_mvnorm_log_prob(resid, cov)
+    return torch.logsumexp(mc_log_probs, dim=0) - log(mc_log_probs.shape[0])
 
 
 def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
@@ -1590,16 +1905,30 @@ def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
     return -0.5 * (d * math.log(2 * math.pi) + logdet.unsqueeze(0) + (z ** 2).sum(1).T)
 
 
-def _quantile(x: torch.Tensor, q: float) -> torch.Tensor:
+def _matmul_per_row(mats: torch.Tensor, vecs: torch.Tensor) -> torch.Tensor:
     """
-    Quantile along the first dimension, with linear interpolation (like ``torch.quantile``, which has an input-size
-    limit).
+    ``mats[r] @ vecs[n, r]`` for each sample ``n`` and row ``r`` (or ``mats[r] @ vecs[n]``, if ``vecs`` is shared
+    across rows) -- e.g. turning standard-normal noise into correlated noise with each row's cholesky factor.
+
+    Like ``mats @ vecs.unsqueeze(-1)``, but without that broadcast's copy of ``mats`` for every sample (which, for
+    many samples, can be much larger than the inputs or the output).
+
+    :param mats: A ``(num_rows, d, d)`` tensor.
+    :param vecs: A ``(num_samples, num_rows, d)`` tensor, or ``(num_samples, d)`` (the same for every row).
+    :return: A ``(num_samples, num_rows, d)`` tensor.
     """
-    x = x.sort(0).values
-    pos = q * (x.shape[0] - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, x.shape[0] - 1)
-    return x[lo] + (pos - lo) * (x[hi] - x[lo])
+    # (in einsum's notation, r = row, n = sample, i/j = the matrix's row/column; j is summed over)
+    if vecs.ndim == 2:
+        return torch.einsum('rij,nj->nri', mats, vecs)
+    return torch.einsum('rij,nrj->nri', mats, vecs)
+
+
+def _quantile_interval(x: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    The ``alpha`` and ``1 - alpha`` quantiles along the first dimension (the samples), from a single sort.
+    """
+    lower, upper = torch.quantile(x, torch.tensor([alpha, 1 - alpha], dtype=x.dtype, device=x.device), dim=0)
+    return lower, upper
 
 
 def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict]]:
@@ -1617,19 +1946,19 @@ def _unpack_states(states) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.T
             regime_probs = torch.stack([s.regime_probs for s in states], 1)
         if states[0].scaling is not None:
             scaling = {k: torch.stack([s.scaling[k] for s in states], 1) for k in states[0].scaling}
-        means, covs = torch.stack([s.mean for s in states], 1), torch.stack([s.cov for s in states], 1)
+        means, covs = (torch.stack(x, 1) for x in zip(*states))  # (a StateTuple iterates as (mean, cov))
         return means, covs, regime_probs, scaling
     means, covs = states
     return _maybe_stack(means, 1), _maybe_stack(covs, 1), None, None
 
 
-def _map_states(x: Union[torch.Tensor, dict, None], fun: Callable) -> Union[torch.Tensor, dict, None]:
-    """Apply ``fun`` to a tensor, or to each tensor in a dict (e.g. adaptive-scaling states); None stays None."""
+def _index_states(x: Union[torch.Tensor, dict, None], item: tuple) -> Union[torch.Tensor, dict, None]:
+    """Index a tensor, or each tensor in a dict (e.g. adaptive-scaling states); None stays None."""
     if x is None:
         return None
     if isinstance(x, dict):
-        return {k: fun(v) for k, v in x.items()}
-    return fun(x)
+        return {k: v[item] for k, v in x.items()}
+    return x[item]
 
 
 def _maybe_stack(x: Union[torch.Tensor, Sequence[torch.Tensor]], dim: int) -> torch.Tensor:

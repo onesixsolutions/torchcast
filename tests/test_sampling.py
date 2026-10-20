@@ -24,12 +24,13 @@ def _gen(seed: int = 0) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
+@pytest.mark.parametrize('shared_noise', [False, True])
 @torch.no_grad()
-def test_sample_moments():
+def test_sample_moments(shared_noise: bool):
     kf = _correlated_kf()
     pred = kf(torch.randn(3, 12, 2).cumsum(1))
     n = 20_000
-    s = pred.sample(n, generator=_gen())
+    s = pred.sample(n, generator=_gen(), shared_noise=shared_noise)
     assert s.observations.shape == (n, 3, 12, 2) and s.means.shape == (n, 3, 12, 2) and s.covs.shape == (n, 3, 12, 2, 2)
     mean, cov = pred
     sd = cov.diagonal(dim1=-2, dim2=-1).sqrt()
@@ -42,52 +43,54 @@ def test_sample_moments():
     assert torch.allclose(emp_corr, corr, atol=5 / math.sqrt(n))
 
     # without observation noise, the conditional covariance is the measure-covariance:
-    s2 = pred.sample(10, observation_noise=False, generator=_gen())
+    s2 = pred.sample(10, observation_noise=False, generator=_gen(), shared_noise=False)
     assert s2.observations is None
     assert torch.allclose(s2.covs, pred.measure_covs.expand(10, -1, -1, -1, -1))
     assert torch.equal(s2['a'], s2.means[..., 0])
     # reproducible given a generator:
-    assert torch.equal(pred.sample(5, generator=_gen(1)).observations, pred.sample(5, generator=_gen(1)).observations)
+    assert torch.equal(pred.sample(5, generator=_gen(1), shared_noise=False).observations, pred.sample(5, generator=_gen(1), shared_noise=False).observations)
 
 
+@pytest.mark.parametrize('shared_noise', [False, True])
 @torch.no_grad()
-def test_sample_mixture():
+def test_sample_mixture(shared_noise: bool):
     torch.manual_seed(0)
     kf = KalmanFilter(
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
         measures=['a', 'b'],
-        mixture=[MixtureComponent(measure='a', mean_init=-3., prob_init=.2, id='low')]
+        mixture=[MixtureComponent(measure='a', offset_init=-3., prob_init=.2, id='low')]
     )
     component = kf.mixture.components[0]
     pred = kf(torch.randn(2, 8, 2))
     n = 40_000
-    s = pred.sample(n, generator=_gen())
+    s = pred.sample(n, generator=_gen(), shared_noise=shared_noise)
     mix = pred.get_mixture('a')
 
     # in the 'low' regime, 'a' has the component's variance added to its measurement-noise (which identifies the
     # regime here), and is offset by the component's mean:
     R = pred.measure_covs[0, 0]
-    in_low = s.covs[..., 0, 0] > R[0, 0] + component.var / 2
+    in_low = s.covs[..., 0, 0] > R[0, 0] + component.extra_var / 2
     p = mix.probs[..., 1]
     assert ((in_low.float().mean(0) - p).abs() < 5 * (p * (1 - p) / n).sqrt()).all()
-    assert torch.allclose(s.covs[..., 0, 0][in_low], (R[0, 0] + component.var).expand(int(in_low.sum())))
+    assert torch.allclose(s.covs[..., 0, 0][in_low], (R[0, 0] + component.extra_var).expand(int(in_low.sum())))
     assert torch.allclose(s.covs[..., 0, 1], R[0, 1].expand_as(s.covs[..., 0, 1]))  # (correlation is unchanged)
     # the same state-draws (`sample()` draws this white-noise first), without the regimes:
     num_rows = pred.state_means_flat.shape[0]
-    white_noise = torch.randn((n, num_rows, 2), generator=_gen())
+    white_noise = torch.randn((n, 2) if shared_noise else (n, num_rows, 2), generator=_gen())
     standard_means = pred._get_measured_mean_samples(
         pred.measurement_model_flat, pred.state_means_flat, pred.state_covs_flat, white_noise=white_noise
     ).view(n, 2, 8, 2)
     offset = s.means[..., 0] - standard_means[..., 0]
-    assert torch.allclose(offset[in_low], component.mean.expand(int(in_low.sum())), atol=1e-5)
+    assert torch.allclose(offset[in_low], component.offset.expand(int(in_low.sum())), atol=1e-5)
     # the observations follow the mixture:
     for q in (.05, .5, .95):
         emp_cdf_at_quantile = (s['a'] <= mix.quantile(q)).float().mean(0)
         assert ((emp_cdf_at_quantile - q).abs() < 5 * math.sqrt(q * (1 - q) / n)).all()
 
 
+@pytest.mark.parametrize('shared_noise', [False, True])
 @torch.no_grad()
-def test_sample_binomial():
+def test_sample_binomial(shared_noise: bool):
     torch.manual_seed(1)
     visit = (torch.rand(3, 12) > .4).float()
     spend = torch.randn(3, 12).cumsum(1) * .2 + 3.
@@ -100,7 +103,7 @@ def test_sample_binomial():
     bf.mc_sampling = 100
     pred = bf(torch.stack([visit, spend], -1))
     n = 20_000
-    s = pred.sample(n, generator=_gen())
+    s = pred.sample(n, generator=_gen(), shared_noise=shared_noise)
     assert set(torch.unique(s['visit']).tolist()) <= {0., 1.}
     prob = s.means[..., 0]
     assert ((prob > 0) & (prob < 1)).all()
@@ -125,7 +128,7 @@ def test_derived_sum_of_correlated_measures():
     mean, cov = pred
     total_mean = (mean[..., 0] + mean[..., 1]).reshape(-1).numpy()
     total_sd = (cov[..., 0, 0] + cov[..., 1, 1] + 2 * cov[..., 0, 1]).sqrt().reshape(-1).numpy()
-    n = 1000  # (the default `derived_num_samples`)
+    n = 1000  # (the default `num_samples`)
     assert np.all(np.abs(df_total['mean'].values - total_mean) < 5 * total_sd / math.sqrt(n))
     z = stats.norm.ppf(.95)
     # (the se of a sample-quantile of a normal at the 95th %ile is ~2.1 * sd / sqrt(n))
@@ -161,7 +164,7 @@ def test_derived_with_transform_and_actuals():
     # the exact standard-error of the sample-mean of exp(a) + exp(b) (lognormal variances/covariance):
     lognormal_var = torch.exp(2 * mean + var) * (torch.exp(var) - 1)
     lognormal_cov = torch.exp(mean.sum(-1) + var.sum(-1) / 2) * (torch.exp(cov[..., 0, 1]) - 1)
-    se = ((lognormal_var.sum(-1) + 2 * lognormal_cov) / 1000).sqrt()  # (the default `derived_num_samples`)
+    se = ((lognormal_var.sum(-1) + 2 * lognormal_cov) / 1000).sqrt()  # (the default `num_samples`)
     assert np.all(np.abs(df_total['mean'].values - expected.reshape(-1).numpy()) < 5 * se.reshape(-1).numpy())
     # the function is also applied to the (back-transformed) actuals:
     expected_actual = y.exp().sum(-1).reshape(-1).numpy()
@@ -175,7 +178,7 @@ def test_derived_with_transform_and_actuals():
     with pytest.raises(ValueError, match="conf=None"):
         pred.to_dataframe(derived={'total': lambda s: s['a'] + s['b']}, conf=None)
     # the sample-count is configurable:
-    df_small = pred.to_dataframe(derived={'total': lambda s: s['a'] + s['b']}, derived_num_samples=50)
+    df_small = pred.to_dataframe(derived={'total': lambda s: s['a'] + s['b']}, num_samples=50)
     assert not np.allclose(df_small.query("measure == 'total'")['mean'].values, df_total['mean'].values)
 
 
@@ -194,7 +197,7 @@ def test_sample_nonlinear_independent_rows():
     kf.mc_sampling = 5000
     X = torch.randn(2, 6, 2)
     pred = kf(torch.randn(2, 6, 1), X=X)
-    samples = pred.sample(5000, observation_noise=False, generator=_gen())
+    samples = pred.sample(5000, observation_noise=False, generator=_gen(), shared_noise=False)
     means = samples.means[..., 0].reshape(5000, -1)  # (samples, rows)
     corr = np.corrcoef(means.T.numpy())
     off_diag = corr[~np.eye(corr.shape[0], dtype=bool)]
@@ -236,9 +239,9 @@ def test_sample_binomial_saturated_probability():
     pred = bf(y)
     # sampled means (num_samples, num_rows, num_measures), with the probability saturated at 1:
     means = torch.stack([torch.ones(20, 8), torch.randn(20, 8)], -1)
-    covs = pred._conditional_measure_covs(means)
-    assert (covs[..., 0, 0] == 0).all()
-    observations = pred._sample_observations(means, covs, generator=_gen())
+    extra_vars = pred._conditional_measure_vars(means)
+    assert (extra_vars[..., 0] == 0).all()
+    observations = pred._sample_observations(means, extra_vars, generator=_gen())
     assert (observations[..., 0] == 1).all()
     assert torch.isfinite(observations).all()
     assert (observations[..., 1] != means[..., 1]).all()  # (noise was added to the gaussian measure)
@@ -257,7 +260,7 @@ def test_derived_binomial_spend():
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'log_spend']],
         measures=['visit', 'log_spend'],
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='log_spend', mean_init=1., prob_init=.1, id='quick')],
+        mixture=[MixtureComponent(measure='log_spend', offset_init=1., prob_init=.1, id='quick')],
     )
     bf.mc_sampling = 100
     pred = bf(torch.stack([visit, log_spend], -1))
@@ -292,7 +295,7 @@ kf.mc_sampling = 10
 with torch.no_grad():
     pred = kf(torch.rand(20, 100, 1) * .5 + .25, start_offsets=[0] * 20)  # 2000 rows, state-rank 18
     before = peak_mb()
-    pred.sample(500)
+    pred.sample(500, shared_noise=False)
 print(peak_mb() - before)
 """
 
@@ -327,7 +330,7 @@ def test_nonlinear_model_linear_measures_exact():
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
-        mixture=[MixtureComponent(measure='spend', mean_init=-1., prob_init=.1, id='quick')],
+        mixture=[MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
     )
     bf.mc_sampling = 200
     pred = bf(y)
@@ -345,3 +348,100 @@ def test_nonlinear_model_linear_measures_exact():
     df_states = pred.to_dataframe(type='states')
     df_states2 = pred.to_dataframe(type='states')
     assert np.array_equal(df_states[['lower', 'upper']].values, df_states2[['lower', 'upper']].values)
+
+
+@torch.no_grad()
+def test_measured_mean_samples_white_noise_shape():
+    """
+    `_get_measured_mean_samples(white_noise=...)` rejects noise of the wrong shape (rather than e.g. silently using
+    only the first columns of noise with too many) -- and states whose rows don't match the measurement-model's.
+    """
+    kf = _correlated_kf()
+    pred = kf(torch.randn(2, 5, 2).cumsum(1))
+    kwargs = dict(
+        measurement_model=pred.measurement_model_flat,
+        state_means=pred.state_means_flat,
+        state_covs=pred.state_covs_flat,
+    )
+    dim = pred.measurement_model_flat.extended_measure_mat.shape[1]
+    rows = pred.state_means_flat.shape[0]
+    assert pred._get_measured_mean_samples(**kwargs, white_noise=torch.randn(7, dim)).shape == (7, rows, 2)
+    assert pred._get_measured_mean_samples(**kwargs, white_noise=torch.randn(7, rows, dim)).shape == (7, rows, 2)
+    bad_shapes = [(7, dim + 1), (7, rows + 1, dim), (7, rows, dim + 1), (dim,)]
+    for bad in map(torch.randn, bad_shapes):
+        with pytest.raises(ValueError, match="white_noise"):
+            pred._get_measured_mean_samples(**kwargs, white_noise=bad)
+    # (a single row would otherwise broadcast against the measurement-model's rows)
+    with pytest.raises(ValueError, match="state_means"):
+        pred._get_measured_mean_samples(
+            **{**kwargs, 'state_means': kwargs['state_means'][:1], 'state_covs': kwargs['state_covs'][:1]},
+            white_noise=torch.randn(7, dim),
+        )
+
+
+@torch.no_grad()
+def test_sample_shared_noise():
+    """With `shared_noise=True`, every row uses the same underlying standard-normal draws."""
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(3, 6, 1).cumsum(1))
+    mean, cov = pred
+    measure_sd = pred.measure_covs[..., 0, 0].sqrt()
+    state_sd = (cov[..., 0, 0] - pred.measure_covs[..., 0, 0]).sqrt()
+
+    def is_shared(z):
+        return torch.allclose(z, z[:, :1, :1].expand_as(z), atol=1e-4)
+
+    s = pred.sample(50, generator=_gen(), shared_noise=True)
+    assert is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)  # the state's noise
+    assert is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)  # the observation-noise
+    # vs. independent by default:
+    s = pred.sample(50, generator=_gen(), shared_noise=False)
+    assert not is_shared((s.means[..., 0] - mean[..., 0]) / state_sd)
+    assert not is_shared((s.observations[..., 0] - s.means[..., 0]) / measure_sd)
+
+
+@torch.no_grad()
+def test_sample_binomial_measure_order():
+    """
+    Binary measures listed in a different order than `measures`, with a different `num_obs` each: each measure's
+    binomial draws use its own `num_obs` (proportions are multiples of 1 / num_obs).
+    """
+    torch.manual_seed(0)
+    num_obs = torch.tensor([3., 50.])  # (in the order of `binary_measures`: 'b', then 'a')
+    counts = torch.stack([torch.randint(0, 51, (2, 6)), torch.randint(0, 4, (2, 6))], -1).float()  # ('a', 'b')
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        binary_measures=['b', 'a'],
+        observed_counts=False,
+    )
+    bf.mc_sampling = 20
+    pred = bf(counts / torch.tensor([50., 3.]), num_obs=num_obs.expand(2, 6, 2))
+    s = pred.sample(200, generator=_gen(), shared_noise=False)
+    for j, n in [(0, 50.), (1, 3.)]:  # ('a' has 50 trials, 'b' has 3)
+        x = s.observations[..., j] * n
+        assert torch.allclose(x, x.round(), atol=1e-4), f"measure {j} isn't a proportion out of {n}"
+    assert (s.observations[..., 0] * 3 % 1).abs().gt(1e-3).any()  # ('a' isn't out of 3)
+
+
+@torch.no_grad()
+def test_linear_model_outputs_draw_no_samples():
+    """
+    A linear model's means and intervals are closed-form, so `to_dataframe()` draws no output samples (and doesn't warn
+    about unused ones) -- except once, for `derived`.
+    """
+    import warnings
+    from unittest import mock
+
+    kf = KalmanFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    pred = kf(torch.randn(2, 5, 1).cumsum(1))
+    with mock.patch.object(type(pred), '_get_output_samples', autospec=True,
+                           side_effect=type(pred)._get_output_samples) as spy:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', UserWarning)
+            warnings.filterwarnings('ignore', message='.*group-names.*')
+            pred.to_dataframe()
+            assert spy.call_count == 0
+            pred.to_dataframe(derived={'double': lambda s: s['y'] * 2})
+            assert spy.call_count == 1

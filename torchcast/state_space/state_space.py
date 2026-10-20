@@ -1,4 +1,4 @@
-from typing import Any, Iterator, List, NamedTuple, Optional, Sequence, Union, TYPE_CHECKING, Callable
+from typing import List, Optional, Sequence, Union, TYPE_CHECKING, Callable
 from warnings import warn
 
 import numpy as np
@@ -7,11 +7,14 @@ import torch
 from tqdm.auto import tqdm
 
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
-from torchcast.internals.hessian import hessian, mvnorm_from_hessian
+from torchcast.internals.hessian import mvnorm_from_hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, as_timestep_list
 from torchcast.covariance import Covariance
-from torchcast.state_space.newton import NewtonResult, newton_refine as _newton_refine
+from torchcast.state_space.newton import NewtonResult, newton_refine as _newton_refine, _hessian_sampler
+from torchcast.state_space.chunking import (
+    _FitChunk, _ChunkedObjective, _get_group_slices, _subset_groups, _subset_loss_fun
+)
 from torchcast.process.regression import Process
 
 from .mixture import MixtureComponent, MixtureModel, RegimeTransition
@@ -235,30 +238,14 @@ class StateSpaceModel(torch.nn.Module):
             **kwargs
         )
         used_keys = used_keys.union(measurement_model.used_keys)
-        component_X = {}
-        if self.mixture is not None:
-            component_X, mixture_keys = self.mixture.get_component_X(kwargs)
-            used_keys.update(mixture_keys)
+        # (None without mixture components)
+        regime_prior, base_probs, mixture_keys = self._prepare_regimes(
+            kwargs, init_regime_probs=init_regime_probs, num_groups=num_groups, num_timesteps=out_timesteps
+        )
+        used_keys.update(mixture_keys)
         unused_kwargs = set(kwargs) - used_keys
         if unused_kwargs:
             raise RuntimeError(f"Unexpected kwargs in {type(self).__name__}.forward(): {set(unused_kwargs)})")
-
-        # regime-probabilities (if mixture components). base_probs[t] are the base-rates for the regime-prior at t:
-        # time-varying if any components have predictors.
-        base_probs = regime_prior = None
-        if self.mixture is not None:
-            if component_X:
-                base_probs = self.mixture.base_probs(component_X).unbind(1)
-                if len(base_probs) < out_timesteps:
-                    raise ValueError(
-                        f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
-                        f"{out_timesteps}."
-                    )
-            else:
-                base_probs = [self.mixture.base_probs()] * out_timesteps
-            regime_prior = self._initial_regime_prior(init_regime_probs, base_probs[0], num_groups)
-        elif init_regime_probs is not None:
-            raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
 
         # first loop through to do predict -> update
         scaling1step = init_multiplier
@@ -595,10 +582,7 @@ class StateSpaceModel(torch.nn.Module):
                       y: torch.Tensor,
                       chunk_size: Optional[int] = None,
                       hessian_chunk_size: Optional[int] = None,
-                      hessian_subsample: Union[float, int, Sequence[int], torch.Tensor, Callable, None] = None,
-                      hessian_subsample_weights: Optional[Sequence[float]] = None,
-                      hessian_resample: bool = False,
-                      hessian_subsample_seed: int = 0,
+                      hessian_subsample: Union[float, int, Callable, None] = None,
                       final_full_hessian: bool = False,
                       max_steps: int = 10,
                       grad_tol: float = 1e-5,
@@ -635,25 +619,24 @@ class StateSpaceModel(torch.nn.Module):
          line-search and stopping-rules still use all the data, so this converges to the same optimum (the hessian
          just sets the direction/scale of the steps), though less than quadratically near the end. Can be:
 
-         - a fraction (float between 0 and 1) or a number (int) of groups, sampled uniformly at random;
-         - group indices (a tensor/array/list), e.g. a stratified sample, with ``hessian_subsample_weights``;
-         - a function taking a ``torch.Generator`` and returning indices, or ``(indices, weights)``: e.g. a stratified
-           sampler, which can be combined with ``hessian_resample``.
+         - a fraction (float between 0 and 1) or a number (int) of groups, sampled uniformly at random (once, with a
+           fixed seed);
+         - a function taking a ``torch.Generator`` (with a fixed seed) and returning group indices, or ``(indices,
+           weights)``. It's called for each hessian, so a random function draws a new subsample each time (so that
+           the subsample's errors average out over steps), e.g. ``lambda gen: torch.randperm(num_groups,
+           generator=gen)[:n]``; for a fixed subsample, return the same indices each time, e.g. ``lambda gen: (idx,
+           weights)``. The ``weights`` are relative weights for the groups, e.g. inverse inclusion probabilities: the
+           subsample's hessian is then the hessian of a weighted mean of the groups' losses, an estimate of the full
+           data's (mean) hessian.
 
          A uniform sample can estimate poorly the directions that only a few groups inform (e.g. parameters driven
          by rare events or a small sub-population) -- often the weak directions. For those, oversample the
-         informative groups and pass weights.
+         informative groups (e.g. a stratified sampler) and return weights.
 
          The hessian in the result is then also from the subsample, so it can't be used for
          ``NewtonResult.laplace_mvnorm()`` (unless ``final_full_hessian``). Group kwargs, ``callable_kwargs`` and
          :class:`.LossFun` weights are subset to match; a custom ``get_loss`` must handle any subset of groups (and
          can't be combined with weights).
-        :param hessian_subsample_weights: Relative weights for the groups in ``hessian_subsample`` (if indices), e.g.
-         inverse inclusion probabilities: the subsample's hessian is then the hessian of a weighted mean of the
-         groups' losses, an estimate of the full data's (mean) hessian.
-        :param hessian_resample: If True, draw a new subsample for each hessian, so that the subsample's errors average
-         out over steps, rather than a fixed one (the default; deterministic). Not for fixed indices.
-        :param hessian_subsample_seed: Seed for drawing the subsample(s).
         :param final_full_hessian: With ``hessian_subsample``, compute the full-data hessian at the final parameters
          (which is expensive), so that ``NewtonResult.laplace_mvnorm()``, ``decrement()`` and ``weak_directions()``
          use it.
@@ -705,11 +688,9 @@ class StateSpaceModel(torch.nn.Module):
                 group_weights=group_weights,
             )
 
-        sampler = _hessian_sampler(hessian_subsample, hessian_subsample_weights, num_groups)
+        sampler = _hessian_sampler(hessian_subsample, num_groups)
         subsampled = sampler is not None
-        if hessian_resample and not (subsampled and sampler.random):
-            raise ValueError("`hessian_resample` requires `hessian_subsample` to be a fraction, number or function.")
-        gen = torch.Generator().manual_seed(hessian_subsample_seed)
+        gen = torch.Generator().manual_seed(0)
         objective = _ChunkedObjective(
             self,
             chunks=chunks,
@@ -717,7 +698,9 @@ class StateSpaceModel(torch.nn.Module):
             callable_kwargs=callable_kwargs,
             hessian_chunks=_hessian_chunks(*sampler(gen)) if subsampled else _hessian_chunks(),
             hessian_subsampled=subsampled,
-            resample_hessian_chunks=(lambda: _hessian_chunks(*sampler(gen))) if hessian_resample else None,
+            resample_hessian_chunks=(
+                (lambda: _hessian_chunks(*sampler(gen))) if subsampled and sampler.resample else None
+            ),
         )
         if decrement_tol == 'auto':
             decrement_tol = None if subsampled else 1e-3
@@ -789,26 +772,23 @@ class StateSpaceModel(torch.nn.Module):
             mixture=self.mixture,
         )
 
-    def _initial_regime_prior(self,
-                              init_regime_probs: Optional[torch.Tensor],
-                              base_probs: torch.Tensor,
-                              num_groups: int) -> torch.Tensor:
+    def _prepare_regimes(self,
+                         kwargs: dict,
+                         init_regime_probs: Optional[torch.Tensor],
+                         num_groups: int,
+                         num_timesteps: int) -> tuple[Optional[torch.Tensor], Optional[Sequence[torch.Tensor]], set]:
         """
-        The regime-prior for the first timestep. ``init_regime_probs`` (from ``initial_state``) are treated like the
-        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
-        transition. If not given, the transition's ``initial()`` is used.
+        For models with mixture components: see ``MixtureModel.prepare``.
+
+        :return: ``(regime_prior, base_probs, used_keys)``; ``(None, None, set())`` without mixture components.
         """
-        transition = self.mixture.transition
-        if init_regime_probs is None:
-            return transition.initial(base_probs, num_groups)
-        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.mixture.num_combos:
-            raise ValueError(
-                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.mixture.num_combos}), "
-                f"got {tuple(init_regime_probs.shape)}"
-            )
-        if init_regime_probs.shape[0] not in (1, num_groups):
-            raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
-        return transition(init_regime_probs.expand(num_groups, -1), base_probs)
+        if self.mixture is None:
+            if init_regime_probs is not None:
+                raise ValueError("`initial_state` has `regime_probs`, but this model has no mixture components.")
+            return None, None, set()
+        return self.mixture.prepare(
+            kwargs, init_regime_probs=init_regime_probs, num_groups=num_groups, num_timesteps=num_timesteps
+        )
 
     def _prepare_chunks(self,
                         y: torch.Tensor,
@@ -897,7 +877,7 @@ class StateSpaceModel(torch.nn.Module):
         if self.mixture is not None:
             for component in self.mixture.components:
                 if getattr(component, 'predictors', None):
-                    out |= {component.kwarg_name, f'{component.id}__{component.kwarg_name}'}
+                    out |= {component.model_mat_kwarg_name, f'{component.id}__{component.model_mat_kwarg_name}'}
         for module in self.modules():
             if isinstance(module, Covariance):
                 for pkwarg in module.predictor_kwargs:
@@ -1300,215 +1280,6 @@ class LossFun:
                 raise ValueError(f"Expected `weights.shape[0]` to be {num_groups}, got {weights.shape[0]}")
             weights = weights[group_slice]
         return type(self)(weights=weights, reduce=self.reduce)
-
-
-class _FitChunk(NamedTuple):
-    group_slice: Union[slice, torch.Tensor]  # a slice, or indices, of the full data's groups
-    y: torch.Tensor
-    kwargs: dict
-    get_loss: Callable
-    weight: float
-
-
-def _get_group_slices(num_groups: int, chunk_size: Optional[int]) -> List[slice]:
-    if chunk_size is None or chunk_size >= num_groups:
-        return [slice(None)]
-    if chunk_size < 1:
-        raise ValueError(f"`chunk_size` must be a positive integer, got {chunk_size}")
-    return [slice(start, start + chunk_size) for start in range(0, num_groups, chunk_size)]
-
-
-def _subset_groups(value: Any,
-                   group_slice: Union[slice, torch.Tensor],
-                   num_groups: int,
-                   strict: bool = False,
-                   name: str = '') -> Any:
-    """
-    Subset a forward-kwarg to a chunk of groups: tensors/arrays/lists whose first dimension is ``num_groups`` are
-    sliced; tuples and ``StateTuple`` (e.g. ``initial_state``) and dicts are handled recursively; anything else (e.g. scalars) is passed
-    as-is. With ``strict`` (for kwargs known to be group-indexed), a first dimension other than ``num_groups`` (or 1,
-    for broadcasting) raises.
-    """
-    if isinstance(value, (torch.Tensor, np.ndarray, list)):
-        size = len(value) if isinstance(value, list) else (value.shape[0] if value.ndim else None)
-        if size == num_groups:
-            if isinstance(group_slice, slice):
-                return value[group_slice]
-            if isinstance(value, list):
-                return [value[i] for i in group_slice.tolist()]
-            if isinstance(value, np.ndarray):
-                return value[group_slice.cpu().numpy()]
-            return value[group_slice.to(value.device)]
-        if strict and size != 1:
-            raise ValueError(f"Expected `{name}` to have first dimension {num_groups} (num_groups), got {size}.")
-        return value
-    if isinstance(value, StateTuple):  # e.g. ``initial_state`` with ``regime_probs`` / ``scaling``
-        return StateTuple(*(
-            None if v is None else _subset_groups(v, group_slice, num_groups, strict, name)
-            for v in (value.mean, value.cov, value.regime_probs, value.scaling)
-        ))
-    if isinstance(value, tuple):
-        return tuple(_subset_groups(v, group_slice, num_groups, strict, name) for v in value)
-    if isinstance(value, dict):
-        return {k: _subset_groups(v, group_slice, num_groups, strict, name) for k, v in value.items()}
-    return value
-
-
-def _subset_loss_fun(get_loss: Callable, group_slice: Union[slice, torch.Tensor], num_groups: int) -> Callable:
-    if (isinstance(group_slice, slice) and group_slice == slice(None)) or not isinstance(get_loss, LossFun):
-        return get_loss
-    return get_loss.subset(group_slice, num_groups)
-
-
-class _HessianSampler:
-    """
-    Draws the subsample of groups for ``newton_refine(hessian_subsample=...)``: ``sampler(generator)`` returns
-    ``(group_idx, group_weights)``.
-    """
-
-    def __init__(self, fun: Callable, random: bool, fraction: float):
-        self.fun = fun
-        self.random = random  # can resample
-        self.fraction = fraction  # (expected) fraction of groups
-
-    def __call__(self, generator: torch.Generator) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        out = self.fun(generator)
-        idx, weights = out if isinstance(out, tuple) else (out, None)
-        return torch.as_tensor(idx, dtype=torch.long), weights
-
-
-def _hessian_sampler(subsample: Any,
-                     weights: Optional[Sequence[float]],
-                     num_groups: int) -> Optional[_HessianSampler]:
-    if subsample is None:
-        if weights is not None:
-            raise ValueError("`hessian_subsample_weights` requires `hessian_subsample` indices.")
-        return None
-    if callable(subsample):
-        if weights is not None:
-            raise ValueError("With a `hessian_subsample` function, return `(indices, weights)` from it instead.")
-        # (fraction for reporting only; from one draw)
-        idx, _ = _HessianSampler(subsample, True, 1.)(torch.Generator().manual_seed(0))
-        return _HessianSampler(subsample, random=True, fraction=len(idx) / num_groups)
-    if isinstance(subsample, (float, int)) and not isinstance(subsample, bool):
-        if isinstance(subsample, float):
-            if not 0 < subsample <= 1:
-                raise ValueError("If `hessian_subsample` is a float, it should be in (0, 1].")
-            subsample = max(1, round(subsample * num_groups))
-        if weights is not None:
-            raise ValueError("`hessian_subsample_weights` requires `hessian_subsample` indices.")
-        if subsample >= num_groups:
-            return None
-        n = subsample
-        return _HessianSampler(
-            lambda gen: torch.randperm(num_groups, generator=gen)[:n].sort().values, random=True, fraction=n / num_groups
-        )
-    # fixed indices:
-    idx = torch.as_tensor(subsample, dtype=torch.long)
-    if weights is not None and len(weights) != len(idx):
-        raise ValueError("`hessian_subsample_weights` should have one weight per index in `hessian_subsample`.")
-    return _HessianSampler(lambda gen: (idx, weights), random=False, fraction=len(idx) / num_groups)
-
-
-class _ChunkedObjective:
-    """
-    A model's loss, summed over chunks of groups (see ``fit(chunk_size=...)``), and its gradient/hessian w.r.t. the
-    parameters that require grad. Only one chunk's computation-graph is in memory at a time.
-
-    :param hessian_chunks: Chunks to use for the hessian, which needs more memory per group than the loss/gradient.
-     Defaults to ``chunks``.
-    :param hessian_subsampled: Whether ``hessian_chunks`` are only a subsample of groups.
-    :param resample_hessian_chunks: Optionally, a function returning new ``hessian_chunks`` (a new subsample), called
-     for each hessian.
-    """
-
-    def __init__(self,
-                 ss_model: StateSpaceModel,
-                 chunks: Sequence[_FitChunk],
-                 num_groups: int,
-                 callable_kwargs: Optional[dict[str, Callable]] = None,
-                 hessian_chunks: Optional[Sequence[_FitChunk]] = None,
-                 hessian_subsampled: bool = False,
-                 resample_hessian_chunks: Optional[Callable[[], Sequence[_FitChunk]]] = None):
-        self.ss_model = ss_model
-        self.chunks = chunks
-        self.hessian_chunks = hessian_chunks or chunks
-        self.hessian_subsampled = hessian_subsampled
-        self.resample_hessian_chunks = resample_hessian_chunks
-        self.num_groups = num_groups
-        self.callable_kwargs = callable_kwargs or {}
-
-        self.params = []
-        self.param_names = []
-        for nm, par in ss_model.named_parameters():
-            if not par.requires_grad:
-                continue
-            self.param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
-            self.params.append(par)
-
-    def chunk_losses(self, chunks: Optional[Sequence[_FitChunk]] = None) -> Iterator[torch.Tensor]:
-        """
-        Yields each chunk's (weighted) loss. Callers should finish with each (e.g. ``backward()``) before the next, so
-        that only one graph is in memory.
-        """
-        for chunk in (self.chunks if chunks is None else chunks):
-            kwargs = chunk.kwargs
-            if self.callable_kwargs:
-                # called per chunk: outputs may be part of the graph, which is freed by each chunk's backward()
-                callable_kwargs = {k: v() for k, v in self.callable_kwargs.items()}
-                kwargs = {**kwargs, **self.ss_model._subset_kwargs(callable_kwargs, chunk.group_slice, self.num_groups)}
-            pred = self.ss_model(chunk.y, **kwargs)
-            yield chunk.get_loss(pred, chunk.y) * chunk.weight
-
-    @torch.no_grad()
-    def loss(self) -> float:
-        return sum(loss.item() for loss in self.chunk_losses())
-
-    def loss_and_grad(self) -> tuple[float, torch.Tensor]:
-        total_loss = 0.
-        total_grad = 0.
-        for loss in self.chunk_losses():
-            total_grad = total_grad + self._flat_grad(loss)
-            total_loss += loss.item()
-        return total_loss, total_grad
-
-    def loss_grad_hessian(self) -> tuple[float, torch.Tensor, torch.Tensor]:
-        """
-        The loss and gradient are always from all groups. If ``hessian_chunks`` are a subsample of groups, the hessian
-        is from those (as an estimate of the full-data hessian, on the same mean-scale).
-        """
-        if self.resample_hessian_chunks is not None:
-            self.hessian_chunks = self.resample_hessian_chunks()
-        total_loss = 0.
-        total_grad = 0.
-        total_hess = 0.
-        for loss in self.chunk_losses(self.hessian_chunks):
-            loss = loss.squeeze()
-            if not self.hessian_subsampled:
-                total_grad = total_grad + self._flat_grad(loss, retain_graph=True)
-                total_loss += loss.item()
-            total_hess = total_hess + hessian(output=loss, inputs=self.params, allow_unused=True, progress=False)
-            del loss
-        if self.hessian_subsampled:
-            total_loss, total_grad = self.loss_and_grad()
-        return total_loss, total_grad, total_hess
-
-    def _flat_grad(self, loss: torch.Tensor, retain_graph: bool = False) -> torch.Tensor:
-        grads = torch.autograd.grad(loss, self.params, retain_graph=retain_graph, allow_unused=True)
-        return torch.cat([
-            (torch.zeros_like(p) if g is None else g).reshape(-1) for p, g in zip(self.params, grads)
-        ]).detach()
-
-    def get_vector(self) -> torch.Tensor:
-        # matches the ordering of ``hessian()``, ``param_names``
-        return torch.cat([p.reshape(-1) for p in self.params])
-
-    @torch.no_grad()
-    def set_vector(self, vector: torch.Tensor):
-        offset = 0
-        for p in self.params:
-            p.copy_(vector[offset:offset + p.numel()].view_as(p))
-            offset += p.numel()
 
 
 class _OptimizerClosure:

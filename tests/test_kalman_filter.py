@@ -1,3 +1,4 @@
+import pickle
 import copy
 import itertools
 from collections import defaultdict
@@ -651,9 +652,9 @@ def test_joseph_form_option():
     with pytest.raises(AssertionError, match="joseph-form"):
         kf(y[..., :1])
     # older pickles (no attribute) use the joseph form:
-    del kf.joseph_form
-    with pytest.raises(AssertionError, match="joseph-form"):
-        kf(y[..., :1])
+    del kf._covariance_update, kf.joseph_form
+    kf = pickle.loads(pickle.dumps(kf))
+    assert kf.joseph_form is True
 
 
 @pytest.mark.parametrize("with_mixture", [False, True])
@@ -671,7 +672,7 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         adaptive_scaling=True,
-        mixture=[MixtureComponent(measure='y1', mean_init=-3., prob_init=.1, id='low')] if with_mixture else None,
+        mixture=[MixtureComponent(measure='y1', offset_init=-3., prob_init=.1, id='low')] if with_mixture else None,
     )
     with torch.no_grad():
         kf.adaptive_scaling.weight.fill_(.8)  # (a strong effect, so a lost state would show)
@@ -702,7 +703,7 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
         assert torch.equal(pred_n.scaling_states[k][:, 10], pred_n.update_scaling_states[k][:, 7])
 
     # chunked fitting subsets it with the rest of `initial_state`:
-    from torchcast.state_space.state_space import _subset_groups
+    from torchcast.state_space.chunking import _subset_groups
     sub = _subset_groups(state, slice(0, 2), num_groups=3)
     assert all(v.shape[0] == 2 for v in sub.scaling.values())
 
