@@ -445,3 +445,20 @@ def test_linear_model_outputs_draw_no_samples():
             assert spy.call_count == 0
             pred.to_dataframe(derived={'double': lambda s: s['y'] * 2})
             assert spy.call_count == 1
+
+
+@torch.no_grad()
+def test_simulate_repeats_num_obs():
+    # simulate(num_sims > 1) lays sims out in blocks of groups; each row's num_obs must be its own group's
+    torch.manual_seed(0)
+    bf = BinomialFilter(
+        measures=['y'], processes=[LocalLevel(id='lvl', measure='y')], binary_measures=['y'], observed_counts=True
+    )
+    num_groups, num_times, num_sims = 3, 10, 4
+    num_obs = torch.tensor([1., 50., 50.]).view(-1, 1, 1).expand(num_groups, num_times, 1)
+    sim = bf.simulate(out_timesteps=num_times, num_groups=num_groups, num_sims=num_sims, num_obs=num_obs)
+    # (observations are proportions: with num_obs=1 they can only be 0 or 1)
+    obs = sim.sample(200, shared_noise=True, generator=_gen()).observations.reshape(200, num_sims, num_groups, -1)
+    is_binary = (obs == 0) | (obs == 1)
+    assert is_binary[:, :, 0].all()
+    assert not is_binary[:, :, 1:].all()

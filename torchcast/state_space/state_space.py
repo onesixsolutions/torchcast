@@ -180,6 +180,11 @@ class StateSpaceModel(torch.nn.Module):
                 k: (repeat(v, simulate, dim=0) if isinstance(v, (torch.Tensor, np.ndarray)) else v)
                 for k, v in kwargs.items()
             }
+            if prediction_kwargs:  # (e.g. BinomialFilter's num_obs)
+                prediction_kwargs = {
+                    k: (repeat(v, simulate, dim=0) if isinstance(v, (torch.Tensor, np.ndarray)) else v)
+                    for k, v in prediction_kwargs.items()
+                }
 
         n_step = int(n_step)
         assert n_step > 0
