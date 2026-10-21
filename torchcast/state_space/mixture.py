@@ -14,13 +14,14 @@ The :class:`MixtureModel` owns the components. Multivariate support is accomplis
  of regimes (e.g. [(measure1=standard, measure2=standard), (measure1=weird, measure2=standard), ...] and so on). Regime
 probabilities are tracked jointly over this table, allowing p(measure_x=weird) to vary over time and across groups.
 
-Optionally, groups can belong to latent classes (``MixtureModel(..., num_classes=K)``) with their own base-rates for
-each component -- a discrete random effect on the base-rates, e.g. some customers have outliers much more often than
-others. The table of combos is then repeated once per class. Classes share the transition (it applies within each
-class), and a group never changes class, so its posterior over classes accumulates evidence over all of its timesteps,
-and carries over into forecasts.
+Optionally, groups can belong to latent classes (``MixtureModel(..., classes=[LatentClass(...), ...])``) with their own
+base-rates for each component -- a discrete random effect on the base-rates, e.g. some customers have outliers much more
+often than others. The table of combos is then repeated once per class. Classes share the transition (it applies within
+each class), and a group never changes class, so its posterior over classes accumulates evidence over all of its
+timesteps, and carries over into forecasts.
 """
 import itertools
+import math
 from typing import Optional, Sequence, Mapping
 
 import torch
@@ -101,6 +102,43 @@ class MixtureComponent(torch.nn.Module):
         return f'{type(self).__name__}(id={repr(self.id)}, measure={repr(self.measure)})'
 
 
+class LatentClass:
+    """
+    A latent class of groups, for :class:`MixtureModel`'s ``classes``: groups in this class have their own base-rate
+    for each component. Which class a group is in isn't known; the model learns each class's base-rates, and its
+    posterior over each group's class accumulates evidence over all of the group's timesteps.
+
+    The first of a model's classes is the reference: its base-rates are the components' own (see
+    :class:`MixtureComponent`'s ``prob_init``). Each other class's base-rates are relative to the reference's, via
+    ``relative_rate_init``.
+
+    :param id: A unique identifier (among the model's classes).
+    :param membership_prob_init: Initial value for the prior probability that a group is in this class. Either given
+     for all of the model's classes (normalized to sum to 1), or for none (equal probabilities).
+    :param relative_rate_init: For classes after the first (required, with at least one ratio other than 1): a
+     dictionary mapping a component's ``qualified_id`` (``'{measure}.{id}'``) to the initial value of its rate in this
+     class, relative to the reference class -- e.g. ``{'log_theo.high': .1}`` for a 'high' regime ~10x less common.
+     Exactly, it multiplies the component's odds vs. its measure's standard regime (for a rare component, that's about
+     the same as multiplying its rate). Components not listed are initialized as in the reference class.
+    """
+
+    def __init__(self,
+                 id: str,
+                 membership_prob_init: Optional[float] = None,
+                 relative_rate_init: Optional[Mapping[str, float]] = None):
+        self.id = id
+        if membership_prob_init is not None and not 0 < membership_prob_init < 1:
+            raise ValueError(f"LatentClass '{id}': `membership_prob_init` must be between 0 and 1.")
+        self.membership_prob_init = membership_prob_init
+        self.relative_rate_init = dict(relative_rate_init or {})
+        for key, ratio in self.relative_rate_init.items():
+            if not ratio > 0:
+                raise ValueError(f"LatentClass '{id}': `relative_rate_init['{key}']` must be positive, got {ratio}.")
+
+    def __repr__(self) -> str:
+        return f'{type(self).__name__}(id={repr(self.id)})'
+
+
 class RegimeTransition(torch.nn.Module):
     """
     Base-class for how regime-probabilities evolve over time. Subclasses implement :func:`initial` (the regime-prior
@@ -111,7 +149,7 @@ class RegimeTransition(torch.nn.Module):
     base-rates: a ``(num_combos,)`` tensor (or, if any components have predictors, a ``(num_groups, num_combos)``
     tensor, for the timestep that the regime-prior is for).
 
-    With latent classes (``MixtureModel(num_classes > 1)``), the transition only sees the combos *within* a class (so
+    With latent classes (``MixtureModel(classes=...)``), the transition only sees the combos *within* a class (so
     ``num_combos`` is the number per class): the :class:`MixtureModel` applies it to each class separately -- to the
     combo-probabilities given the class, with that class's base-rates (normalized within the class), as if each class
     of each group were a separate group (``(num_groups * num_classes, num_combos)`` tensors) -- and scales the result
@@ -145,7 +183,7 @@ class StaticTransition(RegimeTransition):
     """
     A static mixture: the regimes are independent across timesteps, so the regime-prior at every timestep is
     ``base_probs`` (whatever the previous posterior). It has no parameters. With latent classes
-    (``MixtureModel(num_classes > 1)``), the regimes are independent across timesteps *given* the class, which stays
+    (``MixtureModel(classes=...)``), the regimes are independent across timesteps *given* the class, which stays
     fixed: each group's base-rates are a mixture over the classes, learned from all of its timesteps.
 
     :param num_combos: The number of regime-combos.
@@ -237,22 +275,21 @@ class MixtureModel(torch.nn.Module):
      simpler ``P - K @ H @ P`` instead -- less memory (and compute), but less numerically robust. The non-standard
      combos are the safer place for this: a component's extra variance makes their update better-conditioned, and
      their covariances only matter in proportion to their posterior probability. Default True.
-    :param num_classes: The number of latent classes of groups, each with its own base-rate for each component (a
-     discrete random effect on the base-rates). Default 1 (no classes). With ``K > 1`` classes, the table of combos is
-     repeated once per class (class-major: ``self.combos[i]`` is in class ``self.combo_class[i]``), and the base-rates
-     are learned per class: each component's logit gets a per-class offset, and the classes have prior logits (both
-     fixed at 0 for class 0, for identifiability). Otherwise the classes are the same: the ``transition`` is shared,
-     applied within each class with that class's base-rates (see :class:`RegimeTransition`), so its ``num_combos`` is
-     the number of combos per class (``self.num_class_combos``); and groups never change class. The class-offsets are
-     initialized at ``class_spread_init * c`` for class ``c``, so that the classes start in increasing order of their
-     components' base-rates (otherwise, the classes would be symmetric). Only the bookkeeping of regime-probabilities
-     grows with ``K``: combos with the same observable regimes share a state-update and likelihood (see
-     :func:`effective_combos`). Use :func:`class_probs` for the posterior probability of each class. Note that
-     ``Predictions.sample()`` draws the regime-combo independently at each timestep (as it does the state; samples
-     are not trajectories), so a sample's class can differ across timesteps: the per-timestep distributions are
-     right, but a path from these samples doesn't stay in one class. For trajectories, use ``simulate()``, which
-     simulates the regimes (and so the class) along with the state.
-    :param class_spread_init: See ``num_classes``. Default 1.
+    :param classes: Optional :class:`LatentClass` objects (at least two): latent classes of groups, each with its own
+     base-rate for each component (a discrete random effect on the base-rates). Default None (no classes; i.e. one).
+     With ``K`` classes, the table of combos is repeated once per class (class-major: ``self.combos[i]`` is in class
+     ``self.combo_class[i]``), and the base-rates are learned per class: each component's logit gets a per-class offset,
+     and the classes have prior logits (both fixed at 0 for the first class, for identifiability). Otherwise the classes
+     are the same: the ``transition`` is shared, applied within each class with that class's base-rates (see
+     :class:`RegimeTransition`), so its ``num_combos`` is the number of combos per class (``self.num_class_combos``);
+     and groups never change class. The initial values come from each class's ``membership_prob_init`` and
+     ``relative_rate_init``; the latter is required for all but the first class, since otherwise the classes would be
+     symmetric. Only the bookkeeping of regime-probabilities grows with ``K``: combos with the same observable regimes
+     share a state-update and likelihood (see :func:`effective_combos`). Use :func:`class_probs` for the posterior
+     probability of each class. Note that ``Predictions.sample()`` draws the regime-combo independently at each timestep
+     (as it does the state; samples are not trajectories), so a sample's class can differ across timesteps: the
+     per-timestep distributions are right, but a path from these samples doesn't stay in one class. For trajectories,
+     use ``simulate()``, which simulates the regimes (and so the class) along with the state.
     """
 
     def __init__(self,
@@ -260,8 +297,7 @@ class MixtureModel(torch.nn.Module):
                  transition: Optional[RegimeTransition] = None,
                  univariate_prob: bool = False,
                  joseph_form: bool = True,
-                 num_classes: int = 1,
-                 class_spread_init: float = 1.):
+                 classes: Optional[Sequence[LatentClass]] = None):
         super().__init__()
         if not components:
             raise ValueError("`components` cannot be empty.")
@@ -280,8 +316,8 @@ class MixtureModel(torch.nn.Module):
         self.univariate_prob = univariate_prob
         self.joseph_form = joseph_form
 
-        if num_classes < 1:
-            raise ValueError(f"`num_classes` must be at least 1, got {num_classes}")
+        self.classes = list(classes or [])
+        num_classes = max(len(self.classes), 1)
         self.num_classes = num_classes
         # the combos within a class; with latent classes, these are repeated for each class (class-major):
         class_combos = list(itertools.product(*[[None] + self._by_measure[m] for m in self.mixture_measures]))
@@ -289,8 +325,8 @@ class MixtureModel(torch.nn.Module):
         self.combo_class: list[int] = [c for c in range(num_classes) for _ in class_combos]
 
         self._class_prior_logits = self._class_offsets = None
-        if num_classes > 1:
-            self._init_classes(class_spread_init)
+        if self.classes:
+            self._init_classes()
 
         if transition is None:
             transition = StickyTransition(num_combos=self.num_class_combos)
@@ -301,13 +337,48 @@ class MixtureModel(torch.nn.Module):
             )
         self.transition = transition
 
-    def _init_classes(self, class_spread_init: float) -> None:
+    def _init_classes(self) -> None:
+        classes = self.classes
+        if len(classes) < 2:
+            raise ValueError("`classes` needs at least two classes (or None, for no classes).")
+        ids = [c.id for c in classes]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"Latent classes must have unique ids, got {ids}")
+        if classes[0].relative_rate_init:
+            raise ValueError(
+                f"LatentClass '{ids[0]}' is the first (reference) class, so can't have `relative_rate_init`: the other "
+                f"classes' rates are relative to its."
+            )
+        component_ids = [c.qualified_id for c in self.components]
+        for cls in classes[1:]:
+            if not any(ratio != 1 for ratio in cls.relative_rate_init.values()):
+                raise ValueError(
+                    f"LatentClass '{cls.id}' needs a `relative_rate_init` with at least one ratio other than 1 (vs. "
+                    f"the reference class '{ids[0]}'); otherwise the classes start out identical."
+                )
+            unknown = set(cls.relative_rate_init) - set(component_ids)
+            if unknown:
+                raise ValueError(
+                    f"LatentClass '{cls.id}': `relative_rate_init` has unknown components {sorted(unknown)}; expected "
+                    f"(a subset of) {component_ids}"
+                )
+        membership = [c.membership_prob_init for c in classes]
+        if any(p is None for p in membership) and not all(p is None for p in membership):
+            raise ValueError("`membership_prob_init` should be given for all classes, or for none.")
+
+        to = {'dtype': torch.get_default_dtype()}
         # the prior logit of classes 1, ..., K-1 (class 0's is fixed at 0):
-        self._class_prior_logits = torch.nn.Parameter(torch.zeros(self.num_classes - 1))
-        # for each component (in the order of self.components), the offset to its logit in classes 1, ..., K-1
-        # (class 0's is fixed at 0). initialized in increasing order, to break the symmetry between classes:
-        spread = class_spread_init * torch.arange(1, self.num_classes, dtype=torch.get_default_dtype())
-        self._class_offsets = torch.nn.Parameter(spread.expand(len(self.components), -1).clone())
+        log_membership = torch.zeros(len(classes), **to)
+        if membership[0] is not None:
+            log_membership = torch.as_tensor(membership, **to).log()
+        self._class_prior_logits = torch.nn.Parameter(log_membership[1:] - log_membership[0])
+        # for each component (in the order of self.components), the offset to its logit in classes 1, ..., K-1 (class
+        # 0's is fixed at 0): the log of the ratio of its odds (vs. its measure's standard regime) to class 0's.
+        offsets = torch.zeros(len(self.components), len(classes) - 1, **to)
+        for k, cls in enumerate(classes[1:]):
+            for qualified_id, ratio in cls.relative_rate_init.items():
+                offsets[component_ids.index(qualified_id), k] = math.log(ratio)
+        self._class_offsets = torch.nn.Parameter(offsets)
 
     @staticmethod
     def sample_combos(regime_probs: torch.Tensor) -> torch.Tensor:
@@ -320,12 +391,10 @@ class MixtureModel(torch.nn.Module):
         idx = torch.multinomial(regime_probs.detach(), 1)
         return torch.zeros_like(regime_probs).scatter_(-1, idx, 1.)
 
-    def class_log_prior(self) -> torch.Tensor:
+    def _class_log_prior(self) -> torch.Tensor:
         """
-        :return: A ``(num_classes,)`` tensor: the log prior probability of each latent class.
+        :return: A ``(num_classes,)`` tensor: the log prior probability of each latent class (with classes).
         """
-        if self.num_classes == 1:
-            return torch.zeros(1, dtype=self.components[0].logit.dtype, device=self.components[0].logit.device)
         logits = self._class_prior_logits
         return torch.log_softmax(torch.cat([torch.zeros_like(logits[:1]), logits]), 0)
 
@@ -482,7 +551,7 @@ class MixtureModel(torch.nn.Module):
         if self.num_classes == 1:
             return combo_log_probs
         # (*batch_shape, num_classes, num_class_combos) -> class-major (*batch_shape, num_combos):
-        return (self.class_log_prior().unsqueeze(-1) + combo_log_probs).flatten(-2)
+        return (self._class_log_prior().unsqueeze(-1) + combo_log_probs).flatten(-2)
 
     def base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         return self.log_base_probs(component_X).exp()
