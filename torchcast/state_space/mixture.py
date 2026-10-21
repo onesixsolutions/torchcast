@@ -144,11 +144,9 @@ class RegimeTransition(torch.nn.Module):
 class StaticTransition(RegimeTransition):
     """
     A static mixture: the regimes are independent across timesteps, so the regime-prior at every timestep is
-    ``base_probs`` (whatever the previous posterior). It has no parameters. Without latent classes, this supports
-    :func:`StateSpaceModel.simulate` -- the regimes aren't simulated along a trajectory, and drawing them per-timestep
-    is only right when they're independent. With latent classes (``MixtureModel(num_classes > 1)``), the regimes are
-    independent across timesteps *given* the class, which stays fixed: each group's base-rates are a mixture over the
-    classes, learned from all of its timesteps.
+    ``base_probs`` (whatever the previous posterior). It has no parameters. With latent classes
+    (``MixtureModel(num_classes > 1)``), the regimes are independent across timesteps *given* the class, which stays
+    fixed: each group's base-rates are a mixture over the classes, learned from all of its timesteps.
 
     :param num_combos: The number of regime-combos.
     """
@@ -252,8 +250,8 @@ class MixtureModel(torch.nn.Module):
      :func:`effective_combos`). Use :func:`class_probs` for the posterior probability of each class. Note that
      ``Predictions.sample()`` draws the regime-combo independently at each timestep (as it does the state; samples
      are not trajectories), so a sample's class can differ across timesteps: the per-timestep distributions are
-     right, but a path from these samples doesn't stay in one class. For the same reason, ``simulate()`` raises for
-     models with latent classes (or stickiness).
+     right, but a path from these samples doesn't stay in one class. For trajectories, use ``simulate()``, which
+     simulates the regimes (and so the class) along with the state.
     :param class_spread_init: See ``num_classes``. Default 1.
     """
 
@@ -311,21 +309,16 @@ class MixtureModel(torch.nn.Module):
         spread = class_spread_init * torch.arange(1, self.num_classes, dtype=torch.get_default_dtype())
         self._class_offsets = torch.nn.Parameter(spread.expand(len(self.components), -1).clone())
 
-    def regimes_independent_over_time(self, tol: float = 1e-6) -> bool:
+    @staticmethod
+    def sample_combos(regime_probs: torch.Tensor) -> torch.Tensor:
         """
-        Whether the regimes are (effectively) independent across timesteps: a static mixture, i.e. a
-        :class:`StaticTransition`, or a :class:`StickyTransition` whose stay-probabilities are all below ``tol``,
-        without latent classes. Otherwise -- stickiness, latent classes, or a custom :class:`RegimeTransition` (which
-        can't be inspected) -- the regimes at different timesteps are correlated, so drawing them per-timestep doesn't
-        give trajectories.
+        For simulations: draw a combo for each row.
+
+        :param regime_probs: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
+        :return: A ``(num_groups, num_combos)`` one-hot tensor of the drawn combos.
         """
-        if self.num_classes > 1:
-            return False
-        if isinstance(self.transition, StaticTransition):
-            return True
-        if isinstance(self.transition, StickyTransition):
-            return bool(self.transition.get_stay_prob().max() < tol)
-        return False
+        idx = torch.multinomial(regime_probs.detach(), 1)
+        return torch.zeros_like(regime_probs).scatter_(-1, idx, 1.)
 
     def class_log_prior(self) -> torch.Tensor:
         """

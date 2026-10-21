@@ -414,12 +414,10 @@ def test_initial_state_continuation():
     pred_state = full.get_state_at_times(split, type_='prediction')
     assert torch.allclose(pred_state.regime_probs, full.regime_probs[:, split])
 
-    # simulate from the state: not with stickiness (regimes aren't simulated as trajectories), but a static mixture:
-    with pytest.raises(NotImplementedError, match="static mixtures"):
-        kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
-    kf.mixture.transition._stay_logit.fill_(-30.)
+    # simulate from the state (the regimes are simulated too, so the regime-probs are one-hot):
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
     assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
+    assert ((sim.regime_probs == 0) | (sim.regime_probs == 1)).all() and (sim.regime_probs.sum(-1) == 1).all()
 
     # a model without mixture components rejects regime-probs:
     kf_plain = _make_kf(['y1', 'y2'], [])
@@ -509,9 +507,6 @@ def test_component_predictors_continuation():
     cont = kf(y[:, split:], X=X[:, split:], initial_state=state)
     assert torch.allclose(cont.regime_probs, full.regime_probs[:, split:], atol=1e-6)
     assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
-    with pytest.raises(NotImplementedError, match="static mixtures"):
-        kf.simulate(out_timesteps=5, initial_state=state, num_sims=2, X=X[:, split:split + 5])
-    kf.mixture.transition._stay_logit.fill_(-30.)
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2, X=X[:, split:split + 5])
     assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
 
@@ -1077,9 +1072,9 @@ def test_latent_classes_with_two_components():
         labels, probs, _, _ = pred._get_regime_combos()
         assert len(set(labels)) == mixture.num_combos and labels[-1] == ('high', 'low', 'class1')
         assert pred.sample(5, shared_noise=False).means.shape == (5, 3, 20, 2)
-        # simulate() promises trajectories, which it can't deliver with classes:
-        with pytest.raises(NotImplementedError, match="static mixtures"):
-            kf.simulate(out_timesteps=5, num_groups=2)
+        # simulated trajectories stay in one class:
+        sim_class = mixture.class_probs(kf.simulate(out_timesteps=5, num_groups=2, num_sims=10).regime_probs)
+        assert (sim_class == sim_class[:, :1]).all()
 
 
 def test_latent_classes_fit():
@@ -1116,17 +1111,30 @@ def test_latent_classes_fit():
 
 
 @torch.no_grad()
-def test_static_transition_simulate():
-    """`StaticTransition` is a static mixture, so `simulate()` works -- but not with latent classes."""
-    kf = _make_kf(['y1', 'y2'], ['y1'], transition=StaticTransition(num_combos=2))
-    assert kf.mixture.regimes_independent_over_time()
-    assert not list(kf.mixture.transition.parameters())
-    sim = kf.simulate(out_timesteps=5, num_groups=3, num_sims=2)
-    assert torch.allclose(sim.regime_probs, kf.mixture.base_probs().expand(6, 5, -1))
-    assert sim.sample(4, shared_noise=False).means.shape == (4, 6, 5, 2)
+def test_simulate_regimes():
+    """
+    `simulate()` simulates the regimes as trajectories: one-hot regime-probs, persisting as often as the sticky
+    transition implies; with latent classes, each trajectory stays in one class, drawn from the class prior.
+    """
+    torch.manual_seed(0)
+    kf = _make_kf(['y1', 'y2'], ['y1'])
+    kf.mixture.transition._stay_logit.fill_(2.)
+    sim = kf.simulate(out_timesteps=30, num_groups=2000)
+    rp = sim.regime_probs
+    assert ((rp == 0) | (rp == 1)).all() and (rp.sum(-1) == 1).all()
+    assert ((sim.get_mixture('y1').probs == 0) | (sim.get_mixture('y1').probs == 1)).all()
+    base_probs = kf.mixture.base_probs()
+    assert torch.allclose(rp.mean((0, 1)), base_probs, atol=.02)
+    # P(same combo at consecutive timesteps), for the stationary chain:
+    T = kf.mixture.transition.matrix(base_probs)
+    p_same = (base_probs * T.diagonal()).sum()
+    assert abs((rp[:, 1:] * rp[:, :-1]).sum(-1).mean() - p_same) < .02
 
-    assert not _make_kf(['y1', 'y2'], ['y1']).mixture.regimes_independent_over_time()
-    kf_classes = _make_kf(['y1', 'y2'], ['y1'], num_classes=2, transition=StaticTransition(num_combos=2))
-    assert not kf_classes.mixture.regimes_independent_over_time()
-    with pytest.raises(NotImplementedError, match="static mixtures"):
-        kf_classes.simulate(out_timesteps=5, num_groups=3)
+    # latent classes, with a static transition: regimes are redrawn each timestep, but the class stays.
+    kf = _make_kf(['y1', 'y2'], ['y1'], num_classes=2, transition=StaticTransition(num_combos=2))
+    assert not list(kf.mixture.transition.parameters())
+    kf.mixture._class_offsets.fill_(4.)
+    kf.mixture._class_prior_logits.fill_(-1.)
+    sim_class = kf.mixture.class_probs(kf.simulate(out_timesteps=30, num_groups=1000).regime_probs)
+    assert (sim_class == sim_class[:, :1]).all()
+    assert abs(sim_class[:, 0, 1].mean() - torch.sigmoid(torch.tensor(-1.))) < .04

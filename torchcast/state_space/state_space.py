@@ -280,6 +280,10 @@ class StateSpaceModel(torch.nn.Module):
             cov1s.append(cov1step)
             scale1s.append(scaling1step)
             scaling_states1.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
+            if simulate and regime_prior is not None:
+                # simulate the regime along with the state: the simulation's regime-probabilities are its (one-hot)
+                # trajectory, and the next timestep's prior is conditional on it
+                regime_prior = self.mixture.sample_combos(regime_prior)
             regime1s.append(regime_prior)
 
             regime_post = regime_prior  # unless updated below
@@ -1220,10 +1224,10 @@ class StateSpaceModel(torch.nn.Module):
         """
         Generate simulated state-trajectories from your model.
 
-        For models with mixture components, only static mixtures are supported (e.g. with a ``StaticTransition``; see
-        ``MixtureModel.regimes_independent_over_time()``): the regimes aren't simulated along the trajectories, and
-        drawing them per-timestep from the output (e.g. ``sample()``) is only right if they're independent across
-        timesteps. Otherwise (stickiness, latent classes, a custom transition) this raises ``NotImplementedError``.
+        For models with mixture components, the regimes are simulated too: at each timestep, a regime-combo is drawn
+        from the regime-prior given the trajectory so far (so stickiness and latent classes carry over), and the
+        output's ``regime_probs`` are these (one-hot) draws. So e.g. ``sample()`` on the output uses the simulated
+        regimes.
 
         :param out_timesteps: The number of timesteps to generate in the output.
         :param initial_state: The initial state of the system: a tuple of `mean`, `cov`. Can be obtained from previous
@@ -1239,14 +1243,6 @@ class StateSpaceModel(torch.nn.Module):
         :param kwargs: Further arguments passed to the `processes`.
         :return: A :class:`.Predictions` object with zero state-covariance.
         """
-        if self.mixture is not None and not self.mixture.regimes_independent_over_time():
-            # the regimes aren't simulated along the trajectory (sampling them from the output is per-timestep), which
-            # is only right if they're independent across timesteps:
-            raise NotImplementedError(
-                "`simulate()` is only supported for static mixtures (regimes independent across timesteps), e.g. "
-                "`MixtureModel(components, transition=StaticTransition(num_combos))`. Regimes aren't simulated as "
-                "trajectories, so stickiness or latent classes would be lost."
-            )
 
         if num_groups is not None:
             if start_offsets is not None and len(start_offsets) != num_groups:

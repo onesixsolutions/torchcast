@@ -198,6 +198,5 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 #   `LinearModel`'s `X`) to the model, covering the forecast horizon.
 # - Passing a list of components is shorthand for `mixture=MixtureModel(components)`. To configure it, pass the
 #   `MixtureModel` yourself: e.g. `MixtureModel(components, transition=...)`. The default `StickyTransition` learns
-#   a "stickiness" that controls how regime-probabilities persist over time; `StaticTransition` is a static mixture
-#   (needed for `simulate()`, which doesn't simulate regimes as trajectories); you can also write your own
-#   `RegimeTransition`.
+#   a "stickiness" that controls how regime-probabilities persist over time; `StaticTransition` is a static mixture;
+#   you can also write your own `RegimeTransition`.
