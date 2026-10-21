@@ -1287,7 +1287,8 @@ class Predictions:
         warning, if any of these are mixture measures).
 
         :return: A tuple of (1) a label for each combo: a tuple with the regime of each mixture measure ('standard' or
-         the component id; with latent classes, followed by the class, e.g. 'class1'), (2) a ``(num_groups, num_timesteps, num_combos)`` tensor of combo probabilities, (3) a
+         the component id; with latent classes, followed by the class, e.g. 'class1'), (2) a ``(num_groups,
+         num_timesteps, num_combos)`` tensor of combo probabilities, (3) a
          ``(num_groups, num_timesteps, num_combos, num_measures)`` tensor of means, and (4) a ``(num_groups,
          num_timesteps, num_combos, num_measures, num_measures)`` tensor of covariances.
         """

@@ -7,7 +7,9 @@ from torch.distributions import MultivariateNormal, Normal
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel
-from torchcast.state_space.mixture import MixtureComponent, MixtureModel, RegimeTransition, StickyTransition
+from torchcast.state_space.mixture import (
+    ClassStickyTransition, MixtureComponent, MixtureModel, RegimeTransition, StickyTransition
+)
 
 
 def _make_kf(measures, mixture_measures, **mixture_kwargs) -> KalmanFilter:
@@ -921,3 +923,190 @@ def test_kalman_update_broadcasts():
             )
             assert torch.allclose(batched.mean[e], single.mean, atol=1e-5)
             assert torch.allclose(batched.cov[e], single.cov, atol=1e-5)
+
+
+# Latent classes -------------------------------------------------------------------------------------------------------
+
+def test_latent_classes_single_class_unchanged():
+    """
+    `num_classes=1` (the default) adds no parameters, and `ClassStickyTransition` with one class is `StickyTransition`.
+    """
+    kf = _make_kf(['y1', 'y2'], ['y1', 'y2'], num_classes=1)
+    assert isinstance(kf.mixture.transition, StickyTransition)
+    assert not isinstance(kf.mixture.transition, ClassStickyTransition)
+    assert set(kf.state_dict()) == set(_make_kf(['y1', 'y2'], ['y1', 'y2']).state_dict())
+    assert kf.mixture.combo_class == [0] * kf.mixture.num_combos
+
+    torch.manual_seed(1)
+    sticky, class_sticky = StickyTransition(num_combos=4), ClassStickyTransition(num_combos=4, num_classes=1)
+    with torch.no_grad():
+        sticky._stay_logit.normal_()
+        class_sticky._stay_logit.copy_(sticky._stay_logit)
+    base_probs = torch.softmax(torch.randn(4), 0)
+    posterior = torch.softmax(torch.randn(5, 4), -1)
+    assert torch.allclose(class_sticky(posterior, base_probs), sticky(posterior, base_probs))
+    assert torch.allclose(class_sticky.matrix(base_probs), sticky.matrix(base_probs))
+
+
+@torch.no_grad()
+def test_identical_classes_match_single_class():
+    """
+    Two classes with the same base-rates (and stay-probabilities) are indistinguishable: the same log-prob and
+    predictions as one class, the class-probabilities stay at their prior, and the regime-probabilities summed over
+    classes are the single class's.
+    """
+    y = _make_y()
+    kf1 = _make_kf(['y1', 'y2'], ['y1', 'y2'])
+    kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], num_classes=2)
+    kf1.mixture.transition._stay_logit.normal_()
+    kf2.load_state_dict(
+        {k: v for k, v in kf1.state_dict().items() if not k.startswith('mixture.transition.')}, strict=False
+    )
+    kf2.mixture.transition._stay_logit.copy_(kf1.mixture.transition._stay_logit.repeat(2))
+    kf2.mixture._class_offsets.zero_()
+    kf2.mixture._class_prior_logits.fill_(.5)
+
+    pred1, pred2 = kf1(y, out_timesteps=20, n_step=2), kf2(y, out_timesteps=20, n_step=2)
+    assert torch.allclose(pred1.log_prob(y), pred2.log_prob(y), atol=1e-5)
+    assert torch.allclose(pred1.means, pred2.means, atol=1e-5)
+    class_prior = kf2.mixture.class_log_prior().exp()
+    assert torch.allclose(class_prior, torch.sigmoid(torch.tensor([-.5, .5])))
+    assert torch.allclose(kf2.mixture.class_probs(pred2.regime_probs), class_prior.expand(3, 20, -1), atol=1e-5)
+    rp2 = pred2.regime_probs.unflatten(-1, (2, -1)).sum(-2)
+    assert torch.allclose(pred1.regime_probs, rp2, atol=1e-5)
+
+
+def test_class_sticky_transition():
+    torch.manual_seed(1)
+    num_classes, per_class = 3, 4
+    transition = ClassStickyTransition(num_combos=num_classes * per_class, num_classes=num_classes)
+    with torch.no_grad():
+        transition._stay_logit.normal_()
+    base_probs = torch.softmax(torch.randn(num_classes * per_class), 0)
+    T = transition.matrix(base_probs)
+    assert torch.allclose(T.sum(-1), torch.ones(num_classes * per_class))
+    for c in range(num_classes):
+        block = slice(c * per_class, (c + 1) * per_class)
+        # block-diagonal: no transitions between classes
+        assert (T[block, :block.start] == 0).all() and (T[block, block.stop:] == 0).all()
+        # within a class, the stationary distribution is the class's (normalized) base-rates:
+        within = base_probs[block] / base_probs[block].sum()
+        assert torch.allclose(within @ T[block, block], within, atol=1e-6)
+
+    posterior = torch.softmax(torch.randn(5, num_classes * per_class), -1)
+    nxt = transition(posterior, base_probs)
+    assert torch.allclose(nxt, posterior @ T, atol=1e-6)
+    # class mass is conserved:
+    by_class = lambda x: x.unflatten(-1, (num_classes, per_class)).sum(-1)
+    assert torch.allclose(by_class(nxt), by_class(posterior), atol=1e-6)
+    assert torch.allclose(transition.initial(base_probs, 5), base_probs.expand(5, -1))
+    # per-group base-probs (components with predictors):
+    group_base_probs = torch.softmax(torch.randn(5, num_classes * per_class), -1)
+    expected = torch.stack([posterior[g] @ transition.matrix(group_base_probs[g]) for g in range(5)])
+    assert torch.allclose(transition(posterior, group_base_probs), expected, atol=1e-6)
+
+    with pytest.raises(ValueError, match="multiple of"):
+        ClassStickyTransition(num_combos=5, num_classes=2)
+    with pytest.raises(ValueError, match="classes"):
+        MixtureModel(
+            [MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')],
+            num_classes=2,
+            transition=ClassStickyTransition(num_combos=4, num_classes=4)
+        )
+
+
+@torch.no_grad()
+def test_latent_classes_base_probs():
+    """Combos are class-major; each class has its own base-rates (the component's logit + the class's offset)."""
+    torch.manual_seed(0)
+    mixture = MixtureModel(
+        [MixtureComponent(measure='y', offset_init=-4., prob_init=.1, id='low', predictors=['x'])],
+        num_classes=3,
+    )
+    assert mixture.num_combos == 6 and mixture.combo_class == [0, 0, 1, 1, 2, 2]
+    assert [c[0] is None for c in mixture.combos] == [True, False] * 3
+    mixture._class_prior_logits.normal_()
+    X = torch.randn(2, 4, 1)
+    component = mixture.components[0]
+    base_probs = mixture.base_probs({component.qualified_id: X})
+    assert base_probs.shape == (2, 4, 6)
+    assert torch.allclose(base_probs.sum(-1), torch.ones(2, 4))
+    class_probs = mixture.class_probs(base_probs)
+    assert torch.allclose(class_probs, mixture.class_log_prior().exp().expand(2, 4, -1))
+    offsets = torch.cat([torch.zeros(1), mixture._class_offsets[0]])
+    for c in range(3):
+        p_low = base_probs[..., 2 * c + 1] / class_probs[..., c]
+        assert torch.allclose(p_low, torch.sigmoid(component.get_logit(X) + offsets[c]), atol=1e-6)
+    # initialized in increasing order of base-rates:
+    assert (offsets.diff() > 0).all()
+
+
+def test_latent_classes_with_two_components():
+    """A 'high' and a 'low' component on one measure, and a component on another: classes x 3 x 2 combos."""
+    torch.manual_seed(0)
+    mixture = MixtureModel(
+        [
+            MixtureComponent(measure='y1', offset_init=-4., prob_init=.1, id='low'),
+            MixtureComponent(measure='y1', offset_init=4., prob_init=.05, id='high'),
+            MixtureComponent(measure='y2', offset_init=-4., prob_init=.1, id='low'),
+        ],
+        num_classes=2,
+    )
+    assert mixture.num_combos == 2 * 3 * 2
+    kf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['y1', 'y2']],
+        measures=['y1', 'y2'],
+        mixture=mixture,
+    )
+    # classes don't add state-updates: only the observable combos are distinct.
+    assert len(mixture.effective_combos(['y1', 'y2'])[0]) == 6
+    assert len(mixture.effective_combos(['y1'])[0]) == 3
+
+    y = _make_y()
+    y[1, 3:6, 1] = float('nan')
+    pred = kf(y, out_timesteps=20)
+    pred.log_prob(y).sum().backward()
+    assert (mixture._class_offsets.grad.abs() > 0).all()
+    assert (mixture._class_prior_logits.grad.abs() > 0).all()
+
+    with torch.no_grad():
+        class_probs = mixture.class_probs(pred.regime_probs)
+        # no observations -> no change in class-probabilities:
+        assert torch.allclose(class_probs[:, 15:], class_probs[:, 15:16].expand(-1, 5, -1), atol=1e-6)
+        assert torch.allclose(pred.get_mixture('y1').probs.sum(-1), torch.ones(3, 20), atol=1e-6)
+        labels, probs, _, _ = pred._get_regime_combos()
+        assert len(set(labels)) == mixture.num_combos and labels[-1] == ('high', 'low', 'class1')
+        assert pred.sample(5, shared_noise=False).means.shape == (5, 3, 20, 2)
+
+
+def test_latent_classes_fit():
+    """
+    Groups from two classes with different rates of low outliers (2% vs. 25%): fitting with two classes recovers the
+    rates, separates the groups' posterior class-probabilities, and these carry over into forecasts.
+    """
+    torch.manual_seed(0)
+    num_groups, num_times = 40, 40
+    frequent = torch.arange(num_groups) % 2 == 1
+    y = torch.randn(num_groups, num_times).cumsum(1) * .1
+    is_low = torch.rand(num_groups, num_times) < torch.where(frequent, .25, .02).unsqueeze(-1)
+    y[is_low] += -4. + torch.randn(int(is_low.sum())) * .3
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level')],
+        measures=['y'],
+        mixture=MixtureModel(
+            [MixtureComponent(measure='y', offset_init=-3., prob_init=.1, id='low')], num_classes=2
+        ),
+    )
+    kf.fit(y.unsqueeze(-1), stopping={'max_iter': 40}, verbose=0)
+    mixture = kf.mixture
+    with torch.no_grad():
+        rates = torch.sigmoid(mixture.components[0].logit + torch.cat([torch.zeros(1), mixture._class_offsets[0]]))
+        assert 0. < rates[0] < .05
+        assert .15 < rates[1] < .35
+
+        pred = kf(y.unsqueeze(-1), out_timesteps=num_times + 10)
+        class_probs = mixture.class_probs(pred.regime_probs)  # (G, T, 2)
+        assert ((class_probs[:, num_times - 1, 1] > .5) == frequent).all()
+        # forecasts keep each group's class -- the regime-probs don't revert to a shared base-rate:
+        p_low = pred.get_mixture('y').probs[:, -1, 1]
+        assert (p_low[frequent].mean() / p_low[~frequent].mean()) > 5
