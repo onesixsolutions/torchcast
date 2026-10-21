@@ -311,7 +311,7 @@ class StateSpaceModel(torch.nn.Module):
             regimeus.append(regime_post)
             scaling_statesu.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
             if self.mixture is not None and t + 1 < out_timesteps:
-                regime_prior = self.mixture.transition(regime_post, base_probs[t + 1])
+                regime_prior = self.mixture.next_prior(regime_post, base_probs[t + 1])
 
         # 2nd loop to get n_step predicts:
         meanps = {}
@@ -343,7 +343,7 @@ class StateSpaceModel(torch.nn.Module):
                             mask=tmask
                         )
                         if regimep is not None:
-                            regimep = self.mixture.transition(regimep, base_probs[tu_h])
+                            regimep = self.mixture.next_prior(regimep, base_probs[tu_h])
                     if tu_h not in meanps:
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp

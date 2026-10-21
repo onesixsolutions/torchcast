@@ -16,9 +16,9 @@ probabilities are tracked jointly over this table, allowing p(measure_x=weird) t
 
 Optionally, groups can belong to latent classes (``MixtureModel(..., num_classes=K)``) with their own base-rates for
 each component -- a discrete random effect on the base-rates, e.g. some customers have outliers much more often than
-others.
-The table of combos is then repeated once per class, and with :class:`ClassStickyTransition` a group never changes
-class, so its posterior over classes accumulates evidence over all of its timesteps, and carries over into forecasts.
+others. The table of combos is then repeated once per class. Classes share the transition (it applies within each
+class), and a group never changes class, so its posterior over classes accumulates evidence over all of its timesteps,
+and carries over into forecasts.
 """
 import itertools
 from typing import Optional, Sequence, Mapping
@@ -110,6 +110,13 @@ class RegimeTransition(torch.nn.Module):
     Both receive ``base_probs``, the long-run probability of each combo implied by the :class:`MixtureComponent`
     base-rates: a ``(num_combos,)`` tensor (or, if any components have predictors, a ``(num_groups, num_combos)``
     tensor, for the timestep that the regime-prior is for).
+
+    With latent classes (``MixtureModel(num_classes > 1)``), the transition only sees the combos *within* a class (so
+    ``num_combos`` is the number per class): the :class:`MixtureModel` applies it to each class separately -- to the
+    combo-probabilities given the class, with that class's base-rates (normalized within the class), as if each class
+    of each group were a separate group (``(num_groups * num_classes, num_combos)`` tensors) -- and scales the result
+    by the probability of the class. So groups never change class, and the classes share the transition's
+    parameters, differing only in their base-rates.
     """
 
     def __init__(self, num_combos: int):
@@ -137,12 +144,11 @@ class RegimeTransition(torch.nn.Module):
 class StaticTransition(RegimeTransition):
     """
     A static mixture: the regimes are independent across timesteps, so the regime-prior at every timestep is
-    ``base_probs`` (whatever the previous posterior). It has no parameters. Unlike the other transitions, this
-    supports :func:`StateSpaceModel.simulate` -- the regimes aren't simulated along a trajectory, and drawing them
-    per-timestep is only right when they're independent.
-
-    Not for latent classes (``MixtureModel(num_classes > 1)``): a group's class would be redrawn at each timestep, so
-    the classes would be equivalent to a single class with the average base-rates.
+    ``base_probs`` (whatever the previous posterior). It has no parameters. Without latent classes, this supports
+    :func:`StateSpaceModel.simulate` -- the regimes aren't simulated along a trajectory, and drawing them per-timestep
+    is only right when they're independent. With latent classes (``MixtureModel(num_classes > 1)``), the regimes are
+    independent across timesteps *given* the class, which stays fixed: each group's base-rates are a mixture over the
+    classes, learned from all of its timesteps.
 
     :param num_combos: The number of regime-combos.
     """
@@ -209,59 +215,6 @@ class StickyTransition(RegimeTransition):
 
 
 
-class ClassStickyTransition(StickyTransition):
-    """
-    For a :class:`MixtureModel` with latent classes (``num_classes > 1``): a :class:`StickyTransition` within each
-    class, where groups never change class. The combos are class-major (all of class 0's combos, then class 1's, ...;
-    see :class:`MixtureModel`). Each combo ``i`` persists with probability ``stay_i``; otherwise the next combo is
-    drawn from a distribution ``b_c`` over the combos of the *same* class ``c``, ``b_c ∝ base_probs[c] * (1 -
-    stay[c])``. So the transition-matrix is block-diagonal, with one :class:`StickyTransition`-style block per class.
-
-    The transition conserves the total probability of each class, so a group's class-probabilities only change via
-    the likelihood (in the update-step): they accumulate evidence over all of the group's timesteps, and carry over
-    unchanged into forecasts. Within each class, the stationary distribution is that class's base-rates
-    (``base_probs[c]``, normalized within the class). The initial distribution is ``base_probs`` (the class prior times
-    the within-class base-rates). With ``num_classes=1`` this is the same as :class:`StickyTransition`.
-
-    :param num_combos: The number of regime-combos (``num_classes`` times the number of combos per class).
-    :param num_classes: The number of latent classes.
-    :param stay_init: Initial value for the probability of persisting in the current combo.
-    """
-
-    def __init__(self, num_combos: int, num_classes: int, stay_init: float = 0.1):
-        if num_combos % num_classes:
-            raise ValueError(f"`num_combos` ({num_combos}) must be a multiple of `num_classes` ({num_classes}).")
-        super().__init__(num_combos=num_combos, stay_init=stay_init)
-        self.num_classes = num_classes
-
-    def _by_class(self, x: torch.Tensor) -> torch.Tensor:
-        """``(..., num_combos)`` -> ``(..., num_classes, num_combos // num_classes)``."""
-        return x.unflatten(-1, (self.num_classes, self.num_combos // self.num_classes))
-
-    def _jump_probs(self, base_probs: torch.Tensor) -> torch.Tensor:
-        # normalized within each class:
-        b = self._by_class(base_probs * (1 - self.get_stay_prob()))
-        return (b / b.sum(-1, keepdim=True)).flatten(-2)
-
-    def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
-        stay = self.get_stay_prob()
-        # as in StickyTransition, except that the probability of leaving a combo is pooled within its class
-        # (G, num_classes, 1), and goes to that class's combos:
-        leave = self._by_class(posterior * (1 - stay)).sum(-1, keepdim=True)
-        return posterior * stay + (leave * self._by_class(self._jump_probs(base_probs))).flatten(-2)
-
-    def matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
-        """
-        The (block-diagonal) transition-matrix, for inspection and testing.
-
-        :param base_probs: A ``(num_combos,)`` tensor.
-        :return: The ``(num_combos, num_combos)`` transition-matrix.
-        """
-        combo_class = torch.arange(self.num_combos, device=base_probs.device) // (self.num_combos // self.num_classes)
-        same_class = combo_class.unsqueeze(-1) == combo_class.unsqueeze(0)
-        return torch.where(same_class, super().matrix(base_probs), 0.)
-
-
 class MixtureModel(torch.nn.Module):
     """
     Experimental. Mixture components for a state-space model: pass as the ``mixture`` argument of
@@ -288,17 +241,19 @@ class MixtureModel(torch.nn.Module):
      their covariances only matter in proportion to their posterior probability. Default True.
     :param num_classes: The number of latent classes of groups, each with its own base-rate for each component (a
      discrete random effect on the base-rates). Default 1 (no classes). With ``K > 1`` classes, the table of combos is
-     repeated once per class (class-major: ``self.combos[i]`` is in class ``self.combo_class[i]``), the default
-     ``transition`` is :class:`ClassStickyTransition` (groups never change class), and the base-rates are learned per
-     class: each component's logit gets a per-class offset, and the classes have prior logits (both fixed at 0 for
-     class 0, for identifiability). The class-offsets are initialized at ``class_spread_init * c`` for class ``c``, so
-     that the classes start in increasing order of their components' base-rates (otherwise, the classes would be
-     symmetric). Only the bookkeeping of regime-probabilities grows with ``K``: combos with the same observable regimes
-     share a state-update and likelihood (see :func:`effective_combos`). Use :func:`class_probs` for the posterior
-     probability of each class. Note that ``Predictions.sample()`` draws the regime-combo independently at each
-     timestep (as it does the state; samples are not trajectories), so a sample's class can differ across timesteps:
-     the per-timestep distributions are right, but a path from these samples doesn't stay in one class. For the same
-     reason, ``simulate()`` raises for models with latent classes (or stickiness).
+     repeated once per class (class-major: ``self.combos[i]`` is in class ``self.combo_class[i]``), and the base-rates
+     are learned per class: each component's logit gets a per-class offset, and the classes have prior logits (both
+     fixed at 0 for class 0, for identifiability). Otherwise the classes are the same: the ``transition`` is shared,
+     applied within each class with that class's base-rates (see :class:`RegimeTransition`), so its ``num_combos`` is
+     the number of combos per class (``self.num_class_combos``); and groups never change class. The class-offsets are
+     initialized at ``class_spread_init * c`` for class ``c``, so that the classes start in increasing order of their
+     components' base-rates (otherwise, the classes would be symmetric). Only the bookkeeping of regime-probabilities
+     grows with ``K``: combos with the same observable regimes share a state-update and likelihood (see
+     :func:`effective_combos`). Use :func:`class_probs` for the posterior probability of each class. Note that
+     ``Predictions.sample()`` draws the regime-combo independently at each timestep (as it does the state; samples
+     are not trajectories), so a sample's class can differ across timesteps: the per-timestep distributions are
+     right, but a path from these samples doesn't stay in one class. For the same reason, ``simulate()`` raises for
+     models with latent classes (or stickiness).
     :param class_spread_init: See ``num_classes``. Default 1.
     """
 
@@ -340,18 +295,11 @@ class MixtureModel(torch.nn.Module):
             self._init_classes(class_spread_init)
 
         if transition is None:
-            if num_classes == 1:
-                transition = StickyTransition(num_combos=self.num_combos)
-            else:
-                transition = ClassStickyTransition(num_combos=self.num_combos, num_classes=num_classes)
-        elif transition.num_combos != self.num_combos:
-            raise ValueError(f"`transition` has {transition.num_combos} combos, but expected {self.num_combos}")
-        elif getattr(transition, 'num_classes', num_classes) != num_classes:
-            raise ValueError(f"`transition` has {transition.num_classes} classes, but expected {num_classes}")
-        elif num_classes > 1 and isinstance(transition, StaticTransition):
+            transition = StickyTransition(num_combos=self.num_class_combos)
+        elif transition.num_combos != self.num_class_combos:
+            per_class = " per class" if num_classes > 1 else ""
             raise ValueError(
-                "A `StaticTransition` redraws each group's class at every timestep, so latent classes would be "
-                "equivalent to a single class; use `num_classes=1`, or a transition that keeps the class."
+                f"`transition` has {transition.num_combos} combos, but expected {self.num_class_combos}{per_class}"
             )
         self.transition = transition
 
@@ -393,7 +341,49 @@ class MixtureModel(torch.nn.Module):
         :param regime_probs: A ``(..., num_combos)`` tensor of regime-probabilities (e.g. ``Predictions.regime_probs``).
         :return: A ``(..., num_classes)`` tensor: the probability of each latent class.
         """
-        return regime_probs.unflatten(-1, (self.num_classes, self.num_combos // self.num_classes)).sum(-1)
+        return regime_probs.unflatten(-1, (self.num_classes, self.num_class_combos)).sum(-1)
+
+    def next_prior(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
+        """
+        The regime-prior at the next timestep: ``self.transition`` applied to the regime-posterior. With latent
+        classes, it's applied within each class (see :class:`RegimeTransition`), so the probability of each class is
+        unchanged.
+
+        :param posterior: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the current timestep.
+        :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor, for the next timestep.
+        :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the next timestep.
+        """
+        if self.num_classes == 1:
+            return self.transition(posterior, base_probs)
+        class_mass, within = self._split_classes(posterior)
+        _, within_base = self._split_classes(base_probs.expand_as(posterior))
+        return self._merge_classes(class_mass, self.transition(within, within_base))
+
+    def _initial_regime_probs(self, base_probs: torch.Tensor, num_groups: int) -> torch.Tensor:
+        """
+        The transition's ``initial()`` (within each class, with latent classes).
+        """
+        if self.num_classes == 1:
+            return self.transition.initial(base_probs, num_groups)
+        class_mass, within_base = self._split_classes(base_probs.expand(num_groups, -1))
+        return self._merge_classes(class_mass, self.transition.initial(within_base, num_groups * self.num_classes))
+
+    def _split_classes(self, probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param probs: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
+        :return: The ``(num_groups, num_classes, 1)`` probability of each class, and the ``(num_groups * num_classes,
+         num_class_combos)`` probabilities of the combos given the class (the classes folded into the rows, so a
+         transition sees them as more groups).
+        """
+        by_class = probs.unflatten(-1, (self.num_classes, self.num_class_combos))
+        class_mass = by_class.sum(-1, keepdim=True)
+        return class_mass, (by_class / class_mass.clamp_min(1e-30)).flatten(0, 1)
+
+    def _merge_classes(self, class_mass: torch.Tensor, within: torch.Tensor) -> torch.Tensor:
+        """
+        The inverse of :func:`_split_classes`: back to a ``(num_groups, num_combos)`` tensor.
+        """
+        return (class_mass * within.unflatten(0, class_mass.shape[:2])).flatten(-2)
 
     def validate(self, measures: Sequence[str], non_gaussian_measures: Sequence[str] = ()) -> None:
         """
@@ -418,6 +408,11 @@ class MixtureModel(torch.nn.Module):
     @property
     def num_combos(self) -> int:
         return len(self.combos)
+
+    @property
+    def num_class_combos(self) -> int:
+        """The number of combos within each latent class (``num_combos`` without classes)."""
+        return self.num_combos // self.num_classes
 
     def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
         """
@@ -482,7 +477,7 @@ class MixtureModel(torch.nn.Module):
             regime_log_probs[measure] = dict(zip([None] + [c.qualified_id for c in comps], log_probs))
 
         # per combo: regimes are independent across measures, so their log-probabilities add:
-        class_combos = self.combos[:self.num_combos // self.num_classes]
+        class_combos = self.combos[:self.num_class_combos]
         combo_log_probs = [
             sum(
                 regime_log_probs[measure][None if c is None else c.qualified_id]
@@ -536,7 +531,7 @@ class MixtureModel(torch.nn.Module):
         transition. If not given, the transition's ``initial()`` is used.
         """
         if init_regime_probs is None:
-            return self.transition.initial(base_probs, num_groups)
+            return self._initial_regime_probs(base_probs, num_groups)
         if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.num_combos:
             raise ValueError(
                 f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.num_combos}), "
@@ -544,7 +539,7 @@ class MixtureModel(torch.nn.Module):
             )
         if init_regime_probs.shape[0] not in (1, num_groups):
             raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
-        return self.transition(init_regime_probs.expand(num_groups, -1), base_probs)
+        return self.next_prior(init_regime_probs.expand(num_groups, -1), base_probs)
 
     def effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
         """

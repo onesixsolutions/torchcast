@@ -8,7 +8,7 @@ from torch.distributions import MultivariateNormal, Normal
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel
 from torchcast.state_space.mixture import (
-    ClassStickyTransition, MixtureComponent, MixtureModel, RegimeTransition, StaticTransition, StickyTransition
+    MixtureComponent, MixtureModel, RegimeTransition, StaticTransition, StickyTransition
 )
 
 
@@ -925,42 +925,36 @@ def test_kalman_update_broadcasts():
 
 # Latent classes -------------------------------------------------------------------------------------------------------
 
-def test_latent_classes_single_class_unchanged():
+def test_latent_classes_parameters():
     """
-    `num_classes=1` (the default) adds no parameters, and `ClassStickyTransition` with one class is `StickyTransition`.
+    `num_classes=1` (the default) adds no parameters. With classes, the only extra parameters are the classes' prior
+    logits and offsets: the transition is shared, over the combos within a class.
     """
     kf = _make_kf(['y1', 'y2'], ['y1', 'y2'], num_classes=1)
-    assert isinstance(kf.mixture.transition, StickyTransition)
-    assert not isinstance(kf.mixture.transition, ClassStickyTransition)
     assert set(kf.state_dict()) == set(_make_kf(['y1', 'y2'], ['y1', 'y2']).state_dict())
     assert kf.mixture.combo_class == [0] * kf.mixture.num_combos
 
-    torch.manual_seed(1)
-    sticky, class_sticky = StickyTransition(num_combos=4), ClassStickyTransition(num_combos=4, num_classes=1)
-    with torch.no_grad():
-        sticky._stay_logit.normal_()
-        class_sticky._stay_logit.copy_(sticky._stay_logit)
-    base_probs = torch.softmax(torch.randn(4), 0)
-    posterior = torch.softmax(torch.randn(5, 4), -1)
-    assert torch.allclose(class_sticky(posterior, base_probs), sticky(posterior, base_probs))
-    assert torch.allclose(class_sticky.matrix(base_probs), sticky.matrix(base_probs))
+    kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], num_classes=3)
+    assert kf2.mixture.num_combos == 12 and kf2.mixture.num_class_combos == 4
+    assert kf2.mixture.transition._stay_logit.shape == (4,)
+    shapes = lambda m: {k: tuple(v.shape) for k, v in m.state_dict().items()}
+    extra = shapes(kf2).items() - shapes(kf).items()
+    assert dict(extra) == {'mixture._class_prior_logits': (2,), 'mixture._class_offsets': (2, 2)}
+    with pytest.raises(ValueError, match="per class"):
+        _make_kf(['y1', 'y2'], ['y1', 'y2'], num_classes=3, transition=StickyTransition(num_combos=12))
 
 
 @torch.no_grad()
 def test_identical_classes_match_single_class():
     """
-    Two classes with the same base-rates (and stay-probabilities) are indistinguishable: the same log-prob and
-    predictions as one class, the class-probabilities stay at their prior, and the regime-probabilities summed over
-    classes are the single class's.
+    Two classes with the same base-rates are indistinguishable: the same log-prob and predictions as one class, the
+    class-probabilities stay at their prior, and the regime-probabilities summed over classes are the single class's.
     """
     y = _make_y()
     kf1 = _make_kf(['y1', 'y2'], ['y1', 'y2'])
     kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], num_classes=2)
     kf1.mixture.transition._stay_logit.normal_()
-    kf2.load_state_dict(
-        {k: v for k, v in kf1.state_dict().items() if not k.startswith('mixture.transition.')}, strict=False
-    )
-    kf2.mixture.transition._stay_logit.copy_(kf1.mixture.transition._stay_logit.repeat(2))
+    kf2.load_state_dict(kf1.state_dict(), strict=False)
     kf2.mixture._class_offsets.zero_()
     kf2.mixture._class_prior_logits.fill_(.5)
 
@@ -974,43 +968,51 @@ def test_identical_classes_match_single_class():
     assert torch.allclose(pred1.regime_probs, rp2, atol=1e-5)
 
 
-def test_class_sticky_transition():
+@torch.no_grad()
+def test_latent_classes_transition():
+    """
+    With classes, the (shared) transition applies within each class, with the class's base-rates: block-diagonal,
+    conserving class mass, with each class's base-rates as its stationary distribution.
+    """
     torch.manual_seed(1)
     num_classes, per_class = 3, 4
-    transition = ClassStickyTransition(num_combos=num_classes * per_class, num_classes=num_classes)
-    with torch.no_grad():
-        transition._stay_logit.normal_()
-    base_probs = torch.softmax(torch.randn(num_classes * per_class), 0)
-    T = transition.matrix(base_probs)
-    assert torch.allclose(T.sum(-1), torch.ones(num_classes * per_class))
+    mixture = MixtureModel(
+        [MixtureComponent(measure=m, offset_init=0., prob_init=.1, id=m) for m in ['a', 'b']],
+        num_classes=num_classes,
+    )
+    transition = mixture.transition
+    transition._stay_logit.normal_()
+    C = num_classes * per_class
+    base_probs = torch.softmax(torch.randn(C), 0)
+    # (sticky is linear, so the matrix's rows are the next-prior from each combo)
+    T = mixture.next_prior(torch.eye(C), base_probs)
+    assert torch.allclose(T.sum(-1), torch.ones(C))
     for c in range(num_classes):
         block = slice(c * per_class, (c + 1) * per_class)
         # block-diagonal: no transitions between classes
         assert (T[block, :block.start] == 0).all() and (T[block, block.stop:] == 0).all()
-        # within a class, the stationary distribution is the class's (normalized) base-rates:
+        # within a class, the shared transition with the class's (normalized) base-rates, which are stationary:
         within = base_probs[block] / base_probs[block].sum()
+        assert torch.allclose(T[block, block], transition.matrix(within), atol=1e-6)
         assert torch.allclose(within @ T[block, block], within, atol=1e-6)
 
-    posterior = torch.softmax(torch.randn(5, num_classes * per_class), -1)
-    nxt = transition(posterior, base_probs)
+    posterior = torch.softmax(torch.randn(5, C), -1)
+    nxt = mixture.next_prior(posterior, base_probs)
     assert torch.allclose(nxt, posterior @ T, atol=1e-6)
-    # class mass is conserved:
-    by_class = lambda x: x.unflatten(-1, (num_classes, per_class)).sum(-1)
-    assert torch.allclose(by_class(nxt), by_class(posterior), atol=1e-6)
-    assert torch.allclose(transition.initial(base_probs, 5), base_probs.expand(5, -1))
+    assert torch.allclose(mixture.class_probs(nxt), mixture.class_probs(posterior), atol=1e-6)
+    assert torch.allclose(mixture._initial_prior(None, base_probs, 5), base_probs.expand(5, -1), atol=1e-6)
     # per-group base-probs (components with predictors):
-    group_base_probs = torch.softmax(torch.randn(5, num_classes * per_class), -1)
-    expected = torch.stack([posterior[g] @ transition.matrix(group_base_probs[g]) for g in range(5)])
-    assert torch.allclose(transition(posterior, group_base_probs), expected, atol=1e-6)
+    group_base_probs = torch.softmax(torch.randn(5, C), -1)
+    expected = torch.stack([posterior[g] @ mixture.next_prior(torch.eye(C), group_base_probs[g]) for g in range(5)])
+    assert torch.allclose(mixture.next_prior(posterior, group_base_probs), expected, atol=1e-6)
 
-    with pytest.raises(ValueError, match="multiple of"):
-        ClassStickyTransition(num_combos=5, num_classes=2)
-    with pytest.raises(ValueError, match="classes"):
-        MixtureModel(
-            [MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')],
-            num_classes=2,
-            transition=ClassStickyTransition(num_combos=4, num_classes=4)
-        )
+    # a static transition with classes: regimes are redrawn from the class's base-rates; the class stays.
+    mixture.transition = StaticTransition(num_combos=per_class)
+    nxt = mixture.next_prior(posterior, base_probs)
+    within_base = base_probs.view(num_classes, per_class)
+    within_base = within_base / within_base.sum(-1, keepdim=True)
+    expected = (mixture.class_probs(posterior).unsqueeze(-1) * within_base).flatten(-2)
+    assert torch.allclose(nxt, expected, atol=1e-6)
 
 
 @torch.no_grad()
@@ -1115,7 +1117,7 @@ def test_latent_classes_fit():
 
 @torch.no_grad()
 def test_static_transition_simulate():
-    """`StaticTransition` is a static mixture, so `simulate()` works; it can't be combined with latent classes."""
+    """`StaticTransition` is a static mixture, so `simulate()` works -- but not with latent classes."""
     kf = _make_kf(['y1', 'y2'], ['y1'], transition=StaticTransition(num_combos=2))
     assert kf.mixture.regimes_independent_over_time()
     assert not list(kf.mixture.transition.parameters())
@@ -1124,5 +1126,7 @@ def test_static_transition_simulate():
     assert sim.sample(4, shared_noise=False).means.shape == (4, 6, 5, 2)
 
     assert not _make_kf(['y1', 'y2'], ['y1']).mixture.regimes_independent_over_time()
-    with pytest.raises(ValueError, match="StaticTransition"):
-        _make_kf(['y1', 'y2'], ['y1'], num_classes=2, transition=StaticTransition(num_combos=4))
+    kf_classes = _make_kf(['y1', 'y2'], ['y1'], num_classes=2, transition=StaticTransition(num_combos=2))
+    assert not kf_classes.mixture.regimes_independent_over_time()
+    with pytest.raises(NotImplementedError, match="static mixtures"):
+        kf_classes.simulate(out_timesteps=5, num_groups=3)
