@@ -1077,6 +1077,9 @@ def test_latent_classes_with_two_components():
         labels, probs, _, _ = pred._get_regime_combos()
         assert len(set(labels)) == mixture.num_combos and labels[-1] == ('high', 'low', 'class1')
         assert pred.sample(5, shared_noise=False).means.shape == (5, 3, 20, 2)
+        # simulate() promises trajectories, which it can't deliver with classes:
+        with pytest.raises(NotImplementedError, match="latent classes"):
+            kf.simulate(out_timesteps=5, num_groups=2)
 
 
 def test_latent_classes_fit():

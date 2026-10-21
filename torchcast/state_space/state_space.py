@@ -1234,6 +1234,13 @@ class StateSpaceModel(torch.nn.Module):
         :param kwargs: Further arguments passed to the `processes`.
         :return: A :class:`.Predictions` object with zero state-covariance.
         """
+        if self.mixture is not None and self.mixture.num_classes > 1:
+            # the regimes aren't simulated along the trajectory (sampling them from the output is per-timestep), so a
+            # trajectory wouldn't stay in one latent class:
+            raise NotImplementedError(
+                "`simulate()` is not supported for mixtures with latent classes (`num_classes > 1`): regimes aren't "
+                "sampled as trajectories, so a simulated group wouldn't stay in one class."
+            )
 
         if num_groups is not None:
             if start_offsets is not None and len(start_offsets) != num_groups:

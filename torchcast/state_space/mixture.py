@@ -276,7 +276,8 @@ class MixtureModel(torch.nn.Module):
      share a state-update and likelihood (see :func:`effective_combos`). Use :func:`class_probs` for the posterior
      probability of each class. Note that ``Predictions.sample()`` draws the regime-combo independently at each
      timestep (as it does the state; samples are not trajectories), so a sample's class can differ across timesteps:
-     the per-timestep distributions are right, but a path from these samples doesn't stay in one class.
+     the per-timestep distributions are right, but a path from these samples doesn't stay in one class. For the same
+     reason, ``simulate()`` raises for models with latent classes.
     :param class_spread_init: See ``num_classes``. Default 1.
     """
 
