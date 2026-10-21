@@ -1220,6 +1220,11 @@ class StateSpaceModel(torch.nn.Module):
         """
         Generate simulated state-trajectories from your model.
 
+        For models with mixture components, only static mixtures are supported (see
+        ``MixtureModel.regimes_independent_over_time()``): the regimes aren't simulated along the trajectories, and
+        drawing them per-timestep from the output (e.g. ``sample()``) is only right if they're independent across
+        timesteps. Otherwise (stickiness, latent classes, a custom transition) this raises ``NotImplementedError``.
+
         :param out_timesteps: The number of timesteps to generate in the output.
         :param initial_state: The initial state of the system: a tuple of `mean`, `cov`. Can be obtained from previous
          model-predictions by calling ``get_state_at_times()`` on the output predictions.
@@ -1234,12 +1239,13 @@ class StateSpaceModel(torch.nn.Module):
         :param kwargs: Further arguments passed to the `processes`.
         :return: A :class:`.Predictions` object with zero state-covariance.
         """
-        if self.mixture is not None and self.mixture.num_classes > 1:
-            # the regimes aren't simulated along the trajectory (sampling them from the output is per-timestep), so a
-            # trajectory wouldn't stay in one latent class:
+        if self.mixture is not None and not self.mixture.regimes_independent_over_time():
+            # the regimes aren't simulated along the trajectory (sampling them from the output is per-timestep), which
+            # is only right if they're independent across timesteps:
             raise NotImplementedError(
-                "`simulate()` is not supported for mixtures with latent classes (`num_classes > 1`): regimes aren't "
-                "sampled as trajectories, so a simulated group wouldn't stay in one class."
+                "`simulate()` is only supported for static mixtures (regimes independent across timesteps: a "
+                "`StickyTransition` with stay-probabilities ~0, and no latent classes). Regimes aren't simulated as "
+                "trajectories, so stickiness or latent classes would be lost."
             )
 
         if num_groups is not None:

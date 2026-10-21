@@ -277,7 +277,7 @@ class MixtureModel(torch.nn.Module):
      probability of each class. Note that ``Predictions.sample()`` draws the regime-combo independently at each
      timestep (as it does the state; samples are not trajectories), so a sample's class can differ across timesteps:
      the per-timestep distributions are right, but a path from these samples doesn't stay in one class. For the same
-     reason, ``simulate()`` raises for models with latent classes.
+     reason, ``simulate()`` raises for models with latent classes (or stickiness).
     :param class_spread_init: See ``num_classes``. Default 1.
     """
 
@@ -336,6 +336,17 @@ class MixtureModel(torch.nn.Module):
         # (class 0's is fixed at 0). initialized in increasing order, to break the symmetry between classes:
         spread = class_spread_init * torch.arange(1, self.num_classes, dtype=torch.get_default_dtype())
         self._class_offsets = torch.nn.Parameter(spread.expand(len(self.components), -1).clone())
+
+    def regimes_independent_over_time(self, tol: float = 1e-6) -> bool:
+        """
+        Whether the regimes are (effectively) independent across timesteps: a static mixture, i.e. a
+        :class:`StickyTransition` whose stay-probabilities are all below ``tol``, without latent classes. Otherwise --
+        stickiness, latent classes, or a custom :class:`RegimeTransition` (which can't be inspected) -- the regimes at
+        different timesteps are correlated, so drawing them per-timestep doesn't give trajectories.
+        """
+        if self.num_classes > 1 or not isinstance(self.transition, StickyTransition):
+            return False
+        return bool(self.transition.get_stay_prob().max() < tol)
 
     def class_log_prior(self) -> torch.Tensor:
         """

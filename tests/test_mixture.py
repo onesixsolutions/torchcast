@@ -422,7 +422,10 @@ def test_initial_state_continuation():
     pred_state = full.get_state_at_times(split, type_='prediction')
     assert torch.allclose(pred_state.regime_probs, full.regime_probs[:, split])
 
-    # simulate from the state:
+    # simulate from the state: not with stickiness (regimes aren't simulated as trajectories), but a static mixture:
+    with pytest.raises(NotImplementedError, match="static mixtures"):
+        kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
+    kf.mixture.transition._stay_logit.fill_(-30.)
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
     assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
 
@@ -514,6 +517,9 @@ def test_component_predictors_continuation():
     cont = kf(y[:, split:], X=X[:, split:], initial_state=state)
     assert torch.allclose(cont.regime_probs, full.regime_probs[:, split:], atol=1e-6)
     assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
+    with pytest.raises(NotImplementedError, match="static mixtures"):
+        kf.simulate(out_timesteps=5, initial_state=state, num_sims=2, X=X[:, split:split + 5])
+    kf.mixture.transition._stay_logit.fill_(-30.)
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2, X=X[:, split:split + 5])
     assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
 
@@ -1078,7 +1084,7 @@ def test_latent_classes_with_two_components():
         assert len(set(labels)) == mixture.num_combos and labels[-1] == ('high', 'low', 'class1')
         assert pred.sample(5, shared_noise=False).means.shape == (5, 3, 20, 2)
         # simulate() promises trajectories, which it can't deliver with classes:
-        with pytest.raises(NotImplementedError, match="latent classes"):
+        with pytest.raises(NotImplementedError, match="static mixtures"):
             kf.simulate(out_timesteps=5, num_groups=2)
 
 
