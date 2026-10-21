@@ -1220,7 +1220,7 @@ class StateSpaceModel(torch.nn.Module):
         """
         Generate simulated state-trajectories from your model.
 
-        For models with mixture components, only static mixtures are supported (see
+        For models with mixture components, only static mixtures are supported (e.g. with a ``StaticTransition``; see
         ``MixtureModel.regimes_independent_over_time()``): the regimes aren't simulated along the trajectories, and
         drawing them per-timestep from the output (e.g. ``sample()``) is only right if they're independent across
         timesteps. Otherwise (stickiness, latent classes, a custom transition) this raises ``NotImplementedError``.
@@ -1243,8 +1243,8 @@ class StateSpaceModel(torch.nn.Module):
             # the regimes aren't simulated along the trajectory (sampling them from the output is per-timestep), which
             # is only right if they're independent across timesteps:
             raise NotImplementedError(
-                "`simulate()` is only supported for static mixtures (regimes independent across timesteps: a "
-                "`StickyTransition` with stay-probabilities ~0, and no latent classes). Regimes aren't simulated as "
+                "`simulate()` is only supported for static mixtures (regimes independent across timesteps), e.g. "
+                "`MixtureModel(components, transition=StaticTransition(num_combos))`. Regimes aren't simulated as "
                 "trajectories, so stickiness or latent classes would be lost."
             )
 

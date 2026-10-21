@@ -8,7 +8,7 @@ from torch.distributions import MultivariateNormal, Normal
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel
 from torchcast.state_space.mixture import (
-    ClassStickyTransition, MixtureComponent, MixtureModel, RegimeTransition, StickyTransition
+    ClassStickyTransition, MixtureComponent, MixtureModel, RegimeTransition, StaticTransition, StickyTransition
 )
 
 
@@ -122,14 +122,6 @@ def test_custom_transition():
 
     kf = _make_kf(['y'], ['y'], transition=MyTransition(num_combos=2))
     assert isinstance(kf.mixture.transition, MyTransition)
-
-
-class StaticTransition(RegimeTransition):
-    def initial(self, base_probs, num_groups):
-        return base_probs.expand(num_groups, -1)
-
-    def forward(self, posterior, base_probs):
-        return base_probs.expand(posterior.shape[0], -1)
 
 
 def test_parameters_registered_and_get_grads():
@@ -1119,3 +1111,18 @@ def test_latent_classes_fit():
         # forecasts keep each group's class -- the regime-probs don't revert to a shared base-rate:
         p_low = pred.get_mixture('y').probs[:, -1, 1]
         assert (p_low[frequent].mean() / p_low[~frequent].mean()) > 5
+
+
+@torch.no_grad()
+def test_static_transition_simulate():
+    """`StaticTransition` is a static mixture, so `simulate()` works; it can't be combined with latent classes."""
+    kf = _make_kf(['y1', 'y2'], ['y1'], transition=StaticTransition(num_combos=2))
+    assert kf.mixture.regimes_independent_over_time()
+    assert not list(kf.mixture.transition.parameters())
+    sim = kf.simulate(out_timesteps=5, num_groups=3, num_sims=2)
+    assert torch.allclose(sim.regime_probs, kf.mixture.base_probs().expand(6, 5, -1))
+    assert sim.sample(4, shared_noise=False).means.shape == (4, 6, 5, 2)
+
+    assert not _make_kf(['y1', 'y2'], ['y1']).mixture.regimes_independent_over_time()
+    with pytest.raises(ValueError, match="StaticTransition"):
+        _make_kf(['y1', 'y2'], ['y1'], num_classes=2, transition=StaticTransition(num_combos=4))

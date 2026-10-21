@@ -12,5 +12,7 @@ from .state_space import StateSpaceModel, LossFun
 from .state import StateTuple
 from .predictions import Predictions, PredictionSamples, MixtureOfNormals
 from .newton import NewtonResult
-from .mixture import MixtureModel, MixtureComponent, RegimeTransition, StickyTransition
+from .mixture import (
+    MixtureModel, MixtureComponent, RegimeTransition, StaticTransition, StickyTransition, ClassStickyTransition
+)
 from .transforms import Transform, LogTransform, BoxCoxTransform, SmearingTransform

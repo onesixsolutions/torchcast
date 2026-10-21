@@ -133,6 +133,27 @@ class RegimeTransition(torch.nn.Module):
         raise NotImplementedError
 
 
+
+class StaticTransition(RegimeTransition):
+    """
+    A static mixture: the regimes are independent across timesteps, so the regime-prior at every timestep is
+    ``base_probs`` (whatever the previous posterior). It has no parameters. Unlike the other transitions, this
+    supports :func:`StateSpaceModel.simulate` -- the regimes aren't simulated along a trajectory, and drawing them
+    per-timestep is only right when they're independent.
+
+    Not for latent classes (``MixtureModel(num_classes > 1)``): a group's class would be redrawn at each timestep, so
+    the classes would be equivalent to a single class with the average base-rates.
+
+    :param num_combos: The number of regime-combos.
+    """
+
+    def initial(self, base_probs: torch.Tensor, num_groups: int) -> torch.Tensor:
+        return base_probs.expand(num_groups, -1)
+
+    def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
+        return base_probs.expand(posterior.shape[0], -1)
+
+
 class StickyTransition(RegimeTransition):
     """
     Each combo ``i`` persists with probability ``stay_i``; otherwise the next combo is drawn from a shared distribution
@@ -141,8 +162,8 @@ class StickyTransition(RegimeTransition):
     Rather than learning ``b`` directly, it's derived so that the stationary distribution of ``T`` is ``base_probs``
     (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run probability of each
     combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture where the
-    regime-prior is always ``base_probs``. (If the base-rates vary over time -- components with predictors -- then
-    ``base_probs`` is the stationary distribution for the current predictors.)
+    regime-prior is always ``base_probs`` (as in :class:`StaticTransition`). (If the base-rates vary over time --
+    components with predictors -- then ``base_probs`` is the stationary distribution for the current predictors.)
 
     :param num_combos: The number of regime-combos.
     :param stay_init: Initial value for the probability of persisting in the current combo.
@@ -327,6 +348,11 @@ class MixtureModel(torch.nn.Module):
             raise ValueError(f"`transition` has {transition.num_combos} combos, but expected {self.num_combos}")
         elif getattr(transition, 'num_classes', num_classes) != num_classes:
             raise ValueError(f"`transition` has {transition.num_classes} classes, but expected {num_classes}")
+        elif num_classes > 1 and isinstance(transition, StaticTransition):
+            raise ValueError(
+                "A `StaticTransition` redraws each group's class at every timestep, so latent classes would be "
+                "equivalent to a single class; use `num_classes=1`, or a transition that keeps the class."
+            )
         self.transition = transition
 
     def _init_classes(self, class_spread_init: float) -> None:
@@ -340,13 +366,18 @@ class MixtureModel(torch.nn.Module):
     def regimes_independent_over_time(self, tol: float = 1e-6) -> bool:
         """
         Whether the regimes are (effectively) independent across timesteps: a static mixture, i.e. a
-        :class:`StickyTransition` whose stay-probabilities are all below ``tol``, without latent classes. Otherwise --
-        stickiness, latent classes, or a custom :class:`RegimeTransition` (which can't be inspected) -- the regimes at
-        different timesteps are correlated, so drawing them per-timestep doesn't give trajectories.
+        :class:`StaticTransition`, or a :class:`StickyTransition` whose stay-probabilities are all below ``tol``,
+        without latent classes. Otherwise -- stickiness, latent classes, or a custom :class:`RegimeTransition` (which
+        can't be inspected) -- the regimes at different timesteps are correlated, so drawing them per-timestep doesn't
+        give trajectories.
         """
-        if self.num_classes > 1 or not isinstance(self.transition, StickyTransition):
+        if self.num_classes > 1:
             return False
-        return bool(self.transition.get_stay_prob().max() < tol)
+        if isinstance(self.transition, StaticTransition):
+            return True
+        if isinstance(self.transition, StickyTransition):
+            return bool(self.transition.get_stay_prob().max() < tol)
+        return False
 
     def class_log_prior(self) -> torch.Tensor:
         """
