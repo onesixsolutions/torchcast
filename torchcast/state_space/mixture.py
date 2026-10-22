@@ -58,17 +58,27 @@ class MixtureComponent(torch.nn.Module):
             raise ValueError("`predictors` should be a list of strings, not a string.")
         self.predictors = list(predictors or [])
 
-        offset_init = torch.as_tensor(offset_init, dtype=torch.get_default_dtype())
+        offset_init = self._as_scalar(offset_init, 'offset_init')
         self.offset = torch.nn.Parameter(offset_init)
         self._log_extra_std = torch.nn.Parameter(torch.zeros_like(offset_init))
 
-        assert 0 < prob_init < 1
-        prob_init = torch.as_tensor(prob_init, dtype=torch.get_default_dtype())
+        prob_init = self._as_scalar(prob_init, 'prob_init')
+        if not 0 < prob_init < 1:
+            raise ValueError(f"`prob_init` should be between 0 and 1, got {prob_init.item()}.")
         # logit relative to the standard regime, whose logit is fixed at 0
         self.logit = torch.nn.Parameter(torch.log(prob_init) - torch.log1p(-prob_init))
         self.coefs = None
         if self.predictors:
             self.coefs = torch.nn.Parameter(torch.zeros(len(self.predictors)))
+
+    @staticmethod
+    def _as_scalar(value, name: str) -> torch.Tensor:
+        # (a 0-dim tensor: e.g. a one-element array from data would otherwise give the parameter a shape that doesn't
+        # match the other measures' offsets / variances)
+        value = torch.as_tensor(value, dtype=torch.get_default_dtype())
+        if value.numel() != 1:
+            raise ValueError(f"`{name}` should be a single number, got shape {tuple(value.shape)}.")
+        return value.reshape(())
 
     @property
     def qualified_id(self) -> str:

@@ -921,3 +921,16 @@ def test_kalman_update_broadcasts():
             )
             assert torch.allclose(batched.mean[e], single.mean, atol=1e-5)
             assert torch.allclose(batched.cov[e], single.cov, atol=1e-5)
+
+
+def test_component_params_from_arrays():
+    # one-element arrays (e.g. computed from data) become scalar params, so their offsets stack with other measures'
+    component = MixtureComponent('a', offset_init=np.array([-2.]), prob_init=np.array([.1]), id='low')
+    assert component.offset.shape == component.logit.shape == ()
+    kf = KalmanFilter(
+        measures=['a', 'b'], processes=[LocalLevel(id=f'l{m}', measure=m) for m in 'ab'], mixture=[component]
+    )
+    with torch.no_grad():
+        kf(torch.randn(3, 5, 2))
+    with pytest.raises(ValueError, match='single number'):
+        MixtureComponent('a', offset_init=[-2., -3.], prob_init=.1, id='low')
