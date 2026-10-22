@@ -129,28 +129,31 @@ class LogTransform(Transform):
     """
     For a measure that was log-transformed before modeling.
 
+    :param offset: A value to be added before transforming (e.g. to prevent passing zero to log) and removed after
+     back-transforming.
     :param base: The base of the logarithm; defaults to e.
     :param bias_adjust: See :class:`Transform`.
     """
 
-    def __init__(self, base: float = math.e, bias_adjust: Optional[float] = None):
+    def __init__(self, offset: float = 0.0, base: float = math.e, bias_adjust: Optional[float] = None):
         super().__init__(bias_adjust=bias_adjust)
         assert base > 0
-        self.base = base
+        self._log_base = math.log(base)
+        assert offset >= 0
+        self.offset = offset
 
-    @property
-    def _log_base(self) -> float:
-        return math.log(self.base)
+    def _remove_offset(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.clip(x - self.offset, min=0.0)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.log(x) / self._log_base
+        return torch.log(x + self.offset) / self._log_base
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.exp(x * self._log_base)
+        return self._remove_offset(torch.exp(x * self._log_base))
 
     def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
         # closed-form (lognormal)
-        return torch.exp(mean * self._log_base + var * self._log_base ** 2 / 2)
+        return self._remove_offset(torch.exp(mean * self._log_base + var * self._log_base ** 2 / 2))
 
 
 class BoxCoxTransform(Transform):

@@ -528,7 +528,7 @@ def test_dataset_from_dataframe_transform():
     assert torch.allclose(ds.tensors[0], raw.tensors[0].log(), rtol=1e-4, atol=1e-6)
     assert torch.equal(ds.tensors[1], raw.tensors[1])
     # ... or all of `measure_colnames`; or a dict:
-    ds = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], transform={'b': LogTransform(10)}, **kwargs)
+    ds = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], transform={'b': LogTransform(base=10)}, **kwargs)
     raw = TimeSeriesDataset.from_dataframe(df, measure_colnames=['a', 'b'], **kwargs)
     assert torch.equal(ds.tensors[0][..., 0], raw.tensors[0][..., 0])
     assert torch.allclose(ds.tensors[0][..., 1], raw.tensors[0][..., 1].log10(), rtol=1e-4, atol=1e-6)
