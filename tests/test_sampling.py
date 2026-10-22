@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 from scipy import stats
@@ -462,3 +463,52 @@ def test_simulate_repeats_num_obs():
     is_binary = (obs == 0) | (obs == 1)
     assert is_binary[:, :, 0].all()
     assert not is_binary[:, :, 1:].all()
+
+
+@pytest.mark.parametrize('nonlinear', [True, False])
+@torch.no_grad()
+def test_sample_outputs_chunked(nonlinear: bool, monkeypatch):
+    # sample-based outputs are computed in chunks of groups (for memory); their noise is shared across rows, so the
+    # results must be identical to computing all groups at once
+    from torchcast.state_space import predictions as predictions_module
+    from torchcast.utils.data import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    num_groups, num_times = 5, 8
+    mixture = [MixtureComponent('y', offset_init=-2., prob_init=.2, id='low')]
+    processes = [LocalLevel(id=f'lvl_{m}', measure=m) for m in ('b', 'y')]
+    if nonlinear:
+        model = BinomialFilter(measures=['b', 'y'], processes=processes, binary_measures=['b'], mixture=mixture)
+        y = torch.cat([torch.randint(0, 2, (num_groups, num_times, 1)), torch.randn(num_groups, num_times, 1)], -1)
+    else:
+        model = KalmanFilter(measures=['b', 'y'], processes=processes, mixture=mixture)
+        y = torch.randn(num_groups, num_times, 2)
+    pred = model(y)
+    dataset = TimeSeriesDataset(
+        y, group_names=[f'g{i}' for i in range(num_groups)], start_times=[0] * num_groups, measures=[['b', 'y']],
+        dt_unit=None
+    )
+
+    def outputs():
+        kwargs = {'use_map': False} if nonlinear else {}
+        df = pred.to_dataframe(
+            dataset, conf=.9, num_samples=50, transform={'y': LogTransform()},
+            # (for the binary measure, derived values depend on the chunking: its binomial draws are per row)
+            derived={'d': (lambda s: 2 * s['y']) if nonlinear else (lambda s: s['b'] * s['y'])}, **kwargs
+        )
+        means = pred.get_means(num_samples=50, **kwargs)
+        return df.reset_index(drop=True), means
+
+    df_whole, means_whole = outputs()
+
+    calls = []
+    original = predictions_module.Predictions._output_summaries
+    monkeypatch.setattr(predictions_module, '_MAX_OUTPUT_SAMPLE_ELEMENTS', 1)  # one group per chunk
+    monkeypatch.setattr(
+        predictions_module.Predictions, '_output_summaries', lambda self, **kw: calls.append(1) or original(self, **kw)
+    )
+    df_chunked, means_chunked = outputs()
+
+    assert len(calls) == num_groups
+    pd.testing.assert_frame_equal(df_chunked, df_whole)
+    assert torch.equal(means_chunked, means_whole)

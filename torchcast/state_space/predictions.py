@@ -3,7 +3,7 @@ import numbers
 from math import log
 
 from dataclasses import dataclass, fields
-from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator
+from typing import Any, Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator
 from warnings import warn
 
 import torch
@@ -30,6 +30,9 @@ if TYPE_CHECKING:
 _OUTPUT_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
 # the default number of samples for sample-based outputs:
 _DEFAULT_NUM_SAMPLES = 1000
+# sample-based outputs are computed in chunks of groups, so that their samples have at most about this many elements
+# (~64MB per tensor in float32). since their noise is shared across rows, the results don't depend on the chunking.
+_MAX_OUTPUT_SAMPLE_ELEMENTS = 2 ** 24
 
 
 class Predictions:
@@ -179,7 +182,9 @@ class Predictions:
 
         if self.measurement_model.is_nonlinear:
             # monte-carlo for the means of nonlinear measures; there's no closed form cov
-            return self._get_means(use_map=False), None
+            return self._map_group_chunks(
+                lambda chunk: chunk._get_means(use_map=False), num_samples=_DEFAULT_NUM_SAMPLES
+            ), None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
             _, probs, means, covs = self._get_regime_combos()
@@ -204,10 +209,11 @@ class Predictions:
         :param num_samples: See :func:`to_dataframe`.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
-        return self._get_means(
-            use_map=self._resolve_use_map(use_map),
-            transforms=self._standardize_transforms(transform),
-            mmean_samples=num_samples,
+        use_map = self._resolve_use_map(use_map)
+        transforms = self._standardize_transforms(transform)
+        return self._map_group_chunks(
+            lambda chunk: chunk._get_means(use_map=use_map, transforms=transforms, mmean_samples=num_samples),
+            num_samples=num_samples if not use_map else 0,
         )
 
     def _get_means(self,
@@ -475,10 +481,11 @@ class Predictions:
         :param derived: Quantities computed from multiple measures, e.g. ``{'total': lambda s: s['a'] + s['b']}``.
          Each function receives a dictionary of ``{measure: (num_samples, num_groups, num_timesteps)}`` samples from
          the (joint) predictive distribution, including observation noise and on the scale given by ``transform``, and
-         should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
-         key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
-         actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
-         that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
+         should return a ``(num_samples, num_groups, num_timesteps)`` tensor, computing each group and timestep from
+         its own values (e.g. not a total across groups: for memory, it's applied to chunks of groups at a time).
+         Each is added to the output with its key as the 'measure'; the mean and intervals are computed across samples
+         (see :func:`sample`). If there are actuals, the function is applied to them too (so it should handle missing
+         values, which are nan; measures that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
         :param num_samples: The number of monte-carlo samples, for the outputs that need them: the means (with
          ``use_map=False`` or a ``transform``) and intervals of measures with a nonlinear measured-mean, ``derived``,
          and ``type='states'``/``'observed_states'`` for nonlinear models. Drawn with a fixed seed, so repeated calls
@@ -693,6 +700,59 @@ class Predictions:
         alpha = None if conf is False else (1 - conf) / 2
         transforms = self._standardize_transforms(transform)
         use_map = self._resolve_use_map(use_map)
+        if derived:
+            overlap = set(derived) & set(self.measurement_model.measures)
+            if overlap:
+                raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
+
+        # (intervals for nonlinear measures are always monte-carlo)
+        needs_samples = (not use_map) or (alpha is not None and self.measurement_model.is_nonlinear) or derived
+        by_measure = self._map_group_chunks(
+            lambda chunk: chunk._output_summaries(
+                alpha=alpha, transforms=transforms, use_map=use_map, derived=derived, num_samples=num_samples
+            ),
+            num_samples=num_samples if needs_samples else 0,
+        )
+
+        from torchcast.utils import TimeSeriesDataset
+
+        actuals = {}
+        if isinstance(dataset, TimeSeriesDataset):
+            for mgroup, tens in zip(dataset.measures, dataset.tensors):
+                for m in mgroup:
+                    if m not in self.measurement_model.measures:
+                        continue
+                    actuals[m] = tens[..., mgroup.index(m)]
+                    if m in transforms:
+                        actuals[m] = transforms[m].inverse(actuals[m])
+            missing = set(self.measurement_model.measures) - set(dataset.all_measures)
+            if missing:
+                warn(
+                    f"The following measures in your model are not present in your dataset, please double-check that "
+                    f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
+                )
+
+        if derived:
+            actuals.update(self._derived_actuals(derived, actuals))
+
+        return self._summaries_to_dataframe(
+            by_measure,
+            actuals=actuals,
+            dataset=dataset,
+            group_colname=group_colname,
+            time_colname=time_colname,
+        )
+
+    def _output_summaries(self,
+                          alpha: Optional[float],
+                          transforms: dict[str, 'Transform'],
+                          use_map: bool,
+                          derived: Optional[dict[str, Callable]],
+                          num_samples: int) -> dict[str, tuple[torch.Tensor, ...]]:
+        """
+        For ``to_dataframe()``: for each measure and ``derived`` quantity, ``(num_groups, num_timesteps)`` tensors with
+        the mean and (unless ``alpha`` is None) the lower and upper bounds.
+        """
         measures = list(self.measurement_model.measures)
 
         # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
@@ -707,42 +767,35 @@ class Predictions:
         if alpha is not None:
             intervals = self._get_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples)
             by_measure = {m: (*v, *intervals[m]) for m, v in by_measure.items()}
-
-        from torchcast.utils import TimeSeriesDataset
-
-        actuals = {}
-        if isinstance(dataset, TimeSeriesDataset):
-            for mgroup, tens in zip(dataset.measures, dataset.tensors):
-                for m in mgroup:
-                    if m not in by_measure:
-                        continue
-                    actuals[m] = tens[..., mgroup.index(m)]
-                    if m in transforms:
-                        actuals[m] = transforms[m].inverse(actuals[m])
-            missing = set(by_measure) - set(dataset.all_measures)
-            if missing:
-                warn(
-                    f"The following measures in your model are not present in your dataset, please double-check that "
-                    f"the names you passed to the dataset match the `measures` you passed to the model:\n{missing}"
-                )
-
         if derived:
-            self._add_derived(
+            by_measure.update(self._derived_summaries(
                 derived,
                 alpha=alpha,
                 transforms=transforms,
-                by_measure=by_measure,
-                actuals=actuals,
                 mmean_samples=num_samples if mmean_samples is None else mmean_samples,
-            )
+            ))
+        return by_measure
 
-        return self._summaries_to_dataframe(
-            by_measure,
-            actuals=actuals,
-            dataset=dataset,
-            group_colname=group_colname,
-            time_colname=time_colname,
-        )
+    def _map_group_chunks(self, fun: Callable[['Predictions'], Any], num_samples: int) -> Any:
+        """
+        Applies ``fun`` to chunks of groups (``self[start:end]``), each small enough that its sample-based outputs'
+        samples have at most about ``_MAX_OUTPUT_SAMPLE_ELEMENTS`` elements, and concatenates the results along the
+        groups. Sample-based outputs share their noise across rows (with a fixed seed), so the results are the same as
+        for all groups at once -- just with bounded memory. (The exception: ``BinomialPredictions`` draws binary
+        observations independently per row, so ``derived`` quantities of binary measures depend on the chunking --
+        each row's draws are still valid, and reproducible.)
+
+        :param fun: Takes a ``Predictions`` object, returns a ``(num_groups, ...)`` tensor, or a dict of tuples of them.
+        :param num_samples: The number of samples ``fun`` draws (0 if none, in which case there's no chunking).
+        """
+        dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        group_size = max(1, _MAX_OUTPUT_SAMPLE_ELEMENTS // max(1, num_samples * self.num_timesteps * dim))
+        if not num_samples or group_size >= self.num_groups:
+            return fun(self)
+        results = [fun(self[start:start + group_size]) for start in range(0, self.num_groups, group_size)]
+        if isinstance(results[0], torch.Tensor):
+            return torch.cat(results)
+        return {k: tuple(torch.cat(parts) for parts in zip(*(r[k] for r in results))) for k in results[0]}
 
     def _get_intervals(self,
                        alpha: float,
@@ -840,25 +893,19 @@ class Predictions:
             warn("`mmean_samples` argument to `_get_intervals()` ignored, no sampling needed.")
         return out
 
-    def _add_derived(self,
-                     derived: dict[str, Callable],
-                     alpha: Optional[float],
-                     transforms: dict[str, 'Transform'],
-                     by_measure: dict,
-                     actuals: dict[str, torch.Tensor],
-                     mmean_samples: Union[torch.Tensor, int, None] = None) -> None:
+    def _derived_summaries(self,
+                           derived: dict[str, Callable],
+                           alpha: Optional[float],
+                           transforms: dict[str, 'Transform'],
+                           mmean_samples: Union[torch.Tensor, int, None] = None) -> dict[str, tuple[torch.Tensor, ...]]:
         """
-        Adds summaries of derived quantities to ``by_measure``, and (if there are any actuals, i.e. a dataset) the
-        derived actuals to ``actuals``. Modifies both in place.
-
         :param mmean_samples: Samples of the state's measured-mean (see ``_resolve_mmean_samples``): pass the ones the
          means and intervals use, to save compute (and to share them). The rest of each sample (the regime, the
          observations) is drawn given these, as in :func:`sample`.
+        :return: For each derived quantity, ``(num_groups, num_timesteps)`` tensors with the mean and (unless ``alpha``
+         is None) the lower and upper bounds.
         """
         measures = list(self.measurement_model.measures)
-        overlap = set(derived) & set(measures)
-        if overlap:
-            raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
         mmean_samples = self._resolve_mmean_samples(mmean_samples)
         # summaries are per-row, so shared noise is fine (and uses less memory):
         num_samples = mmean_samples.shape[0]
@@ -875,21 +922,33 @@ class Predictions:
                 warn(f"`{type(t).__name__}(bias_adjust=...)` is ignored for `derived`.")
             values[m] = t.inverse(values[m])
 
-        # the functions are also applied to the actuals (as a batch of one sample), if there's a dataset. measures that
-        # aren't in the dataset are nan, like missing values:
-        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
-        if measure_actuals:
-            nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
-            measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
-
+        out = {}
         expected_shape = (num_samples, self.num_groups, self.num_timesteps)
         for name, fun in derived.items():
-            out = fun(values)
-            if tuple(out.shape) != expected_shape:
-                raise ValueError(f"`derived['{name}']` returned shape {tuple(out.shape)}, expected {expected_shape}.")
-            by_measure[name] = (out.mean(0),) if alpha is None else (out.mean(0), *_quantile_interval(out, alpha))
-            if measure_actuals:
-                actuals[name] = fun(measure_actuals).squeeze(0)
+            samples = fun(values)
+            if tuple(samples.shape) != expected_shape:
+                raise ValueError(
+                    f"`derived['{name}']` returned shape {tuple(samples.shape)}, expected {expected_shape}."
+                )
+            out[name] = (samples.mean(0),)
+            if alpha is not None:
+                out[name] += _quantile_interval(samples, alpha)
+        return out
+
+    def _derived_actuals(self,
+                         derived: dict[str, Callable],
+                         actuals: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """
+        The ``derived`` functions applied to the actuals (as a batch of one sample), if there are any. Measures that
+        aren't in the dataset are nan, like missing values.
+        """
+        measures = list(self.measurement_model.measures)
+        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
+        if not measure_actuals:
+            return {}
+        nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
+        measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
+        return {name: fun(measure_actuals).squeeze(0) for name, fun in derived.items()}
 
     def _summaries_to_dataframe(self,
                                 by_measure: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
