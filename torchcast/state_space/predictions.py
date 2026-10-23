@@ -39,6 +39,10 @@ class Predictions:
     """
     The output of the :class:`.StateSpaceModel` forward pass, containing the underlying state means and covariances, as
     well as methods such as ``log_prob()``, ``to_dataframe()``, and ``plot()``.
+
+    The states (``state_means``, ``state_covs``) are those that each timestep's observations are predicted from: for
+    filtering/forecasting, the predicted (prior) states, before that timestep's update; for :func:`.simulate`, the
+    simulated states. (``update_means`` and ``update_covs``, if included, are the states after each update.)
     """
     _means = None
     _covs = None

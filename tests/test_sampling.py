@@ -586,3 +586,28 @@ def test_simulate_float64():
     kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y']).double()
     sim = kf.simulate(out_timesteps=5, num_groups=2, include_updates_in_output=True)
     assert sim.state_means.dtype == sim.update_covs.dtype == torch.float64
+
+
+@torch.no_grad()
+def test_simulate_outputs_simulated_states():
+    # observations are generated from the simulated states: so e.g. the variance of a sum over time is that of the
+    # trajectories' sum, plus the observation-noise (a fresh draw from each step's prior would get it wrong)
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])
+    kf.process_covariance.cholesky_log_diag.fill_(0.)  # (process-noise large relative to the observation-noise)
+    kf.measure_covariance.cholesky_log_diag.fill_(-1.)
+    num_times = 10
+    sim = kf.simulate(out_timesteps=num_times, num_groups=1, num_sims=4000, include_updates_in_output=True)
+    assert torch.equal(sim.state_means, sim.update_means)
+    assert (sim.state_covs.diagonal(dim1=-2, dim2=-1) <= 1e-6).all()
+
+    obs = sim.sample(1, shared_noise=False, generator=_gen()).observations[0, ..., 0]  # (sims, times)
+    states = sim.update_means[..., 0]
+    measure_var = sim.measure_covs[0, 0, 0, 0]
+    # observations scatter around the simulated states by the observation-noise only:
+    assert torch.isclose((obs - states).var(), measure_var, rtol=.1)
+    # ...so e.g. a sum over time has the trajectories' variance, plus the observation-noise:
+    assert torch.isclose(obs.sum(1).var(), states.sum(1).var() + num_times * measure_var, rtol=.1)
+
+    with pytest.raises(ValueError, match='n_step'):
+        kf(out_timesteps=5, initial_state=kf._prepare_initial_state(None), simulate=1, n_step=2)

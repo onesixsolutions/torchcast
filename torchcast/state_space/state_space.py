@@ -152,7 +152,9 @@ class StateSpaceModel(torch.nn.Module):
         :param include_updates_in_output: If False, only the ``n_step`` ahead predictions are included in the output.
          This means that we cannot use this output to generate the ``initial_state`` for subsequent forward-passes. Set
          to True to allow this -- False by default to reduce memory.
-        :param simulate: If specified, will generate `simulate` samples from the model.
+        :param simulate: If specified, will generate `simulate` state-trajectories from the model (see
+         :func:`simulate`): the output's states are the simulated ones (rather than predictions). Requires
+         ``n_step=1``.
         :param prediction_kwargs: A dictionary of kwargs to pass to initialize ``Predictions()``.
         :param kwargs: Further arguments passed to the `processes`. For example, the :class:`.LinearModel` expects an
          ``X`` argument for predictors.
@@ -188,6 +190,8 @@ class StateSpaceModel(torch.nn.Module):
 
         n_step = int(n_step)
         assert n_step > 0
+        if simulate and n_step > 1:
+            raise ValueError("`simulate` requires `n_step=1`: the output's states are the simulated ones.")
 
         meanu, covu, inputs, num_groups, out_timesteps = self._standardize_input(
             y,
@@ -287,6 +291,10 @@ class StateSpaceModel(torch.nn.Module):
                 meanu = torch.distributions.MultivariateNormal(mean1step, cov1step, validate_args=False).sample()
                 covu = torch.eye(meanu.shape[-1], dtype=meanu.dtype, device=meanu.device) * 1e-6
                 covu = covu.expand(num_groups, -1, -1)
+                # the observations at t are generated from the simulated state (not from a fresh draw of the
+                # prior, which would ignore the process-noise that the trajectory carries forward), so it's the
+                # output's state for t:
+                mean1s[-1], cov1s[-1] = meanu, covu
             elif t < len(inputs):
                 measured_mean, measure_mat = measurement_model(mean1step, time=t)
                 measure_cov = self._apply_cov_scaling(measure_covs[t], scaling1step)
@@ -1233,7 +1241,11 @@ class StateSpaceModel(torch.nn.Module):
         :param num_groups: The number of groups; if `None` will be inferred from the shape of `initial_state` and/or
          ``start_offsets``.
         :param kwargs: Further arguments passed to the `processes`.
-        :return: A :class:`.Predictions` object with zero state-covariance.
+        :return: A :class:`.Predictions` object whose states are the simulated ones (with zero covariance, up to a
+         small jitter), so e.g. its ``means`` are the measured-means of the trajectories, and :func:`Predictions.sample`
+         draws observations around them. (With ``include_updates_in_output=True``, the ``update_*`` attributes are the
+         same states.) Regimes, for models with mixture components, aren't simulated: the regime-probabilities are
+         rolled forward with the transition.
         """
 
         if num_groups is not None:
