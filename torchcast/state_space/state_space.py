@@ -121,6 +121,7 @@ class StateSpaceModel(torch.nn.Module):
                 include_updates_in_output: bool = False,
                 simulate: Optional[int] = None,
                 prediction_kwargs: Optional[dict] = None,
+                generator: Optional[torch.Generator] = None,
                 **kwargs) -> 'Predictions':
         """
         Generate n-step-ahead predictions from the model.
@@ -155,6 +156,8 @@ class StateSpaceModel(torch.nn.Module):
         :param simulate: If specified, will generate `simulate` state-trajectories from the model (see
          :func:`simulate`): the output's states are the simulated ones (rather than predictions). Requires
          ``n_step=1``.
+        :param generator: With ``simulate``, an optional :class:`torch.Generator` for the simulation's draws, for
+         reproducibility.
         :param prediction_kwargs: A dictionary of kwargs to pass to initialize ``Predictions()``.
         :param kwargs: Further arguments passed to the `processes`. For example, the :class:`.LinearModel` expects an
          ``X`` argument for predictors.
@@ -288,13 +291,20 @@ class StateSpaceModel(torch.nn.Module):
 
             regime_post = regime_prior  # unless updated below
             if simulate:
-                meanu = torch.distributions.MultivariateNormal(mean1step, cov1step, validate_args=False).sample()
+                z = torch.randn(mean1step.shape, generator=generator, dtype=mean1step.dtype, device=mean1step.device)
+                meanu = mean1step + (torch.linalg.cholesky(cov1step) @ z.unsqueeze(-1)).squeeze(-1)
                 covu = torch.eye(meanu.shape[-1], dtype=meanu.dtype, device=meanu.device) * 1e-6
                 covu = covu.expand(num_groups, -1, -1)
                 # the observations at t are generated from the simulated state (not from a fresh draw of the
                 # prior, which would ignore the process-noise that the trajectory carries forward), so it's the
                 # output's state for t:
                 mean1s[-1], cov1s[-1] = meanu, covu
+                if regime_prior is not None:
+                    # likewise the regime: drawn from the prior, then rolled forward (so e.g. a sticky regime
+                    # persists, as in the model)
+                    combo = torch.multinomial(regime_prior, 1, generator=generator).squeeze(-1)
+                    regime_post = torch.nn.functional.one_hot(combo, regime_prior.shape[-1]).to(regime_prior.dtype)
+                    regime1s[-1] = regime_post
             elif t < len(inputs):
                 measured_mean, measure_mat = measurement_model(mean1step, time=t)
                 measure_cov = self._apply_cov_scaling(measure_covs[t], scaling1step)
@@ -1225,6 +1235,7 @@ class StateSpaceModel(torch.nn.Module):
                  start_offsets: Optional[Sequence] = None,
                  num_sims: int = 1,
                  num_groups: Optional[int] = None,
+                 generator: Optional[torch.Generator] = None,
                  **kwargs):
         """
         Generate simulated state-trajectories from your model.
@@ -1240,12 +1251,14 @@ class StateSpaceModel(torch.nn.Module):
          etc.). Tensors associated with this output can be reshaped with ``tensor.reshape(num_sims, num_groups, ...)``.
         :param num_groups: The number of groups; if `None` will be inferred from the shape of `initial_state` and/or
          ``start_offsets``.
+        :param generator: An optional :class:`torch.Generator` for the simulation's draws, for reproducibility.
         :param kwargs: Further arguments passed to the `processes`.
         :return: A :class:`.Predictions` object whose states are the simulated ones (with zero covariance, up to a
          small jitter), so e.g. its ``means`` are the measured-means of the trajectories, and :func:`Predictions.sample`
          draws observations around them. (With ``include_updates_in_output=True``, the ``update_*`` attributes are the
-         same states.) Regimes, for models with mixture components, aren't simulated: the regime-probabilities are
-         rolled forward with the transition.
+         same states.) For models with mixture components, the regimes are simulated too: each timestep's
+         ``regime_probs`` are one-hot, for the simulated regime-combo (drawn from the prior given the previous one), so
+         :func:`Predictions.sample` draws observations in that regime.
         """
 
         if num_groups is not None:
@@ -1264,6 +1277,7 @@ class StateSpaceModel(torch.nn.Module):
             out_timesteps=out_timesteps,
             initial_state=initial_state,
             simulate=num_sims,
+            generator=generator,
             **kwargs
         )
 

@@ -934,3 +934,36 @@ def test_component_params_from_arrays():
         kf(torch.randn(3, 5, 2))
     with pytest.raises(ValueError, match='single number'):
         MixtureComponent('a', offset_init=[-2., -3.], prob_init=.1, id='low')
+
+
+@torch.no_grad()
+def test_simulate_regimes():
+    # regimes are simulated: one combo per step, persisting as the (sticky) transition says; `sample()` follows them
+    torch.manual_seed(0)
+    low = MixtureComponent('y', offset_init=-2., prob_init=.2, id='low')
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level', measure='y')],
+        measures=['y'],
+        mixture=MixtureModel([low], transition=StickyTransition(num_combos=2, stay_init=.8)),
+    )
+    sim = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(0))
+    probs = sim.regime_probs  # (sims, times, combos)
+    assert ((probs == 0) | (probs == 1)).all() and (probs.sum(-1) == 1).all()
+
+    path = probs.argmax(-1)
+    is_low = path == kf.mixture.combos.index((low,))
+    prev_low, next_low = is_low[:, :-1], is_low[:, 1:]
+    stay = kf.mixture.transition.get_stay_prob()[0]
+    # P(same as the previous step) = stay + (1 - stay) * base-rate
+    assert abs(next_low[prev_low].float().mean() - (stay + (1 - stay) * .2)) < .03
+    assert abs((~next_low[~prev_low]).float().mean() - (stay + (1 - stay) * .8)) < .02
+
+    # observations are drawn in the simulated regime
+    samples = sim.sample(5, shared_noise=False)
+    assert torch.equal(samples.regimes, path.expand_as(samples.regimes))
+
+    # reproducible with a generator
+    again = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(0))
+    assert torch.equal(again.state_means, sim.state_means) and torch.equal(again.regime_probs, sim.regime_probs)
+    other = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(1))
+    assert not torch.equal(other.state_means, sim.state_means)
