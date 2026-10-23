@@ -8,7 +8,8 @@ from torch.distributions import MultivariateNormal, Normal
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel
 from torchcast.mixture import MixtureModel
-from torchcast.mixture.component import LatentClass, MixtureComponent
+from torchcast.mixture.component import MixtureComponent
+from torchcast.mixture.latent_class import LatentClass
 from torchcast.mixture.regime_transition import RegimeTransition, StickyTransition, StaticTransition
 
 
