@@ -664,7 +664,7 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
     With adaptive scaling, the scaler's state (and the multiplier for the next step) is carried in the `StateTuple`,
     so forecasting from ``get_state_at_times()`` matches a single pass exactly -- including the first step.
     """
-    from torchcast.state_space import MixtureComponent
+    from torchcast.mixture.component import MixtureComponent
 
     torch.manual_seed(0)
     measures = ['y1', 'y2']

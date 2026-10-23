@@ -8,7 +8,9 @@ from scipy import stats
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LocalTrend, SaturatedLinearModel
-from torchcast.state_space import MixtureComponent, LogTransform
+from torchcast.state_space import LogTransform
+from torchcast.mixture.component import MixtureComponent
+
 
 # monte-carlo tests: sample sizes and tolerances are chosen so that each check is ~5 standard-errors
 

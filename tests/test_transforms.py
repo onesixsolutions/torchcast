@@ -7,7 +7,8 @@ from scipy import stats
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel
-from torchcast.state_space import Transform, LogTransform, BoxCoxTransform, MixtureComponent
+from torchcast.state_space import Transform, LogTransform, BoxCoxTransform
+from torchcast.mixture.component import MixtureComponent
 
 
 class _QuadratureLog(LogTransform):

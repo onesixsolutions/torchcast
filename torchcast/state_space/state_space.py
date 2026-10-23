@@ -11,13 +11,13 @@ from torchcast.internals.hessian import mvnorm_from_hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
-from torchcast.state_space.newton import NewtonResult, newton_refine as _newton_refine, _hessian_sampler
-from torchcast.state_space.chunking import (
+from torchcast.process.regression import Process
+from torchcast.mixture import MixtureModel, MixtureComponent
+
+from .newton import NewtonResult, newton_refine as _newton_refine, _hessian_sampler
+from .chunking import (
     _FitChunk, _ChunkedObjective, _get_group_slices, _subset_groups, _subset_loss_fun
 )
-from torchcast.process.regression import Process
-
-from .mixture import MixtureComponent, MixtureModel, RegimeTransition
 from .state import StateTuple, _as_state_tuple
 from .predictions import Predictions
 from .adaptive_scaling import EWMAdaptiveScaler, AdaptiveScaler

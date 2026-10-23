@@ -7,7 +7,9 @@ from torch.distributions import MultivariateNormal, Normal
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel
-from torchcast.state_space.mixture import MixtureComponent, MixtureModel, RegimeTransition, StickyTransition
+from torchcast.mixture import MixtureModel
+from torchcast.mixture.component import MixtureComponent
+from torchcast.mixture.regime_transition import RegimeTransition, StickyTransition, StaticTransition
 
 
 def _make_kf(measures, mixture_measures, **mixture_kwargs) -> KalmanFilter:
@@ -122,12 +124,7 @@ def test_custom_transition():
     assert isinstance(kf.mixture.transition, MyTransition)
 
 
-class StaticTransition(RegimeTransition):
-    def initial(self, base_probs, num_groups):
-        return base_probs.expand(num_groups, -1)
 
-    def forward(self, posterior, base_probs):
-        return base_probs.expand(posterior.shape[0], -1)
 
 
 def test_parameters_registered_and_get_grads():

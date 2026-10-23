@@ -17,7 +17,7 @@ from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
     from torchcast.process import Process
-    from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+    from torchcast.mixture import MixtureModel, MixtureComponent
     from torchcast.state_space import StateTuple
     from torchcast.state_space.transforms import Transform
     from torchcast.utils import TimeSeriesDataset

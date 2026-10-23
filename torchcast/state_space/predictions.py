@@ -17,8 +17,8 @@ from .transforms import Transform, _IdentityTransform
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
-    from .mixture import MixtureModel
     from .state import StateTuple
+    from torchcast.mixture import MixtureModel
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise

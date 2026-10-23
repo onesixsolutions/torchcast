@@ -17,7 +17,8 @@ from torch.distributions import Binomial
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, SaturatedLinearModel
-from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+from torchcast.mixture import MixtureModel
+from torchcast.mixture.component import MixtureComponent
 from torchcast.state_space.transforms import LogTransform
 
 
