@@ -285,7 +285,8 @@ class StateSpaceModel(torch.nn.Module):
             regime_post = regime_prior  # unless updated below
             if simulate:
                 meanu = torch.distributions.MultivariateNormal(mean1step, cov1step, validate_args=False).sample()
-                covu = torch.eye(meanu.shape[-1]).expand(num_groups, -1, -1) * 1e-6
+                covu = torch.eye(meanu.shape[-1], dtype=meanu.dtype, device=meanu.device) * 1e-6
+                covu = covu.expand(num_groups, -1, -1)
             elif t < len(inputs):
                 measured_mean, measure_mat = measurement_model(mean1step, time=t)
                 measure_cov = self._apply_cov_scaling(measure_covs[t], scaling1step)

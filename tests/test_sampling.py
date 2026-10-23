@@ -579,3 +579,10 @@ def test_regime_noise_scale():
 
     with pytest.raises(ValueError, match='unknown components'):
         pred.sample(5, shared_noise=True, regime_noise_scale={'high': 0.})
+
+
+@torch.no_grad()
+def test_simulate_float64():
+    kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y']).double()
+    sim = kf.simulate(out_timesteps=5, num_groups=2, include_updates_in_output=True)
+    assert sim.state_means.dtype == sim.update_covs.dtype == torch.float64
