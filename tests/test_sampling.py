@@ -510,5 +510,35 @@ def test_sample_outputs_chunked(nonlinear: bool, monkeypatch):
     df_chunked, means_chunked = outputs()
 
     assert len(calls) == num_groups
-    pd.testing.assert_frame_equal(df_chunked, df_whole)
+    # (identical draws; `derived` means differ only by floating-point rounding, from batched linear algebra)
+    pd.testing.assert_frame_equal(df_chunked, df_whole, check_exact=False, rtol=1e-5, atol=1e-5)
     assert torch.equal(means_chunked, means_whole)
+
+
+@torch.no_grad()
+def test_derived_mean_control_variates():
+    # derived means use the measures (whose means are exact) as control variates: for a sum, the result is exact, even
+    # with few samples -- the sum of the measures' back-transformed means (without bias_adjust, which `derived` ignores)
+    from torchcast.utils.data import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        mixture=[MixtureComponent('a', offset_init=-1., prob_init=.2, id='low')],
+    )
+    num_groups, num_times = 4, 20
+    y = torch.randn(num_groups, num_times, 2)
+    pred = kf(y)
+    dataset = TimeSeriesDataset(
+        y, group_names=[f'g{i}' for i in range(num_groups)], start_times=[0] * num_groups, measures=[['a', 'b']],
+        dt_unit=None
+    )
+    with pytest.warns(UserWarning, match='bias_adjust'):
+        df = pred.to_dataframe(
+            dataset, conf=False, num_samples=50, transform=LogTransform(bias_adjust=.5),
+            derived={'total': lambda s: s['a'] + s['b']}
+        )
+    total = torch.as_tensor(df.query("measure == 'total'")['mean'].to_numpy()).view(num_groups, num_times)
+    expected = pred.get_means(transform=LogTransform()).sum(-1)
+    assert torch.allclose(total.to(expected.dtype), expected, rtol=1e-4)

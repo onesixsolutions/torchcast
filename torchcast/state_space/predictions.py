@@ -219,13 +219,16 @@ class Predictions:
     def _get_means(self,
                    use_map: bool,
                    transforms: Optional[dict[str, 'Transform']] = None,
-                   mmean_samples: Union[torch.Tensor, int, None] = None) -> torch.Tensor:
+                   mmean_samples: Union[torch.Tensor, int, None] = None,
+                   adjust_bias: bool = True) -> torch.Tensor:
         """
         The means, given already-resolved arguments -- separate from :func:`get_means` so that callers can share one
         set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
 
         :param mmean_samples: Pass already-computed samples to save compute (and to share them), otherwise will
          compute if needed (or for the latter this can be an int for num_draws).
+        :param adjust_bias: Whether the transforms' ``bias_adjust`` applies, for measures with a linear measured-mean
+         (False: the mean of the back-transformed distribution).
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
          (handling mixtures if needed).
         """
@@ -254,7 +257,7 @@ class Predictions:
         for measure in simple_measures:
             midx = all_measures.index(measure)
             transform = transforms.get(measure, identity)
-            mean = transform.inverse_mean(measured_mean[:, midx], system_cov[:, midx, midx])
+            mean = transform.inverse_mean(measured_mean[:, midx], system_cov[:, midx, midx], adjust_bias=adjust_bias)
             out[measure] = mean.view(*batch_shape)
 
         # mixture measures: the same, for each regime, mixed by the regime-probabilities:
@@ -268,7 +271,7 @@ class Predictions:
             )
             transform = transforms.get(measure, identity)
             regime_means = [
-                transform.inverse_mean(mixture.means[..., k], mixture.vars[..., k], regime=label)
+                transform.inverse_mean(mixture.means[..., k], mixture.vars[..., k], adjust_bias, regime=label)
                 for k, (label, _, _) in enumerate(self._regimes(measure))
             ]
             out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
@@ -484,8 +487,10 @@ class Predictions:
          should return a ``(num_samples, num_groups, num_timesteps)`` tensor, computing each group and timestep from
          its own values (e.g. not a total across groups: for memory, it's applied to chunks of groups at a time).
          Each is added to the output with its key as the 'measure'; the mean and intervals are computed across samples
-         (see :func:`sample`). If there are actuals, the function is applied to them too (so it should handle missing
-         values, which are nan; measures that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
+         (see :func:`sample`). The mean uses the measures whose means are exact (those with a linear measured-mean) as
+         control variates, which reduces its monte-carlo error -- e.g. a sum of these measures is exact. If there are
+         actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
+         that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
         :param num_samples: The number of monte-carlo samples, for the outputs that need them: the means (with
          ``use_map=False`` or a ``transform``) and intervals of measures with a nonlinear measured-mean, ``derived``,
          and ``type='states'``/``'observed_states'`` for nonlinear models. Drawn with a fixed seed, so repeated calls
@@ -922,6 +927,18 @@ class Predictions:
                 warn(f"`{type(t).__name__}(bias_adjust=...)` is ignored for `derived`.")
             values[m] = t.inverse(values[m])
 
+        # measures whose samples have a known (exact) mean: control variates, for the derived quantities' means
+        identity = _IdentityTransform()
+        control_measures = [
+            m for m in measures
+            if m not in self._nonlinear_measures and _has_gaussian_noise(transforms.get(m, identity))
+        ]
+        controls = control_means = None
+        if control_measures:
+            cidx = [measures.index(m) for m in control_measures]
+            controls = torch.stack([values[m] for m in control_measures], -1)
+            control_means = self._get_means(use_map=True, transforms=transforms, adjust_bias=False)[..., cidx]
+
         out = {}
         expected_shape = (num_samples, self.num_groups, self.num_timesteps)
         for name, fun in derived.items():
@@ -930,7 +947,10 @@ class Predictions:
                 raise ValueError(
                     f"`derived['{name}']` returned shape {tuple(samples.shape)}, expected {expected_shape}."
                 )
-            out[name] = (samples.mean(0),)
+            if controls is None:
+                out[name] = (samples.mean(0),)
+            else:
+                out[name] = (_control_variate_mean(samples, controls, control_means),)
             if alpha is not None:
                 out[name] += _quantile_interval(samples, alpha)
         return out
@@ -1980,6 +2000,41 @@ def _matmul_per_row(mats: torch.Tensor, vecs: torch.Tensor) -> torch.Tensor:
     if vecs.ndim == 2:
         return torch.einsum('rij,nj->nri', mats, vecs)
     return torch.einsum('rij,nrj->nri', mats, vecs)
+
+
+def _has_gaussian_noise(transform: 'Transform') -> bool:
+    """
+    Whether ``transform.inverse_mean`` is the mean of back-transformed *gaussian* samples (e.g. not a
+    :class:`.SmearingTransform`, which uses the empirical distribution of the residuals instead).
+    """
+    from .transforms import Transform
+
+    return type(transform)._noise_nodes is Transform._noise_nodes
+
+
+def _control_variate_mean(samples: torch.Tensor, controls: torch.Tensor, control_means: torch.Tensor) -> torch.Tensor:
+    """
+    The mean of ``samples``, with variance reduced by control variates: quantities sampled alongside them, whose exact
+    means are known. Per row, regress the samples on the controls (across samples); the estimate is the samples' mean,
+    minus the coefficients times how far the controls' sample-means are from their exact means. E.g. for the sum of two
+    measures, with the measures as controls, the coefficients are 1 and the estimate is exact.
+
+    :param samples: A ``(num_samples, *batch_shape)`` tensor.
+    :param controls: A ``(num_samples, *batch_shape, num_controls)`` tensor.
+    :param control_means: A ``(*batch_shape, num_controls)`` tensor of the controls' exact means.
+    :return: A ``batch_shape`` tensor.
+    """
+    control_sample_means = controls.mean(0)
+    xc = controls - control_sample_means
+    # (standardized, so the regression is well-conditioned whatever the controls' scales; constant controls drop out)
+    scale = xc.square().mean(0).sqrt()
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    xc = xc / scale
+    fc = samples - samples.mean(0)
+    cov_xx = torch.einsum('n...i,n...j->...ij', xc, xc)
+    cov_xf = torch.einsum('n...i,n...->...i', xc, fc)
+    coefs = (torch.linalg.pinv(cov_xx) @ cov_xf.unsqueeze(-1)).squeeze(-1) / scale
+    return samples.mean(0) - (coefs * (control_sample_means - control_means)).sum(-1)
 
 
 def _quantile_interval(x: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:
