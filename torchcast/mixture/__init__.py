@@ -11,9 +11,9 @@ duration data was log1p transformed, an outlier will increase the variance and s
 back-transformed forecasts).
 
 The :class:`MixtureModel` owns the components. Multivariate support is accomplished by enumerating the possible "combos"
- of regimes (e.g. [(measure1=standard, measure2=standard), (measure1=weird, measure2=standard), ...] and so on). Regime
+of regimes (e.g. [(measure1=standard, measure2=standard), (measure1=weird, measure2=standard), ...] and so on). Regime
 probabilities are tracked jointly over this table, allowing p(measure_x=weird) to vary over time and across groups.
 """
-from .regime_transition import StickyTransition
+from .regime_transition import RegimeTransition, StickyTransition
 from .component import MixtureComponent
 from .model import MixtureModel

@@ -2001,7 +2001,7 @@ class MixtureOfNormals:
     For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
     then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.
 
-    :param labels: A name for each component (``'standard'``, then the :class:`MixtureComponent` ids).
+    :param labels: A name for each component (``'standard'``, then the :class:`.MixtureComponent` ids).
     :param probs: The probability of each component.
     :param means: The mean of each component.
     :param vars: The variance of each component.

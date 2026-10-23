@@ -123,7 +123,7 @@ class MixtureModel(torch.nn.Module):
 
     def log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        :param component_X: Required if any components have predictors: the output of :func:`_get_component_X` (keyed
+        :param component_X: Required if any components have predictors: the output of ``_get_component_X()`` (keyed
          by ``qualified_id``), or slices of it (e.g. for one timestep), all with the same leading dims.
         :return: The log long-run probability of each combo: a ``(num_combos,)`` tensor, or with predictors
          ``(*leading_dims, num_combos)``. Regimes are independent across measures; within a measure, the standard

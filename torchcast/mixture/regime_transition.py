@@ -85,7 +85,7 @@ class StickyTransition(RegimeTransition):
 
     def matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
         """
-        The transition-matrix, for inspection and testing (:func:`forward` applies it without building it).
+        The transition-matrix, for inspection and testing (``forward()`` applies it without building it).
 
         :param base_probs: A ``(num_combos,)`` tensor (so not for components with predictors, whose base-rates vary
          by group).
