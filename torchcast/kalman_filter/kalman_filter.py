@@ -10,7 +10,7 @@ from torchcast.covariance import Covariance
 from torchcast.internals.utils import update_tensor, mvnorm_log_prob
 from torchcast.process import Process
 
-from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+from torchcast.mixture import MixtureModel, MixtureComponent
 from torchcast.state_space.state_space import StateSpaceModel, StateTuple
 
 from typing import Optional, Union

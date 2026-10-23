@@ -7,9 +7,9 @@ from torch.distributions import MultivariateNormal, Normal
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LinearModel
-from torchcast.state_space.mixture import (
-    LatentClass, MixtureComponent, MixtureModel, RegimeTransition, StaticTransition, StickyTransition
-)
+from torchcast.mixture import MixtureModel
+from torchcast.mixture.component import LatentClass, MixtureComponent
+from torchcast.mixture.regime_transition import RegimeTransition, StickyTransition, StaticTransition
 
 
 def _make_kf(measures, mixture_measures, **mixture_kwargs) -> KalmanFilter:
@@ -1168,27 +1168,59 @@ def test_latent_classes_fit():
         assert (p_low[frequent].mean() / p_low[~frequent].mean()) > 5
 
 
+def test_component_params_from_arrays():
+    # one-element arrays (e.g. computed from data) become scalar params, so their offsets stack with other measures'
+    component = MixtureComponent('a', offset_init=np.array([-2.]), prob_init=np.array([.1]), id='low')
+    assert component.offset.shape == component.logit.shape == ()
+    kf = KalmanFilter(
+        measures=['a', 'b'], processes=[LocalLevel(id=f'l{m}', measure=m) for m in 'ab'], mixture=[component]
+    )
+    with torch.no_grad():
+        kf(torch.randn(3, 5, 2))
+    with pytest.raises(ValueError, match='single number'):
+        MixtureComponent('a', offset_init=[-2., -3.], prob_init=.1, id='low')
+
+
 @torch.no_grad()
 def test_simulate_regimes():
+    # regimes are simulated: one combo per step, persisting as the (sticky) transition says; `sample()` follows them
+    torch.manual_seed(0)
+    low = MixtureComponent('y', offset_init=-2., prob_init=.2, id='low')
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level', measure='y')],
+        measures=['y'],
+        mixture=MixtureModel([low], transition=StickyTransition(num_combos=2, stay_init=.8)),
+    )
+    sim = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(0))
+    probs = sim.regime_probs  # (sims, times, combos)
+    assert ((probs == 0) | (probs == 1)).all() and (probs.sum(-1) == 1).all()
+
+    path = probs.argmax(-1)
+    is_low = path == kf.mixture.combos.index((low,))
+    prev_low, next_low = is_low[:, :-1], is_low[:, 1:]
+    stay = kf.mixture.transition.get_stay_prob()[0]
+    # P(same as the previous step) = stay + (1 - stay) * base-rate
+    assert abs(next_low[prev_low].float().mean() - (stay + (1 - stay) * .2)) < .03
+    assert abs((~next_low[~prev_low]).float().mean() - (stay + (1 - stay) * .8)) < .02
+
+    # observations are drawn in the simulated regime
+    samples = sim.sample(5, shared_noise=False)
+    assert torch.equal(samples.regimes, path.expand_as(samples.regimes))
+
+    # reproducible with a generator
+    again = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(0))
+    assert torch.equal(again.state_means, sim.state_means) and torch.equal(again.regime_probs, sim.regime_probs)
+    other = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(1))
+    assert not torch.equal(other.state_means, sim.state_means)
+
+
+@torch.no_grad()
+def test_simulate_latent_classes():
     """
-    `simulate()` simulates the regimes as trajectories: one-hot regime-probs, persisting as often as the sticky
-    transition implies; with latent classes, each trajectory stays in one class, drawn from the class prior.
+    With latent classes, each simulated trajectory stays in one class, drawn from the class prior (here with a static
+    transition: the regimes are redrawn each timestep, but the class stays).
     """
     torch.manual_seed(0)
-    kf = _make_kf(['y1', 'y2'], ['y1'])
-    kf.mixture.transition._stay_logit.fill_(2.)
-    sim = kf.simulate(out_timesteps=30, num_groups=2000)
-    rp = sim.regime_probs
-    assert ((rp == 0) | (rp == 1)).all() and (rp.sum(-1) == 1).all()
-    assert ((sim.get_mixture('y1').probs == 0) | (sim.get_mixture('y1').probs == 1)).all()
-    base_probs = kf.mixture.base_probs()
-    assert torch.allclose(rp.mean((0, 1)), base_probs, atol=.02)
-    # P(same combo at consecutive timesteps), for the stationary chain:
-    T = kf.mixture.transition.matrix(base_probs)
-    p_same = (base_probs * T.diagonal()).sum()
-    assert abs((rp[:, 1:] * rp[:, :-1]).sum(-1).mean() - p_same) < .02
-
-    # latent classes, with a static transition: regimes are redrawn each timestep, but the class stays.
     kf = _make_kf(['y1', 'y2'], ['y1'], classes=_classes(2.), transition=StaticTransition(num_combos=2))
     assert not list(kf.mixture.transition.parameters())
     kf.mixture._class_offsets.fill_(4.)

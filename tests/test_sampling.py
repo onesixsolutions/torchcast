@@ -1,13 +1,16 @@
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 from scipy import stats
 
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.process import LocalLevel, LocalTrend, SaturatedLinearModel
-from torchcast.state_space import MixtureComponent, LogTransform
+from torchcast.state_space import LogTransform
+from torchcast.mixture.component import MixtureComponent
+
 
 # monte-carlo tests: sample sizes and tolerances are chosen so that each check is ~5 standard-errors
 
@@ -462,3 +465,151 @@ def test_simulate_repeats_num_obs():
     is_binary = (obs == 0) | (obs == 1)
     assert is_binary[:, :, 0].all()
     assert not is_binary[:, :, 1:].all()
+
+
+@pytest.mark.parametrize('nonlinear', [True, False])
+@torch.no_grad()
+def test_sample_outputs_chunked(nonlinear: bool, monkeypatch):
+    # sample-based outputs are computed in chunks of groups (for memory); their noise is shared across rows, so the
+    # results must be identical to computing all groups at once
+    from torchcast.state_space import predictions as predictions_module
+    from torchcast.utils.data import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    num_groups, num_times = 5, 8
+    mixture = [MixtureComponent('y', offset_init=-2., prob_init=.2, id='low')]
+    processes = [LocalLevel(id=f'lvl_{m}', measure=m) for m in ('b', 'y')]
+    if nonlinear:
+        model = BinomialFilter(measures=['b', 'y'], processes=processes, binary_measures=['b'], mixture=mixture)
+        y = torch.cat([torch.randint(0, 2, (num_groups, num_times, 1)), torch.randn(num_groups, num_times, 1)], -1)
+    else:
+        model = KalmanFilter(measures=['b', 'y'], processes=processes, mixture=mixture)
+        y = torch.randn(num_groups, num_times, 2)
+    pred = model(y)
+    dataset = TimeSeriesDataset(
+        y, group_names=[f'g{i}' for i in range(num_groups)], start_times=[0] * num_groups, measures=[['b', 'y']],
+        dt_unit=None
+    )
+
+    def outputs():
+        kwargs = {'use_map': False} if nonlinear else {}
+        df = pred.to_dataframe(
+            dataset, conf=.9, num_samples=50, transform={'y': LogTransform()},
+            # (for the binary measure, derived values depend on the chunking: its binomial draws are per row)
+            derived={'d': (lambda s: 2 * s['y']) if nonlinear else (lambda s: s['b'] * s['y'])}, **kwargs
+        )
+        means = pred.get_means(num_samples=50, **kwargs)
+        return df.reset_index(drop=True), means
+
+    df_whole, means_whole = outputs()
+
+    calls = []
+    original = predictions_module.Predictions._output_summaries
+    monkeypatch.setattr(predictions_module, '_MAX_OUTPUT_SAMPLE_ELEMENTS', 1)  # one group per chunk
+    monkeypatch.setattr(
+        predictions_module.Predictions, '_output_summaries', lambda self, **kw: calls.append(1) or original(self, **kw)
+    )
+    df_chunked, means_chunked = outputs()
+
+    assert len(calls) == num_groups
+    # (identical draws: results differ only by floating-point rounding, e.g. from batched linear algebra)
+    pd.testing.assert_frame_equal(df_chunked, df_whole, check_exact=False, rtol=1e-5, atol=1e-5)
+    assert torch.allclose(means_chunked, means_whole, rtol=1e-5, atol=1e-5)
+
+
+@torch.no_grad()
+def test_derived_mean_control_variates():
+    # derived means use the measures (whose means are exact) as control variates: for a sum, the result is exact, even
+    # with few samples -- the sum of the measures' back-transformed means (without bias_adjust, which `derived` ignores)
+    from torchcast.utils.data import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        mixture=[MixtureComponent('a', offset_init=-1., prob_init=.2, id='low')],
+    )
+    num_groups, num_times = 4, 20
+    y = torch.randn(num_groups, num_times, 2)
+    pred = kf(y)
+    dataset = TimeSeriesDataset(
+        y, group_names=[f'g{i}' for i in range(num_groups)], start_times=[0] * num_groups, measures=[['a', 'b']],
+        dt_unit=None
+    )
+    with pytest.warns(UserWarning, match='bias_adjust'):
+        df = pred.to_dataframe(
+            dataset, conf=False, num_samples=50, transform=LogTransform(bias_adjust=.5),
+            derived={'total': lambda s: s['a'] + s['b']}
+        )
+    total = torch.as_tensor(df.query("measure == 'total'")['mean'].to_numpy()).view(num_groups, num_times)
+    expected = pred.get_means(transform=LogTransform()).sum(-1)
+    assert torch.allclose(total.to(expected.dtype), expected, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_regime_noise_scale():
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        mixture=[MixtureComponent('a', offset_init=-2., prob_init=.3, id='low')],
+    )
+    pred = kf(torch.randn(3, 10, 2))
+    full = pred.sample(500, shared_noise=False, generator=_gen())
+    pinned = pred.sample(500, shared_noise=False, generator=_gen(), regime_noise_scale={'low': 0.})
+    half = pred.sample(500, shared_noise=False, generator=_gen(), regime_noise_scale={'a.low': .5})
+
+    # the regimes are drawn as usual
+    assert torch.equal(pinned.regimes, full.regimes)
+    low = pinned.regimes == kf.mixture.combos.index((kf.mixture.components[0],))
+    assert .2 < low.float().mean() < .4
+
+    measured_mean, _ = pred._measured_moments_flat()
+    center = (measured_mean[:, 0].view(3, 10) + kf.mixture.components[0].offset).expand_as(low)
+    # draws in the 'low' regime are pinned at its center (or their deviation from it is scaled)
+    assert torch.allclose(pinned.observations[..., 0][low], center[low])
+    assert torch.allclose(pinned.means[..., 0][low], center[low])
+    assert torch.allclose(
+        (half.observations[..., 0] - center)[low], .5 * (full.observations[..., 0] - center)[low], atol=1e-5
+    )
+    # ...while the standard regime, and the other measure, are sampled as usual
+    assert torch.allclose(pinned.observations[..., 0][~low], full.observations[..., 0][~low], atol=1e-5)
+    assert torch.allclose(pinned.observations[..., 1], full.observations[..., 1], atol=1e-5)
+    # covs reflect the scaling
+    assert (pinned.covs[..., 0, :][low] == 0).all()
+    assert torch.allclose(pinned.covs[..., 1, 1], full.covs[..., 1, 1])
+
+    with pytest.raises(ValueError, match='unknown components'):
+        pred.sample(5, shared_noise=True, regime_noise_scale={'high': 0.})
+
+
+@torch.no_grad()
+def test_simulate_float64():
+    kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y']).double()
+    sim = kf.simulate(out_timesteps=5, num_groups=2, include_updates_in_output=True)
+    assert sim.state_means.dtype == sim.update_covs.dtype == torch.float64
+
+
+@torch.no_grad()
+def test_simulate_outputs_simulated_states():
+    # observations are generated from the simulated states: so e.g. the variance of a sum over time is that of the
+    # trajectories' sum, plus the observation-noise (a fresh draw from each step's prior would get it wrong)
+    torch.manual_seed(0)
+    kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])
+    kf.process_covariance.cholesky_log_diag.fill_(0.)  # (process-noise large relative to the observation-noise)
+    kf.measure_covariance.cholesky_log_diag.fill_(-1.)
+    num_times = 10
+    sim = kf.simulate(out_timesteps=num_times, num_groups=1, num_sims=4000, include_updates_in_output=True)
+    assert torch.equal(sim.state_means, sim.update_means)
+    assert (sim.state_covs.diagonal(dim1=-2, dim2=-1) <= 1e-6).all()
+
+    obs = sim.sample(1, shared_noise=False, generator=_gen()).observations[0, ..., 0]  # (sims, times)
+    states = sim.update_means[..., 0]
+    measure_var = sim.measure_covs[0, 0, 0, 0]
+    # observations scatter around the simulated states by the observation-noise only:
+    assert torch.isclose((obs - states).var(), measure_var, rtol=.1)
+    # ...so e.g. a sum over time has the trajectories' variance, plus the observation-noise:
+    assert torch.isclose(obs.sum(1).var(), states.sum(1).var() + num_times * measure_var, rtol=.1)
+
+    with pytest.raises(ValueError, match='n_step'):
+        kf(out_timesteps=5, initial_state=kf._prepare_initial_state(None), simulate=1, n_step=2)

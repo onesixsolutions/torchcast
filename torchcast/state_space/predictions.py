@@ -3,7 +3,7 @@ import numbers
 from math import log
 
 from dataclasses import dataclass, fields
-from typing import Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator
+from typing import Any, Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator, Mapping
 from warnings import warn
 
 import torch
@@ -17,8 +17,8 @@ from .transforms import Transform, _IdentityTransform
 from torchcast.internals.utils import get_nan_groups, class_or_instancemethod, ragged_cat, mvnorm_log_prob
 
 if TYPE_CHECKING:
-    from .mixture import MixtureModel
     from .state import StateTuple
+    from torchcast.mixture import MixtureModel
     from torchcast.utils import TimeSeriesDataset
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise
@@ -30,12 +30,19 @@ if TYPE_CHECKING:
 _OUTPUT_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
 # the default number of samples for sample-based outputs:
 _DEFAULT_NUM_SAMPLES = 1000
+# sample-based outputs are computed in chunks of groups, so that their samples have at most about this many elements
+# (~64MB per tensor in float32). since their noise is shared across rows, the results don't depend on the chunking.
+_MAX_OUTPUT_SAMPLE_ELEMENTS = 2 ** 24
 
 
 class Predictions:
     """
     The output of the :class:`.StateSpaceModel` forward pass, containing the underlying state means and covariances, as
     well as methods such as ``log_prob()``, ``to_dataframe()``, and ``plot()``.
+
+    The states (``state_means``, ``state_covs``) are those that each timestep's observations are predicted from: for
+    filtering/forecasting, the predicted (prior) states, before that timestep's update; for :func:`.simulate`, the
+    simulated states. (``update_means`` and ``update_covs``, if included, are the states after each update.)
     """
     _means = None
     _covs = None
@@ -179,7 +186,9 @@ class Predictions:
 
         if self.measurement_model.is_nonlinear:
             # monte-carlo for the means of nonlinear measures; there's no closed form cov
-            return self._get_means(use_map=False), None
+            return self._map_group_chunks(
+                lambda chunk: chunk._get_means(use_map=False), num_samples=_DEFAULT_NUM_SAMPLES
+            ), None
         elif self.mixture is not None:
             # the exact mean and covariance of the mixture over regime-combos:
             _, probs, means, covs = self._get_regime_combos()
@@ -204,22 +213,26 @@ class Predictions:
         :param num_samples: See :func:`to_dataframe`.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
-        return self._get_means(
-            use_map=self._resolve_use_map(use_map),
-            transforms=self._standardize_transforms(transform),
-            mmean_samples=num_samples,
+        use_map = self._resolve_use_map(use_map)
+        transforms = self._standardize_transforms(transform)
+        return self._map_group_chunks(
+            lambda chunk: chunk._get_means(use_map=use_map, transforms=transforms, mmean_samples=num_samples),
+            num_samples=num_samples if not use_map else 0,
         )
 
     def _get_means(self,
                    use_map: bool,
                    transforms: Optional[dict[str, 'Transform']] = None,
-                   mmean_samples: Union[torch.Tensor, int, None] = None) -> torch.Tensor:
+                   mmean_samples: Union[torch.Tensor, int, None] = None,
+                   adjust_bias: bool = True) -> torch.Tensor:
         """
         The means, given already-resolved arguments -- separate from :func:`get_means` so that callers can share one
         set of samples (e.g. ``to_dataframe``: between the means, the intervals and ``derived``).
 
         :param mmean_samples: Pass already-computed samples to save compute (and to share them), otherwise will
          compute if needed (or for the latter this can be an int for num_draws).
+        :param adjust_bias: Whether the transforms' ``bias_adjust`` applies, for measures with a linear measured-mean
+         (False: the mean of the back-transformed distribution).
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor: the back-transformed measured mean
          (handling mixtures if needed).
         """
@@ -248,7 +261,7 @@ class Predictions:
         for measure in simple_measures:
             midx = all_measures.index(measure)
             transform = transforms.get(measure, identity)
-            mean = transform.inverse_mean(measured_mean[:, midx], system_cov[:, midx, midx])
+            mean = transform.inverse_mean(measured_mean[:, midx], system_cov[:, midx, midx], adjust_bias=adjust_bias)
             out[measure] = mean.view(*batch_shape)
 
         # mixture measures: the same, for each regime, mixed by the regime-probabilities:
@@ -262,39 +275,77 @@ class Predictions:
             )
             transform = transforms.get(measure, identity)
             regime_means = [
-                transform.inverse_mean(mixture.means[..., k], mixture.vars[..., k], regime=label)
+                transform.inverse_mean(mixture.means[..., k], mixture.vars[..., k], adjust_bias, regime=label)
                 for k, (label, _, _) in enumerate(self._regimes(measure))
             ]
             out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
 
         # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
-        # regime-probabilities (all ones without mixture components):
-        if nonlinear_measures:
-            # to apply a transform with bias_adjust != 1, we need to rescale not just the measurement-var (easy)
-            # but also the state-var; but since we're sampling the state-var, we need to sample it with a scaling factor
-            deviation_scales = [
-                math.sqrt(transforms.get(m, identity).var_multi) if m in nonlinear_measures else 1.
-                for m in all_measures
-            ]
+        # regime-probabilities (all ones without mixture components). `bias_adjust` scales the variance, including the
+        # state's: so the state is sampled with its deviations scaled -- once per measure, so its regimes' nonzero
+        # values must be the same. A regime with `bias_adjust=0` needs no sampling: it's the plug-in `inverse(MAP)`.
+        var_multis = {m: self._nonlinear_var_multis(m, transforms.get(m, identity)) for m in nonlinear_measures}
+        sampled = {m: [v for v in vm.values() if v is not None] for m, vm in var_multis.items()}
+        if any(sampled.values()):
+            deviation_scales = [math.sqrt(sampled[m][0]) if sampled.get(m) else 1. for m in all_measures]
             mmean_samples = self._resolve_mmean_samples(mmean_samples, deviation_scales=deviation_scales)
 
         for measure in nonlinear_measures:
             midx = all_measures.index(measure)
             transform = transforms.get(measure, identity)
             noise_var = self.measure_covs_flat[:, midx, midx]
-            if not self._mixture_components(measure):
-                out[measure] = transform.inverse_mean(mmean_samples[..., midx], noise_var).mean(0).view(*batch_shape)
+            regime_means = []
+            for label, offset, extra in self._regimes(measure):
+                var_multi = var_multis[measure][label]
+                if var_multi is None:  # (bias_adjust=0)
+                    regime_means.append(transform.inverse(measured_mean[:, midx] + offset))
+                else:
+                    regime_means.append(transform.inverse_mean(
+                        mmean_samples[..., midx] + offset,
+                        (noise_var + extra) * var_multi,
+                        adjust_bias=False,
+                        regime=label,
+                    ).mean(0))
+            if len(regime_means) == 1:
+                out[measure] = regime_means[0].view(*batch_shape)
                 continue
-
-            # more complex logic for measures with mixture components:
-            regime_means = [
-                transform.inverse_mean(mmean_samples[..., midx] + offset, noise_var + extra, regime=label).mean(0)
-                for label, offset, extra in self._regimes(measure)
-            ]
             probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
             out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
 
         return torch.stack([out[m] for m in all_measures], -1)
+
+    def _needs_mc_means(self, use_map: bool, transforms: dict[str, 'Transform']) -> bool:
+        """
+        Whether the means need monte-carlo samples: for measures with a nonlinear measured-mean, without ``use_map``,
+        unless every regime has ``bias_adjust=0`` (the plug-in, see ``_get_means``).
+        """
+        if use_map:
+            return False
+        identity = _IdentityTransform()
+        return any(
+            not np.isclose(transforms.get(m, identity).var_multi(label), 0)
+            for m in self._nonlinear_measures
+            for label, _, _ in self._regimes(m)
+        )
+
+    def _nonlinear_var_multis(self, measure: str, transform: 'Transform') -> dict[Optional[str], Optional[float]]:
+        """
+        For the monte-carlo means of a measure with a nonlinear measured-mean: each regime's ``bias_adjust`` (see
+        ``Transform.var_multi``), or None where it's 0 (no sampling needed). The state is sampled once per measure, so
+        the other regimes' values must be the same -- if not, they're ignored (with a warning), i.e. set to 1.
+        """
+        out = {}
+        for label, _, _ in self._regimes(measure):
+            var_multi = transform.var_multi(label)
+            out[label] = None if np.isclose(var_multi, 0) else var_multi
+        nonzero = {v for v in out.values() if v is not None}
+        if len(nonzero) > 1:
+            warn(
+                f"'{measure}' has a nonlinear measured-mean, so its regimes' `bias_adjust` values must be 0 or the "
+                f"same, got {transform.bias_adjust}; using 1 for those that aren't 0."
+            )
+            out = {k: (None if v is None else 1.) for k, v in out.items()}
+        return out
 
     # Log-probability --------------------------------------------------------------------------------------------------
 
@@ -475,8 +526,11 @@ class Predictions:
         :param derived: Quantities computed from multiple measures, e.g. ``{'total': lambda s: s['a'] + s['b']}``.
          Each function receives a dictionary of ``{measure: (num_samples, num_groups, num_timesteps)}`` samples from
          the (joint) predictive distribution, including observation noise and on the scale given by ``transform``, and
-         should return a ``(num_samples, num_groups, num_timesteps)`` tensor. Each is added to the output with its
-         key as the 'measure'; the mean and intervals are computed across samples (see :func:`sample`). If there are
+         should return a ``(num_samples, num_groups, num_timesteps)`` tensor, computing each group and timestep from
+         its own values (e.g. not a total across groups: for memory, it's applied to chunks of groups at a time).
+         Each is added to the output with its key as the 'measure'; the mean and intervals are computed across samples
+         (see :func:`sample`). The mean uses the measures whose means are exact (those with a linear measured-mean) as
+         control variates, which reduces its monte-carlo error -- e.g. a sum of these measures is exact. If there are
          actuals, the function is applied to them too (so it should handle missing values, which are nan; measures
          that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
         :param num_samples: The number of monte-carlo samples, for the outputs that need them: the means (with
@@ -693,20 +747,19 @@ class Predictions:
         alpha = None if conf is False else (1 - conf) / 2
         transforms = self._standardize_transforms(transform)
         use_map = self._resolve_use_map(use_map)
-        measures = list(self.measurement_model.measures)
+        if derived:
+            overlap = set(derived) & set(self.measurement_model.measures)
+            if overlap:
+                raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
 
-        # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
-        # (intervals for nonlinear measures are always monte-carlo):
-        mmean_samples = None
-        needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
-        if (not use_map) or needs_mc_intervals:
-            mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
-
-        means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
-        by_measure = {m: (means[..., j],) for j, m in enumerate(measures)}
-        if alpha is not None:
-            intervals = self._get_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples)
-            by_measure = {m: (*v, *intervals[m]) for m, v in by_measure.items()}
+        # (intervals for nonlinear measures are always monte-carlo)
+        needs_samples = (not use_map) or (alpha is not None and self.measurement_model.is_nonlinear) or derived
+        by_measure = self._map_group_chunks(
+            lambda chunk: chunk._output_summaries(
+                alpha=alpha, transforms=transforms, use_map=use_map, derived=derived, num_samples=num_samples
+            ),
+            num_samples=num_samples if needs_samples else 0,
+        )
 
         from torchcast.utils import TimeSeriesDataset
 
@@ -714,12 +767,12 @@ class Predictions:
         if isinstance(dataset, TimeSeriesDataset):
             for mgroup, tens in zip(dataset.measures, dataset.tensors):
                 for m in mgroup:
-                    if m not in by_measure:
+                    if m not in self.measurement_model.measures:
                         continue
                     actuals[m] = tens[..., mgroup.index(m)]
                     if m in transforms:
                         actuals[m] = transforms[m].inverse(actuals[m])
-            missing = set(by_measure) - set(dataset.all_measures)
+            missing = set(self.measurement_model.measures) - set(dataset.all_measures)
             if missing:
                 warn(
                     f"The following measures in your model are not present in your dataset, please double-check that "
@@ -727,14 +780,7 @@ class Predictions:
                 )
 
         if derived:
-            self._add_derived(
-                derived,
-                alpha=alpha,
-                transforms=transforms,
-                by_measure=by_measure,
-                actuals=actuals,
-                mmean_samples=num_samples if mmean_samples is None else mmean_samples,
-            )
+            actuals.update(self._derived_actuals(derived, actuals))
 
         return self._summaries_to_dataframe(
             by_measure,
@@ -743,6 +789,60 @@ class Predictions:
             group_colname=group_colname,
             time_colname=time_colname,
         )
+
+    def _output_summaries(self,
+                          alpha: Optional[float],
+                          transforms: dict[str, 'Transform'],
+                          use_map: bool,
+                          derived: Optional[dict[str, Callable]],
+                          num_samples: int) -> dict[str, tuple[torch.Tensor, ...]]:
+        """
+        For ``to_dataframe()``: for each measure and ``derived`` quantity, ``(num_groups, num_timesteps)`` tensors with
+        the mean and (unless ``alpha`` is None) the lower and upper bounds.
+        """
+        measures = list(self.measurement_model.measures)
+
+        # samples of the state's measured-mean, shared by the means, the intervals and `derived` -- only if needed
+        # (intervals for nonlinear measures are always monte-carlo):
+        mmean_samples = None
+        needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
+        if needs_mc_intervals or self._needs_mc_means(use_map, transforms):
+            mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
+
+        means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
+        by_measure = {m: (means[..., j],) for j, m in enumerate(measures)}
+        if alpha is not None:
+            intervals = self._get_intervals(alpha, transforms=transforms, mmean_samples=mmean_samples)
+            by_measure = {m: (*v, *intervals[m]) for m, v in by_measure.items()}
+        if derived:
+            by_measure.update(self._derived_summaries(
+                derived,
+                alpha=alpha,
+                transforms=transforms,
+                mmean_samples=num_samples if mmean_samples is None else mmean_samples,
+            ))
+        return by_measure
+
+    def _map_group_chunks(self, fun: Callable[['Predictions'], Any], num_samples: int) -> Any:
+        """
+        Applies ``fun`` to chunks of groups (``self[start:end]``), each small enough that its sample-based outputs'
+        samples have at most about ``_MAX_OUTPUT_SAMPLE_ELEMENTS`` elements, and concatenates the results along the
+        groups. Sample-based outputs share their noise across rows (with a fixed seed), so the results are the same as
+        for all groups at once -- just with bounded memory. (The exception: ``BinomialPredictions`` draws binary
+        observations independently per row, so ``derived`` quantities of binary measures depend on the chunking --
+        each row's draws are still valid, and reproducible.)
+
+        :param fun: Takes a ``Predictions`` object, returns a ``(num_groups, ...)`` tensor, or a dict of tuples of them.
+        :param num_samples: The number of samples ``fun`` draws (0 if none, in which case there's no chunking).
+        """
+        dim = self.measurement_model_flat.extended_measure_mat.shape[1]
+        group_size = max(1, _MAX_OUTPUT_SAMPLE_ELEMENTS // max(1, num_samples * self.num_timesteps * dim))
+        if not num_samples or group_size >= self.num_groups:
+            return fun(self)
+        results = [fun(self[start:start + group_size]) for start in range(0, self.num_groups, group_size)]
+        if isinstance(results[0], torch.Tensor):
+            return torch.cat(results)
+        return {k: tuple(torch.cat(parts) for parts in zip(*(r[k] for r in results))) for k in results[0]}
 
     def _get_intervals(self,
                        alpha: float,
@@ -840,29 +940,23 @@ class Predictions:
             warn("`mmean_samples` argument to `_get_intervals()` ignored, no sampling needed.")
         return out
 
-    def _add_derived(self,
-                     derived: dict[str, Callable],
-                     alpha: Optional[float],
-                     transforms: dict[str, 'Transform'],
-                     by_measure: dict,
-                     actuals: dict[str, torch.Tensor],
-                     mmean_samples: Union[torch.Tensor, int, None] = None) -> None:
+    def _derived_summaries(self,
+                           derived: dict[str, Callable],
+                           alpha: Optional[float],
+                           transforms: dict[str, 'Transform'],
+                           mmean_samples: Union[torch.Tensor, int, None] = None) -> dict[str, tuple[torch.Tensor, ...]]:
         """
-        Adds summaries of derived quantities to ``by_measure``, and (if there are any actuals, i.e. a dataset) the
-        derived actuals to ``actuals``. Modifies both in place.
-
         :param mmean_samples: Samples of the state's measured-mean (see ``_resolve_mmean_samples``): pass the ones the
          means and intervals use, to save compute (and to share them). The rest of each sample (the regime, the
          observations) is drawn given these, as in :func:`sample`.
+        :return: For each derived quantity, ``(num_groups, num_timesteps)`` tensors with the mean and (unless ``alpha``
+         is None) the lower and upper bounds.
         """
         measures = list(self.measurement_model.measures)
-        overlap = set(derived) & set(measures)
-        if overlap:
-            raise ValueError(f"`derived` names can't be the same as measures: {overlap}")
         mmean_samples = self._resolve_mmean_samples(mmean_samples)
         # summaries are per-row, so shared noise is fine (and uses less memory):
         num_samples = mmean_samples.shape[0]
-        _, _, observations = self._sample_given_state(
+        _, _, observations, _ = self._sample_given_state(
             mmean_samples,
             generator=self._output_generator(state=False),
             shared_noise=True,
@@ -875,21 +969,48 @@ class Predictions:
                 warn(f"`{type(t).__name__}(bias_adjust=...)` is ignored for `derived`.")
             values[m] = t.inverse(values[m])
 
-        # the functions are also applied to the actuals (as a batch of one sample), if there's a dataset. measures that
-        # aren't in the dataset are nan, like missing values:
-        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
-        if measure_actuals:
-            nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
-            measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
+        # measures whose samples have a known (exact) mean: control variates, for the derived quantities' means
+        identity = _IdentityTransform()
+        control_measures = [
+            m for m in measures
+            if m not in self._nonlinear_measures and _has_gaussian_noise(transforms.get(m, identity))
+        ]
+        controls = control_means = None
+        if control_measures:
+            cidx = [measures.index(m) for m in control_measures]
+            controls = torch.stack([values[m] for m in control_measures], -1)
+            control_means = self._get_means(use_map=True, transforms=transforms, adjust_bias=False)[..., cidx]
 
+        out = {}
         expected_shape = (num_samples, self.num_groups, self.num_timesteps)
         for name, fun in derived.items():
-            out = fun(values)
-            if tuple(out.shape) != expected_shape:
-                raise ValueError(f"`derived['{name}']` returned shape {tuple(out.shape)}, expected {expected_shape}.")
-            by_measure[name] = (out.mean(0),) if alpha is None else (out.mean(0), *_quantile_interval(out, alpha))
-            if measure_actuals:
-                actuals[name] = fun(measure_actuals).squeeze(0)
+            samples = fun(values)
+            if tuple(samples.shape) != expected_shape:
+                raise ValueError(
+                    f"`derived['{name}']` returned shape {tuple(samples.shape)}, expected {expected_shape}."
+                )
+            if controls is None:
+                out[name] = (samples.mean(0),)
+            else:
+                out[name] = (_control_variate_mean(samples, controls, control_means),)
+            if alpha is not None:
+                out[name] += _quantile_interval(samples, alpha)
+        return out
+
+    def _derived_actuals(self,
+                         derived: dict[str, Callable],
+                         actuals: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """
+        The ``derived`` functions applied to the actuals (as a batch of one sample), if there are any. Measures that
+        aren't in the dataset are nan, like missing values.
+        """
+        measures = list(self.measurement_model.measures)
+        measure_actuals = {m: a for m, a in actuals.items() if m in measures}
+        if not measure_actuals:
+            return {}
+        nans = torch.full_like(next(iter(measure_actuals.values())), float('nan'))
+        measure_actuals = {m: measure_actuals.get(m, nans).unsqueeze(0) for m in measures}
+        return {name: fun(measure_actuals).squeeze(0) for name, fun in derived.items()}
 
     def _summaries_to_dataframe(self,
                                 by_measure: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -1059,7 +1180,8 @@ class Predictions:
                num_samples: int,
                shared_noise: bool,
                observation_noise: bool = True,
-               generator: Optional[torch.Generator] = None) -> 'PredictionSamples':
+               generator: Optional[torch.Generator] = None,
+               regime_noise_scale: Optional[Mapping[str, float]] = None) -> 'PredictionSamples':
         """
         Draw samples from the predictive distribution: jointly across measures, for each group and timestep. These
         are *not* trajectories -- the model's timesteps are correlated (via the state), while samples for different
@@ -1081,19 +1203,42 @@ class Predictions:
          timesteps (see above).
         :param observation_noise: If True (the default), also sample the observations.
         :param generator: An optional :class:`torch.Generator`, for reproducibility.
+        :param regime_noise_scale: For models with mixture components: scales the randomness of draws in a
+         component's regime, ``{component_id: scale}`` (or ``'{measure}.{component_id}'``; others get 1). A draw's
+         value for that measure is its regime's center -- the measured-mean of the state's mean (the MAP), plus the
+         component's offset -- plus ``scale`` times its deviation from that center (from the state, the observation
+         noise, and the component's extra variance). E.g. ``{'low': 0.}`` pins draws in a 'low' regime at its center
+         (on the modeled scale), while the standard regime is sampled as usual: e.g. to check how much a component's
+         variance contributes to back-transformed outputs (a sample-based analogue of a transform's per-regime
+         ``bias_adjust=0``). The regimes are drawn as usual. The state is shared across measures, so this also weakens
+         the draws' correlation with other measures. The scales are in ``PredictionSamples.noise_scales`` (and
+         reflected in ``covs``).
         :return: A :class:`PredictionSamples`.
         """
         batch_shape = self.state_means.shape[0:2]
         measures = list(self.measurement_model.measures)
+        noise_scale_table = self._regime_noise_scale_table(regime_noise_scale) if regime_noise_scale else None
         # sample the measured-mean (via the state), then the rest given it (the same generator draws the state's noise
         # first, then the regimes and observations):
         means = self._get_output_samples(num_samples, generator=generator, shared_noise=shared_noise)
-        means, extra_vars, observations = self._sample_given_state(
+        means, extra_vars, observations, combo_idx = self._sample_given_state(
             means,
             generator=generator,
             shared_noise=shared_noise,
             observation_measures=measures if observation_noise else None,
         )
+        noise_scales = None
+        if noise_scale_table is not None:
+            # each draw's deviation from its regime's center, scaled:
+            noise_scales = noise_scale_table[combo_idx]  # (num_samples, num_rows, num_measures)
+            shift, _ = self.mixture.combo_offsets(measures, like=means)
+            centers = self._measured_moments_flat()[0] + shift[combo_idx]
+            means = centers + noise_scales * (means - centers)
+            if observations is not None:
+                observations = centers + noise_scales * (observations - centers)
+            noise_scales = noise_scales.view(num_samples, *batch_shape, len(measures))
+        if combo_idx is not None:
+            combo_idx = combo_idx.view(num_samples, *batch_shape)
         if observations is not None:
             observations = observations.view(num_samples, *batch_shape, len(measures))
 
@@ -1107,14 +1252,44 @@ class Predictions:
             measure_covs=self.measure_covs,
             extra_vars=extra_vars,
             observations=observations,
+            regimes=combo_idx,
+            noise_scales=noise_scales,
         )
+
+    def _regime_noise_scale_table(self, regime_noise_scale: Mapping[str, float]) -> torch.Tensor:
+        """
+        For :func:`sample`'s ``regime_noise_scale``: a ``(num_combos, num_measures)`` table with each measure's scale
+        in each regime-combo.
+        """
+        if self.mixture is None:
+            raise ValueError("`regime_noise_scale` is only for models with mixture components.")
+        components = list(self.mixture.components)
+        known = {c.id for c in components} | {c.qualified_id for c in components}
+        unknown = set(regime_noise_scale) - known
+        if unknown:
+            raise ValueError(f"`regime_noise_scale` has unknown components: {unknown}")
+        if any(v < 0 for v in regime_noise_scale.values()):
+            raise ValueError("`regime_noise_scale` values must be non-negative.")
+        measures = list(self.measurement_model.measures)
+        table = torch.ones(
+            (self.mixture.num_combos, len(measures)), dtype=self.state_means.dtype, device=self.state_means.device
+        )
+        for c, combo in enumerate(self.mixture.combos):
+            for measure, component in zip(self.mixture.mixture_measures, combo):
+                if component is None or measure not in measures:
+                    continue
+                scale = regime_noise_scale.get(component.qualified_id, regime_noise_scale.get(component.id))
+                if scale is not None:
+                    table[c, measures.index(measure)] = scale
+        return table
 
     def _sample_given_state(self,
                             means: torch.Tensor,
                             generator: Optional[torch.Generator],
                             shared_noise: bool,
                             observation_measures: Optional[Sequence[str]]
-                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
+                                       Optional[torch.Tensor]]:
         """
         The rest of a sample, given samples of the measured-mean (one per sample of the state): the regime (for
         models with mixture components), then the observations.
@@ -1123,7 +1298,7 @@ class Predictions:
         :param observation_measures: The measures whose observations to sample (the others' observations are their
          means); or None to skip the observations.
         :return: The means (with the regimes' offsets), the per-sample variances added to the diagonal of
-         ``measure_covs`` (or None), and the observations (or None).
+         ``measure_covs`` (or None), the observations (or None), and the drawn regime-combos (or None).
         """
         # the observations' covariance given the sampled state is `measure_covs` plus a per-sample diagonal (e.g. a
         # binary measure's binomial variance; a regime's extra variance) -- tracked as just that diagonal, rather
@@ -1131,8 +1306,11 @@ class Predictions:
         extra_vars = self._conditional_measure_vars(means)
 
         # sample the regime:
+        combo_idx = None
         if self.mixture is not None:
-            means, extra_vars = self._sample_regimes(means, extra_vars, generator=generator, shared_noise=shared_noise)
+            means, extra_vars, combo_idx = self._sample_regimes(
+                means, extra_vars, generator=generator, shared_noise=shared_noise
+            )
 
         observations = None
         if observation_measures is not None:
@@ -1143,7 +1321,7 @@ class Predictions:
                 measures=observation_measures,
                 shared_noise=shared_noise,
             )
-        return means, extra_vars, observations
+        return means, extra_vars, observations, combo_idx
 
     def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
         """
@@ -1163,11 +1341,12 @@ class Predictions:
                         means: torch.Tensor,
                         extra_vars: Optional[torch.Tensor],
                         generator: Optional[torch.Generator],
-                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
         their mean and its variance to their (conditional) variance -- i.e. to ``extra_vars``, the per-sample diagonal
-        added to ``measure_covs`` (see ``_conditional_measure_vars``).
+        added to ``measure_covs`` (see ``_conditional_measure_vars``). Also returns the ``(num_samples, num_rows)``
+        indices of the drawn combos.
 
         :param shared_noise: If True, the draws use the same uniforms for every row (inverting each row's cdf of the
          regime-probabilities); otherwise they're independent.
@@ -1184,7 +1363,7 @@ class Predictions:
         else:
             combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
         extra = extra_var[combo_idx]  # (num_samples, num_rows, num_measures)
-        return means + shift[combo_idx], extra if extra_vars is None else extra_vars + extra
+        return means + shift[combo_idx], extra if extra_vars is None else extra_vars + extra, combo_idx
 
     def _sample_observations(self,
                              means: torch.Tensor,
@@ -1779,12 +1958,18 @@ class PredictionSamples:
      extra variance). See :attr:`covs`.
     :param observations: If ``observation_noise=True``, a ``(num_samples, num_groups, num_timesteps, num_measures)``
      tensor of sampled observations.
+    :param regimes: For models with mixture components, a ``(num_samples, num_groups, num_timesteps)`` tensor with
+     the index of each sample's regime-combo (into ``MixtureModel.combos``).
+    :param noise_scales: With ``sample(regime_noise_scale=...)``, a ``(num_samples, num_groups, num_timesteps,
+     num_measures)`` tensor of the scales applied to each draw's deviation from its regime's center.
     """
     measures: list
     means: torch.Tensor
     measure_covs: torch.Tensor
     extra_vars: Optional[torch.Tensor] = None
     observations: Optional[torch.Tensor] = None
+    regimes: Optional[torch.Tensor] = None
+    noise_scales: Optional[torch.Tensor] = None
 
     @property
     def covs(self) -> torch.Tensor:
@@ -1796,6 +1981,8 @@ class PredictionSamples:
         covs = self.measure_covs.expand(self.means.shape[0], *self.measure_covs.shape)
         if self.extra_vars is not None:
             covs = covs + torch.diag_embed(self.extra_vars)
+        if self.noise_scales is not None:
+            covs = covs * self.noise_scales.unsqueeze(-1) * self.noise_scales.unsqueeze(-2)
         return covs
 
     def __getitem__(self, measure: str) -> torch.Tensor:
@@ -1817,7 +2004,7 @@ class MixtureOfNormals:
     For example, to get the mean on the original scale of a log-transformed measure, back-transform each component and
     then mix: ``(mix.probs * torch.exp(mix.means + mix.vars / 2)).sum(-1)``.
 
-    :param labels: A name for each component (``'standard'``, then the :class:`MixtureComponent` ids).
+    :param labels: A name for each component (``'standard'``, then the :class:`.MixtureComponent` ids).
     :param probs: The probability of each component.
     :param means: The mean of each component.
     :param vars: The variance of each component.
@@ -1924,6 +2111,41 @@ def _matmul_per_row(mats: torch.Tensor, vecs: torch.Tensor) -> torch.Tensor:
     if vecs.ndim == 2:
         return torch.einsum('rij,nj->nri', mats, vecs)
     return torch.einsum('rij,nrj->nri', mats, vecs)
+
+
+def _has_gaussian_noise(transform: 'Transform') -> bool:
+    """
+    Whether ``transform.inverse_mean`` is the mean of back-transformed *gaussian* samples (e.g. not a
+    :class:`.SmearingTransform`, which uses the empirical distribution of the residuals instead).
+    """
+    from .transforms import Transform
+
+    return type(transform)._noise_nodes is Transform._noise_nodes
+
+
+def _control_variate_mean(samples: torch.Tensor, controls: torch.Tensor, control_means: torch.Tensor) -> torch.Tensor:
+    """
+    The mean of ``samples``, with variance reduced by control variates: quantities sampled alongside them, whose exact
+    means are known. Per row, regress the samples on the controls (across samples); the estimate is the samples' mean,
+    minus the coefficients times how far the controls' sample-means are from their exact means. E.g. for the sum of two
+    measures, with the measures as controls, the coefficients are 1 and the estimate is exact.
+
+    :param samples: A ``(num_samples, *batch_shape)`` tensor.
+    :param controls: A ``(num_samples, *batch_shape, num_controls)`` tensor.
+    :param control_means: A ``(*batch_shape, num_controls)`` tensor of the controls' exact means.
+    :return: A ``batch_shape`` tensor.
+    """
+    control_sample_means = controls.mean(0)
+    xc = controls - control_sample_means
+    # (standardized, so the regression is well-conditioned whatever the controls' scales; constant controls drop out)
+    scale = xc.square().mean(0).sqrt()
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    xc = xc / scale
+    fc = samples - samples.mean(0)
+    cov_xx = torch.einsum('n...i,n...j->...ij', xc, xc)
+    cov_xf = torch.einsum('n...i,n...->...i', xc, fc)
+    coefs = (torch.linalg.pinv(cov_xx) @ cov_xf.unsqueeze(-1)).squeeze(-1) / scale
+    return samples.mean(0) - (coefs * (control_sample_means - control_means)).sum(-1)
 
 
 def _quantile_interval(x: torch.Tensor, alpha: float) -> tuple[torch.Tensor, torch.Tensor]:

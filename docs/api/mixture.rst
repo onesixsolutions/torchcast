@@ -3,9 +3,12 @@ Mixture Components
 
 *Experimental.* See the :doc:`../examples/mixture_components` example.
 
-.. automodule:: torchcast.state_space.mixture
-   :members: MixtureModel, MixtureComponent, LatentClass, RegimeTransition, StaticTransition, StickyTransition, MixtureOfNormals
+.. automodule:: torchcast.mixture
+   :members: MixtureModel, MixtureComponent, LatentClass, RegimeTransition, StaticTransition, StickyTransition
    :member-order: bysource
    :show-inheritance:
+
+.. autoclass:: torchcast.state_space.MixtureOfNormals
+   :members:
 
 .. include:: ../macros.hrst

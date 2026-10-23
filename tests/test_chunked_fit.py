@@ -8,7 +8,8 @@ import torch
 from torchcast.kalman_filter import KalmanFilter, BinomialFilter
 from torchcast.covariance import Covariance
 from torchcast.process import LocalLevel, LinearModel, Season
-from torchcast.state_space import LossFun, MixtureComponent, StateTuple
+from torchcast.state_space import LossFun, StateTuple
+from torchcast.mixture.component import MixtureComponent
 from torchcast.utils import Stopping
 
 

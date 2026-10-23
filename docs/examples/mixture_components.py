@@ -18,7 +18,7 @@ import torch
 
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.process import LocalLevel
-from torchcast.state_space import MixtureComponent
+from torchcast.mixture import MixtureComponent
 from torchcast.utils.data import TimeSeriesDataset
 from plotnine.exceptions import PlotnineWarning
 
