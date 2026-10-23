@@ -3,7 +3,7 @@ import numbers
 from math import log
 
 from dataclasses import dataclass, fields
-from typing import Any, Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator
+from typing import Any, Tuple, Union, Optional, Sequence, TYPE_CHECKING, Callable, Iterator, Mapping
 from warnings import warn
 
 import torch
@@ -952,7 +952,7 @@ class Predictions:
         mmean_samples = self._resolve_mmean_samples(mmean_samples)
         # summaries are per-row, so shared noise is fine (and uses less memory):
         num_samples = mmean_samples.shape[0]
-        _, _, observations = self._sample_given_state(
+        _, _, observations, _ = self._sample_given_state(
             mmean_samples,
             generator=self._output_generator(state=False),
             shared_noise=True,
@@ -1176,7 +1176,8 @@ class Predictions:
                num_samples: int,
                shared_noise: bool,
                observation_noise: bool = True,
-               generator: Optional[torch.Generator] = None) -> 'PredictionSamples':
+               generator: Optional[torch.Generator] = None,
+               regime_noise_scale: Optional[Mapping[str, float]] = None) -> 'PredictionSamples':
         """
         Draw samples from the predictive distribution: jointly across measures, for each group and timestep. These
         are *not* trajectories -- the model's timesteps are correlated (via the state), while samples for different
@@ -1198,19 +1199,42 @@ class Predictions:
          timesteps (see above).
         :param observation_noise: If True (the default), also sample the observations.
         :param generator: An optional :class:`torch.Generator`, for reproducibility.
+        :param regime_noise_scale: For models with mixture components: scales the randomness of draws in a
+         component's regime, ``{component_id: scale}`` (or ``'{measure}.{component_id}'``; others get 1). A draw's
+         value for that measure is its regime's center -- the measured-mean of the state's mean (the MAP), plus the
+         component's offset -- plus ``scale`` times its deviation from that center (from the state, the observation
+         noise, and the component's extra variance). E.g. ``{'low': 0.}`` pins draws in a 'low' regime at its center
+         (on the modeled scale), while the standard regime is sampled as usual: e.g. to check how much a component's
+         variance contributes to back-transformed outputs (a sample-based analogue of a transform's per-regime
+         ``bias_adjust=0``). The regimes are drawn as usual. The state is shared across measures, so this also weakens
+         the draws' correlation with other measures. The scales are in ``PredictionSamples.noise_scales`` (and
+         reflected in ``covs``).
         :return: A :class:`PredictionSamples`.
         """
         batch_shape = self.state_means.shape[0:2]
         measures = list(self.measurement_model.measures)
+        noise_scale_table = self._regime_noise_scale_table(regime_noise_scale) if regime_noise_scale else None
         # sample the measured-mean (via the state), then the rest given it (the same generator draws the state's noise
         # first, then the regimes and observations):
         means = self._get_output_samples(num_samples, generator=generator, shared_noise=shared_noise)
-        means, extra_vars, observations = self._sample_given_state(
+        means, extra_vars, observations, combo_idx = self._sample_given_state(
             means,
             generator=generator,
             shared_noise=shared_noise,
             observation_measures=measures if observation_noise else None,
         )
+        noise_scales = None
+        if noise_scale_table is not None:
+            # each draw's deviation from its regime's center, scaled:
+            noise_scales = noise_scale_table[combo_idx]  # (num_samples, num_rows, num_measures)
+            shift, _ = self.mixture.combo_offsets(measures, like=means)
+            centers = self._measured_moments_flat()[0] + shift[combo_idx]
+            means = centers + noise_scales * (means - centers)
+            if observations is not None:
+                observations = centers + noise_scales * (observations - centers)
+            noise_scales = noise_scales.view(num_samples, *batch_shape, len(measures))
+        if combo_idx is not None:
+            combo_idx = combo_idx.view(num_samples, *batch_shape)
         if observations is not None:
             observations = observations.view(num_samples, *batch_shape, len(measures))
 
@@ -1224,14 +1248,44 @@ class Predictions:
             measure_covs=self.measure_covs,
             extra_vars=extra_vars,
             observations=observations,
+            regimes=combo_idx,
+            noise_scales=noise_scales,
         )
+
+    def _regime_noise_scale_table(self, regime_noise_scale: Mapping[str, float]) -> torch.Tensor:
+        """
+        For :func:`sample`'s ``regime_noise_scale``: a ``(num_combos, num_measures)`` table with each measure's scale
+        in each regime-combo.
+        """
+        if self.mixture is None:
+            raise ValueError("`regime_noise_scale` is only for models with mixture components.")
+        components = list(self.mixture.components)
+        known = {c.id for c in components} | {c.qualified_id for c in components}
+        unknown = set(regime_noise_scale) - known
+        if unknown:
+            raise ValueError(f"`regime_noise_scale` has unknown components: {unknown}")
+        if any(v < 0 for v in regime_noise_scale.values()):
+            raise ValueError("`regime_noise_scale` values must be non-negative.")
+        measures = list(self.measurement_model.measures)
+        table = torch.ones(
+            (self.mixture.num_combos, len(measures)), dtype=self.state_means.dtype, device=self.state_means.device
+        )
+        for c, combo in enumerate(self.mixture.combos):
+            for measure, component in zip(self.mixture.mixture_measures, combo):
+                if component is None or measure not in measures:
+                    continue
+                scale = regime_noise_scale.get(component.qualified_id, regime_noise_scale.get(component.id))
+                if scale is not None:
+                    table[c, measures.index(measure)] = scale
+        return table
 
     def _sample_given_state(self,
                             means: torch.Tensor,
                             generator: Optional[torch.Generator],
                             shared_noise: bool,
                             observation_measures: Optional[Sequence[str]]
-                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
+                                       Optional[torch.Tensor]]:
         """
         The rest of a sample, given samples of the measured-mean (one per sample of the state): the regime (for
         models with mixture components), then the observations.
@@ -1240,7 +1294,7 @@ class Predictions:
         :param observation_measures: The measures whose observations to sample (the others' observations are their
          means); or None to skip the observations.
         :return: The means (with the regimes' offsets), the per-sample variances added to the diagonal of
-         ``measure_covs`` (or None), and the observations (or None).
+         ``measure_covs`` (or None), the observations (or None), and the drawn regime-combos (or None).
         """
         # the observations' covariance given the sampled state is `measure_covs` plus a per-sample diagonal (e.g. a
         # binary measure's binomial variance; a regime's extra variance) -- tracked as just that diagonal, rather
@@ -1248,8 +1302,11 @@ class Predictions:
         extra_vars = self._conditional_measure_vars(means)
 
         # sample the regime:
+        combo_idx = None
         if self.mixture is not None:
-            means, extra_vars = self._sample_regimes(means, extra_vars, generator=generator, shared_noise=shared_noise)
+            means, extra_vars, combo_idx = self._sample_regimes(
+                means, extra_vars, generator=generator, shared_noise=shared_noise
+            )
 
         observations = None
         if observation_measures is not None:
@@ -1260,7 +1317,7 @@ class Predictions:
                 measures=observation_measures,
                 shared_noise=shared_noise,
             )
-        return means, extra_vars, observations
+        return means, extra_vars, observations, combo_idx
 
     def _conditional_measure_vars(self, means: torch.Tensor) -> Optional[torch.Tensor]:
         """
@@ -1280,11 +1337,12 @@ class Predictions:
                         means: torch.Tensor,
                         extra_vars: Optional[torch.Tensor],
                         generator: Optional[torch.Generator],
-                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
         their mean and its variance to their (conditional) variance -- i.e. to ``extra_vars``, the per-sample diagonal
-        added to ``measure_covs`` (see ``_conditional_measure_vars``).
+        added to ``measure_covs`` (see ``_conditional_measure_vars``). Also returns the ``(num_samples, num_rows)``
+        indices of the drawn combos.
 
         :param shared_noise: If True, the draws use the same uniforms for every row (inverting each row's cdf of the
          regime-probabilities); otherwise they're independent.
@@ -1301,7 +1359,7 @@ class Predictions:
         else:
             combo_idx = torch.multinomial(regime_probs, num_samples, replacement=True, generator=generator).T
         extra = extra_var[combo_idx]  # (num_samples, num_rows, num_measures)
-        return means + shift[combo_idx], extra if extra_vars is None else extra_vars + extra
+        return means + shift[combo_idx], extra if extra_vars is None else extra_vars + extra, combo_idx
 
     def _sample_observations(self,
                              means: torch.Tensor,
@@ -1893,12 +1951,18 @@ class PredictionSamples:
      extra variance). See :attr:`covs`.
     :param observations: If ``observation_noise=True``, a ``(num_samples, num_groups, num_timesteps, num_measures)``
      tensor of sampled observations.
+    :param regimes: For models with mixture components, a ``(num_samples, num_groups, num_timesteps)`` tensor with
+     the index of each sample's regime-combo (into ``MixtureModel.combos``).
+    :param noise_scales: With ``sample(regime_noise_scale=...)``, a ``(num_samples, num_groups, num_timesteps,
+     num_measures)`` tensor of the scales applied to each draw's deviation from its regime's center.
     """
     measures: list
     means: torch.Tensor
     measure_covs: torch.Tensor
     extra_vars: Optional[torch.Tensor] = None
     observations: Optional[torch.Tensor] = None
+    regimes: Optional[torch.Tensor] = None
+    noise_scales: Optional[torch.Tensor] = None
 
     @property
     def covs(self) -> torch.Tensor:
@@ -1910,6 +1974,8 @@ class PredictionSamples:
         covs = self.measure_covs.expand(self.means.shape[0], *self.measure_covs.shape)
         if self.extra_vars is not None:
             covs = covs + torch.diag_embed(self.extra_vars)
+        if self.noise_scales is not None:
+            covs = covs * self.noise_scales.unsqueeze(-1) * self.noise_scales.unsqueeze(-2)
         return covs
 
     def __getitem__(self, measure: str) -> torch.Tensor:

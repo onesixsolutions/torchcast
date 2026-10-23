@@ -542,3 +542,40 @@ def test_derived_mean_control_variates():
     total = torch.as_tensor(df.query("measure == 'total'")['mean'].to_numpy()).view(num_groups, num_times)
     expected = pred.get_means(transform=LogTransform()).sum(-1)
     assert torch.allclose(total.to(expected.dtype), expected, rtol=1e-4)
+
+
+@torch.no_grad()
+def test_regime_noise_scale():
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalTrend(id=f'trend_{m}', measure=m) for m in 'ab'],
+        measures=['a', 'b'],
+        mixture=[MixtureComponent('a', offset_init=-2., prob_init=.3, id='low')],
+    )
+    pred = kf(torch.randn(3, 10, 2))
+    full = pred.sample(500, shared_noise=False, generator=_gen())
+    pinned = pred.sample(500, shared_noise=False, generator=_gen(), regime_noise_scale={'low': 0.})
+    half = pred.sample(500, shared_noise=False, generator=_gen(), regime_noise_scale={'a.low': .5})
+
+    # the regimes are drawn as usual
+    assert torch.equal(pinned.regimes, full.regimes)
+    low = pinned.regimes == kf.mixture.combos.index((kf.mixture.components[0],))
+    assert .2 < low.float().mean() < .4
+
+    measured_mean, _ = pred._measured_moments_flat()
+    center = (measured_mean[:, 0].view(3, 10) + kf.mixture.components[0].offset).expand_as(low)
+    # draws in the 'low' regime are pinned at its center (or their deviation from it is scaled)
+    assert torch.allclose(pinned.observations[..., 0][low], center[low])
+    assert torch.allclose(pinned.means[..., 0][low], center[low])
+    assert torch.allclose(
+        (half.observations[..., 0] - center)[low], .5 * (full.observations[..., 0] - center)[low], atol=1e-5
+    )
+    # ...while the standard regime, and the other measure, are sampled as usual
+    assert torch.allclose(pinned.observations[..., 0][~low], full.observations[..., 0][~low], atol=1e-5)
+    assert torch.allclose(pinned.observations[..., 1], full.observations[..., 1], atol=1e-5)
+    # covs reflect the scaling
+    assert (pinned.covs[..., 0, :][low] == 0).all()
+    assert torch.allclose(pinned.covs[..., 1, 1], full.covs[..., 1, 1])
+
+    with pytest.raises(ValueError, match='unknown components'):
+        pred.sample(5, shared_noise=True, regime_noise_scale={'high': 0.})
