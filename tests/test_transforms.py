@@ -619,6 +619,9 @@ def test_bias_adjust_per_regime_nonlinear(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(type(pred), '_get_output_samples', lambda *a, **k: pytest.fail("shouldn't sample"))
         all_zero = means({None: 0., 'low': 0.})
+        with pytest.warns(UserWarning, match='group-names'):
+            df = pred.to_dataframe(conf=False, transform=LogTransform(bias_adjust=0.), use_map=False)
+    assert np.allclose(df['mean'].to_numpy(), all_zero.reshape(-1).numpy())
     expected = probs[:, 0] * torch.exp(measured_mean[:, 0]) + probs[:, 1] * torch.exp(measured_mean[:, 0] + offset)
     assert torch.allclose(all_zero.reshape(-1), expected)
 

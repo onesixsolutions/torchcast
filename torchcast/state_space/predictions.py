@@ -310,6 +310,20 @@ class Predictions:
 
         return torch.stack([out[m] for m in all_measures], -1)
 
+    def _needs_mc_means(self, use_map: bool, transforms: dict[str, 'Transform']) -> bool:
+        """
+        Whether the means need monte-carlo samples: for measures with a nonlinear measured-mean, without ``use_map``,
+        unless every regime has ``bias_adjust=0`` (the plug-in, see ``_get_means``).
+        """
+        if use_map:
+            return False
+        identity = _IdentityTransform()
+        return any(
+            not np.isclose(transforms.get(m, identity).var_multi(label), 0)
+            for m in self._nonlinear_measures
+            for label, _, _ in self._regimes(m)
+        )
+
     def _nonlinear_var_multis(self, measure: str, transform: 'Transform') -> dict[Optional[str], Optional[float]]:
         """
         For the monte-carlo means of a measure with a nonlinear measured-mean: each regime's ``bias_adjust`` (see
@@ -788,7 +802,7 @@ class Predictions:
         # (intervals for nonlinear measures are always monte-carlo):
         mmean_samples = None
         needs_mc_intervals = (alpha is not None) and self.measurement_model.is_nonlinear
-        if (not use_map) or needs_mc_intervals:
+        if needs_mc_intervals or self._needs_mc_means(use_map, transforms):
             mmean_samples = self._get_output_samples(num_samples, generator=self._output_generator(state=True))
 
         means = self._get_means(use_map=use_map, transforms=transforms, mmean_samples=mmean_samples)
