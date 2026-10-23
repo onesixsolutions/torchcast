@@ -277,33 +277,57 @@ class Predictions:
             out[measure] = (mixture.probs * torch.stack(regime_means, -1)).sum(-1)
 
         # nonlinear measures (without `use_map`): for each regime, monte-carlo over the state, mixed by the
-        # regime-probabilities (all ones without mixture components):
-        if nonlinear_measures:
-            # to apply a transform with bias_adjust != 1, we need to rescale not just the measurement-var (easy)
-            # but also the state-var; but since we're sampling the state-var, we need to sample it with a scaling factor
-            deviation_scales = [
-                math.sqrt(transforms.get(m, identity).var_multi) if m in nonlinear_measures else 1.
-                for m in all_measures
-            ]
+        # regime-probabilities (all ones without mixture components). `bias_adjust` scales the variance, including the
+        # state's: so the state is sampled with its deviations scaled -- once per measure, so its regimes' nonzero
+        # values must be the same. A regime with `bias_adjust=0` needs no sampling: it's the plug-in `inverse(MAP)`.
+        var_multis = {m: self._nonlinear_var_multis(m, transforms.get(m, identity)) for m in nonlinear_measures}
+        sampled = {m: [v for v in vm.values() if v is not None] for m, vm in var_multis.items()}
+        if any(sampled.values()):
+            deviation_scales = [math.sqrt(sampled[m][0]) if sampled.get(m) else 1. for m in all_measures]
             mmean_samples = self._resolve_mmean_samples(mmean_samples, deviation_scales=deviation_scales)
 
         for measure in nonlinear_measures:
             midx = all_measures.index(measure)
             transform = transforms.get(measure, identity)
             noise_var = self.measure_covs_flat[:, midx, midx]
-            if not self._mixture_components(measure):
-                out[measure] = transform.inverse_mean(mmean_samples[..., midx], noise_var).mean(0).view(*batch_shape)
+            regime_means = []
+            for label, offset, extra in self._regimes(measure):
+                var_multi = var_multis[measure][label]
+                if var_multi is None:  # (bias_adjust=0)
+                    regime_means.append(transform.inverse(measured_mean[:, midx] + offset))
+                else:
+                    regime_means.append(transform.inverse_mean(
+                        mmean_samples[..., midx] + offset,
+                        (noise_var + extra) * var_multi,
+                        adjust_bias=False,
+                        regime=label,
+                    ).mean(0))
+            if len(regime_means) == 1:
+                out[measure] = regime_means[0].view(*batch_shape)
                 continue
-
-            # more complex logic for measures with mixture components:
-            regime_means = [
-                transform.inverse_mean(mmean_samples[..., midx] + offset, noise_var + extra, regime=label).mean(0)
-                for label, offset, extra in self._regimes(measure)
-            ]
             probs = self._measure_regime_probs(measure).view(-1, len(regime_means))
             out[measure] = (probs * torch.stack(regime_means, -1)).sum(-1).view(*batch_shape)
 
         return torch.stack([out[m] for m in all_measures], -1)
+
+    def _nonlinear_var_multis(self, measure: str, transform: 'Transform') -> dict[Optional[str], Optional[float]]:
+        """
+        For the monte-carlo means of a measure with a nonlinear measured-mean: each regime's ``bias_adjust`` (see
+        ``Transform.var_multi``), or None where it's 0 (no sampling needed). The state is sampled once per measure, so
+        the other regimes' values must be the same -- if not, they're ignored (with a warning), i.e. set to 1.
+        """
+        out = {}
+        for label, _, _ in self._regimes(measure):
+            var_multi = transform.var_multi(label)
+            out[label] = None if np.isclose(var_multi, 0) else var_multi
+        nonzero = {v for v in out.values() if v is not None}
+        if len(nonzero) > 1:
+            warn(
+                f"'{measure}' has a nonlinear measured-mean, so its regimes' `bias_adjust` values must be 0 or the "
+                f"same, got {transform.bias_adjust}; using 1 for those that aren't 0."
+            )
+            out = {k: (None if v is None else 1.) for k, v in out.items()}
+        return out
 
     # Log-probability --------------------------------------------------------------------------------------------------
 

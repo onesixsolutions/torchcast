@@ -580,3 +580,60 @@ def test_dataloader_from_dataframe_transform():
             idx = [list(expected.group_names).index(g) for g in batch.group_names]
             assert torch.equal(batch.tensors[0], expected.tensors[0][idx])
             assert torch.equal(batch.tensors[1], expected.tensors[1][idx])
+
+
+def _mixture_preds(nonlinear: bool):
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalLevel(id='level', measure='y')],
+        measures=['y'],
+        measure_funs={'y': 'sigmoid'} if nonlinear else None,
+        mixture=[MixtureComponent('y', offset_init=-1., prob_init=.3, id='low')],
+    )
+    with torch.no_grad():
+        return kf(torch.rand(3, 10, 1) if nonlinear else torch.randn(3, 10, 1))
+
+
+@torch.no_grad()
+def test_bias_adjust_per_regime_linear():
+    # e.g. the median of a low-outlier regime, the mean of the standard regime
+    pred = _mixture_preds(nonlinear=False)
+    means = pred.get_means(transform=LogTransform(bias_adjust={'low': 0.}))[..., 0]
+    mixture = pred.get_mixture('y')
+    standard = torch.exp(mixture.means[..., 0] + mixture.vars[..., 0] / 2)
+    low = torch.exp(mixture.means[..., 1])
+    assert torch.allclose(means, mixture.probs[..., 0] * standard + mixture.probs[..., 1] * low)
+
+
+@torch.no_grad()
+def test_bias_adjust_per_regime_nonlinear(monkeypatch):
+    pred = _mixture_preds(nonlinear=True)
+    measured_mean, _ = pred._measured_moments_flat()
+    probs = pred._measure_regime_probs('y').reshape(-1, 2)
+    offset = pred.mixture.components[0].offset
+
+    def means(bias_adjust):
+        return pred.get_means(transform=LogTransform(bias_adjust=bias_adjust), use_map=False, num_samples=50)[..., 0]
+
+    # all regimes at bias_adjust=0: the plug-in inverse(MAP) per regime, mixed -- with no sampling
+    with monkeypatch.context() as m:
+        m.setattr(type(pred), '_get_output_samples', lambda *a, **k: pytest.fail("shouldn't sample"))
+        all_zero = means({None: 0., 'low': 0.})
+    expected = probs[:, 0] * torch.exp(measured_mean[:, 0]) + probs[:, 1] * torch.exp(measured_mean[:, 0] + offset)
+    assert torch.allclose(all_zero.reshape(-1), expected)
+
+    # each regime is handled separately: changing one regime's value changes only its term
+    # (low at 0) - (both at 0) == (neither at 0) - (standard at 0): the standard regime's term, sampled minus plug-in
+    assert torch.allclose(means({'low': 0.}) - all_zero, means(None) - means({None: 0.}), atol=1e-5)
+
+    # nonzero values must be the same across a nonlinear measure's regimes
+    with pytest.warns(UserWarning, match="must be 0 or the same"):
+        means({None: .5, 'low': .3})
+
+
+def test_bias_adjust_validation():
+    with pytest.raises(ValueError):
+        LogTransform(bias_adjust={'low': 1.5})
+    assert LogTransform(bias_adjust={'low': 0.}).var_multi('low') == 0.
+    assert LogTransform(bias_adjust={'low': 0.}).var_multi(None) == 1.
+    assert LogTransform(bias_adjust=.5).var_multi('low') == .5

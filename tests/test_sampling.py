@@ -510,9 +510,9 @@ def test_sample_outputs_chunked(nonlinear: bool, monkeypatch):
     df_chunked, means_chunked = outputs()
 
     assert len(calls) == num_groups
-    # (identical draws; `derived` means differ only by floating-point rounding, from batched linear algebra)
+    # (identical draws: results differ only by floating-point rounding, e.g. from batched linear algebra)
     pd.testing.assert_frame_equal(df_chunked, df_whole, check_exact=False, rtol=1e-5, atol=1e-5)
-    assert torch.equal(means_chunked, means_whole)
+    assert torch.allclose(means_chunked, means_whole, rtol=1e-5, atol=1e-5)
 
 
 @torch.no_grad()

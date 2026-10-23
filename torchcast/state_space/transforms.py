@@ -2,7 +2,7 @@
 Transforms for mapping predictions from the scale a measure is modeled on (e.g. log) back to its original scale.
 """
 import math
-from typing import Optional, TYPE_CHECKING, Mapping
+from typing import Optional, TYPE_CHECKING, Mapping, Union
 
 import numpy as np
 import torch
@@ -27,23 +27,34 @@ class Transform(torch.nn.Module):
      back-transformed mean is computed with the variance scaled by this: 1 (the default, ``None``) gives the mean of
      the back-transformed distribution; 0 gives no bias-adjustment (i.e. the back-transformed median). Doesn't affect
      intervals. For monte-carlo means (e.g. ``use_map=False`` for nonlinear measures), the variance of the sampled state
-     is scaled too. Ignored (with a warning) for ``Predictions.to_dataframe(derived=...)``, which back-transforms
-     samples.
+     is scaled too. For a measure with mixture components, this can be a dictionary by regime: ``{component_id:
+     value}`` (``None`` for the standard regime; regimes that aren't in it get 1) -- e.g. ``{'low': 0.}`` for the
+     median of a low-outlier regime. (For a measure with a nonlinear measured-mean, a regime's value must be 0, or the
+     same as its other regimes' nonzero values.) Ignored (with a warning) for ``Predictions.to_dataframe(derived=...)``,
+     which back-transforms samples.
     """
     num_nodes: int = 32
     # the quadrature's intermediates have (number of elements) x (number of nodes) values: it's computed in chunks of
     # elements, so they stay below about this many (e.g. for many monte-carlo samples x rows):
     max_quadrature_size: int = 2 ** 24
 
-    def __init__(self, bias_adjust: Optional[float] = None):
+    def __init__(self, bias_adjust: Union[float, Mapping[Optional[str], float], None] = None):
         super().__init__()
-        if bias_adjust is not None and not 0 <= bias_adjust <= 1:
+        values = bias_adjust.values() if isinstance(bias_adjust, Mapping) else [bias_adjust]
+        if any(v is not None and not 0 <= v <= 1 for v in values):
             raise ValueError("`bias_adjust` must be between 0 and 1.")
-        self.bias_adjust = bias_adjust
+        self.bias_adjust = dict(bias_adjust) if isinstance(bias_adjust, Mapping) else bias_adjust
 
-    @property
-    def var_multi(self) -> float:
-        return 1. if self.bias_adjust is None else self.bias_adjust
+    def var_multi(self, regime: Optional[str] = None) -> float:
+        """
+        :param regime: For a measure with mixture components: None for the standard regime, else the component's
+         ``id``.
+        :return: The factor the variance is scaled by, for the back-transformed mean (see ``bias_adjust``).
+        """
+        bias_adjust = self.bias_adjust
+        if isinstance(bias_adjust, dict):
+            bias_adjust = bias_adjust.get(regime)
+        return 1. if bias_adjust is None else float(bias_adjust)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -77,7 +88,7 @@ class Transform(torch.nn.Module):
          differs by regime (a :class:`SmearingTransform` from :func:`SmearingTransform.from_predictions`).
         :return: A tensor with the same shape as ``mean``.
         """
-        return self._expected_inverse(mean, var * (self.var_multi if adjust_bias else 1.), regime=regime)
+        return self._expected_inverse(mean, var * (self.var_multi(regime) if adjust_bias else 1.), regime=regime)
 
     def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
         """
@@ -135,7 +146,10 @@ class LogTransform(Transform):
     :param bias_adjust: See :class:`Transform`.
     """
 
-    def __init__(self, offset: float = 0.0, base: float = math.e, bias_adjust: Optional[float] = None):
+    def __init__(self,
+                 offset: float = 0.0,
+                 base: float = math.e,
+                 bias_adjust: Union[float, Mapping[Optional[str], float], None] = None):
         super().__init__(bias_adjust=bias_adjust)
         assert base > 0
         self._log_base = math.log(base)
@@ -166,7 +180,7 @@ class BoxCoxTransform(Transform):
     :param bias_adjust: See :class:`Transform`.
     """
 
-    def __init__(self, lmbda: float, bias_adjust: Optional[float] = None):
+    def __init__(self, lmbda: float, bias_adjust: Union[float, Mapping[Optional[str], float], None] = None):
         super().__init__(bias_adjust=bias_adjust)
         if lmbda < 0:
             raise ValueError("`lmbda` must be non-negative.")
