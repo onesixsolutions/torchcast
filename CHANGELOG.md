@@ -131,6 +131,20 @@ A parameterization that separates scale from correlation: `diag(std) @ R @ diag(
 - Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
 - Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
 
+### New option: uncorrelated groups of processes or measures (`corr_groups`)
+
+`Covariance.from_processes(processes, corr_groups=[['transient_a', 'transient_b']])` (and `Covariance.from_measures(measures, corr_groups=...)`, keyed on measure names) makes the listed processes correlated with each other but uncorrelated with all the others; processes not in any group form one more group together, and a process's own state-elements always stay correlated. E.g. a random-walk level and a decaying level on the same measure are poorly identified with correlated process-noise (only their sum is observed, and correlated shocks let many combinations of their variances fit equally well); grouping the decaying levels separates them, while keeping the correlations between measures within each group. Groups (rather than arbitrary pairs) are exactly the zero-patterns that masking can guarantee to keep a covariance positive semi-definite.
+
+- Implemented as `Covariance(..., corr_mask=)`: a `(rank, rank)` tensor that the covariance is multiplied by elementwise. It's validated to be symmetric, with ones on the diagonal, and positive semi-definite (which, by the Schur product theorem, guarantees the masked covariance is too). The parameters for masked-out entries remain, but get no gradient. Modules without a mask (incl. those pickled or saved by older versions) are unchanged.
+- `KalmanFilter` now warns when two level-like processes on the same measure (state-elements with process-noise, a fixed measurement-weight, that transition only to themselves -- e.g. `LocalLevel`, `LocalTrend`'s position) have correlated process-noise, with a ready-made `corr_groups` that puts the decaying ones in their own group.
+- `LocalLevel`'s docs note that `decay=True` can't give a half-life below ~13 timesteps, and encourage setting the bounds from domain-knowledge.
+
+### New option: separate adaptive-scaling of the process-covariance
+
+`EWMAdaptiveScaler(num_measures, separate_process_weight=True)` (pass it as `adaptive_scaling=`) learns a second exponent for the process-covariance: the measure-covariance is scaled by `running_std ** weight` and the process-covariance by `running_std ** process_weight`, from the same running statistics. By default (and for models saved by older versions) one multiplier scales both, which suits series that differ in magnitude, where everything about a group is scaled together. For transformed (e.g. log-scaled) measures, where the transform already handles magnitude and the scaling is about how *noisy* each group is, the default also gives noisier groups a faster-moving state -- and, compounded over long forecast horizons, a very large forecast variance (e.g. inflating a log-normal back-transformed mean by orders of magnitude for a few erratic groups). With a separate exponent, the model learns how much of the scaling belongs to the process.
+
+- `AdaptiveScaler` gains `has_process_multiplier` (False by default) and `process_multiplier()`, so custom scalers can do the same. With a process-multiplier, the multiplier recorded per timestep (e.g. in `StateTuple.scaling['multiplier']`) is `(num_groups, 2 * num_measures)`: the measure-multiplier, then the process-multiplier.
+
 ## v1.1.3 (2026-10-07)
 
 ### Bug fix: covariance of `n_step > 1` predictions
