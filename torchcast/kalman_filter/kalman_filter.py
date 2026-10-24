@@ -5,10 +5,12 @@ algorithm (or optionally extended-kalman filtering, if any measure-funs or nonli
 This class inherits most of its methods from :class:`torchcast.state_space.StateSpaceModel`.
 """
 from typing import Sequence
+from warnings import warn
 
 from torchcast.covariance import Covariance
 from torchcast.internals.utils import update_tensor, mvnorm_log_prob
 from torchcast.process import Process
+from torchcast.process.utils import StateElement, FixedValue
 
 from torchcast.mixture import MixtureModel, MixtureComponent
 from torchcast.state_space.state_space import StateSpaceModel, StateTuple
@@ -16,6 +18,23 @@ from torchcast.state_space.state_space import StateSpaceModel, StateTuple
 from typing import Optional, Union
 
 import torch
+
+
+def _is_level_like(se: StateElement) -> bool:
+    """
+    Whether a state element acts as a (possibly decaying) level on its measure: it has process-noise, a fixed non-zero
+    weight in the measurement, and transitions only to itself. E.g. ``LocalLevel``'s level and ``LocalTrend``'s
+    position; not seasons (whose elements rotate into each other) or regression coefficients (weighted by predictors).
+    """
+    if not se.has_process_variance or not isinstance(se._measure_multi, FixedValue):
+        return False
+    return bool(se._measure_multi.value != 0) and set(se.transitions_to) == {se.name}
+
+
+def _has_decay(se: StateElement) -> bool:
+    """Whether a state element's transition to itself is (or may be learned to be) less than 1."""
+    multi = se.transitions_to[se.name]
+    return not (isinstance(multi, FixedValue) and bool(multi.value == 1))
 
 
 class KalmanFilter(StateSpaceModel):
@@ -66,6 +85,58 @@ class KalmanFilter(StateSpaceModel):
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
         self.joseph_form = joseph_form
+        self._warn_correlated_levels()
+
+    def _warn_correlated_levels(self):
+        """
+        Two level-like processes (e.g. a random-walk and a decaying level) on the same measure, with correlated
+        process-noise, are poorly identified: only their sum is observed, and correlated shocks let many combinations
+        of their variances fit equally well.
+        """
+        corr_mask = getattr(self.process_covariance, 'corr_mask', None)
+        level_idx = {}  # process id -> index of its level-like state element
+        decaying = set()
+        start = 0
+        for pid, p in self.processes.items():
+            for i, se in enumerate(p.state_elements.values()):
+                if pid not in level_idx and _is_level_like(se):
+                    level_idx[pid] = start + i
+                    if _has_decay(se):
+                        decaying.add(pid)
+            start += p.rank
+        by_measure = {}
+        for pid in level_idx:
+            by_measure.setdefault(self.processes[pid].measure, []).append(pid)
+
+        correlated = [
+            (a, b) for pids in by_measure.values() for i, a in enumerate(pids) for b in pids[i + 1:]
+            if corr_mask is None or corr_mask[level_idx[a], level_idx[b]] != 0
+        ]
+        if not correlated:
+            return
+        msg = (
+            f"These pairs of level-like processes are on the same measure and have correlated process-noise: "
+            f"{correlated}. That's poorly identified: only their sum is observed, and correlated shocks let many "
+            f"combinations of their variances fit equally well."
+        )
+        # suggestion: decaying levels in one group (correlated across measures), the non-decaying ones in the other:
+        separable = [(a, b) for a, b in correlated if (a in decaying) != (b in decaying)]
+        if separable:
+            suggestion = [[pid for pid in level_idx if pid in decaying]]
+            msg += (
+                f" Consider making the decaying levels uncorrelated with the others, e.g.:\n"
+                f"  process_covariance=Covariance.from_processes(processes, corr_groups={suggestion})\n"
+                f"(The processes in each group are correlated with each other, but not with those in other groups; "
+                f"processes not in any group form one more group together.)"
+            )
+        inseparable = [pair for pair in correlated if pair not in separable]
+        if inseparable:
+            msg += (
+                f" {inseparable} are both decaying or both not, so this doesn't separate them (e.g. two random walks "
+                f"on one measure act as one); consider removing one, or giving them different decay ranges and "
+                f"separate ``corr_groups``."
+            )
+        warn(msg)
 
     def __setstate__(self, state: dict):
         state.setdefault('joseph_form', True)  # (missing in models pickled before it existed)

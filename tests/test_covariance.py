@@ -1,4 +1,5 @@
 import math
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -7,7 +8,7 @@ import torch
 
 from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag
 from torchcast.kalman_filter import BinomialFilter, KalmanFilter
-from torchcast.process import LocalLevel
+from torchcast.process import LocalLevel, LocalTrend
 from torchcast.process.utils import Identity
 
 
@@ -281,3 +282,107 @@ def test_binomial_filter_accepts_covariance():
         measure_covariance=Covariance(rank=2, empty_idx=[0], init_diag_multi=1., method='sd_corr')
     )
     assert bf.measure_covariance.method == 'sd_corr'
+
+
+def test_corr_groups_from_processes():
+    processes = [LocalLevel(id='a'), LocalTrend(id='b'), LocalLevel(id='c'), LocalLevel(id='d')]
+    # elements: a.position, b.position, b.velocity, c.position, d.position
+    cov = Covariance.from_processes(processes, corr_groups=[['b', 'c']])
+    expected = torch.tensor([[1., 0., 0., 0., 1.],
+                             [0., 1., 1., 1., 0.],
+                             [0., 1., 1., 1., 0.],
+                             [0., 1., 1., 1., 0.],
+                             [1., 0., 0., 0., 1.]])  # 'a' and 'd' are unlisted, so in one group together
+    assert torch.equal(cov.corr_mask, expected)
+
+
+def test_corr_groups_from_measures():
+    cov = Covariance.from_measures(['x', 'y', 'z'], corr_groups=[['x'], ['y']])
+    assert torch.equal(cov.corr_mask, torch.eye(3))
+
+
+@pytest.mark.parametrize('corr_groups,match', [
+    ([['a', 'nope']], "unknown process id 'nope'"),
+    ([['a'], ['a', 'b']], "'a' in more than one group"),
+    (['a', 'b'], "list of lists"),
+])
+def test_corr_groups_errors(corr_groups: list, match: str):
+    processes = [LocalLevel(id='a'), LocalLevel(id='b')]
+    with pytest.raises((ValueError, TypeError), match=match):
+        Covariance.from_processes(processes, corr_groups=corr_groups)
+    with pytest.raises(TypeError, match="not both"):
+        Covariance.from_processes(processes, corr_groups=[['a']], corr_mask=torch.eye(2))
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+@pytest.mark.parametrize('empty_idx', [(), (1,)])
+def test_corr_mask(method: str, empty_idx: tuple):
+    torch.manual_seed(0)
+    rank = 5
+    corr_mask = torch.tensor([[1., 0., 1., 0., 1.],
+                              [0., 1., 0., 1., 0.],
+                              [1., 0., 1., 0., 1.],
+                              [0., 1., 0., 1., 0.],
+                              [1., 0., 1., 0., 1.]])
+    module = Covariance(rank=rank, init_diag_multi=1., method=method, empty_idx=list(empty_idx), corr_mask=corr_mask)
+    unmasked = Covariance(rank=rank, init_diag_multi=1., method=method, empty_idx=list(empty_idx))
+    unmasked.load_state_dict({k: v for k, v in module.state_dict().items() if k != 'corr_mask'})
+    with torch.no_grad():
+        cov = module({}, num_groups=1, num_times=1).squeeze()
+        cov_unmasked = unmasked({}, num_groups=1, num_times=1).squeeze()
+    # masked entries are zero, others (and empty rows/cols) as without the mask:
+    assert torch.allclose(cov, cov_unmasked * corr_mask)
+    assert torch.linalg.eigvalsh(cov).min() > -1e-6
+    # no gradient flows through masked-out entries:
+    module({}, num_groups=1, num_times=1)[0, 0, 0, 3].backward()
+    assert all(p.grad is None or (p.grad == 0).all() for p in module.parameters())
+    # the mask is carried through conversions and the state-dict:
+    assert torch.allclose(module.to_method('sd_corr')({}, num_groups=1, num_times=1).squeeze(), cov, atol=1e-5)
+    assert 'corr_mask' in module.state_dict()
+
+
+def test_corr_mask_validation():
+    with pytest.raises(ValueError, match="symmetric"):
+        Covariance(rank=2, init_diag_multi=1., corr_mask=torch.tensor([[1., 1.], [0., 1.]]))
+    with pytest.raises(ValueError, match="diagonal"):
+        Covariance(rank=2, init_diag_multi=1., corr_mask=torch.tensor([[1., 0.], [0., 0.]]))
+    with pytest.raises(ValueError, match="positive semi-definite"):
+        # 0 and 2 uncorrelated, but both correlated with 1: not PSD
+        Covariance(rank=3, init_diag_multi=1., corr_mask=torch.tensor([[1., 1., 0.], [1., 1., 1.], [0., 1., 1.]]))
+
+
+def test_corr_mask_absent_buffer():
+    # modules pickled before ``corr_mask`` existed don't have the buffer:
+    module = Covariance(rank=3, init_diag_multi=1.)
+    assert 'corr_mask' not in module._buffers
+    module({}, num_groups=1, num_times=1)
+
+
+def test_corr_groups_in_kalman_filter():
+    processes = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=['y'],
+        process_covariance=Covariance.from_processes(processes, corr_groups=[['transient']])
+    )
+    y = torch.randn(3, 20, 1).cumsum(1)
+    kf(y).log_prob(y).mean().backward()
+    pcov = kf.process_covariance({}, num_groups=1, num_times=1).squeeze()
+    assert pcov[0, 1] == 0 and pcov[1, 0] == 0
+
+
+def test_warn_correlated_levels():
+    def make(**kwargs):
+        processes = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
+        if kwargs.pop('uncorrelated', False):
+            kwargs['process_covariance'] = Covariance.from_processes(processes, corr_groups=[['transient']])
+        return KalmanFilter(processes=processes, measures=['y'], **kwargs)
+
+    with pytest.warns(UserWarning, match=r"corr_groups=\[\['transient'\]\]"):
+        make()
+    with pytest.warns(UserWarning, match="both decaying or both not"):
+        KalmanFilter(processes=[LocalLevel(id='a'), LocalLevel(id='b')], measures=['y'])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        make(uncorrelated=True)
+        KalmanFilter(processes=[LocalLevel(id='a', measure='x'), LocalLevel(id='b', measure='y')], measures=['x', 'y'])

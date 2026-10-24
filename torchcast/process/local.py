@@ -14,7 +14,9 @@ class LocalLevel(Process):
      (note that this means you should center your time-series, or you should include another process that does not
      have this decaying behavior). Decay can be between 0 and 1, but values < .50 (or even .90) can often be too
      rapid and you will run into trouble with vanishing gradients. When passing a pair of floats, the nn.Module will
-     assign a parameter representing the decay as a learned parameter somewhere between these bounds.
+     assign a parameter representing the decay as a learned parameter somewhere between these bounds. The default value
+     means a half-life that can't go lower than ~13 timesteps; overriding this based on your domain-knowledge is
+     encouraged.
     """
 
     def __init__(self,
