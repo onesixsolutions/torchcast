@@ -48,6 +48,21 @@ class AdaptiveScaler(nn.Module):
         """
         raise NotImplementedError
 
+    @property
+    def has_process_multiplier(self) -> bool:
+        """
+        Whether the process-covariance gets its own multiplier (see :func:`process_multiplier`). If False, the
+        multiplier from :func:`forward` scales both the measure- and the process-covariance.
+        """
+        return False
+
+    def process_multiplier(self) -> torch.Tensor:
+        """
+        If :attr:`has_process_multiplier`: the multiplier for the process-covariance's standard-deviations, as of the
+        last call to :func:`forward`. A ``(num_groups, num_measures)`` tensor, applied to each measure's processes.
+        """
+        raise NotImplementedError
+
     def forward(self,
                 residuals: torch.Tensor,
                 skip_mask: torch.Tensor,
@@ -70,6 +85,15 @@ class EWMAdaptiveScaler(AdaptiveScaler):
     Tracks a running mean of squared residuals per group and measure, and returns ``running_std ** weight`` as a
     multiplier on the standard-deviations. The running mean starts at 1 (multiplier 1, i.e. no adjustment), so groups
     with no observations get no adjustment, and groups with few observations are shrunk towards no adjustment.
+
+    :param num_measures: The number of measures (with measure-variance).
+    :param eps: Lower bound for the running mean of squared residuals.
+    :param separate_process_weight: By default, the multiplier scales both the measure- and the process-covariance.
+     That suits series that differ in magnitude (e.g. untransformed), where everything about a group's process is
+     scaled up or down together. With ``True``, the process-covariance gets its own learned exponent
+     (``running_std ** process_weight``), so that e.g. a group whose observations are noisier doesn't automatically get
+     a faster-moving latent state too. A useful option for transformed (e.g. log-scaled) measures, where differences
+     in magnitude are already handled by the transform, and the scaling is about how noisy each group is.
     """
     # The value the running mean of squared residuals starts at. Instances created by older versions of torchcast
     # started at 0 (so groups with few/no observations were shrunk towards zero variance). This class-level default
@@ -79,7 +103,8 @@ class EWMAdaptiveScaler(AdaptiveScaler):
 
     def __init__(self,
                  num_measures: int,
-                 eps: float = 1e-3):
+                 eps: float = 1e-3,
+                 separate_process_weight: bool = False):
         super().__init__()
 
         # initial alpha:
@@ -93,6 +118,8 @@ class EWMAdaptiveScaler(AdaptiveScaler):
         # coef from log-std to multiplier:
         # initialize with small positive value
         self.weight = nn.Parameter(torch.randn(num_measures).abs() * .01)
+        if separate_process_weight:
+            self.process_weight = nn.Parameter(torch.randn(num_measures).abs() * .01)
 
         # prevent scaling from going to zero:
         self.eps = eps
@@ -179,5 +206,20 @@ class EWMAdaptiveScaler(AdaptiveScaler):
             alpha = alpha * weights
         ewma = (1 - alpha) * self._running + alpha * sq_resids
         self._running = ewma.clamp(self.eps)
+        return self._multiplier(self.weight)
+
+    def _multiplier(self, weight: torch.Tensor) -> torch.Tensor:
         log_running_std = torch.log(self._running ** .5)
-        return torch.exp(torch.clamp(log_running_std * self.weight, max=8))
+        return torch.exp(torch.clamp(log_running_std * weight, max=8))
+
+    @property
+    def has_process_multiplier(self) -> bool:
+        # (getattr: instances pickled before `process_weight` existed don't have it)
+        return getattr(self, 'process_weight', None) is not None
+
+    def process_multiplier(self) -> torch.Tensor:
+        if not self.has_process_multiplier:
+            raise RuntimeError("This scaler was created without `separate_process_weight`.")
+        if self._running is None:
+            raise RuntimeError("`process_multiplier()` is only available after `forward()`.")
+        return self._multiplier(self.process_weight)
