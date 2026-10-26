@@ -408,6 +408,9 @@ class StateSpaceModel(torch.nn.Module):
 
         if scaling is None:
             return cov
+        if scaling.shape[-1] == 2 * len(self.measures):
+            # separate multipliers for the measure- and the process-covariance (see `_get_scaling_multi`):
+            scaling = scaling[..., len(self.measures):] if is_process_cov else scaling[..., :len(self.measures)]
         assert scaling.shape[-1] == len(self.measures)
 
         if is_process_cov:
@@ -440,7 +443,8 @@ class StateSpaceModel(torch.nn.Module):
         if state is None:
             return None
         if multiplier is None:  # (no update yet: no scaling)
-            multiplier = torch.ones((num_groups, len(self.measures)), dtype=like.dtype, device=like.device)
+            width = len(self.measures) * (2 if self.adaptive_scaling.has_process_multiplier else 1)
+            multiplier = torch.ones((num_groups, width), dtype=like.dtype, device=like.device)
         return {**state, 'multiplier': multiplier}
 
     def _get_scaling_multi(self,
@@ -451,6 +455,9 @@ class StateSpaceModel(torch.nn.Module):
         :param regime_probs: If the model has mixture components, the ``(num_groups, num_combos)`` posterior
          regime-probabilities from the update-step. Residuals are then weighted by the probability that each measure
          is in its standard regime, so that residuals explained by a mixture component don't inflate the scaling.
+        :return: A ``(num_groups, num_measures)`` multiplier for the standard-deviations; or, if the scaler has a
+         separate process-multiplier, ``(num_groups, 2 * num_measures)``: the measure-multiplier, then the
+         process-multiplier (``_apply_cov_scaling`` takes the relevant half).
         """
         if self.adaptive_scaling:
             idx = self.measure_covariance.non_empty_idx
@@ -465,7 +472,11 @@ class StateSpaceModel(torch.nn.Module):
             # Handle empty measures (those not in the covariance structure)
             multi_padded = torch.ones_like(input)
             multi_padded[..., idx] = multi
-            return multi_padded
+            if not self.adaptive_scaling.has_process_multiplier:
+                return multi_padded
+            process_padded = torch.ones_like(input)
+            process_padded[..., idx] = self.adaptive_scaling.process_multiplier()
+            return torch.cat([multi_padded, process_padded], dim=-1)
         else:
             return None
 
