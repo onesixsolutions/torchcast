@@ -146,12 +146,6 @@ A parameterization that separates scale from correlation: `diag(std) @ R @ diag(
 - `KalmanFilter` now warns when two level-like processes on the same measure (state-elements with process-noise, a fixed measurement-weight, that transition only to themselves -- e.g. `LocalLevel`, `LocalTrend`'s position) have correlated process-noise, with a ready-made `corr_groups` that puts the decaying ones in their own group.
 - `LocalLevel`'s docs note that `decay=True` can't give a half-life below ~13 timesteps, and encourage setting the bounds from domain-knowledge.
 
-### New option: separate adaptive-scaling of the process-covariance
-
-`EWMAdaptiveScaler(num_measures, separate_process_weight=True)` (pass it as `adaptive_scaling=`) learns a second exponent for the process-covariance: the measure-covariance is scaled by `running_std ** weight` and the process-covariance by `running_std ** process_weight`, from the same running statistics. By default (and for models saved by older versions) one multiplier scales both, which suits series that differ in magnitude, where everything about a group is scaled together. For transformed (e.g. log-scaled) measures, where the transform already handles magnitude and the scaling is about how *noisy* each group is, the default also gives noisier groups a faster-moving state -- and, compounded over long forecast horizons, a very large forecast variance (e.g. inflating a log-normal back-transformed mean by orders of magnitude for a few erratic groups). With a separate exponent, the model learns how much of the scaling belongs to the process.
-
-- `AdaptiveScaler` gains `has_process_multiplier` (False by default) and `process_multiplier()`, so custom scalers can do the same. With a process-multiplier, the multiplier recorded per timestep (e.g. in `StateTuple.scaling['multiplier']`) is `(num_groups, 2 * num_measures)`: the measure-multiplier, then the process-multiplier.
-
 ## v1.1.3 (2026-10-07)
 
 ### Bug fix: covariance of `n_step > 1` predictions
