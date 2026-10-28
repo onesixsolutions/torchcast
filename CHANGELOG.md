@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Unreleased
+## v2.0.0 (unreleased)
 
 ### New feature: mixture components (experimental)
 
