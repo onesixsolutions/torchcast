@@ -14,6 +14,7 @@ import os
 import sys
 
 import strong_sphinx_theme
+from sphinx.ext.autodoc import ClassDocumenter
 
 sys.path.insert(0, os.path.abspath('../torchcast'))
 
@@ -78,3 +79,33 @@ intersphinx_mapping = {
 nbsphinx_custom_formats = {
     '.py': ['jupytext.reads', {'fmt': 'py:percent'}],
 }
+
+
+def _skip_object_base(app, name, obj, options, bases):
+    if not any(base.__module__.startswith('torchcast') for base in bases):
+        bases[:] = []
+
+
+# Sphinx's ClassDocumenter unconditionally emits a "Bases: %s" line even when
+# `bases` has been emptied by the `autodoc-process-bases` event above, so we
+# have to patch it out after the fact rather than via that event alone.
+_orig_add_directive_header = ClassDocumenter.add_directive_header
+
+
+def _add_directive_header_no_bare_bases(self, sig):
+    result = self.directive.result
+    start = len(result)
+    _orig_add_directive_header(self, sig)
+    for i in range(start, len(result)):
+        if result[i].strip() == 'Bases:':
+            del result[i]
+            if i > start and result[i - 1].strip() == '':
+                del result[i - 1]
+            break
+
+
+ClassDocumenter.add_directive_header = _add_directive_header_no_bare_bases
+
+
+def setup(app):
+    app.connect('autodoc-process-bases', _skip_object_base)

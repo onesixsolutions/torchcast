@@ -37,7 +37,16 @@ class AdaptiveScaler(nn.Module):
 class EWMAdaptiveScaler(AdaptiveScaler):
     """
     Exponentially Weighted Moving Average (EWM) based adaptive scaling.
+
+    Tracks a running mean of squared residuals per group and measure, and returns ``running_std ** weight`` as a
+    multiplier on the standard-deviations. The running mean starts at 1 (multiplier 1, i.e. no adjustment), so groups
+    with no observations get no adjustment, and groups with few observations are shrunk towards no adjustment.
     """
+    # The value the running mean of squared residuals starts at. Instances created by older versions of torchcast
+    # started at 0 (so groups with few/no observations were shrunk towards zero variance). This class-level default
+    # keeps that behavior for instances unpickled from those versions (unpickling doesn't call ``__init__``), while
+    # ``__init__`` sets the new default. For ``load_state_dict()``, see ``_load_from_state_dict``.
+    _running_init: float = 0.0
 
     def __init__(self,
                  num_measures: int,
@@ -59,9 +68,27 @@ class EWMAdaptiveScaler(AdaptiveScaler):
         # prevent scaling from going to zero:
         self.eps = eps
 
+        self._running_init = 1.0
+
         self._running = None
         self._time = None
         self._called_initialize = None
+
+    def get_extra_state(self) -> dict:
+        return {'running_init': self._running_init}
+
+    def set_extra_state(self, state: dict):
+        self._running_init = state['running_init']
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        # state-dicts saved by older versions have no extra-state; those params were fit with a running-init of 0:
+        extra_state_key = prefix + '_extra_state'
+        if extra_state_key not in state_dict:
+            state_dict = {**state_dict, extra_state_key: {'running_init': 0.0}}
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     @torch.no_grad()
     def initialize(self, num_timesteps: int):
@@ -88,7 +115,7 @@ class EWMAdaptiveScaler(AdaptiveScaler):
 
     def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
         if self._running is None:
-            self._running = torch.zeros_like(residuals)
+            self._running = torch.full_like(residuals, self._running_init)
             self._time = torch.zeros_like(residuals)
         self._time += (~skip_mask).int()
 

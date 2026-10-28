@@ -68,11 +68,3 @@ include_trailing_comma = true
 force_grid_wrap = 0
 use_parentheses = true
 line_length = 120
-
-[tool.semantic_release]
-version_variables = ["torchcast/__init__.py:__version__"]
-commit_author = "Strong Analytics <access@strong.io>"
-commit_message = "Bump to {version} [skip ci]"
-
-[tool.semantic_release.publish]
-upload_to_vcs_release = true
