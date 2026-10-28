@@ -601,6 +601,24 @@ def test_sigmoid_legacy_jacobian_unpickling():
 
 
 @torch.no_grad()
+def test_unpickling_model_from_before_mixtures():
+    """Models pickled before mixture components existed have no `mixture` attribute; they should still predict."""
+    import pickle
+    from torchcast.kalman_filter import BinomialFilter
+
+    torch.manual_seed(0)
+    y = torch.randn(3, 10, 2)
+    y[..., 0] = (y[..., 0] > 0).float()
+    kf = BinomialFilter(processes=[LocalLevel(id='lv', measure='v'), LocalLevel(id='ls', measure='s')],
+                        measures=['v', 's'], binary_measures=['v'])
+    expected = kf(y).means
+    del kf.mixture  # simulate an older pickle
+    loaded = pickle.loads(pickle.dumps(kf))
+    assert loaded.mixture is None
+    assert torch.allclose(loaded(y).means, expected)
+
+
+@torch.no_grad()
 def test_joseph_form_option():
     """`joseph_form=False` uses the simpler covariance update -- the same, in exact arithmetic."""
     from torchcast.kalman_filter import BinomialFilter
