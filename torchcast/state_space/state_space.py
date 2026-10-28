@@ -103,6 +103,12 @@ class StateSpaceModel(torch.nn.Module):
         if self.mixture is not None:
             self.mixture.validate(measures, non_gaussian_measures=self._non_gaussian_measures)
 
+    def __setstate__(self, state: dict):
+        # models pickled before mixture components existed have no ``mixture`` attribute:
+        if 'mixture' not in state and 'mixture' not in state.get('_modules', {}):
+            state['mixture'] = None
+        super().__setstate__(state)
+
     @property
     def _non_gaussian_measures(self) -> Sequence[str]:
         """
