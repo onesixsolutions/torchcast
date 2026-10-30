@@ -1313,8 +1313,7 @@ class Predictions:
                             generator: Optional[torch.Generator],
                             shared_noise: bool,
                             observation_measures: Optional[Sequence[str]]
-                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-                                       Optional[torch.Tensor]]:
+                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         The rest of a sample, given samples of the measured-mean (one per sample of the state): the regime (for
         models with mixture components), then the observations.
