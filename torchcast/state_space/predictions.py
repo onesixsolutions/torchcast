@@ -465,10 +465,10 @@ class Predictions:
         return any(m in measurement_model.measures for m in self.mixture.mixture_measures)
 
     def _effective_combo_terms(self,
-                      measures: Sequence[str],
-                      like: torch.Tensor,
-                      log_prior: Optional[torch.Tensor] = None
-                      ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+                               measures: Sequence[str],
+                               like: torch.Tensor,
+                               log_prior: Optional[torch.Tensor] = None
+                               ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
         are distinguishable given ``measures`` (see ``MixtureModel.get_effective_combos``).
@@ -482,10 +482,15 @@ class Predictions:
         """
         if log_prior is None:
             log_prior = self.mixture.get_log_base_probs().expand(like.shape[0], -1)
-        effective, mapping = self.mixture.get_effective_combos(measures)
-        for e, eff in enumerate(effective):
-            shift, extra_var = self.mixture.get_effective_offsets(eff, len(measures), like=like)
-            yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
+        effective_combos, mapping = self.mixture.get_effective_combos(measures)
+        for idx, combo in enumerate(effective_combos):
+            shift, extra_var = self.mixture.get_effective_offsets(combo, measures, like=like)
+            # `mapping` gives each combo's effective combo, so `mapping == idx` selects the combos that the effective
+            # combo at `idx` stands for. given the observed measures, these combos are mutually exclusive, so the prior
+            # for this effective combo is the sum of these combos' priors. for example, if only measure1 is observed,
+            # the effective combo (measure1='weird') pools p(measure1='weird', measure2='standard')
+            # + p(measure1='weird', measure2='weird').
+            yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == idx).to(log_prior.device)], dim=-1)
 
     # Dataframes & plotting --------------------------------------------------------------------------------------------
 
@@ -1338,10 +1343,10 @@ class Predictions:
         return None
 
     def _sample_combos(self,
-                        means: torch.Tensor,
-                        extra_vars: Optional[torch.Tensor],
-                        generator: Optional[torch.Generator],
-                        shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                       means: torch.Tensor,
+                       extra_vars: Optional[torch.Tensor],
+                       generator: Optional[torch.Generator],
+                       shared_noise: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         For each sample, draw a regime-combo; for measures in a non-standard regime, add the component's offset to
         their mean and its variance to their (conditional) variance -- i.e. to ``extra_vars``, the per-sample diagonal

@@ -270,8 +270,8 @@ class KalmanFilter(StateSpaceModel):
         else:
             log_prior = combo_prior.clamp_min(1e-30).log()
 
-        effective, mapping = self.mixture.get_effective_combos(measures)
-        if len(effective) == 1:
+        effective_combos, mapping = self.mixture.get_effective_combos(measures)
+        if len(effective_combos) == 1:
             # no mixture measures observed, so observations are uninformative about the regime:
             standard = self._kalman_update(
                 input=input,
@@ -297,7 +297,7 @@ class KalmanFilter(StateSpaceModel):
         # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
         # broadcast.
         shifts, extra_vars = zip(*(
-            self.mixture.get_effective_offsets(eff, len(measures), like=input) for eff in effective
+            self.mixture.get_effective_offsets(combo, measures, like=input) for combo in effective_combos
         ))
         shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
         extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)

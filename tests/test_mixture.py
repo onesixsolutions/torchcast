@@ -60,9 +60,14 @@ def test_mixture_model_combos():
     assert len(effective) == 2
     assert (mapping == a_weird.long()).all()
 
-    # measure-indices refer to the observed measures:
-    effective, _ = rm.get_effective_combos(['b', 'c'])
-    assert {i for eff in effective for i, _ in eff} == {1}
+    # 'a' unobserved: effective combos are of 'c's regimes; offsets go to 'c's position among the observed measures
+    with torch.no_grad():
+        components[1].offset.fill_(3.)
+    effective, _ = rm.get_effective_combos(['c', 'b'])
+    assert effective == [(), ('c.c1',), ('c.c2',)]
+    shift, extra_var = rm.get_effective_offsets(effective[1], ['c', 'b'], like=base_probs)
+    assert torch.equal(shift, torch.tensor([3., 0.]))
+    assert extra_var[0] > 0 and extra_var[1] == 0
 
 
 def test_standard_regime():
