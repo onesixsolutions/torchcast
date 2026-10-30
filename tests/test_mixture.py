@@ -65,7 +65,7 @@ def test_mixture_model_combos():
         components[1].offset.fill_(3.)
     effective, _ = rm.get_effective_combos(['c', 'b'])
     assert effective == [(), ('c.c1',), ('c.c2',)]
-    shift, extra_var = rm.get_effective_offsets(effective[1], ['c', 'b'], like=base_probs)
+    shift, extra_var = rm.get_combo_offsets(effective[1], ['c', 'b'], like=base_probs)
     assert torch.equal(shift, torch.tensor([3., 0.]))
     assert extra_var[0] > 0 and extra_var[1] == 0
 

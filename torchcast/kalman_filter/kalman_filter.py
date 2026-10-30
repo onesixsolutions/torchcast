@@ -297,7 +297,7 @@ class KalmanFilter(StateSpaceModel):
         # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
         # broadcast.
         shifts, extra_vars = zip(*(
-            self.mixture.get_effective_offsets(combo, measures, like=input) for combo in effective_combos
+            self.mixture.get_combo_offsets(combo, measures, like=input) for combo in effective_combos
         ))
         shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
         extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)
