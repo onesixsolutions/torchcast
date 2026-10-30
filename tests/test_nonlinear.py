@@ -279,7 +279,7 @@ def _sigmoid_mixture_data(low: float = .2, high: float = .8) -> torch.Tensor:
 def test_mixture_nonlinear_log_prob_matches_quadrature():
     """
     The marginal likelihood is ``P(standard) * E[N(y; sigmoid(Z), R)] + P(low) * E[N(y; sigmoid(Z) + mu, R + sigma^2)]``,
-    using the regime-prior at each timestep.
+    using the combo-prior at each timestep.
 
     (With default state-uncertainty: the monte-carlo log-prob converges slowly when the measurement-noise is small
     relative to the spread of the sampled means, so this tests the mixture logic rather than monte-carlo efficiency.)
@@ -292,7 +292,7 @@ def test_mixture_nonlinear_log_prob_matches_quadrature():
     z_mean, z_var = _linear_moments(pred, 0)
     r = pred.measure_covs_flat[:, 0, 0].double()
     obs = y.reshape(-1).double()
-    probs = pred.regime_probs.reshape(-1, 2).double()  # combos: (standard, low)
+    probs = pred.combo_probs.reshape(-1, 2).double()  # combos: (standard, low)
 
     def density(z, offset=0., var=r):
         mu = torch.sigmoid(z.clamp(-8, 8)) + offset
@@ -330,7 +330,7 @@ def test_mixture_nonlinear_predictions_match_quadrature():
 
     z_mean, z_var = _linear_moments(pred, 0)
     r = pred.measure_covs_flat[:, 0, 0].double()
-    probs = pred.regime_probs.reshape(-1, 2).double()
+    probs = pred.combo_probs.reshape(-1, 2).double()
     standard_mean = _gauss_hermite_expectation(lambda z: torch.sigmoid(z.clamp(-8, 8)), z_mean, z_var)
     expected_mean = standard_mean + probs[:, 1] * _COMPONENT_OFFSET
 
@@ -410,7 +410,7 @@ def test_mixture_nonlinear_get_mixture_warns():
     with pytest.warns(UserWarning, match="linearized"):
         mixture = pred.get_mixture('y')
     # the regime-probabilities are exact:
-    assert torch.allclose(mixture.probs, pred.regime_probs)
+    assert torch.allclose(mixture.probs, pred.combo_probs)
     with pytest.warns(UserWarning, match="linearized"):
         pred._get_regime_combos()
 

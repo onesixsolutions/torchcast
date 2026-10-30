@@ -56,7 +56,7 @@ class MixtureComponent(torch.nn.Module):
      The predictors are passed to the model's ``forward()`` as a ``(num_groups, num_timesteps, len(predictors))``
      tensor ``X`` (see ``model_mat_kwarg_name``) -- or, to use a different tensor than other consumers of ``X`` (e.g.
      a ``LinearModel``), as ``{id}__X``. Like the predictors of a ``LinearModel``, they need to cover the forecast
-     horizon too: the regime-prior for each timestep uses that timestep's predictors.
+     horizon too: the combo-prior for each timestep uses that timestep's predictors.
     :param model_mat_kwarg_name: The name of the ``forward()`` keyword-argument with the predictors (as for
      ``LinearModel``). Default 'X'.
     """

@@ -560,8 +560,8 @@ def test_regime_noise_scale():
     half = pred.sample(500, shared_noise=False, generator=_gen(), regime_noise_scale={'a.low': .5})
 
     # the regimes are drawn as usual
-    assert torch.equal(pinned.regimes, full.regimes)
-    low = pinned.regimes == kf.mixture.combos.index((kf.mixture.components[0],))
+    assert torch.equal(pinned.combos, full.combos)
+    low = pinned.combos == kf.mixture.combos.index((kf.mixture.components[0],))
     assert .2 < low.float().mean() < .4
 
     measured_mean, _ = pred._measured_moments_flat()

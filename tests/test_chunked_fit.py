@@ -207,10 +207,10 @@ def test_subset_kwargs_mixture():
     num_groups = 6
     model = _make_model('mixture')
     X = torch.randn(num_groups, 5, 1)
-    regime_probs = torch.softmax(torch.randn(num_groups, model.mixture.num_combos), -1)
-    initial_state = StateTuple(torch.zeros(num_groups, 5), torch.eye(5).expand(num_groups, -1, -1), regime_probs)
+    combo_probs = torch.softmax(torch.randn(num_groups, model.mixture.num_combos), -1)
+    initial_state = StateTuple(torch.zeros(num_groups, 5), torch.eye(5).expand(num_groups, -1, -1), combo_probs)
     out = model._subset_kwargs({'y1_low__X': X, 'initial_state': initial_state}, slice(2, 4), num_groups)
     assert torch.equal(out['y1_low__X'], X[2:4])
     assert isinstance(out['initial_state'], StateTuple)
-    assert torch.equal(out['initial_state'].regime_probs, regime_probs[2:4])
+    assert torch.equal(out['initial_state'].combo_probs, combo_probs[2:4])
     assert out['initial_state'].mean.shape == (2, 5) and out['initial_state'].cov.shape == (2, 5, 5)

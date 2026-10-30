@@ -19,7 +19,7 @@ class MixtureModel(torch.nn.Module):
     all-standard.
 
     :param components: The mixture components. Mixture measures are ordered by their first appearance here.
-    :param transition: A :class:`RegimeTransition`, controlling how regime-probabilities evolve over time. Defaults to
+    :param transition: A :class:`RegimeTransition`, controlling how combo-probabilities evolve over time. Defaults to
      :class:`StickyTransition`.
     :param univariate_prob: If True, the per-timestep regime-probabilities are computed using only the likelihood of
      the mixture measures, rather than of all observed measures. This is an approximation (exact if the other
@@ -200,35 +200,35 @@ class MixtureModel(torch.nn.Module):
         shift, extra_var = zip(*offsets)
         return torch.stack(shift), torch.stack(extra_var)
 
-    def get_standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
+    def get_standard_probs(self, combo_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
         """
         The probability that each measure is in its standard regime.
 
-        :param regime_probs: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
+        :param combo_probs: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
         :param measures: The measures to return probabilities for.
         :return: A ``(num_groups, len(measures))`` tensor with the probability that each measure is in its standard
          regime (always 1 for measures without mixture components).
         """
-        mask = torch.ones((self.num_combos, len(measures)), dtype=regime_probs.dtype, device=regime_probs.device)
+        mask = torch.ones((self.num_combos, len(measures)), dtype=combo_probs.dtype, device=combo_probs.device)
         for j, measure in enumerate(measures):
             if measure in self.mixture_measures:
                 k = self.mixture_measures.index(measure)
                 mask[:, j] = torch.as_tensor([float(combo[k].is_standard) for combo in self.combos])
-        return regime_probs @ mask
+        return combo_probs @ mask
 
     def prepare(self,
                 kwargs: Mapping,
-                init_regime_probs: Optional[torch.Tensor],
+                init_combo_probs: Optional[torch.Tensor],
                 num_groups: int,
                 num_timesteps: int) -> tuple[torch.Tensor, Sequence[torch.Tensor], set[str]]:
         """
-        For a model's ``forward()``: the regime-prior for the first timestep, and the base-rates for the regime-prior
+        For a model's ``forward()``: the combo-prior for the first timestep, and the base-rates for the combo-prior
         at each timestep (``base_probs[t]``; time-varying if any components have predictors).
 
         :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
-        :param init_regime_probs: The ``regime_probs`` of ``forward()``'s ``initial_state``, if any (see
+        :param init_combo_probs: The ``combo_probs`` of ``forward()``'s ``initial_state``, if any (see
          ``_initial_prior``).
-        :return: ``(regime_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
+        :return: ``(combo_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
         """
         component_X, used_keys = self._get_component_X(kwargs)
         if component_X:
@@ -240,8 +240,8 @@ class MixtureModel(torch.nn.Module):
                 )
         else:
             base_probs = [self.get_base_probs()] * num_timesteps
-        regime_prior = self._initial_prior(init_regime_probs, base_probs[0], num_groups)
-        return regime_prior, base_probs, used_keys
+        combo_prior = self._initial_prior(init_combo_probs, base_probs[0], num_groups)
+        return combo_prior, base_probs, used_keys
 
     def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
         """
@@ -275,23 +275,23 @@ class MixtureModel(torch.nn.Module):
         return out, used
 
     def _initial_prior(self,
-                      init_regime_probs: Optional[torch.Tensor],
+                      init_combo_probs: Optional[torch.Tensor],
                       base_probs: torch.Tensor,
                       num_groups: int) -> torch.Tensor:
         """
-        The regime-prior for the first timestep. ``init_regime_probs`` (from ``initial_state``) are treated like the
+        The combo-prior for the first timestep. ``init_combo_probs`` (from ``initial_state``) are treated like the
         mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
         transition. If not given, the transition's ``initial()`` is used.
         """
-        if init_regime_probs is None:
+        if init_combo_probs is None:
             return self.transition.initial(base_probs, num_groups)
-        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.num_combos:
+        if init_combo_probs.ndim != 2 or init_combo_probs.shape[-1] != self.num_combos:
             raise ValueError(
-                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.num_combos}), "
-                f"got {tuple(init_regime_probs.shape)}"
+                f"Expected `initial_state.combo_probs` to have shape (num_groups, {self.num_combos}), "
+                f"got {tuple(init_combo_probs.shape)}"
             )
-        if init_regime_probs.shape[0] not in (1, num_groups):
-            raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
-        return self.transition(init_regime_probs.expand(num_groups, -1), base_probs)
+        if init_combo_probs.shape[0] not in (1, num_groups):
+            raise ValueError(f"Expected `initial_state.combo_probs.shape[0]` to be 1 or {num_groups}")
+        return self.transition(init_combo_probs.expand(num_groups, -1), base_probs)
 
 

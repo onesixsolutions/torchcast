@@ -3,13 +3,13 @@ import torch
 
 class RegimeTransition(torch.nn.Module):
     """
-    Base-class for how regime-probabilities evolve over time. Subclasses implement :func:`initial` (the regime-prior
-    at the first timestep) and :func:`forward` (the regime-prior at the next timestep, given the regime-posterior at
+    Base-class for how combo-probabilities evolve over time. Subclasses implement :func:`initial` (the combo-prior
+    at the first timestep) and :func:`forward` (the combo-prior at the next timestep, given the combo-posterior at
     the current timestep).
 
     Both receive ``base_probs``, the long-run probability of each combo implied by the :class:`MixtureComponent`
     base-rates: a ``(num_combos,)`` tensor (or, if any components have predictors, a ``(num_groups, num_combos)``
-    tensor, for the timestep that the regime-prior is for).
+    tensor, for the timestep that the combo-prior is for).
     """
 
     def __init__(self, num_combos: int):
@@ -20,15 +20,15 @@ class RegimeTransition(torch.nn.Module):
         """
         :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor.
         :param num_groups: The number of groups.
-        :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
+        :return: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
         """
         raise NotImplementedError
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         """
-        :param posterior: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the current timestep.
+        :param posterior: A ``(num_groups, num_combos)`` tensor of combo-probabilities at the current timestep.
         :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor, for the next timestep.
-        :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the next timestep.
+        :return: A ``(num_groups, num_combos)`` tensor of combo-probabilities at the next timestep.
         """
         raise NotImplementedError
 
@@ -49,7 +49,7 @@ class StickyTransition(RegimeTransition):
     Rather than learning ``b`` directly, it's derived so that the stationary distribution of ``T`` is ``base_probs``
     (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run probability of each
     combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture where the
-    regime-prior is always ``base_probs``. (If the base-rates vary over time -- components with predictors -- then
+    combo-prior is always ``base_probs``. (If the base-rates vary over time -- components with predictors -- then
     ``base_probs`` is the stationary distribution for the current predictors.)
 
     :param num_combos: The number of regime-combos.
