@@ -197,7 +197,10 @@ def test_update_step_univariate():
     R = torch.tensor([[[.3]]])
     for obs in (1.2, -3.5):
         input = torch.tensor([[obs]])
-        state = kf._update_step(input=input, mean=mean, cov=cov, measured_mean=mean, measure_mat=H, measure_cov=R)
+        state = kf._update_step(
+            input=input, mean=mean, cov=cov, measured_mean=mean, measure_mat=H, measure_cov=R,
+            combo_prior=kf.mixture.get_base_probs().expand(1, -1),
+        )
 
         # by hand: the standard regime is the usual update; the component's regime is an update with the residual
         # offset by the component's mean, and the component's variance added to the measurement-noise.
@@ -236,7 +239,10 @@ def test_update_step_unobserved_mixture_measure():
         measure_mat=torch.tensor([[[0., 1.]]]).expand(4, -1, -1),
         measure_cov=torch.full((4, 1, 1), .3),
     )
-    state = kf._update_step(**kwargs, val_idx=torch.tensor([1]))
+    # no fallback to the base-rates: the prior comes from forward()
+    with pytest.raises(ValueError, match='combo_prior'):
+        kf._update_step(**kwargs, val_idx=torch.tensor([1]))
+    state = kf._update_step(**kwargs, val_idx=torch.tensor([1]), combo_prior=kf.mixture.get_base_probs().expand(4, -1))
     expected_mean, expected_cov = kf_plain._update_step(**kwargs, val_idx=torch.tensor([1]))
     assert torch.allclose(state.mean, expected_mean)
     assert torch.allclose(state.cov, expected_cov)
