@@ -52,7 +52,7 @@ class NewtonResult:
      ``hessian * loss_scale`` is the hessian of the summed loss (used for the Laplace approximation). ``None`` for a
      custom ``get_loss``, where this isn't known.
     :param hessian_subsample: If the hessian was computed on a subsample of groups, the (expected) fraction used.
-     The hessian is then only an estimate (fine for ``weak_directions()``, but not for ``laplace_mvnorm()``).
+     The hessian is then only an estimate (fine for ``get_weak_directions()``, but not for ``get_laplace_mvnorm()``).
     :param history: One dict per Newton step, with the loss, largest absolute gradient, parameters, etc. before the
      step; and the line-search scale and largest absolute (scaled) step taken.
     """
@@ -67,13 +67,13 @@ class NewtonResult:
     hessian_subsample: Optional[float] = None
     history: List[dict] = field(default_factory=list)
 
-    def eigen(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_eigen(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
         :return: Eigenvalues (ascending) and eigenvectors (columns) of the hessian.
         """
         return torch.linalg.eigh(_symmetrize(self.hessian.double()))
 
-    def weak_directions(self, num: int = 3, num_params: int = 3) -> List[tuple[float, List[tuple[str, float]]]]:
+    def get_weak_directions(self, num: int = 3, num_params: int = 3) -> List[tuple[float, List[tuple[str, float]]]]:
         """
         The directions in parameter-space that the loss is flattest along (smallest eigenvalues of the hessian), which
         flags weakly identified parameters (ridges).
@@ -82,7 +82,7 @@ class NewtonResult:
         :param num_params: For each direction, the number of parameters to return, with the largest absolute loadings.
         :return: A list of ``(eigenvalue, [(param_name, loading), ...])``.
         """
-        evals, evecs = self.eigen()
+        evals, evecs = self.get_eigen()
         out = []
         for i in range(min(num, len(evals))):
             vec = evecs[:, i]
@@ -90,7 +90,7 @@ class NewtonResult:
             out.append((evals[i].item(), [(self.param_names[j], vec[j].item()) for j in top.tolist()]))
         return out
 
-    def summed_hessian(self) -> torch.Tensor:
+    def get_summed_hessian(self) -> torch.Tensor:
         """
         :return: The hessian of the *summed* loss (rather than the mean), as used for a Laplace approximation.
         """
@@ -105,23 +105,23 @@ class NewtonResult:
             )
         return self.hessian * self.loss_scale
 
-    def decrement(self, eig_floor: float = 1e-6) -> float:
+    def get_decrement(self, eig_floor: float = 1e-6) -> float:
         """
         The Newton decrement at the final parameters, ``g^T |H|^-1 g / 2`` (on the scale of the summed loss, if
         ``loss_scale`` is known): the loss-decrease predicted by another full Newton step. See ``decrement_tol`` in
         :func:`StateSpaceModel.newton_refine()`. Uses the result's hessian, so it's an estimate if that's from a
         subsample.
         """
-        evals, evecs = self.eigen()
+        evals, evecs = self.get_eigen()
         _, decrement = saddle_free_step(self.grad, evals, evecs, eig_floor)
         return decrement * (self.loss_scale or 1.)
 
-    def laplace_mvnorm(self) -> torch.distributions.MultivariateNormal:
+    def get_laplace_mvnorm(self) -> torch.distributions.MultivariateNormal:
         """
         The Laplace approximation, like :func:`StateSpaceModel.get_laplace_mvnorm()` but reusing the final hessian
         rather than recomputing it.
         """
-        return mvnorm_from_hessian(self.params, self.summed_hessian())
+        return mvnorm_from_hessian(self.params, self.get_summed_hessian())
 
 
 def compare_hessians(full: NewtonResult,
@@ -153,8 +153,8 @@ def compare_hessians(full: NewtonResult,
     if not torch.allclose(full.params, approx.params):
         raise ValueError("The results should be at the same parameters (e.g. ``max_steps=0`` from the same model).")
     grad = full.grad.double()
-    evals_f, evecs_f = full.eigen()
-    evals_a, evecs_a = approx.eigen()
+    evals_f, evecs_f = full.get_eigen()
+    evals_a, evecs_a = approx.get_eigen()
     step_f, dec_f = saddle_free_step(grad, evals_f, evecs_f, eig_floor)
     step_a, dec_a = saddle_free_step(grad, evals_a, evecs_a, eig_floor)
     k = min(num_weak, len(evals_f))
@@ -284,7 +284,7 @@ def newton_refine(objective: NewtonObjective,
             f"Newton: {'converged' if converged else 'did not converge'} ({stop_reason}) after {len(history)} steps; "
             f"loss {loss:.6g}, max|grad| {grad.abs().max().item():.3g}. Weakest directions (smallest eigenvalues):"
         )
-        for ev, loadings in result.weak_directions():
+        for ev, loadings in result.get_weak_directions():
             print(f"  {ev:.3g}: " + ", ".join(f"{nm} ({ld:+.2f})" for nm, ld in loadings))
     return result
 

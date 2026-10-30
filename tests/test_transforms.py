@@ -640,6 +640,6 @@ def test_bias_adjust_validation():
         LogTransform(bias_adjust={'low': 1.5})
     with pytest.raises(ValueError, match='__standard__'):
         LogTransform(bias_adjust={None: 1., 'low': 0.})
-    assert LogTransform(bias_adjust={'low': 0.}).var_multi('low') == 0.
-    assert LogTransform(bias_adjust={'low': 0.}).var_multi(None) == 1.
-    assert LogTransform(bias_adjust=.5).var_multi('low') == .5
+    assert LogTransform(bias_adjust={'low': 0.}).get_var_multi('low') == 0.
+    assert LogTransform(bias_adjust={'low': 0.}).get_var_multi(None) == 1.
+    assert LogTransform(bias_adjust=.5).get_var_multi('low') == .5

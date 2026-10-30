@@ -79,11 +79,11 @@ class StickyTransition(RegimeTransition):
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         stay = self.get_stay_prob()
-        # equivalent to `posterior @ self.matrix(base_probs)`, without materializing the matrix:
+        # equivalent to `posterior @ self.get_matrix(base_probs)`, without materializing the matrix:
         leave = (posterior * (1 - stay)).sum(-1, keepdim=True)
         return posterior * stay + leave * self._jump_probs(base_probs)
 
-    def matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
+    def get_matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
         """
         The transition-matrix, for inspection and testing (``forward()`` applies it without building it).
 

@@ -117,7 +117,7 @@ component = kf_mixture.mixture.components[0]
 pd.Series({
     'component offset': component.offset.item(),
     'component (extra) std': component.extra_var.sqrt().item(),
-    'component probability': kf_mixture.mixture.base_probs()[1].item(),
+    'component probability': kf_mixture.mixture.get_base_probs()[1].item(),
     'stickiness (standard, quick)': kf_mixture.mixture.transition.get_stay_prob().detach().numpy().round(3),
     'measurement std (mixture model)': kf_mixture.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),
     'measurement std (standard model)': kf_standard.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),

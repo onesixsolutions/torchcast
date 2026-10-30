@@ -324,7 +324,7 @@ class Predictions:
             return False
         identity = _IdentityTransform()
         return any(
-            not np.isclose(transforms.get(m, identity).var_multi(regime.id), 0)
+            not np.isclose(transforms.get(m, identity).get_var_multi(regime.id), 0)
             for m in self._nonlinear_measures
             for regime in self._regimes(m)
         )
@@ -337,7 +337,7 @@ class Predictions:
         """
         out = {}
         for regime in self._regimes(measure):
-            var_multi = transform.var_multi(regime.id)
+            var_multi = transform.get_var_multi(regime.id)
             out[regime.id] = None if np.isclose(var_multi, 0) else var_multi
         nonzero = {v for v in out.values() if v is not None}
         if len(nonzero) > 1:
@@ -481,10 +481,10 @@ class Predictions:
          (pooled over the combos that are indistinguishable given ``measures``).
         """
         if log_prior is None:
-            log_prior = self.mixture.log_base_probs().expand(like.shape[0], -1)
-        effective, mapping = self.mixture.effective_combos(measures)
+            log_prior = self.mixture.get_log_base_probs().expand(like.shape[0], -1)
+        effective, mapping = self.mixture.get_effective_combos(measures)
         for e, eff in enumerate(effective):
-            shift, extra_var = self.mixture.effective_offsets(eff, len(measures), like=like)
+            shift, extra_var = self.mixture.get_effective_offsets(eff, len(measures), like=like)
             yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == e).to(log_prior.device)], dim=-1)
 
     # Dataframes & plotting --------------------------------------------------------------------------------------------
@@ -1231,7 +1231,7 @@ class Predictions:
         if noise_scale_table is not None:
             # each draw's deviation from its regime's center, scaled:
             noise_scales = noise_scale_table[combo_idx]  # (num_samples, num_rows, num_measures)
-            shift, _ = self.mixture.combo_offsets(measures, like=means)
+            shift, _ = self.mixture.get_combo_offsets(measures, like=means)
             centers = self._measured_moments_flat()[0] + shift[combo_idx]
             means = centers + noise_scales * (means - centers)
             if observations is not None:
@@ -1353,7 +1353,8 @@ class Predictions:
         """
         rm = self.mixture
         num_samples = means.shape[0]
-        shift, extra_var = rm.combo_offsets(self.measurement_model.measures, like=means)  # (num_combos, num_measures)
+        # (num_combos, num_measures):
+        shift, extra_var = rm.get_combo_offsets(self.measurement_model.measures, like=means)
         regime_probs = self.regime_probs.reshape(-1, rm.num_combos)
         if shared_noise:
             uniforms = torch.rand(num_samples, generator=generator, dtype=means.dtype, device=means.device)
@@ -1481,7 +1482,7 @@ class Predictions:
             )
         measures = list(self.measurement_model.measures)
         measured_mean, system_cov = self._measured_moments_flat()
-        shift, extra_var = rm.combo_offsets(measures, like=measured_mean)  # (num_combos, num_measures)
+        shift, extra_var = rm.get_combo_offsets(measures, like=measured_mean)  # (num_combos, num_measures)
         means = [measured_mean + shift[c] for c in range(rm.num_combos)]
         covs = [system_cov + torch.diag(extra_var[c]) for c in range(rm.num_combos)]
         batch_shape = self.state_means.shape[0:2]
@@ -1500,7 +1501,7 @@ class Predictions:
         """
         if self.mixture is None or measure not in self.mixture.mixture_measures:
             return [StandardRegime(measure)]
-        return self.mixture.regimes(measure)
+        return self.mixture.get_regimes(measure)
 
     def _measure_regime_probs(self, measure: str) -> torch.Tensor:
         """
@@ -1516,7 +1517,7 @@ class Predictions:
         rm = self.mixture
         k = rm.mixture_measures.index(measure)
         probs = []
-        for regime in rm.regimes(measure):
+        for regime in rm.get_regimes(measure):
             in_regime = torch.as_tensor([combo[k] is regime for combo in rm.combos], device=self.regime_probs.device)
             probs.append(self.regime_probs[..., in_regime].sum(-1))
         return torch.stack(probs, -1)

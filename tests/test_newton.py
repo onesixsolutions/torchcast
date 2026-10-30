@@ -110,7 +110,7 @@ def test_newton_hessian_matches_laplace(monkeypatch):
         mvnorm, names = model.get_laplace_mvnorm(y)
     assert names == result.param_names
     assert torch.allclose(mvnorm.loc, result.params)
-    assert torch.allclose(result.summed_hessian(), hessians[0], rtol=1e-4, atol=1e-3)
+    assert torch.allclose(result.get_summed_hessian(), hessians[0], rtol=1e-4, atol=1e-3)
 
 
 def test_newton_reuse_hessian():
@@ -131,7 +131,7 @@ def test_fit_newton_finish():
     model.fit(y, verbose=0, stopping={'max_iter': 3}, newton_finish={'max_steps': 2, 'decrement_tol': None})
     assert isinstance(model.newton_result, NewtonResult)
     assert len(model.newton_result.history) == 2
-    assert len(model.newton_result.weak_directions(num=2)) == 2
+    assert len(model.newton_result.get_weak_directions(num=2)) == 2
 
 
 @pytest.mark.parametrize('variant', ['sigmoid', 'adaptive', 'binomial'])
@@ -176,7 +176,7 @@ def test_hessian_subsample_matches_subset_data():
     assert torch.allclose(result.grad, full.grad)
 
     with pytest.raises(RuntimeError, match='subsample'):
-        result.laplace_mvnorm()
+        result.get_laplace_mvnorm()
 
 
 def _level_data_and_model():
@@ -238,8 +238,8 @@ def test_final_full_hessian_and_compare():
     assert result.hessian_subsample is None
     full = copy.deepcopy(model).newton_refine(y, max_steps=0, verbose=False)
     assert torch.allclose(result.hessian, full.hessian, rtol=1e-4, atol=1e-6)
-    result.laplace_mvnorm()  # allowed: full hessian
-    assert result.decrement() == pytest.approx(full.decrement(), rel=1e-3)
+    result.get_laplace_mvnorm()  # allowed: full hessian
+    assert result.get_decrement() == pytest.approx(full.get_decrement(), rel=1e-3)
 
     same = compare_hessians(full, full)
     assert same['direction_cosine'] == pytest.approx(1.)
