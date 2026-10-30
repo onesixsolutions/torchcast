@@ -76,15 +76,6 @@ def test_standard_regime():
     # the standard regime's id is reserved:
     with pytest.raises(ValueError, match='reserved'):
         MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='__standard__')
-    # pickled before `StandardRegime` (when the combo-table used None for the standard regime):
-    rm = MixtureModel([MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')])
-    state = rm.__dict__.copy()
-    state['_modules'] = {k: v for k, v in state['_modules'].items() if k != 'standard_regimes'}
-    state['combos'] = [(None,), (rm.components[0],)]
-    old = MixtureModel.__new__(MixtureModel)
-    old.__setstate__(state)
-    assert old.combos[0][0].is_standard and old.combos[1][0] is rm.components[0]
-    assert torch.allclose(old.base_probs(), rm.base_probs())
 
 
 def test_mixture_model_validation():

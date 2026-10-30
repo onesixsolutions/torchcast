@@ -68,16 +68,6 @@ class MixtureModel(torch.nn.Module):
             raise ValueError(f"`transition` has {transition.num_combos} combos, but expected {self.num_combos}")
         self.transition = transition
 
-    def __setstate__(self, state: dict) -> None:
-        super().__setstate__(state)
-        if 'standard_regimes' not in self._modules:
-            # pickled before `StandardRegime` (when combos used None for the standard regime):
-            ref = self.components[0].logit
-            self.standard_regimes = torch.nn.ModuleList([StandardRegime(m) for m in self.mixture_measures])
-            self.standard_regimes.to(device=ref.device, dtype=ref.dtype)
-            self.combos = list(itertools.product(*[self.regimes(m) for m in self.mixture_measures]))
-            self.__dict__.pop('_by_measure', None)
-
     def validate(self, measures: Sequence[str], non_gaussian_measures: Sequence[str] = ()) -> None:
         """
         Called by the :class:`.StateSpaceModel`. Mixture measures must be measures of the model, with a gaussian
@@ -211,6 +201,8 @@ class MixtureModel(torch.nn.Module):
 
     def standard_probs(self, regime_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
         """
+        The probability that each measure is in its standard regime.
+
         :param regime_probs: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
         :param measures: The measures to return probabilities for.
         :return: A ``(num_groups, len(measures))`` tensor with the probability that each measure is in its standard
