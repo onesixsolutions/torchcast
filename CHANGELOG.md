@@ -67,7 +67,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 
 ### New feature: sampling predictions, and derived quantities
 
-- `Predictions.sample(num_samples, shared_noise, observation_noise=True, generator=None)` draws from the predictive distribution, jointly across measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`, observations are sampled too (binomial draws for binary measures). `shared_noise` (required) says whether the underlying random draws are shared across groups and timesteps (cheaper, fine for per-row summaries) or independent (needed to aggregate across groups). Returns a `PredictionSamples`, whose `regimes` gives each draw's regime-combo, for mixture models.
+- `Predictions.sample(num_samples, shared_noise, observation_noise=True, generator=None)` draws from the predictive distribution, jointly across measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`, observations are sampled too (binomial draws for binary measures). `shared_noise` (required) says whether the underlying random draws are shared across groups and timesteps (cheaper, fine for per-row summaries) or independent (needed to aggregate across groups). Returns a `PredictionSamples`, whose `combos` gives each draw's regime-combo, for mixture models.
 - `sample(regime_noise_scale={'quick': 0.})` scales the randomness of draws in a component's regime: `0` pins them at the regime's center (the measured-mean of the state's mean, plus the offset), while the standard regime is sampled as usual -- e.g. to see how much a component's variance contributes to back-transformed outputs.
 - `Predictions.to_dataframe(derived={'total': lambda s: s['a'] + s['b']})` adds quantities computed from several
   measures, from joint samples (so correlations between measures are accounted for), on the scale given by
@@ -79,7 +79,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 ### Behavior change: `simulate()`
 
 - **`simulate()` now outputs the simulated states**, so its `means`, `sample()` and `to_dataframe()` describe observations around the simulated trajectories. Before, each timestep's output was the one-step *prior* given the previous simulated state -- so e.g. `sample()` drew fresh process-noise for each timestep, ignoring the process-noise the trajectory actually carried forward, and the variance of quantities summed over time (e.g. a lifetime total) was too small. **Code that uses `simulate()` will get different (correct) values.** With `include_updates_in_output=True`, the `update_*` attributes are the same states. `forward(simulate=...)` now requires `n_step=1`.
-- For models with mixture components, the regimes are simulated too: one regime-combo per timestep, drawn given the previous one (so e.g. a sticky regime persists), with one-hot `regime_probs` -- so `sample()` draws observations in the simulated regime. Before, the regime-probabilities were just rolled forward.
+- For models with mixture components, the regimes are simulated too: one regime-combo per timestep, drawn given the previous one (so e.g. a sticky regime persists), with one-hot `combo_probs` -- so `sample()` draws observations in the simulated regime. Before, the regime-probabilities were just rolled forward.
 - `simulate(generator=...)` for reproducible simulations.
 - Bug fix: `simulate()` failed for float64 (or non-cpu) models.
 
@@ -103,7 +103,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   own, rather than a second, joint sampling pass. Much faster (e.g. ~11x for `to_dataframe()` of a `BinomialFilter`
   with mixture components); the intervals change only by monte-carlo error.
 - `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
-  tuple it replaces (unpacking, `len()`, indexing), and also carries the regime-probabilities of models with mixture
+  tuple it replaces (unpacking, `len()`, indexing), and also carries the combo-probabilities (`combo_probs`) of models with mixture
   components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks
   `isinstance(..., tuple)` will need updating.)
 - `AdaptiveScaler.forward()` takes an optional `weights` argument. It's only passed for models with mixture
