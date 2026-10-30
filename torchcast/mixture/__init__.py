@@ -21,6 +21,6 @@ each class), and a group never changes class, so its posterior over classes accu
 timesteps, and carries over into forecasts.
 """
 from .regime_transition import RegimeTransition, StaticTransition, StickyTransition
-from .component import MixtureComponent
+from .component import MixtureComponent, StandardRegime, STANDARD_REGIME_ID
 from .latent_class import LatentClass
 from .model import MixtureModel
