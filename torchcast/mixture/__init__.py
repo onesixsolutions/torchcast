@@ -15,5 +15,5 @@ of regimes (e.g. [(measure1=standard, measure2=standard), (measure1=weird, measu
 probabilities are tracked jointly over this table, allowing p(measure_x=weird) to vary over time and across groups.
 """
 from .regime_transition import RegimeTransition, StickyTransition
-from .component import MixtureComponent
+from .component import MixtureComponent, StandardRegime, STANDARD_REGIME_ID
 from .model import MixtureModel
