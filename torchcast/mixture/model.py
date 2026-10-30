@@ -218,6 +218,7 @@ class MixtureModel(torch.nn.Module):
 
     @property
     def num_combos(self) -> int:
+        """The number of regime-combos (``len(self.combos)``)."""
         return len(self.combos)
 
     @property
@@ -241,9 +242,9 @@ class MixtureModel(torch.nn.Module):
 
     def get_log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        Get the probability of each combo of regimes (like ``(measure1='standard', measure2='weird')``).
-         This probability is just the product of each independent regime probability (which can be predicted by a model-
-        matrix, ``component_X``).
+        Get the log-probability of each combo of regimes (like ``(measure1='standard', measure2='weird')``). This is
+        just the product (the sum, on the log-scale) of each independent regime probability, which can be predicted by a
+        model-matrix, ``component_X``.
 
         :param component_X: Required if any components have predictors: the output of ``_get_component_X()`` (keyed
          by ``qualified_id``), or slices of it (e.g. for one timestep), all with the same leading dims.

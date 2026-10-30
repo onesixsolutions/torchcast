@@ -29,9 +29,14 @@ class StandardRegime(torch.nn.Module):
 
     @property
     def qualified_id(self) -> str:
+        """``'{measure}.__standard__'``."""
         return f'{self.measure}.{self.id}'
 
     def get_logit(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        :param X: Ignored (the standard regime has no predictors).
+        :return: The fixed logit, 0, that the components' logits are relative to.
+        """
         return self.logit
 
     def __repr__(self) -> str:
