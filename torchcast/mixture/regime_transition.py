@@ -22,7 +22,7 @@ class RegimeTransition(torch.nn.Module):
         :param num_groups: The number of groups.
         :return: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
         """
-        raise NotImplementedError
+        return base_probs.expand(num_groups, -1)
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         """
@@ -34,9 +34,6 @@ class RegimeTransition(torch.nn.Module):
 
 
 class StaticTransition(RegimeTransition):
-    def initial(self, base_probs, num_groups):
-        return base_probs.expand(num_groups, -1)
-
     def forward(self, posterior, base_probs):
         return base_probs.expand(posterior.shape[0], -1)
 
@@ -73,9 +70,6 @@ class StickyTransition(RegimeTransition):
     def _jump_probs(self, base_probs: torch.Tensor) -> torch.Tensor:
         b = base_probs * (1 - self.get_stay_prob())
         return b / b.sum(-1, keepdim=True)
-
-    def initial(self, base_probs: torch.Tensor, num_groups: int) -> torch.Tensor:
-        return base_probs.expand(num_groups, -1)
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         stay = self.get_stay_prob()
