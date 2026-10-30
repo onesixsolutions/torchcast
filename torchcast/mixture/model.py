@@ -53,6 +53,7 @@ class MixtureModel(torch.nn.Module):
 
         self.mixture_measures = list(by_measure)
         self.components = torch.nn.ModuleList([c for m in self.mixture_measures for c in by_measure[m]])
+        self._components_by_id = {c.qualified_id: c for c in self.components}
         # (not in `components`: they have no parameters, but their buffers should follow `.to()`)
         self.standard_regimes = torch.nn.ModuleList([StandardRegime(m) for m in self.mixture_measures])
         self.univariate_prob = univariate_prob
@@ -119,63 +120,62 @@ class MixtureModel(torch.nn.Module):
          regime has logit 0 and each component has its own logit.
         """
         component_X = component_X or {}
-        logits = {
-            r.qualified_id: r.get_logit(component_X.get(r.qualified_id))
-            for m in self.mixture_measures for r in self.get_regimes(m)
-        }
-        b_shape = torch.broadcast_shapes(*(lg.shape for lg in logits.values()))
 
-        # per measure: the log-probability of each of its regimes
-        regime_log_probs = {}
+        # per measure: get the log-probability of each of its regimes by softmaxing across its logits:
+        log_probs_per_regime = {}
         for measure in self.mixture_measures:
-            names = [r.qualified_id for r in self.get_regimes(measure)]
-            log_probs = torch.log_softmax(torch.stack([logits[n].expand(b_shape) for n in names], -1), -1)
-            regime_log_probs.update(zip(names, log_probs.unbind(-1)))
+            regime_names, regime_logits = zip(*[
+                (r.qualified_id, r.get_logit(component_X.get(r.qualified_id)))
+                for r in self.get_regimes(measure)
+            ])
+            regime_log_probs = torch.log_softmax(torch.stack(torch.broadcast_tensors(*regime_logits), -1), -1)
+            log_probs_per_regime.update(zip(regime_names, regime_log_probs.unbind(-1)))
 
         # now that we have probs for each regime individually, we compute the probability of each *combo* of regimes.
         # we treat them as independent here, so it's just the product (sum on the log-scale)
-        logs_probs_per_combo = [sum(regime_log_probs[r.qualified_id] for r in combo) for combo in self.combos]
+        logs_probs_per_combo = [sum(log_probs_per_regime[r.qualified_id] for r in combo) for combo in self.combos]
         return torch.stack(logs_probs_per_combo, -1)
 
-    def get_effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
+    def get_effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple[str, ...]], torch.Tensor]:
         """
         When only a subset of measures is observed, combos that differ only in unobserved measures are
         indistinguishable (they imply the same likelihood and the same state-update). So each 'effective' combo (aka a
         hypothesis) stands for one or more combos: those that are indistinguishable given ``measures``.
 
         :param measures: The measures observed.
-        :return: A tuple of (1) the list of unique 'effective' combos -- each a tuple of ``(measure_idx, component)``
-         pairs for the observed measures that are in a non-standard regime (``measure_idx`` indexes into
-         ``measures``); the first is always the empty tuple (all-standard); and (2) a ``(num_combos,)`` long tensor
-         mapping each combo to its effective combo.
+        :return: A tuple of two items. The first is a list of the unique 'effective' combos -- each a tuple of the
+         ``qualified_id`` of each component that's in effect, i.e. for the observed measures that are in a
+         non-standard regime; the first is always the empty tuple (all-standard). The second is a ``(num_combos,)``
+         long tensor mapping each item in ``self.combos`` to its effective combo (an index into the first item).
         """
-        midx = {m: measures.index(m) for m in self.mixture_measures if m in measures}
-        effective = [()]
+        effective: list[tuple[str, ...]] = [()]
         mapping = []
         for combo in self.combos:
-            eff = tuple(
-                (midx[m], r) for m, r in zip(self.mixture_measures, combo) if not r.is_standard and m in midx
-            )
+            eff = tuple(r.qualified_id for r in combo if not r.is_standard and r.measure in measures)
             if eff not in effective:
                 effective.append(eff)
+            # if it was added on an earlier iter, ``mapping`` tells us where to find the ith combo in ``effective``
             mapping.append(effective.index(eff))
         return effective, torch.as_tensor(mapping, dtype=torch.long)
 
-    @staticmethod
-    def get_effective_offsets(effective_combo: tuple,
-                          num_measures: int,
-                          like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_effective_offsets(self,
+                              effective_combo: tuple[str, ...],
+                              measures: Sequence[str],
+                              like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        :param effective_combo: An entry from :func:`get_effective_combos`: ``(measure_idx, component)`` pairs.
-        :param num_measures: The number of (observed) measures that ``measure_idx`` indexes.
+        :param effective_combo: An entry from :func:`get_effective_combos`: the ``qualified_id`` of each component
+         that's in effect.
+        :param measures: The (observed) measures.
         :param like: A tensor whose dtype/device to use.
         :return: Two ``(num_measures,)`` tensors: the offset to the measured-mean, and the variance to add to the
          measurement-noise, for each measure.
         """
         zero = torch.zeros((), dtype=like.dtype, device=like.device)
-        shift, extra_var = [zero] * num_measures, [zero] * num_measures
-        for i, component in effective_combo:
-            shift[i], extra_var[i] = component.offset, component.extra_var
+        shift, extra_var = [zero] * len(measures), [zero] * len(measures)
+        for qualified_id in effective_combo:
+            component = self._components_by_id[qualified_id]
+            midx = measures.index(component.measure)
+            shift[midx], extra_var[midx] = component.offset, component.extra_var
         return torch.stack(shift), torch.stack(extra_var)
 
     def get_combo_offsets(self, measures: Sequence[str], like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -188,11 +188,8 @@ class MixtureModel(torch.nn.Module):
         measures = list(measures)
         offsets = (
             self.get_effective_offsets(
-                tuple(
-                    (measures.index(m), r) for m, r in zip(self.mixture_measures, combo)
-                    if not r.is_standard and m in measures
-                ),
-                num_measures=len(measures),
+                effective_combo=tuple(r.qualified_id for r in combo if not r.is_standard and r.measure in measures),
+                measures=measures,
                 like=like,
             )
             for combo in self.combos
@@ -275,9 +272,9 @@ class MixtureModel(torch.nn.Module):
         return out, used
 
     def _initial_prior(self,
-                      init_combo_probs: Optional[torch.Tensor],
-                      base_probs: torch.Tensor,
-                      num_groups: int) -> torch.Tensor:
+                       init_combo_probs: Optional[torch.Tensor],
+                       base_probs: torch.Tensor,
+                       num_groups: int) -> torch.Tensor:
         """
         The combo-prior for the first timestep. ``init_combo_probs`` (from ``initial_state``) are treated like the
         mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
@@ -293,5 +290,3 @@ class MixtureModel(torch.nn.Module):
         if init_combo_probs.shape[0] not in (1, num_groups):
             raise ValueError(f"Expected `initial_state.combo_probs.shape[0]` to be 1 or {num_groups}")
         return self.transition(init_combo_probs.expand(num_groups, -1), base_probs)
-
-
