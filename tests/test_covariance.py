@@ -123,7 +123,7 @@ def test_sd_corr_correlations():
     i = 3
     for j in range(rank):
         if j != i:
-            module.corr_unconstrained[module.off_diag_idx(i, j)] = 0.
+            module.corr_unconstrained[module.get_off_diag_idx(i, j)] = 0.
     cov = module({}, 1, 1)[0, 0]
     assert (cov[i, [j for j in range(rank) if j != i]] == 0).all()
     # (... but only zeroing the row is a zero *partial* correlation, not a zero marginal correlation)
@@ -135,7 +135,7 @@ def test_corr_cholesky():
     std = cov.diagonal().sqrt()
     L_expected = torch.linalg.cholesky(cov / std.outer(std))
     for method in ('log_cholesky', 'sd_corr'):
-        _assert_close(Covariance.from_matrix(cov, method=method).corr_cholesky(), L_expected)
+        _assert_close(Covariance.from_matrix(cov, method=method).get_corr_cholesky(), L_expected)
 
 
 @torch.no_grad()
@@ -143,8 +143,8 @@ def test_sd_corr_index_helpers():
     module = Covariance(rank=5, empty_idx=[1], init_diag_multi=1., method='sd_corr')
     module.corr_unconstrained.zero_()
     module.log_std_devs.zero_()
-    module.corr_unconstrained[module.off_diag_idx(0, 3)] = 1.
-    module.log_std_devs[module.param_idx(4)] = math.log(2.)
+    module.corr_unconstrained[module.get_off_diag_idx(0, 3)] = 1.
+    module.log_std_devs[module.get_param_idx(4)] = math.log(2.)
     cov = module({}, 1, 1)[0, 0]
     expected = torch.eye(5)
     expected[1, 1] = 0
@@ -152,9 +152,9 @@ def test_sd_corr_index_helpers():
     expected[0, 3] = expected[3, 0] = math.tanh(1.)
     _assert_close(cov, expected)
     with pytest.raises(ValueError):
-        module.param_idx(1)
+        module.get_param_idx(1)
     with pytest.raises(ValueError):
-        module.off_diag_idx(2, 2)
+        module.get_off_diag_idx(2, 2)
 
 
 @pytest.mark.parametrize('scale', [0., 1., 30.])
@@ -179,14 +179,14 @@ def test_sd_corr_derivatives(scale: float):
 def test_sd_corr_freezing_hooks():
     module = Covariance(rank=4, init_diag_multi=1., method='sd_corr')
     keep_std = torch.ones_like(module.log_std_devs)
-    keep_std[module.param_idx(2)] = 0
+    keep_std[module.get_param_idx(2)] = 0
     module.log_std_devs.register_hook(lambda g: g * keep_std)
     keep_corr = torch.ones_like(module.corr_unconstrained)
-    keep_corr[module.off_diag_idx(2, 0)] = 0
+    keep_corr[module.get_off_diag_idx(2, 0)] = 0
     module.corr_unconstrained.register_hook(lambda g: g * keep_corr)
     (module({}, 1, 1) ** 2).sum().backward()
-    assert module.log_std_devs.grad[module.param_idx(2)] == 0
-    assert module.corr_unconstrained.grad[module.off_diag_idx(2, 0)] == 0
+    assert module.log_std_devs.grad[module.get_param_idx(2)] == 0
+    assert module.corr_unconstrained.grad[module.get_off_diag_idx(2, 0)] == 0
     assert (module.log_std_devs.grad != 0).sum() == 3
     assert (module.corr_unconstrained.grad != 0).sum() == num_off_diag(4) - 1
 

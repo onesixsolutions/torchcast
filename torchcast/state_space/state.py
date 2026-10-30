@@ -7,7 +7,7 @@ class StateTuple:
     """
     The state of a :class:`.StateSpaceModel` at a single timestep: a ``(num_groups, state_dim)`` mean and a
     ``(num_groups, state_dim, state_dim)`` covariance. If the model has mixture components, also holds the
-    ``(num_groups, num_combos)`` regime-probabilities (``regime_probs``). If the model has ``adaptive_scaling``, also
+    ``(num_groups, num_combos)`` combo-probabilities (``combo_probs``). If the model has ``adaptive_scaling``, also
     holds the adaptive-scaler's state (``scaling``: a dict of ``(num_groups, ...)`` tensors, incl. the pending
     ``'multiplier'`` for the next step), so that a forecast continued from this state matches one made in a single
     pass.
@@ -19,11 +19,11 @@ class StateTuple:
     def __init__(self,
                  mean: torch.Tensor,
                  cov: torch.Tensor,
-                 regime_probs: Optional[torch.Tensor] = None,
+                 combo_probs: Optional[torch.Tensor] = None,
                  scaling: Optional[Mapping[str, torch.Tensor]] = None):
         self.mean = mean
         self.cov = cov
-        self.regime_probs = regime_probs
+        self.combo_probs = combo_probs
         self.scaling = None if scaling is None else dict(scaling)
 
     def __iter__(self) -> Iterator[torch.Tensor]:
@@ -36,7 +36,7 @@ class StateTuple:
         return (self.mean, self.cov)[item]
 
     def __repr__(self) -> str:
-        regimes = '' if self.regime_probs is None else f', regime_probs={tuple(self.regime_probs.shape)}'
+        regimes = '' if self.combo_probs is None else f', combo_probs={tuple(self.combo_probs.shape)}'
         scaling = '' if self.scaling is None else f', scaling={list(self.scaling)}'
         return f'{type(self).__name__}(mean={tuple(self.mean.shape)}, cov={tuple(self.cov.shape)}{regimes}{scaling})'
 

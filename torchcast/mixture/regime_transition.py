@@ -3,13 +3,13 @@ import torch
 
 class RegimeTransition(torch.nn.Module):
     """
-    Base-class for how regime-probabilities evolve over time. Subclasses implement :func:`initial` (the regime-prior
-    at the first timestep) and :func:`forward` (the regime-prior at the next timestep, given the regime-posterior at
+    Base-class for how combo-probabilities evolve over time. Subclasses implement :func:`initial` (the combo-prior
+    at the first timestep) and :func:`forward` (the combo-prior at the next timestep, given the combo-posterior at
     the current timestep).
 
     Both receive ``base_probs``, the long-run probability of each combo implied by the :class:`MixtureComponent`
     base-rates: a ``(num_combos,)`` tensor (or, if any components have predictors, a ``(num_groups, num_combos)``
-    tensor, for the timestep that the regime-prior is for).
+    tensor, for the timestep that the combo-prior is for).
 
     With latent classes (``MixtureModel(classes=...)``), the transition only sees the combos *within* a class (so
     ``num_combos`` is the number per class): the :class:`MixtureModel` applies it to each class separately -- to the
@@ -27,15 +27,15 @@ class RegimeTransition(torch.nn.Module):
         """
         :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor.
         :param num_groups: The number of groups.
-        :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities.
+        :return: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
         """
         raise NotImplementedError
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         """
-        :param posterior: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the current timestep.
+        :param posterior: A ``(num_groups, num_combos)`` tensor of combo-probabilities at the current timestep.
         :param base_probs: A ``(num_combos,)`` or ``(num_groups, num_combos)`` tensor, for the next timestep.
-        :return: A ``(num_groups, num_combos)`` tensor of regime-probabilities at the next timestep.
+        :return: A ``(num_groups, num_combos)`` tensor of combo-probabilities at the next timestep.
         """
         raise NotImplementedError
 
@@ -66,7 +66,7 @@ class StickyTransition(RegimeTransition):
     Rather than learning ``b`` directly, it's derived so that the stationary distribution of ``T`` is ``base_probs``
     (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run probability of each
     combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture where the
-    regime-prior is always ``base_probs`` (as in :class:`StaticTransition`). (If the base-rates vary over time --
+    combo-prior is always ``base_probs`` (as in :class:`StaticTransition`). (If the base-rates vary over time --
     components with predictors -- then ``base_probs`` is the stationary distribution for the current predictors.)
 
     :param num_combos: The number of regime-combos.
@@ -96,11 +96,11 @@ class StickyTransition(RegimeTransition):
 
     def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         stay = self.get_stay_prob()
-        # equivalent to `posterior @ self.matrix(base_probs)`, without materializing the matrix:
+        # equivalent to `posterior @ self.get_matrix(base_probs)`, without materializing the matrix:
         leave = (posterior * (1 - stay)).sum(-1, keepdim=True)
         return posterior * stay + leave * self._jump_probs(base_probs)
 
-    def matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
+    def get_matrix(self, base_probs: torch.Tensor) -> torch.Tensor:
         """
         The transition-matrix, for inspection and testing (``forward()`` applies it without building it).
 
