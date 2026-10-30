@@ -459,7 +459,7 @@ class StateSpaceModel(torch.nn.Module):
             if self.mixture is None or regime_probs is None:
                 multi = self.adaptive_scaling(resid, nan_mask)
             else:
-                weights = self.mixture.standard_probs(regime_probs, [self.measures[i] for i in idx])
+                weights = self.mixture.get_standard_probs(regime_probs, [self.measures[i] for i in idx])
                 multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
 
             # Handle empty measures (those not in the covariance structure)
@@ -661,12 +661,12 @@ class StateSpaceModel(torch.nn.Module):
          informative groups (e.g. a stratified sampler) and return weights.
 
          The hessian in the result is then also from the subsample, so it can't be used for
-         ``NewtonResult.laplace_mvnorm()`` (unless ``final_full_hessian``). Group kwargs, ``callable_kwargs`` and
+         ``NewtonResult.get_laplace_mvnorm()`` (unless ``final_full_hessian``). Group kwargs, ``callable_kwargs`` and
          :class:`.LossFun` weights are subset to match; a custom ``get_loss`` must handle any subset of groups (and
          can't be combined with weights).
         :param final_full_hessian: With ``hessian_subsample``, compute the full-data hessian at the final parameters
-         (which is expensive), so that ``NewtonResult.laplace_mvnorm()``, ``decrement()`` and ``weak_directions()``
-         use it.
+         (which is expensive), so that ``NewtonResult.get_laplace_mvnorm()``, ``get_decrement()`` and
+         ``get_weak_directions()`` use it.
         :param max_steps: The maximum number of Newton steps.
         :param grad_tol: Converged when the largest absolute gradient is below ``grad_tol`` *and* the largest absolute
          (proposed) step is below ``step_tol``.
@@ -690,7 +690,7 @@ class StateSpaceModel(torch.nn.Module):
         :param verbose: Print each step, and at the end, the weakest directions (smallest eigenvalues of the hessian,
          with the parameters that load most on them).
         :param kwargs: Further keyword-arguments passed to :func:`StateSpaceModel.forward()`.
-        :return: A :class:`.NewtonResult`, with the final hessian, diagnostics, and ``laplace_mvnorm()``.
+        :return: A :class:`.NewtonResult`, with the final hessian, diagnostics, and ``get_laplace_mvnorm()``.
         """
         if get_loss is None:
             get_loss = LossFun()
@@ -752,7 +752,7 @@ class StateSpaceModel(torch.nn.Module):
             result.loss, result.grad, result.hessian = objective.loss_grad_hessian()
             result.hessian_subsample = None
             if verbose:
-                print(f"Full-data hessian at the final parameters: decrement {result.decrement(eig_floor):.3g}")
+                print(f"Full-data hessian at the final parameters: decrement {result.get_decrement(eig_floor):.3g}")
         return result
 
     @property

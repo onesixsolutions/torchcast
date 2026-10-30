@@ -60,7 +60,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
   variance. Custom transforms can override `Transform._expected_inverse()` (a closed form) or
   `Transform._noise_nodes()` (a different noise distribution).
-- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
+- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.get_regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
 - `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
   `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`. `Transform` subclasses
   now implement `transform()` (the forward transformation) as well as `inverse()`.
@@ -131,10 +131,10 @@ Models saved by older versions keep the old behavior, whether loaded by unpickli
 
 ### New option: `Covariance(method='sd_corr')`
 
-A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.param_idx()`, `Covariance.off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
+A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.get_param_idx()`, `Covariance.get_off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
 
 - `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
-- `Covariance.corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
+- `Covariance.get_corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
 - Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
 - Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
 
