@@ -18,7 +18,13 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   and `to_dataframe()` use monte-carlo.
 - Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
   a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
-  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
+  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`; `StaticTransition`
+  is a static mixture.
+- Latent classes: `MixtureModel(..., classes=[LatentClass('reference'), LatentClass('volatile',
+  relative_rate_init={'y.low': 3.}), ...])` gives groups (e.g. customers) their own base-rates for the components -- a
+  discrete random effect, learned per class (each class after the first, relative to the first). A group's class is
+  fixed but unknown: its posterior (`MixtureModel.class_probs(pred.regime_probs)`) accumulates evidence over all of its
+  timesteps and carries into forecasts. The transition is shared by the classes, applied within each one.
 - `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
   only (an approximation, but cheaper). Binary measures never influence the regime-probabilities (their gaussian
   approximation in the update-step is crude).
@@ -60,7 +66,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
   variance. Custom transforms can override `Transform._expected_inverse()` (a closed form) or
   `Transform._noise_nodes()` (a different noise distribution).
-- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `None`) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
+- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
 - `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
   `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`. `Transform` subclasses
   now implement `transform()` (the forward transformation) as well as `inverse()`.

@@ -1,12 +1,11 @@
 import itertools
 import math
-from typing import Sequence, Optional, Mapping
+from typing import Sequence, Optional, Mapping, Union
 
 import torch
 
-from torchcast.mixture import LatentClass, MixtureComponent, StickyTransition
+from torchcast.mixture import LatentClass, MixtureComponent, StandardRegime, StickyTransition
 from torchcast.mixture.regime_transition import RegimeTransition
-
 
 
 class MixtureModel(torch.nn.Module):
@@ -15,9 +14,10 @@ class MixtureModel(torch.nn.Module):
     :class:`.KalmanFilter` (or :class:`.BinomialFilter`). Owns the :class:`MixtureComponent` objects, the
     :class:`RegimeTransition`, and the fixed table of regime-combos.
 
-    A combo is a tuple with one entry per mixture measure (in the order of ``self.mixture_measures``): either ``None``
-    (the standard regime) or one of that measure's components. Measures without components are always in the standard
-    regime, and do not appear in the table. The first combo is always all-standard.
+    A combo is a tuple with one entry per mixture measure (in the order of ``self.mixture_measures``): one of that
+    measure's regimes (see :func:`regimes`) -- its :class:`.StandardRegime`, or one of its components. Measures without
+    components are always in the standard regime, and do not appear in the table. The first combo is always
+    all-standard.
 
     :param components: The mixture components. Mixture measures are ordered by their first appearance here.
     :param transition: A :class:`RegimeTransition`, controlling how regime-probabilities evolve over time. Defaults to
@@ -70,7 +70,8 @@ class MixtureModel(torch.nn.Module):
 
         self.mixture_measures = list(by_measure)
         self.components = torch.nn.ModuleList([c for m in self.mixture_measures for c in by_measure[m]])
-        self._by_measure = by_measure
+        # (not in `components`: they have no parameters, but their buffers should follow `.to()`)
+        self.standard_regimes = torch.nn.ModuleList([StandardRegime(m) for m in self.mixture_measures])
         self.univariate_prob = univariate_prob
         self.joseph_form = joseph_form
 
@@ -78,8 +79,8 @@ class MixtureModel(torch.nn.Module):
         num_classes = max(len(self.classes), 1)
         self.num_classes = num_classes
         # the combos within a class; with latent classes, these are repeated for each class (class-major):
-        class_combos = list(itertools.product(*[[None] + self._by_measure[m] for m in self.mixture_measures]))
-        self.combos: list[tuple[Optional[MixtureComponent], ...]] = class_combos * num_classes
+        class_combos = list(itertools.product(*[self.regimes(m) for m in self.mixture_measures]))
+        self.combos: list[tuple[Union[StandardRegime, MixtureComponent], ...]] = class_combos * num_classes
         self.combo_class: list[int] = [c for c in range(num_classes) for _ in class_combos]
 
         self._class_prior_logits = self._class_offsets = None
@@ -94,6 +95,20 @@ class MixtureModel(torch.nn.Module):
                 f"`transition` has {transition.num_combos} combos, but expected {self.num_class_combos}{per_class}"
             )
         self.transition = transition
+
+    def __setstate__(self, state: dict) -> None:
+        super().__setstate__(state)
+        if 'num_classes' not in self.__dict__:
+            # pickled before latent classes:
+            self.__dict__.update(classes=[], num_classes=1, _class_prior_logits=None, _class_offsets=None)
+            self.combo_class = [0] * len(self.combos)
+        if 'standard_regimes' not in self._modules:
+            # pickled before `StandardRegime` (when combos used None for the standard regime):
+            ref = self.components[0].logit
+            self.standard_regimes = torch.nn.ModuleList([StandardRegime(m) for m in self.mixture_measures])
+            self.standard_regimes.to(device=ref.device, dtype=ref.dtype)
+            self.combos = list(itertools.product(*[self.regimes(m) for m in self.mixture_measures]))
+            self.__dict__.pop('_by_measure', None)
 
     def _init_classes(self) -> None:
         classes = self.classes
@@ -223,39 +238,26 @@ class MixtureModel(torch.nn.Module):
         """The number of combos within each latent class (``num_combos`` without classes)."""
         return self.num_combos // self.num_classes
 
-    def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
+    def regimes(self, measure: str) -> list[Union[StandardRegime, MixtureComponent]]:
         """
-        Pick out the predictors of components' base-rates from the model's ``forward()`` kwargs.
+        :param measure: A mixture measure.
+        :return: The measure's regimes: its :class:`.StandardRegime`, then its components.
+        """
+        k = self.mixture_measures.index(measure)
+        return [self.standard_regimes[k]] + [c for c in self.components if c.measure == measure]
 
-        :param kwargs: The keyword-arguments.
-        :return: A tuple of (1) a dictionary mapping the ``qualified_id`` of each component with predictors to its
-         ``(num_groups, num_timesteps, num_predictors)`` tensor, and (2) the keys used.
+    def base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        out, used = {}, set()
-        for component in self.components:
-            if not component.predictors:
-                continue
-            name = component.model_mat_kwarg_name
-            key = f'{component.id}__{name}'
-            if key not in kwargs:
-                key = name
-            if key not in kwargs:
-                raise TypeError(
-                    f"MixtureComponent '{component.id}' has predictors, so expected a `{name}` (or "
-                    f"`{component.id}__{name}`) keyword-argument."
-                )
-            X = kwargs[key]
-            if X.ndim != 3 or X.shape[-1] != len(component.predictors):
-                raise ValueError(
-                    f"Expected `{key}` to have shape (num_groups, num_timesteps, {len(component.predictors)}) for "
-                    f"MixtureComponent '{component.id}', got {tuple(X.shape)}."
-                )
-            out[component.qualified_id] = X
-            used.add(key)
-        return out, used
+        See ``log_base_probs()``.
+        """
+        return self.log_base_probs(component_X).exp()
 
     def log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
+        Get the probability of each hypothesis (i.e. combo of regimes like ``(measure1='standard', measure2='weird')``).
+         This probability is just the product of each independent regime probability (which can be predicted by a model-
+        matrix, ``component_X``).
+
         :param component_X: Required if any components have predictors: the output of ``_get_component_X()`` (keyed
          by ``qualified_id``), or slices of it (e.g. for one timestep), all with the same leading dims.
         :return: The log long-run probability of each combo: a ``(num_combos,)`` tensor, or with predictors
@@ -265,90 +267,35 @@ class MixtureModel(torch.nn.Module):
          the class's offsets to the components' logits).
         """
         component_X = component_X or {}
-        logits = {c.qualified_id: c.get_logit(component_X.get(c.qualified_id)) for c in self.components}
-        batch_shape = torch.broadcast_shapes(*(lg.shape for lg in logits.values()))
-        to = {'dtype': self.components[0].logit.dtype, 'device': self.components[0].logit.device}
+        logits = {
+            r.qualified_id: r.get_logit(component_X.get(r.qualified_id))
+            for m in self.mixture_measures for r in self.regimes(m)
+        }
+        b_shape = torch.broadcast_shapes(*(lg.shape for lg in logits.values()))
         if self.num_classes > 1:
-            # each component's logit in each class, along a new last dim: (*batch_shape, num_classes)
+            # each component's logit in each class, along a new last dim: (*b_shape, num_classes). (the standard
+            # regime's stays 0 in every class.)
             class_offsets = torch.cat([torch.zeros_like(self._class_offsets[:, :1]), self._class_offsets], 1)
-            logits = {
-                c.qualified_id: logits[c.qualified_id].unsqueeze(-1) + class_offsets[i]
-                for i, c in enumerate(self.components)
-            }
-            batch_shape = (*batch_shape, self.num_classes)
+            for i, c in enumerate(self.components):
+                logits[c.qualified_id] = logits[c.qualified_id].unsqueeze(-1) + class_offsets[i]
+            b_shape = (*b_shape, self.num_classes)
 
-        # per measure: the log-probability of each of its regimes (None = standard, then each component):
+        # per measure: the log-probability of each of its regimes
         regime_log_probs = {}
-        for measure, comps in self._by_measure.items():
-            measure_logits = [torch.zeros(batch_shape, **to)]
-            measure_logits += [logits[c.qualified_id].expand(batch_shape) for c in comps]
-            log_probs = torch.log_softmax(torch.stack(measure_logits, -1), -1).unbind(-1)
-            regime_log_probs[measure] = dict(zip([None] + [c.qualified_id for c in comps], log_probs))
+        for measure in self.mixture_measures:
+            names = [r.qualified_id for r in self.regimes(measure)]
+            log_probs = torch.log_softmax(torch.stack([logits[n].expand(b_shape) for n in names], -1), -1)
+            regime_log_probs.update(zip(names, log_probs.unbind(-1)))
 
-        # per combo: regimes are independent across measures, so their log-probabilities add:
+        # now that we have probs for each regime individually, we compute the probability of each *combo* of regimes.
+        # we treat them as independent here, so it's just the product (sum on the log-scale)
         class_combos = self.combos[:self.num_class_combos]
-        combo_log_probs = [
-            sum(
-                regime_log_probs[measure][None if c is None else c.qualified_id]
-                for measure, c in zip(self.mixture_measures, combo)
-            )
-            for combo in class_combos
-        ]
-        combo_log_probs = torch.stack(combo_log_probs, -1)
+        logs_probs_per_combo = [sum(regime_log_probs[r.qualified_id] for r in combo) for combo in class_combos]
+        log_probs = torch.stack(logs_probs_per_combo, -1)
         if self.num_classes == 1:
-            return combo_log_probs
-        # (*batch_shape, num_classes, num_class_combos) -> class-major (*batch_shape, num_combos):
-        return (self._class_log_prior().unsqueeze(-1) + combo_log_probs).flatten(-2)
-
-    def base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
-        return self.log_base_probs(component_X).exp()
-
-    def prepare(self,
-                kwargs: Mapping,
-                init_regime_probs: Optional[torch.Tensor],
-                num_groups: int,
-                num_timesteps: int) -> tuple[torch.Tensor, Sequence[torch.Tensor], set[str]]:
-        """
-        For a model's ``forward()``: the regime-prior for the first timestep, and the base-rates for the regime-prior
-        at each timestep (``base_probs[t]``; time-varying if any components have predictors).
-
-        :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
-        :param init_regime_probs: The ``regime_probs`` of ``forward()``'s ``initial_state``, if any (see
-         ``_initial_prior``).
-        :return: ``(regime_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
-        """
-        component_X, used_keys = self._get_component_X(kwargs)
-        if component_X:
-            base_probs = self.base_probs(component_X).unbind(1)
-            if len(base_probs) < num_timesteps:
-                raise ValueError(
-                    f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
-                    f"{num_timesteps}."
-                )
-        else:
-            base_probs = [self.base_probs()] * num_timesteps
-        regime_prior = self._initial_prior(init_regime_probs, base_probs[0], num_groups)
-        return regime_prior, base_probs, used_keys
-
-    def _initial_prior(self,
-                      init_regime_probs: Optional[torch.Tensor],
-                      base_probs: torch.Tensor,
-                      num_groups: int) -> torch.Tensor:
-        """
-        The regime-prior for the first timestep. ``init_regime_probs`` (from ``initial_state``) are treated like the
-        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
-        transition. If not given, the transition's ``initial()`` is used.
-        """
-        if init_regime_probs is None:
-            return self._initial_regime_probs(base_probs, num_groups)
-        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.num_combos:
-            raise ValueError(
-                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.num_combos}), "
-                f"got {tuple(init_regime_probs.shape)}"
-            )
-        if init_regime_probs.shape[0] not in (1, num_groups):
-            raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
-        return self.next_prior(init_regime_probs.expand(num_groups, -1), base_probs)
+            return log_probs
+        # (*b_shape, num_classes, num_class_combos) -> class-major (*b_shape, num_combos):
+        return (self._class_log_prior().unsqueeze(-1) + log_probs).flatten(-2)
 
     def effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
         """
@@ -366,7 +313,7 @@ class MixtureModel(torch.nn.Module):
         mapping = []
         for combo in self.combos:
             eff = tuple(
-                (midx[m], c) for m, c in zip(self.mixture_measures, combo) if c is not None and m in midx
+                (midx[m], r) for m, r in zip(self.mixture_measures, combo) if not r.is_standard and m in midx
             )
             if eff not in effective:
                 effective.append(eff)
@@ -401,8 +348,8 @@ class MixtureModel(torch.nn.Module):
         offsets = (
             self.effective_offsets(
                 tuple(
-                    (measures.index(m), c) for m, c in zip(self.mixture_measures, combo)
-                    if c is not None and m in measures
+                    (measures.index(m), r) for m, r in zip(self.mixture_measures, combo)
+                    if not r.is_standard and m in measures
                 ),
                 num_measures=len(measures),
                 like=like,
@@ -423,5 +370,85 @@ class MixtureModel(torch.nn.Module):
         for j, measure in enumerate(measures):
             if measure in self.mixture_measures:
                 k = self.mixture_measures.index(measure)
-                mask[:, j] = torch.as_tensor([float(combo[k] is None) for combo in self.combos])
+                mask[:, j] = torch.as_tensor([float(combo[k].is_standard) for combo in self.combos])
         return regime_probs @ mask
+
+    def prepare(self,
+                kwargs: Mapping,
+                init_regime_probs: Optional[torch.Tensor],
+                num_groups: int,
+                num_timesteps: int) -> tuple[torch.Tensor, Sequence[torch.Tensor], set[str]]:
+        """
+        For a model's ``forward()``: the regime-prior for the first timestep, and the base-rates for the regime-prior
+        at each timestep (``base_probs[t]``; time-varying if any components have predictors).
+
+        :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
+        :param init_regime_probs: The ``regime_probs`` of ``forward()``'s ``initial_state``, if any (see
+         ``_initial_prior``).
+        :return: ``(regime_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
+        """
+        component_X, used_keys = self._get_component_X(kwargs)
+        if component_X:
+            base_probs = self.base_probs(component_X).unbind(1)
+            if len(base_probs) < num_timesteps:
+                raise ValueError(
+                    f"The mixture components' predictors have {len(base_probs)} timesteps, but expected (at least) "
+                    f"{num_timesteps}."
+                )
+        else:
+            base_probs = [self.base_probs()] * num_timesteps
+        regime_prior = self._initial_prior(init_regime_probs, base_probs[0], num_groups)
+        return regime_prior, base_probs, used_keys
+
+    def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
+        """
+        Pick out the predictors of components' base-rates from the model's ``forward()`` kwargs.
+
+        :param kwargs: The keyword-arguments.
+        :return: A tuple of (1) a dictionary mapping the ``qualified_id`` of each component with predictors to its
+         ``(num_groups, num_timesteps, num_predictors)`` tensor, and (2) the keys used.
+        """
+        out, used = {}, set()
+        for component in self.components:
+            if not component.predictors:
+                continue
+            name = component.model_mat_kwarg_name
+            key = f'{component.id}__{name}'
+            if key not in kwargs:
+                key = name
+            if key not in kwargs:
+                raise TypeError(
+                    f"MixtureComponent '{component.id}' has predictors, so expected a `{name}` (or "
+                    f"`{component.id}__{name}`) keyword-argument."
+                )
+            X = kwargs[key]
+            if X.ndim != 3 or X.shape[-1] != len(component.predictors):
+                raise ValueError(
+                    f"Expected `{key}` to have shape (num_groups, num_timesteps, {len(component.predictors)}) for "
+                    f"MixtureComponent '{component.id}', got {tuple(X.shape)}."
+                )
+            out[component.qualified_id] = X
+            used.add(key)
+        return out, used
+
+    def _initial_prior(self,
+                      init_regime_probs: Optional[torch.Tensor],
+                      base_probs: torch.Tensor,
+                      num_groups: int) -> torch.Tensor:
+        """
+        The regime-prior for the first timestep. ``init_regime_probs`` (from ``initial_state``) are treated like the
+        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
+        transition. If not given, the transition's ``initial()`` is used.
+        """
+        if init_regime_probs is None:
+            return self._initial_regime_probs(base_probs, num_groups)
+        if init_regime_probs.ndim != 2 or init_regime_probs.shape[-1] != self.num_combos:
+            raise ValueError(
+                f"Expected `initial_state.regime_probs` to have shape (num_groups, {self.num_combos}), "
+                f"got {tuple(init_regime_probs.shape)}"
+            )
+        if init_regime_probs.shape[0] not in (1, num_groups):
+            raise ValueError(f"Expected `initial_state.regime_probs.shape[0]` to be 1 or {num_groups}")
+        return self.next_prior(init_regime_probs.expand(num_groups, -1), base_probs)
+
+
