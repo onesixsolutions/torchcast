@@ -45,47 +45,43 @@ def test_mixture_model_combos():
     assert rm.mixture_measures == ['a', 'c']
     assert rm.num_combos == 2 * 3
     assert all(r.is_standard for r in rm.combos[0])
-    assert rm.regimes('c') == [rm.combos[0][1], *components[1:]]
-    base_probs = rm.base_probs()
+    assert rm.get_regimes('c') == [rm.combos[0][1], *components[1:]]
+    base_probs = rm.get_base_probs()
     assert torch.isclose(base_probs.sum(), torch.tensor(1.))
     # marginal prob of 'a' being non-standard is its prob_init (it's the only component for 'a'):
     a_weird = torch.tensor([not combo[0].is_standard for combo in rm.combos])
     assert torch.isclose(base_probs[a_weird].sum(), torch.tensor(.1))
 
     # all observed: every combo is distinguishable
-    effective, mapping = rm.effective_combos(['a', 'b', 'c'])
+    effective, mapping = rm.get_effective_combos(['a', 'b', 'c'])
     assert len(effective) == 6
     assert effective[0] == ()
     # 'c' unobserved: combos collapse onto 'a' being standard or not
-    effective, mapping = rm.effective_combos(['a', 'b'])
+    effective, mapping = rm.get_effective_combos(['a', 'b'])
     assert len(effective) == 2
     assert (mapping == a_weird.long()).all()
 
-    # measure-indices refer to the observed measures:
-    effective, _ = rm.effective_combos(['b', 'c'])
-    assert {i for eff in effective for i, _ in eff} == {1}
+    # 'a' unobserved: effective combos are of 'c's regimes; offsets go to 'c's position among the observed measures
+    with torch.no_grad():
+        components[1].offset.fill_(3.)
+    effective, _ = rm.get_effective_combos(['c', 'b'])
+    assert effective == [(), ('c.c1',), ('c.c2',)]
+    shift, extra_var = rm.get_effective_offsets(effective[1], ['c', 'b'], like=base_probs)
+    assert torch.equal(shift, torch.tensor([3., 0.]))
+    assert extra_var[0] > 0 and extra_var[1] == 0
 
 
 def test_standard_regime():
     # the standard regime has no parameters (so isn't fit), but its values follow the model's dtype/device
     rm = MixtureModel([MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')])
-    standard = rm.regimes('a')[0]
+    standard = rm.get_regimes('a')[0]
     assert standard.is_standard and standard.id == '__standard__'
     assert list(rm.parameters()) == list(rm.components.parameters()) + list(rm.transition.parameters())
     assert not any('standard' in k for k in rm.state_dict())
-    assert rm.double().log_base_probs().dtype == torch.float64
+    assert rm.double().get_log_base_probs().dtype == torch.float64
     # the standard regime's id is reserved:
     with pytest.raises(ValueError, match='reserved'):
         MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='__standard__')
-    # pickled before `StandardRegime` (when the combo-table used None for the standard regime):
-    rm = MixtureModel([MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')])
-    state = rm.__dict__.copy()
-    state['_modules'] = {k: v for k, v in state['_modules'].items() if k != 'standard_regimes'}
-    state['combos'] = [(None,), (rm.components[0],)]
-    old = MixtureModel.__new__(MixtureModel)
-    old.__setstate__(state)
-    assert old.combos[0][0].is_standard and old.combos[1][0] is rm.components[0]
-    assert torch.allclose(old.base_probs(), rm.base_probs())
 
 
 def test_mixture_model_validation():
@@ -123,7 +119,7 @@ def test_sticky_transition():
     with torch.no_grad():
         transition._stay_logit.normal_()
     base_probs = torch.softmax(torch.randn(4), 0)
-    T = transition.matrix(base_probs)
+    T = transition.get_matrix(base_probs)
     assert torch.allclose(T.sum(-1), torch.ones(4))
     # base_probs is the stationary distribution:
     assert torch.allclose(base_probs @ T, base_probs, atol=1e-6)
@@ -218,7 +214,7 @@ def test_update_step_univariate():
         expected_mean = w_n * mean_n + w_w * mean_w
         expected_cov = w_n * (cov_n + (mean_n - expected_mean) ** 2) + w_w * (cov_w + (mean_w - expected_mean) ** 2)
 
-        assert torch.allclose(state.regime_probs[:, 1], w_w.view(1), atol=1e-6)
+        assert torch.allclose(state.combo_probs[:, 1], w_w.view(1), atol=1e-6)
         assert torch.allclose(state.mean, expected_mean.view(1, 1), atol=1e-6)
         assert torch.allclose(state.cov, expected_cov.view(1, 1, 1), atol=1e-6)
 
@@ -243,7 +239,7 @@ def test_update_step_unobserved_mixture_measure():
     assert torch.allclose(state.mean, expected_mean)
     assert torch.allclose(state.cov, expected_cov)
     # the regime is unobserved, so the posterior is the prior:
-    assert torch.allclose(state.regime_probs, kf.mixture.base_probs().expand(4, -1))
+    assert torch.allclose(state.combo_probs, kf.mixture.get_base_probs().expand(4, -1))
 
 
 @torch.no_grad()
@@ -264,7 +260,7 @@ def test_log_prob_brute_force():
         m = pred.state_means[g, t] @ H.T
         S = H @ pred.state_covs[g, t] @ H.T + R
         total = 0.
-        for combo, prob in zip(rm.combos, pred.regime_probs[g, t]):
+        for combo, prob in zip(rm.combos, pred.combo_probs[g, t]):
             # each measure in a component's regime: offset mean, and extra variance
             offset = torch.stack([torch.tensor(0.) if c is None else c.offset for c in combo])
             extra = torch.stack([torch.tensor(0.) if c is None else c.extra_var for c in combo])
@@ -339,10 +335,10 @@ def test_binary_measures_excluded_from_responsibilities():
         )
         bf.mc_sampling = 20
         preds[univariate_prob] = bf(y, include_updates_in_output=True)
-    assert torch.allclose(preds[False].update_regime_probs, preds[True].update_regime_probs)
+    assert torch.allclose(preds[False].update_combo_probs, preds[True].update_combo_probs)
     assert torch.allclose(preds[False].state_means, preds[True].state_means)
     # (and responsibilities are actually informative here:)
-    assert preds[False].update_regime_probs[..., 1].max() > .5
+    assert preds[False].update_combo_probs[..., 1].max() > .5
 
 
 @torch.no_grad()
@@ -357,25 +353,25 @@ def test_no_stickiness_is_static():
     y = _make_y(num_measures=2)
     y[0, 3:6, 0] = float('nan')
     pred_static, pred_sticky = kf_static(y), kf_sticky(y)
-    base_probs = kf_static.mixture.base_probs()
-    assert torch.allclose(pred_static.regime_probs, base_probs.expand_as(pred_static.regime_probs))
-    assert torch.allclose(pred_sticky.regime_probs, pred_static.regime_probs, atol=1e-6)
+    base_probs = kf_static.mixture.get_base_probs()
+    assert torch.allclose(pred_static.combo_probs, base_probs.expand_as(pred_static.combo_probs))
+    assert torch.allclose(pred_sticky.combo_probs, pred_static.combo_probs, atol=1e-6)
     assert torch.allclose(pred_sticky.state_means, pred_static.state_means, atol=1e-5)
     assert torch.allclose(pred_sticky.log_prob(y), pred_static.log_prob(y), atol=1e-5)
 
 
 @torch.no_grad()
-def test_regime_probs_through_time():
+def test_combo_probs_through_time():
     kf = _make_kf(['y'], ['y'])
     transition = kf.mixture.transition
     transition._stay_logit.fill_(2.)  # stay ~ .88
-    base_probs = kf.mixture.base_probs()
+    base_probs = kf.mixture.get_base_probs()
 
     y = torch.zeros((2, 10, 1))
     y[0, 4] = -4.  # an outlier (at the component's mean) for group 0 only
     y[:, 7] = float('nan')
     pred = kf(y)
-    priors = pred.regime_probs
+    priors = pred.combo_probs
     assert torch.allclose(priors[:, 0], base_probs.expand(2, -1))
     # after the outlier, group 0 is more likely to be in the 'low' regime -- both vs. the base-rate and vs. group 1:
     assert priors[0, 5, 1] > .5 > base_probs[1]
@@ -386,14 +382,14 @@ def test_regime_probs_through_time():
     assert torch.allclose(priors[:, 8], transition(priors[:, 7], base_probs), atol=1e-6)
     # forecasting past the data:
     pred_fcast = kf(y, out_timesteps=13)
-    assert torch.allclose(pred_fcast.regime_probs[:, 11], transition(pred_fcast.regime_probs[:, 10], base_probs))
+    assert torch.allclose(pred_fcast.combo_probs[:, 11], transition(pred_fcast.combo_probs[:, 10], base_probs))
     # slicing keeps priors aligned:
-    assert torch.allclose(pred[:, 4:6].regime_probs, priors[:, 4:6])
+    assert torch.allclose(pred[:, 4:6].combo_probs, priors[:, 4:6])
 
 
 @pytest.mark.parametrize("n_step,every_step", [(2, True), (3, True), (3, False)])
 @torch.no_grad()
-def test_n_step_regime_probs(n_step: int, every_step: bool):
+def test_n_step_combo_probs(n_step: int, every_step: bool):
     """
     As in ``test_n_step_matches_nan_forecast``: an h-step prediction for t should match a 1-step prediction with the
     observations between t - h and t missing.
@@ -409,7 +405,7 @@ def test_n_step_regime_probs(n_step: int, every_step: bool):
         pred_1 = kf(y_nan, n_step=1)
         assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
         assert torch.allclose(pred_n.state_covs[:, t], pred_1.state_covs[:, t], atol=1e-5)
-        assert torch.allclose(pred_n.regime_probs[:, t], pred_1.regime_probs[:, t], atol=1e-6)
+        assert torch.allclose(pred_n.combo_probs[:, t], pred_1.combo_probs[:, t], atol=1e-6)
     # so the log-prob matches too:
     assert torch.allclose(pred_n.log_prob(y)[:, -1], kf(y_nan, n_step=1).log_prob(y)[:, -1], atol=1e-5)
 
@@ -419,32 +415,32 @@ def test_initial_state_continuation():
     kf = _make_kf(['y1', 'y2'], ['y1'])
     kf.mixture.transition._stay_logit.fill_(1.)
     y = _make_y(num_measures=2)
-    y[:, 11, 0] = -4.  # an outlier right before the split, so the regime-probs at the split are informative
+    y[:, 11, 0] = -4.  # an outlier right before the split, so the combo-probs at the split are informative
     split = 12
 
     full = kf(y)
     state = kf(y[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
-    assert state.regime_probs.shape == (y.shape[0], kf.mixture.num_combos)
+    assert state.combo_probs.shape == (y.shape[0], kf.mixture.num_combos)
     cont = kf(y[:, split:], initial_state=state)
     assert torch.allclose(cont.state_means, full.state_means[:, split:], atol=1e-5)
     assert torch.allclose(cont.state_covs, full.state_covs[:, split:], atol=1e-5)
-    assert torch.allclose(cont.regime_probs, full.regime_probs[:, split:], atol=1e-6)
+    assert torch.allclose(cont.combo_probs, full.combo_probs[:, split:], atol=1e-6)
     assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
 
-    # a plain (mean, cov) tuple restarts regime-probs from the transition's initial distribution:
+    # a plain (mean, cov) tuple restarts combo-probs from the transition's initial distribution:
     cont_tuple = kf(y[:, split:], initial_state=tuple(state))
-    assert torch.allclose(cont_tuple.regime_probs[:, 0], kf.mixture.base_probs().expand(y.shape[0], -1))
+    assert torch.allclose(cont_tuple.combo_probs[:, 0], kf.mixture.get_base_probs().expand(y.shape[0], -1))
 
-    # 'prediction'-type states also carry regime-probs:
+    # 'prediction'-type states also carry combo-probs:
     pred_state = full.get_state_at_times(split, type_='prediction')
-    assert torch.allclose(pred_state.regime_probs, full.regime_probs[:, split])
+    assert torch.allclose(pred_state.combo_probs, full.combo_probs[:, split])
 
     # simulate from the state (the regimes are simulated too, so the regime-probs are one-hot):
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2)
-    assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
-    assert ((sim.regime_probs == 0) | (sim.regime_probs == 1)).all() and (sim.regime_probs.sum(-1) == 1).all()
+    assert sim.combo_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
+    assert ((sim.combo_probs == 0) | (sim.combo_probs == 1)).all() and (sim.combo_probs.sum(-1) == 1).all()
 
-    # a model without mixture components rejects regime-probs:
+    # a model without mixture components rejects combo-probs:
     kf_plain = _make_kf(['y1', 'y2'], [])
     with pytest.raises(ValueError, match="no mixture components"):
         kf_plain(y[:, split:], initial_state=state)
@@ -481,35 +477,35 @@ def test_component_predictors_base_rates():
     kf_plain = _make_kf(['y1', 'y2'], ['y1'])
     kf_plain.load_state_dict({k: v for k, v in kf_zero.state_dict().items() if not k.endswith('coefs')})
     pred_zero, pred_plain = kf_zero(y, X=X), kf_plain(y)
-    assert torch.allclose(pred_zero.regime_probs, pred_plain.regime_probs)
+    assert torch.allclose(pred_zero.combo_probs, pred_plain.combo_probs)
     assert torch.allclose(pred_zero.log_prob(y), pred_plain.log_prob(y))
 
-    # no stickiness: the regime-prior at each timestep is just the base-rate given that timestep's predictors:
+    # no stickiness: the combo-prior at each timestep is just the base-rate given that timestep's predictors:
     kf = _make_kf_with_predictors(stay_logit=-30.)
     component = kf.mixture.components[0]
     pred = kf(y, X=X)
     expected = torch.sigmoid(component.logit + X @ component.coefs)
-    assert torch.allclose(pred.regime_probs[..., 1], expected, atol=1e-6)
+    assert torch.allclose(pred.combo_probs[..., 1], expected, atol=1e-6)
     # incl. when forecasting past the data:
     X_long = torch.cat([X, _make_X(num_times=4)], 1)
     pred_fcast = kf(y, X=X_long, out_timesteps=19)
-    assert torch.allclose(pred_fcast.regime_probs[..., 1], torch.sigmoid(component.logit + X_long @ component.coefs),
+    assert torch.allclose(pred_fcast.combo_probs[..., 1], torch.sigmoid(component.logit + X_long @ component.coefs),
                           atol=1e-6)
     # treated timesteps have more 'low' regime:
     treated = X[..., 0].bool()
-    assert pred.regime_probs[..., 1][treated].mean() > 2 * pred.regime_probs[..., 1][~treated].mean()
+    assert pred.combo_probs[..., 1][treated].mean() > 2 * pred.combo_probs[..., 1][~treated].mean()
 
     # with stickiness, the base-probs for the current predictors are still the stationary distribution:
     kf = _make_kf_with_predictors()
-    base = kf.mixture.base_probs({kf.mixture.components[0].qualified_id: X[:, 0]})  # (num_groups, num_combos)
+    base = kf.mixture.get_base_probs({kf.mixture.components[0].qualified_id: X[:, 0]})  # (num_groups, num_combos)
     assert torch.allclose(kf.mixture.transition(base, base), base, atol=1e-6)
-    assert torch.allclose(kf(y, X=X).regime_probs[:, 0], base, atol=1e-6)
+    assert torch.allclose(kf(y, X=X).combo_probs[:, 0], base, atol=1e-6)
 
 
 @pytest.mark.parametrize("n_step,every_step", [(2, True), (3, True), (3, False)])
 @torch.no_grad()
 def test_component_predictors_n_step(n_step: int, every_step: bool):
-    """As in ``test_n_step_regime_probs``, but with time-varying base-rates (catches off-by-one time-indexing)."""
+    """As in ``test_n_step_combo_probs``, but with time-varying base-rates (catches off-by-one time-indexing)."""
     kf = _make_kf_with_predictors()
     y, X = _make_y(num_measures=2), _make_X()
     pred_n = kf(y, n_step=n_step, every_step=every_step, X=X)
@@ -518,7 +514,7 @@ def test_component_predictors_n_step(n_step: int, every_step: bool):
         y_nan = y.clone()
         y_nan[:, (t - h + 1):t] = float('nan')
         pred_1 = kf(y_nan, n_step=1, X=X)
-        assert torch.allclose(pred_n.regime_probs[:, t], pred_1.regime_probs[:, t], atol=1e-6)
+        assert torch.allclose(pred_n.combo_probs[:, t], pred_1.combo_probs[:, t], atol=1e-6)
         assert torch.allclose(pred_n.state_means[:, t], pred_1.state_means[:, t], atol=1e-5)
 
 
@@ -530,10 +526,10 @@ def test_component_predictors_continuation():
     full = kf(y, X=X)
     state = kf(y[:, :split], X=X[:, :split], include_updates_in_output=True).get_state_at_times(split - 1)
     cont = kf(y[:, split:], X=X[:, split:], initial_state=state)
-    assert torch.allclose(cont.regime_probs, full.regime_probs[:, split:], atol=1e-6)
+    assert torch.allclose(cont.combo_probs, full.combo_probs[:, split:], atol=1e-6)
     assert torch.allclose(cont.log_prob(y[:, split:]), full.log_prob(y)[:, split:], atol=1e-5)
     sim = kf.simulate(out_timesteps=5, initial_state=state, num_sims=2, X=X[:, split:split + 5])
-    assert sim.regime_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
+    assert sim.combo_probs.shape == (2 * y.shape[0], 5, kf.mixture.num_combos)
 
 
 def test_component_predictors_kwargs():
@@ -546,7 +542,7 @@ def test_component_predictors_kwargs():
     with pytest.raises(ValueError, match="timesteps"):
         kf(y, X=X[:, :5])
     with pytest.raises(ValueError, match="needs `X`"):
-        kf.mixture.log_base_probs()
+        kf.mixture.get_log_base_probs()
     with pytest.raises(ValueError, match="list of strings"):
         MixtureComponent(measure='y1', offset_init=0., prob_init=.1, id='x', predictors='treated')
 
@@ -602,9 +598,9 @@ def test_component_predictors_kwarg_name():
         component.coefs.fill_(1.)
         return kf
 
-    expected = make()(y, X=X).regime_probs
+    expected = make()(y, X=X).combo_probs
     renamed = make(model_mat_kwarg_name='Z')
-    assert torch.equal(renamed(y, Z=X).regime_probs, expected)
+    assert torch.equal(renamed(y, Z=X).combo_probs, expected)
     with pytest.raises(TypeError, match="`Z`"):
         renamed(y, X=X)
 
@@ -616,17 +612,17 @@ def test_standard_probs():
         MixtureComponent(measure='c', offset_init=0., prob_init=.2, id='c2'),
     ]
     rm = MixtureModel(components)
-    regime_probs = torch.softmax(torch.randn(4, rm.num_combos), -1)
-    probs = rm.standard_probs(regime_probs, ['a', 'b', 'c'])
+    combo_probs = torch.softmax(torch.randn(4, rm.num_combos), -1)
+    probs = rm.get_standard_probs(combo_probs, ['a', 'b', 'c'])
     for j, m in enumerate(['a', 'b', 'c']):
         if m == 'b':
             assert torch.allclose(probs[:, j], torch.ones(4))
             continue
         k = rm.mixture_measures.index(m)
         standard = torch.tensor([combo[k].is_standard for combo in rm.combos])
-        assert torch.allclose(probs[:, j], regime_probs[:, standard].sum(-1))
+        assert torch.allclose(probs[:, j], combo_probs[:, standard].sum(-1))
     # at base-probs, matches the base-rate:
-    assert torch.allclose(rm.standard_probs(rm.base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
+    assert torch.allclose(rm.get_standard_probs(rm.get_base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
 
 
 @torch.no_grad()
@@ -850,7 +846,7 @@ def test_components_are_offsets():
         kf.mixture.components[0]._log_extra_std.fill_(math.log(.3))
         kf.measure_covariance.cholesky_log_diag.fill_(math.log(.1))
     pred = kf(y, include_updates_in_output=True)
-    p_low = pred.update_regime_probs[..., 1]
+    p_low = pred.update_combo_probs[..., 1]
     # once each group's level is learned, normal observations are standard for both. (Before that, the offset and the
     # level aren't identified: e.g. 'standard regime at level 3' vs. 'low regime at level 7' -- only the base-rate
     # distinguishes them -- so allow a burn-in.)
@@ -877,7 +873,7 @@ def test_joseph_form_option():
         assert kf.mixture.joseph_form is joseph_form
         preds[joseph_form] = kf(y, include_updates_in_output=True)
     assert MixtureModel([MixtureComponent(measure='y', offset_init=0., prob_init=.1, id='a')]).joseph_form
-    for attr in ('update_means', 'update_covs', 'update_regime_probs'):
+    for attr in ('update_means', 'update_covs', 'update_combo_probs'):
         assert torch.allclose(getattr(preds[True], attr), getattr(preds[False], attr), atol=1e-5)
     assert torch.allclose(preds[True].log_prob(y), preds[False].log_prob(y), atol=1e-5)
 
@@ -990,9 +986,9 @@ def test_identical_classes_match_single_class():
     assert torch.allclose(pred1.means, pred2.means, atol=1e-5)
     class_prior = kf2.mixture._class_log_prior().exp()
     assert torch.allclose(class_prior, torch.sigmoid(torch.tensor([-.5, .5])))
-    assert torch.allclose(kf2.mixture.class_probs(pred2.regime_probs), class_prior.expand(3, 20, -1), atol=1e-5)
-    rp2 = pred2.regime_probs.unflatten(-1, (2, -1)).sum(-2)
-    assert torch.allclose(pred1.regime_probs, rp2, atol=1e-5)
+    assert torch.allclose(kf2.mixture.get_class_probs(pred2.combo_probs), class_prior.expand(3, 20, -1), atol=1e-5)
+    rp2 = pred2.combo_probs.unflatten(-1, (2, -1)).sum(-2)
+    assert torch.allclose(pred1.combo_probs, rp2, atol=1e-5)
 
 
 @torch.no_grad()
@@ -1013,7 +1009,7 @@ def test_latent_classes_transition():
     C = num_classes * per_class
     base_probs = torch.softmax(torch.randn(C), 0)
     # (sticky is linear, so the matrix's rows are the next-prior from each combo)
-    T = mixture.next_prior(torch.eye(C), base_probs)
+    T = mixture.get_next_prior(torch.eye(C), base_probs)
     assert torch.allclose(T.sum(-1), torch.ones(C))
     for c in range(num_classes):
         block = slice(c * per_class, (c + 1) * per_class)
@@ -1021,25 +1017,25 @@ def test_latent_classes_transition():
         assert (T[block, :block.start] == 0).all() and (T[block, block.stop:] == 0).all()
         # within a class, the shared transition with the class's (normalized) base-rates, which are stationary:
         within = base_probs[block] / base_probs[block].sum()
-        assert torch.allclose(T[block, block], transition.matrix(within), atol=1e-6)
+        assert torch.allclose(T[block, block], transition.get_matrix(within), atol=1e-6)
         assert torch.allclose(within @ T[block, block], within, atol=1e-6)
 
     posterior = torch.softmax(torch.randn(5, C), -1)
-    nxt = mixture.next_prior(posterior, base_probs)
+    nxt = mixture.get_next_prior(posterior, base_probs)
     assert torch.allclose(nxt, posterior @ T, atol=1e-6)
-    assert torch.allclose(mixture.class_probs(nxt), mixture.class_probs(posterior), atol=1e-6)
+    assert torch.allclose(mixture.get_class_probs(nxt), mixture.get_class_probs(posterior), atol=1e-6)
     assert torch.allclose(mixture._initial_prior(None, base_probs, 5), base_probs.expand(5, -1), atol=1e-6)
     # per-group base-probs (components with predictors):
     group_base_probs = torch.softmax(torch.randn(5, C), -1)
-    expected = torch.stack([posterior[g] @ mixture.next_prior(torch.eye(C), group_base_probs[g]) for g in range(5)])
-    assert torch.allclose(mixture.next_prior(posterior, group_base_probs), expected, atol=1e-6)
+    expected = torch.stack([posterior[g] @ mixture.get_next_prior(torch.eye(C), group_base_probs[g]) for g in range(5)])
+    assert torch.allclose(mixture.get_next_prior(posterior, group_base_probs), expected, atol=1e-6)
 
     # a static transition with classes: regimes are redrawn from the class's base-rates; the class stays.
     mixture.transition = StaticTransition(num_combos=per_class)
-    nxt = mixture.next_prior(posterior, base_probs)
+    nxt = mixture.get_next_prior(posterior, base_probs)
     within_base = base_probs.view(num_classes, per_class)
     within_base = within_base / within_base.sum(-1, keepdim=True)
-    expected = (mixture.class_probs(posterior).unsqueeze(-1) * within_base).flatten(-2)
+    expected = (mixture.get_class_probs(posterior).unsqueeze(-1) * within_base).flatten(-2)
     assert torch.allclose(nxt, expected, atol=1e-6)
 
 
@@ -1057,10 +1053,10 @@ def test_latent_classes_base_probs():
     mixture._class_prior_logits.normal_()
     X = torch.randn(2, 4, 1)
     component = mixture.components[0]
-    base_probs = mixture.base_probs({component.qualified_id: X})
+    base_probs = mixture.get_base_probs({component.qualified_id: X})
     assert base_probs.shape == (2, 4, 6)
     assert torch.allclose(base_probs.sum(-1), torch.ones(2, 4))
-    class_probs = mixture.class_probs(base_probs)
+    class_probs = mixture.get_class_probs(base_probs)
     assert torch.allclose(class_probs, mixture._class_log_prior().exp().expand(2, 4, -1))
     offsets = torch.cat([torch.zeros(1), mixture._class_offsets[0]])
     for c in range(3):
@@ -1083,7 +1079,7 @@ def test_latent_class_init():
     ])
     assert torch.allclose(mixture._class_log_prior().exp(), torch.tensor([.5, .5]))
     # the ratio multiplies the component's odds vs. the standard regime; others are unchanged:
-    base_probs = mixture.base_probs().view(2, 3)
+    base_probs = mixture.get_base_probs().view(2, 3)
     odds = base_probs[:, 1:] / base_probs[:, :1]  # (class, component)
     assert torch.allclose(odds[1] / odds[0], torch.tensor([1., .1]), atol=1e-6)
 
@@ -1136,8 +1132,8 @@ def test_latent_classes_with_two_components():
         mixture=mixture,
     )
     # classes don't add state-updates: only the observable combos are distinct.
-    assert len(mixture.effective_combos(['y1', 'y2'])[0]) == 6
-    assert len(mixture.effective_combos(['y1'])[0]) == 3
+    assert len(mixture.get_effective_combos(['y1', 'y2'])[0]) == 6
+    assert len(mixture.get_effective_combos(['y1'])[0]) == 3
 
     y = _make_y()
     y[1, 3:6, 1] = float('nan')
@@ -1147,7 +1143,7 @@ def test_latent_classes_with_two_components():
     assert (mixture._class_prior_logits.grad.abs() > 0).all()
 
     with torch.no_grad():
-        class_probs = mixture.class_probs(pred.regime_probs)
+        class_probs = mixture.get_class_probs(pred.combo_probs)
         # no observations -> no change in class-probabilities:
         assert torch.allclose(class_probs[:, 15:], class_probs[:, 15:16].expand(-1, 5, -1), atol=1e-6)
         assert torch.allclose(pred.get_mixture('y1').probs.sum(-1), torch.ones(3, 20), atol=1e-6)
@@ -1155,7 +1151,7 @@ def test_latent_classes_with_two_components():
         assert len(set(labels)) == mixture.num_combos and labels[-1] == ('high', 'low', 'volatile')
         assert pred.sample(5, shared_noise=False).means.shape == (5, 3, 20, 2)
         # simulated trajectories stay in one class:
-        sim_class = mixture.class_probs(kf.simulate(out_timesteps=5, num_groups=2, num_sims=10).regime_probs)
+        sim_class = mixture.get_class_probs(kf.simulate(out_timesteps=5, num_groups=2, num_sims=10).combo_probs)
         assert (sim_class == sim_class[:, :1]).all()
 
 
@@ -1186,7 +1182,7 @@ def test_latent_classes_fit():
         assert .15 < rates[1] < .35
 
         pred = kf(y.unsqueeze(-1), out_timesteps=num_times + 10)
-        class_probs = mixture.class_probs(pred.regime_probs)  # (G, T, 2)
+        class_probs = mixture.get_class_probs(pred.combo_probs)  # (G, T, 2)
         assert ((class_probs[:, num_times - 1, 1] > .5) == frequent).all()
         # forecasts keep each group's class -- the regime-probs don't revert to a shared base-rate:
         p_low = pred.get_mixture('y').probs[:, -1, 1]
@@ -1217,7 +1213,7 @@ def test_simulate_regimes():
         mixture=MixtureModel([low], transition=StickyTransition(num_combos=2, stay_init=.8)),
     )
     sim = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(0))
-    probs = sim.regime_probs  # (sims, times, combos)
+    probs = sim.combo_probs  # (sims, times, combos)
     assert ((probs == 0) | (probs == 1)).all() and (probs.sum(-1) == 1).all()
 
     path = probs.argmax(-1)
@@ -1230,11 +1226,11 @@ def test_simulate_regimes():
 
     # observations are drawn in the simulated regime
     samples = sim.sample(5, shared_noise=False)
-    assert torch.equal(samples.regimes, path.expand_as(samples.regimes))
+    assert torch.equal(samples.combos, path.expand_as(samples.combos))
 
     # reproducible with a generator
     again = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(0))
-    assert torch.equal(again.state_means, sim.state_means) and torch.equal(again.regime_probs, sim.regime_probs)
+    assert torch.equal(again.state_means, sim.state_means) and torch.equal(again.combo_probs, sim.combo_probs)
     other = kf.simulate(out_timesteps=50, num_groups=1, num_sims=400, generator=torch.Generator().manual_seed(1))
     assert not torch.equal(other.state_means, sim.state_means)
 
@@ -1250,6 +1246,6 @@ def test_simulate_latent_classes():
     assert not list(kf.mixture.transition.parameters())
     kf.mixture._class_offsets.fill_(4.)
     kf.mixture._class_prior_logits.fill_(-1.)
-    sim_class = kf.mixture.class_probs(kf.simulate(out_timesteps=30, num_groups=1000).regime_probs)
+    sim_class = kf.mixture.get_class_probs(kf.simulate(out_timesteps=30, num_groups=1000).combo_probs)
     assert (sim_class == sim_class[:, :1]).all()
     assert abs(sim_class[:, 0, 1].mean() - torch.sigmoid(torch.tensor(-1.))) < .04

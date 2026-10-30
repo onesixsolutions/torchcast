@@ -49,7 +49,7 @@ class Transform(torch.nn.Module):
             raise ValueError("`bias_adjust` must be between 0 and 1.")
         self.bias_adjust = dict(bias_adjust) if isinstance(bias_adjust, Mapping) else bias_adjust
 
-    def var_multi(self, regime: str = STANDARD_REGIME_ID) -> float:
+    def get_var_multi(self, regime: str = STANDARD_REGIME_ID) -> float:
         """
         :param regime: For a measure with mixture components: the ``id`` of the regime (``'__standard__'``, or a
          component's).
@@ -92,7 +92,7 @@ class Transform(torch.nn.Module):
          differs by regime (a :class:`SmearingTransform` from :func:`SmearingTransform.from_predictions`).
         :return: A tensor with the same shape as ``mean``.
         """
-        return self._expected_inverse(mean, var * (self.var_multi(regime) if adjust_bias else 1.), regime=regime)
+        return self._expected_inverse(mean, var * (self.get_var_multi(regime) if adjust_bias else 1.), regime=regime)
 
     def _expected_inverse(self,
                           mean: torch.Tensor,

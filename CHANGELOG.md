@@ -23,7 +23,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - Latent classes: `MixtureModel(..., classes=[LatentClass('reference'), LatentClass('volatile',
   relative_rate_init={'y.low': 3.}), ...])` gives groups (e.g. customers) their own base-rates for the components -- a
   discrete random effect, learned per class (each class after the first, relative to the first). A group's class is
-  fixed but unknown: its posterior (`MixtureModel.class_probs(pred.regime_probs)`) accumulates evidence over all of its
+  fixed but unknown: its posterior (`MixtureModel.get_class_probs(pred.combo_probs)`) accumulates evidence over all of its
   timesteps and carries into forecasts. The transition is shared by the classes, applied within each one.
 - `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
   only (an approximation, but cheaper). Binary measures never influence the regime-probabilities (their gaussian
@@ -66,14 +66,14 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
   variance. Custom transforms can override `Transform._expected_inverse()` (a closed form) or
   `Transform._noise_nodes()` (a different noise distribution).
-- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
+- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.get_regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
 - `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
   `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`. `Transform` subclasses
   now implement `transform()` (the forward transformation) as well as `inverse()`.
 
 ### New feature: sampling predictions, and derived quantities
 
-- `Predictions.sample(num_samples, shared_noise, observation_noise=True, generator=None)` draws from the predictive distribution, jointly across measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`, observations are sampled too (binomial draws for binary measures). `shared_noise` (required) says whether the underlying random draws are shared across groups and timesteps (cheaper, fine for per-row summaries) or independent (needed to aggregate across groups). Returns a `PredictionSamples`, whose `regimes` gives each draw's regime-combo, for mixture models.
+- `Predictions.sample(num_samples, shared_noise, observation_noise=True, generator=None)` draws from the predictive distribution, jointly across measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`, observations are sampled too (binomial draws for binary measures). `shared_noise` (required) says whether the underlying random draws are shared across groups and timesteps (cheaper, fine for per-row summaries) or independent (needed to aggregate across groups). Returns a `PredictionSamples`, whose `combos` gives each draw's regime-combo, for mixture models.
 - `sample(regime_noise_scale={'quick': 0.})` scales the randomness of draws in a component's regime: `0` pins them at the regime's center (the measured-mean of the state's mean, plus the offset), while the standard regime is sampled as usual -- e.g. to see how much a component's variance contributes to back-transformed outputs.
 - `Predictions.to_dataframe(derived={'total': lambda s: s['a'] + s['b']})` adds quantities computed from several
   measures, from joint samples (so correlations between measures are accounted for), on the scale given by
@@ -85,7 +85,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 ### Behavior change: `simulate()`
 
 - **`simulate()` now outputs the simulated states**, so its `means`, `sample()` and `to_dataframe()` describe observations around the simulated trajectories. Before, each timestep's output was the one-step *prior* given the previous simulated state -- so e.g. `sample()` drew fresh process-noise for each timestep, ignoring the process-noise the trajectory actually carried forward, and the variance of quantities summed over time (e.g. a lifetime total) was too small. **Code that uses `simulate()` will get different (correct) values.** With `include_updates_in_output=True`, the `update_*` attributes are the same states. `forward(simulate=...)` now requires `n_step=1`.
-- For models with mixture components, the regimes are simulated too: one regime-combo per timestep, drawn given the previous one (so e.g. a sticky regime persists), with one-hot `regime_probs` -- so `sample()` draws observations in the simulated regime. Before, the regime-probabilities were just rolled forward.
+- For models with mixture components, the regimes are simulated too: one regime-combo per timestep, drawn given the previous one (so e.g. a sticky regime persists), with one-hot `combo_probs` -- so `sample()` draws observations in the simulated regime. Before, the regime-probabilities were just rolled forward.
 - `simulate(generator=...)` for reproducible simulations.
 - Bug fix: `simulate()` failed for float64 (or non-cpu) models.
 
@@ -109,7 +109,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   own, rather than a second, joint sampling pass. Much faster (e.g. ~11x for `to_dataframe()` of a `BinomialFilter`
   with mixture components); the intervals change only by monte-carlo error.
 - `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
-  tuple it replaces (unpacking, `len()`, indexing), and also carries the regime-probabilities of models with mixture
+  tuple it replaces (unpacking, `len()`, indexing), and also carries the combo-probabilities (`combo_probs`) of models with mixture
   components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks
   `isinstance(..., tuple)` will need updating.)
 - `AdaptiveScaler.forward()` takes an optional `weights` argument. It's only passed for models with mixture
@@ -137,10 +137,10 @@ Models saved by older versions keep the old behavior, whether loaded by unpickli
 
 ### New option: `Covariance(method='sd_corr')`
 
-A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.param_idx()`, `Covariance.off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
+A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.get_param_idx()`, `Covariance.get_off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
 
 - `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
-- `Covariance.corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
+- `Covariance.get_corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
 - Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
 - Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
 

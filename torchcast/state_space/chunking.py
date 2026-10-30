@@ -54,10 +54,10 @@ def _subset_groups(value: Any,
         if strict and size != 1:
             raise ValueError(f"Expected `{name}` to have first dimension {num_groups} (num_groups), got {size}.")
         return value
-    if isinstance(value, StateTuple):  # e.g. ``initial_state`` with ``regime_probs`` / ``scaling``
+    if isinstance(value, StateTuple):  # e.g. ``initial_state`` with ``combo_probs`` / ``scaling``
         return StateTuple(*(
             None if v is None else _subset_groups(v, group_slice, num_groups, strict, name)
-            for v in (value.mean, value.cov, value.regime_probs, value.scaling)
+            for v in (value.mean, value.cov, value.combo_probs, value.scaling)
         ))
     if isinstance(value, tuple):
         return tuple(_subset_groups(v, group_slice, num_groups, strict, name) for v in value)

@@ -192,10 +192,10 @@ class Covariance(nn.Module):
          element. Unlike "log_cholesky" (where off-diagonal entries are in absolute units, and also change the
          variances), each parameter is dimensionless and the variances are set by ``log_std_devs`` alone; this is
          better conditioned for optimization when elements have very different scales, and lets you freeze variances
-         and correlations separately (see :func:`Covariance.param_idx` and :func:`Covariance.off_diag_idx`). Note
-         that a zero ``corr_unconstrained`` is a zero *partial* correlation (given the earlier elements): element
-         ``i`` is uncorrelated with all others when every entry in its row *and* column is zero. Existing modules
-         can be converted with :func:`Covariance.to_method`.
+         and correlations separately (see :func:`Covariance.get_param_idx` and
+         :func:`Covariance.get_off_diag_idx`). Note that a zero ``corr_unconstrained`` is a zero *partial* correlation
+         (given the earlier elements): element ``i`` is uncorrelated with all others when every entry in its row *and*
+         column is zero. Existing modules can be converted with :func:`Covariance.to_method`.
         :param empty_idx: In some cases (e.g. process-covariance) we will have some elements with no variance.
         :param predict_variance: For predicting variance, see :func:`Covariance.from_measures`.
         :param expected_kwargs: If ``predict_variance`` is set, this allows you to set the keyword that will be passed
@@ -360,11 +360,11 @@ class Covariance(nn.Module):
             mini_cov = mini_cov + torch.eye(mini_cov.shape[-1], device=mini_cov.device, dtype=mini_cov.dtype) * 1e-12
         return mini_cov
 
-    def corr_cholesky(self) -> Tensor:
+    def get_corr_cholesky(self) -> Tensor:
         """
         The cholesky factor of the correlation matrix (of the ``param_rank`` block, i.e. excluding ``empty_idx``, and
         before any ``predict_variance``). E.g. for an LKJ prior:
-        ``torch.distributions.LKJCholesky(cov.param_rank, eta).log_prob(cov.corr_cholesky())``.
+        ``torch.distributions.LKJCholesky(cov.param_rank, eta).log_prob(cov.get_corr_cholesky())``.
         """
         if self.method == 'sd_corr':
             return corr_cholesky_from_unconstrained(self.corr_unconstrained, rank=self.param_rank)
@@ -445,7 +445,7 @@ class Covariance(nn.Module):
         out._set_params(method, init_diag_multi=1.0)
         return out.set_matrix_(self._get_mini_cov().detach())
 
-    def param_idx(self, i: int) -> int:
+    def get_param_idx(self, i: int) -> int:
         """
         The index of element ``i`` (of ``0..rank-1``) in the per-element parameters (``log_std_devs`` for
         "sd_corr"/"low_rank", ``cholesky_log_diag`` for "log_cholesky"), accounting for ``empty_idx``. E.g., to
@@ -455,10 +455,10 @@ class Covariance(nn.Module):
 
             cov = Covariance.from_processes(processes, cov_type='initial', method='sd_corr')
             keep_std = torch.ones_like(cov.log_std_devs)
-            keep_std[cov.param_idx(3)] = 0
+            keep_std[cov.get_param_idx(3)] = 0
             cov.log_std_devs.register_hook(lambda g: g * keep_std)
             keep_corr = torch.ones_like(cov.corr_unconstrained)
-            keep_corr[cov.off_diag_idx(3, 0)] = 0
+            keep_corr[cov.get_off_diag_idx(3, 0)] = 0
             cov.corr_unconstrained.register_hook(lambda g: g * keep_corr)
 
         For "sd_corr", these entries are interpretable on their own; for "log_cholesky" they're entries of the
@@ -470,13 +470,13 @@ class Covariance(nn.Module):
             raise IndexError(f"Element {i} out of range for rank {self.rank}.")
         return self.non_empty_idx.index(i)
 
-    def off_diag_idx(self, i: int, j: int) -> int:
+    def get_off_diag_idx(self, i: int, j: int) -> int:
         """
         The index of the pair of elements ``(i, j)`` (in either order, of ``0..rank-1``) in the off-diagonal
         parameters (``corr_unconstrained`` for "sd_corr", ``cholesky_off_diag`` for "log_cholesky"), accounting for
-        ``empty_idx``. See :func:`Covariance.param_idx`.
+        ``empty_idx``. See :func:`Covariance.get_param_idx`.
         """
-        row, col = sorted((self.param_idx(i), self.param_idx(j)), reverse=True)
+        row, col = sorted((self.get_param_idx(i), self.get_param_idx(j)), reverse=True)
         if row == col:
             raise ValueError("``i`` and ``j`` must be different elements.")
         return row * (row - 1) // 2 + col
