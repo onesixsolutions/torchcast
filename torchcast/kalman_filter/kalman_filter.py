@@ -282,13 +282,10 @@ class KalmanFilter(StateSpaceModel):
             standard.combo_probs = log_prior.exp()
             return standard
 
-        # which measures contribute to the responsibilities. non-gaussian measures (e.g. binary) never do: their
-        # gaussian approximation is crude, and their log-prob is computed separately from the gaussian measures' (so
-        # using their correlation here would be inconsistent with training).
-        if self.mixture.univariate_prob:
-            score_idx = [i for i, m in enumerate(measures) if m in self.mixture.mixture_measures]
-        else:
-            score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        # the measures that score the combos: all but the non-gaussian ones (e.g. binary), whose gaussian approximation
+        # here is crude, and whose log-prob is computed separately from the gaussian measures' (so using their
+        # correlation here would be inconsistent with training).
+        score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
         score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
         # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective

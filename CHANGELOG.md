@@ -19,9 +19,8 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
   a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
   mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
-- `MixtureModel(..., univariate_prob=True)` computes the per-timestep regime-probabilities from the mixture measures' likelihood
-  only (an approximation, but cheaper). Binary measures never influence the regime-probabilities (their gaussian
-  approximation in the update-step is crude).
+- Binary measures never influence the regime-probabilities (their gaussian approximation in the update-step is
+  crude).
 - `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
 - Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
   regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing. (For

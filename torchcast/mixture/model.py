@@ -21,10 +21,6 @@ class MixtureModel(torch.nn.Module):
     :param components: The mixture components. Mixture measures are ordered by their first appearance here.
     :param transition: A :class:`RegimeTransition`, controlling how combo-probabilities evolve over time. Defaults to
      :class:`StickyTransition`.
-    :param univariate_prob: If True, the per-timestep regime-probabilities are computed using only the likelihood of
-     the mixture measures, rather than of all observed measures. This is an approximation (exact if the other
-     measures' residuals are uncorrelated with the mixture measures'), but can be cheaper. (Non-gaussian measures,
-     e.g. binary, never influence the regime-probabilities.)
     :param joseph_form: Whether the update-step for the *non-standard* regime-combos (those with any measure in a
      component's regime) uses the Joseph form of the covariance update. (The standard regime's update follows the
      model's ``joseph_form``.) With mixtures, the update runs once for each regime-combo, and the Joseph form's
@@ -37,7 +33,6 @@ class MixtureModel(torch.nn.Module):
     def __init__(self,
                  components: Sequence[MixtureComponent],
                  transition: Optional[RegimeTransition] = None,
-                 univariate_prob: bool = False,
                  joseph_form: bool = True):
         super().__init__()
         if not components:
@@ -56,7 +51,6 @@ class MixtureModel(torch.nn.Module):
         self._components_by_id = {c.qualified_id: c for c in self.components}
         # (not in `components`: they have no parameters, but their buffers should follow `.to()`)
         self.standard_regimes = torch.nn.ModuleList([StandardRegime(m) for m in self.mixture_measures])
-        self.univariate_prob = univariate_prob
         self.joseph_form = joseph_form
 
         self.combos: list[tuple[Union[StandardRegime, MixtureComponent], ...]] = list(
