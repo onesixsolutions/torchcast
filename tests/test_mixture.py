@@ -77,7 +77,7 @@ def test_standard_regime():
     assert standard.is_standard and standard.id == '__standard__'
     assert list(rm.parameters()) == list(rm.components.parameters()) + list(rm.transition.parameters())
     assert not any('standard' in k for k in rm.state_dict())
-    assert rm.double().get_log_base_probs().dtype == torch.float64
+    assert rm.double()._get_log_base_probs().dtype == torch.float64
     # the standard regime's id is reserved:
     with pytest.raises(ValueError, match='reserved'):
         MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='__standard__')
@@ -549,7 +549,7 @@ def test_component_predictors_kwargs():
     with pytest.raises(ValueError, match="timesteps"):
         kf(y, X=X[:, :5])
     with pytest.raises(ValueError, match="needs `X`"):
-        kf.mixture.get_log_base_probs()
+        kf.mixture._get_log_base_probs()
     with pytest.raises(ValueError, match="list of strings"):
         MixtureComponent(measure='y1', offset_init=0., prob_init=.1, id='x', predictors='treated')
 

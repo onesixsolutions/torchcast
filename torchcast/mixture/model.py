@@ -104,11 +104,11 @@ class MixtureModel(torch.nn.Module):
 
     def get_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        See ``get_log_base_probs()``.
+        See ``_get_log_base_probs()``.
         """
-        return self.get_log_base_probs(component_X).exp()
+        return self._get_log_base_probs(component_X).exp()
 
-    def get_log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
+    def _get_log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
         Get the log-probability of each combo of regimes (like ``(measure1='standard', measure2='weird')``). This is
         just the product (the sum, on the log-scale) of each independent regime probability, which can be predicted by a
@@ -228,7 +228,10 @@ class MixtureModel(torch.nn.Module):
         if init_combo_probs is None:
             combo_prior = self.transition.initial(base_probs[0], num_groups)
         else:
-            combo_prior = self._initial_prior(init_combo_probs, base_probs[0], num_groups)
+            # alternate case: init_combo_probs was passed as part of initial state. like the mean/cov of
+            # ``initial_state``, we treat as the state *before* the first timestep, so they're evolved one step by the
+            # transition.
+            combo_prior = self.transition(init_combo_probs.expand(num_groups, -1), base_probs[0])
 
         return combo_prior, base_probs, used_keys
 
@@ -262,24 +265,3 @@ class MixtureModel(torch.nn.Module):
             out[component.qualified_id] = X
             used.add(key)
         return out, used
-
-    def _initial_prior(self,
-                       init_combo_probs: torch.Tensor,
-                       base_probs: torch.Tensor,
-                       num_groups: int) -> torch.Tensor:
-        """
-        The combo-prior for the first timestep. ``init_combo_probs`` (from ``initial_state``) are treated like the
-        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
-        transition.
-        """
-
-        if init_combo_probs.ndim != 2 or init_combo_probs.shape[-1] != self.num_combos:
-            raise ValueError(
-                f"Expected `initial_state.combo_probs` to have shape (num_groups, {self.num_combos}), "
-                f"got {tuple(init_combo_probs.shape)}"
-            )
-
-        if init_combo_probs.shape[0] not in (1, num_groups):
-            raise ValueError(f"Expected `initial_state.combo_probs.shape[0]` to be 1 or {num_groups}")
-
-        return self.transition(init_combo_probs.expand(num_groups, -1), base_probs)
