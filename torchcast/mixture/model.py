@@ -51,7 +51,7 @@ class MixtureModel(torch.nn.Module):
             if len(ids) != len(set(ids)):
                 raise ValueError(f"Mixture components must have unique ids within a measure, but '{measure}' got {ids}")
 
-        self.mixture_measures = list(by_measure)
+        self.mixture_measures = list(by_measure)  # TODO: just rename to 'measures' after 55 is merged
         self.components = torch.nn.ModuleList([c for m in self.mixture_measures for c in by_measure[m]])
         self._components_by_id = {c.qualified_id: c for c in self.components}
         # (not in `components`: they have no parameters, but their buffers should follow `.to()`)
@@ -209,6 +209,9 @@ class MixtureModel(torch.nn.Module):
         :return: ``(combo_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
         """
         component_X, used_keys = self._get_component_X(kwargs)
+
+        # base-probs, the long run probability that the transitioning func converges to (for a given set of predictors)
+        # in the absence of new observations/updates:
         if component_X:
             base_probs = self.get_base_probs(component_X).unbind(1)
             if len(base_probs) < num_timesteps:
@@ -218,7 +221,15 @@ class MixtureModel(torch.nn.Module):
                 )
         else:
             base_probs = [self.get_base_probs()] * num_timesteps
-        combo_prior = self._initial_prior(init_combo_probs, base_probs[0], num_groups)
+
+        # combo-prior: for the most common case of a fresh run, it's just passing base-probs to the transition-func's
+        # ``initial()`` method (and in the most common case that's just returning base_probs).
+        # so in most cases, the prior == base_probs.
+        if init_combo_probs is None:
+            combo_prior = self.transition.initial(base_probs[0], num_groups)
+        else:
+            combo_prior = self._initial_prior(init_combo_probs, base_probs[0], num_groups)
+
         return combo_prior, base_probs, used_keys
 
     def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
@@ -253,21 +264,22 @@ class MixtureModel(torch.nn.Module):
         return out, used
 
     def _initial_prior(self,
-                       init_combo_probs: Optional[torch.Tensor],
+                       init_combo_probs: torch.Tensor,
                        base_probs: torch.Tensor,
                        num_groups: int) -> torch.Tensor:
         """
         The combo-prior for the first timestep. ``init_combo_probs`` (from ``initial_state``) are treated like the
         mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
-        transition. If not given, the transition's ``initial()`` is used.
+        transition.
         """
-        if init_combo_probs is None:
-            return self.transition.initial(base_probs, num_groups)
+
         if init_combo_probs.ndim != 2 or init_combo_probs.shape[-1] != self.num_combos:
             raise ValueError(
                 f"Expected `initial_state.combo_probs` to have shape (num_groups, {self.num_combos}), "
                 f"got {tuple(init_combo_probs.shape)}"
             )
+
         if init_combo_probs.shape[0] not in (1, num_groups):
             raise ValueError(f"Expected `initial_state.combo_probs.shape[0]` to be 1 or {num_groups}")
+
         return self.transition(init_combo_probs.expand(num_groups, -1), base_probs)
