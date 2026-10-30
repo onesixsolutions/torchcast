@@ -201,7 +201,7 @@ class KalmanFilter(StateSpaceModel):
                         **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Hook for subclasses to validate/adjust the inputs to the update step (e.g. ``BinomialFilter`` adjusts the
-        measure-covariance). Called exactly once per update-step, before any mixture hypotheses are constructed; any
+        measure-covariance). Called exactly once per update-step, before the mixture update's effective combos; any
         update-kwargs from ``_parse_kwargs`` are consumed here.
 
         :return: A tuple of (possibly modified) ``input``, ``measured_mean``, ``measure_cov``.
@@ -254,10 +254,10 @@ class KalmanFilter(StateSpaceModel):
                         measures: Sequence[str],
                         regime_prior: Optional[torch.Tensor] = None) -> 'StateTuple':
         """
-        Update step when there are mixture components. Each (effective) regime-combo implies a hypothesis: for
-        measures in a non-standard regime, the measured-mean is offset by the component's mean, and the component's
-        variance is added to the measurement-noise. Each hypothesis is a full kalman update; they're weighted by their
-        posterior probability and collapsed via moment-matching.
+        Update step when there are mixture components. Each effective combo (aka hypothesis; see
+        ``MixtureModel.get_effective_combos``) offsets the measured-mean of measures in a non-standard regime by their
+        component's offset, and adds the component's variance to their measurement-noise. Each effective combo gets a
+        full kalman update; these are weighted by their posterior probability and collapsed via moment-matching.
 
         :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
         :param regime_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo. Defaults
@@ -293,8 +293,9 @@ class KalmanFilter(StateSpaceModel):
             score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
         score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
-        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
-        # updated together, along a leading combo-dimension; tensors that don't depend on the combo broadcast.
+        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective
+        # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
+        # broadcast.
         shifts, extra_vars = zip(*(
             self.mixture.get_effective_offsets(eff, len(measures), like=input) for eff in effective
         ))

@@ -14,8 +14,8 @@ class MixtureModel(torch.nn.Module):
     :class:`RegimeTransition`, and the fixed table of regime-combos.
 
     A combo is a tuple with one entry per mixture measure (in the order of ``self.mixture_measures``): one of that
-    measure's regimes (see :func:`regimes`) -- its :class:`.StandardRegime`, or one of its components. Measures without
-    components are always in the standard regime, and do not appear in the table. The first combo is always
+    measure's regimes (see :func:`get_regimes`) -- its :class:`.StandardRegime`, or one of its components. Measures
+    without components are always in the standard regime, and do not appear in the table. The first combo is always
     all-standard.
 
     :param components: The mixture components. Mixture measures are ordered by their first appearance here.
@@ -108,7 +108,7 @@ class MixtureModel(torch.nn.Module):
 
     def get_log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        Get the probability of each hypothesis (i.e. combo of regimes like ``(measure1='standard', measure2='weird')``).
+        Get the probability of each combo of regimes (like ``(measure1='standard', measure2='weird')``).
          This probability is just the product of each independent regime probability (which can be predicted by a model-
         matrix, ``component_X``).
 
@@ -140,7 +140,8 @@ class MixtureModel(torch.nn.Module):
     def get_effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple], torch.Tensor]:
         """
         When only a subset of measures is observed, combos that differ only in unobserved measures are
-        indistinguishable (they imply the same likelihood and the same state-update).
+        indistinguishable (they imply the same likelihood and the same state-update). So each 'effective' combo (aka a
+        hypothesis) stands for one or more combos: those that are indistinguishable given ``measures``.
 
         :param measures: The measures observed.
         :return: A tuple of (1) the list of unique 'effective' combos -- each a tuple of ``(measure_idx, component)``
@@ -165,7 +166,7 @@ class MixtureModel(torch.nn.Module):
                           num_measures: int,
                           like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        :param effective_combo: An entry from :func:`effective_combos`: ``(measure_idx, component)`` pairs.
+        :param effective_combo: An entry from :func:`get_effective_combos`: ``(measure_idx, component)`` pairs.
         :param num_measures: The number of (observed) measures that ``measure_idx`` indexes.
         :param like: A tensor whose dtype/device to use.
         :return: Two ``(num_measures,)`` tensors: the offset to the measured-mean, and the variance to add to the
