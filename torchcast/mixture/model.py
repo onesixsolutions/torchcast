@@ -159,13 +159,12 @@ class MixtureModel(torch.nn.Module):
             mapping.append(effective.index(eff))
         return effective, torch.as_tensor(mapping, dtype=torch.long)
 
-    def get_effective_offsets(self,
-                              effective_combo: tuple[str, ...],
-                              measures: Sequence[str],
-                              like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_combo_offsets(self,
+                          components: tuple[str, ...],
+                          measures: Sequence[str],
+                          like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        :param effective_combo: An entry from :func:`get_effective_combos`: the ``qualified_id`` of each component
-         that's in effect.
+        :param components: The ``qualified_id`` of each component that's in effect.
         :param measures: The (observed) measures.
         :param like: A tensor whose dtype/device to use.
         :return: Two ``(num_measures,)`` tensors: the offset to the measured-mean, and the variance to add to the
@@ -173,29 +172,10 @@ class MixtureModel(torch.nn.Module):
         """
         zero = torch.zeros((), dtype=like.dtype, device=like.device)
         shift, extra_var = [zero] * len(measures), [zero] * len(measures)
-        for qualified_id in effective_combo:
+        for qualified_id in components:
             component = self._components_by_id[qualified_id]
             midx = measures.index(component.measure)
             shift[midx], extra_var[midx] = component.offset, component.extra_var
-        return torch.stack(shift), torch.stack(extra_var)
-
-    def get_combo_offsets(self, measures: Sequence[str], like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        :param measures: The measures.
-        :param like: A tensor whose dtype/device to use.
-        :return: Two ``(num_combos, len(measures))`` tensors: for each combo, the offset to each measure's
-         measured-mean, and the variance to add to its measurement-noise (zero for measures in the standard regime).
-        """
-        measures = list(measures)
-        offsets = (
-            self.get_effective_offsets(
-                effective_combo=tuple(r.qualified_id for r in combo if not r.is_standard and r.measure in measures),
-                measures=measures,
-                like=like,
-            )
-            for combo in self.combos
-        )
-        shift, extra_var = zip(*offsets)
         return torch.stack(shift), torch.stack(extra_var)
 
     def get_standard_probs(self, combo_probs: torch.Tensor, measures: Sequence[str]) -> torch.Tensor:
