@@ -192,10 +192,10 @@ class Covariance(nn.Module):
          element. Unlike "log_cholesky" (where off-diagonal entries are in absolute units, and also change the
          variances), each parameter is dimensionless and the variances are set by ``log_std_devs`` alone; this is
          better conditioned for optimization when elements have very different scales, and lets you freeze variances
-         and correlations separately (see :func:`Covariance.param_idx` and :func:`Covariance.off_diag_idx`). Note
-         that a zero ``corr_unconstrained`` is a zero *partial* correlation (given the earlier elements): element
-         ``i`` is uncorrelated with all others when every entry in its row *and* column is zero. Existing modules
-         can be converted with :func:`Covariance.to_method`.
+         and correlations separately (see :func:`Covariance.get_param_idx` and
+         :func:`Covariance.get_off_diag_idx`). Note that a zero ``corr_unconstrained`` is a zero *partial* correlation
+         (given the earlier elements): element ``i`` is uncorrelated with all others when every entry in its row *and*
+         column is zero. Existing modules can be converted with :func:`Covariance.to_method`.
         :param empty_idx: In some cases (e.g. process-covariance) we will have some elements with no variance.
         :param predict_variance: For predicting variance, see :func:`Covariance.from_measures`.
         :param expected_kwargs: If ``predict_variance`` is set, this allows you to set the keyword that will be passed
@@ -474,7 +474,7 @@ class Covariance(nn.Module):
         """
         The index of the pair of elements ``(i, j)`` (in either order, of ``0..rank-1``) in the off-diagonal
         parameters (``corr_unconstrained`` for "sd_corr", ``cholesky_off_diag`` for "log_cholesky"), accounting for
-        ``empty_idx``. See :func:`Covariance.param_idx`.
+        ``empty_idx``. See :func:`Covariance.get_param_idx`.
         """
         row, col = sorted((self.get_param_idx(i), self.get_param_idx(j)), reverse=True)
         if row == col:

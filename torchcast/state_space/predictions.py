@@ -332,8 +332,8 @@ class Predictions:
     def _nonlinear_var_multis(self, measure: str, transform: 'Transform') -> dict[str, Optional[float]]:
         """
         For the monte-carlo means of a measure with a nonlinear measured-mean: each regime's ``bias_adjust`` (see
-        ``Transform.var_multi``), or None where it's 0 (no sampling needed). The state is sampled once per measure, so
-        the other regimes' values must be the same -- if not, they're ignored (with a warning), i.e. set to 1.
+        ``Transform.get_var_multi``), or None where it's 0 (no sampling needed). The state is sampled once per measure,
+        so the other regimes' values must be the same -- if not, they're ignored (with a warning), i.e. set to 1.
         """
         out = {}
         for regime in self._regimes(measure):
@@ -471,7 +471,7 @@ class Predictions:
                       ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
-        are distinguishable given ``measures`` (see ``MixtureModel.effective_combos``).
+        are distinguishable given ``measures`` (see ``MixtureModel.get_effective_combos``).
 
         :param like: A ``(batch, ...)`` tensor, for the number of rows, dtype and device.
         :param log_prior: A ``(batch, num_combos)`` tensor of log prior regime-probabilities. Defaults to the
@@ -1497,7 +1497,7 @@ class Predictions:
     def _regimes(self, measure: str) -> list:
         """
         The regimes of a measure: its standard regime, then each of its mixture components (if any). Each has an
-        ``id``, ``offset`` and ``extra_var`` (see :func:`.MixtureModel.regimes`).
+        ``id``, ``offset`` and ``extra_var`` (see :func:`.MixtureModel.get_regimes`).
         """
         if self.mixture is None or measure not in self.mixture.mixture_measures:
             return [StandardRegime(measure)]
