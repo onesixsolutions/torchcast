@@ -2015,12 +2015,21 @@ class MixtureOfNormals:
     vars: torch.Tensor
 
     def mean(self) -> torch.Tensor:
+        """
+        The mean of the mixture.
+        """
         return (self.probs * self.means).sum(-1)
 
     def var(self) -> torch.Tensor:
+        """
+        The variance of the mixture (which includes the spread between the components' means).
+        """
         return (self.probs * (self.vars + self.means ** 2)).sum(-1) - self.mean() ** 2
 
     def cdf(self, value: torch.Tensor) -> torch.Tensor:
+        """
+        The cumulative distribution function at ``value``, which broadcasts against the mixture's batch-shape.
+        """
         z = (value.unsqueeze(-1) - self.means) / self.vars.sqrt()
         return (self.probs * torch.special.ndtr(z)).sum(-1)
 
