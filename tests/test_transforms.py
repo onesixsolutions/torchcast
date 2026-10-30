@@ -619,7 +619,7 @@ def test_bias_adjust_per_regime_nonlinear(monkeypatch):
     # all regimes at bias_adjust=0: the plug-in inverse(MAP) per regime, mixed -- with no sampling
     with monkeypatch.context() as m:
         m.setattr(type(pred), '_get_output_samples', lambda *a, **k: pytest.fail("shouldn't sample"))
-        all_zero = means({None: 0., 'low': 0.})
+        all_zero = means({'__standard__': 0., 'low': 0.})
         with pytest.warns(UserWarning, match='group-names'):
             df = pred.to_dataframe(conf=False, transform=LogTransform(bias_adjust=0.), use_map=False)
     assert np.allclose(df['mean'].to_numpy(), all_zero.reshape(-1).numpy())
@@ -628,16 +628,18 @@ def test_bias_adjust_per_regime_nonlinear(monkeypatch):
 
     # each regime is handled separately: changing one regime's value changes only its term
     # (low at 0) - (both at 0) == (neither at 0) - (standard at 0): the standard regime's term, sampled minus plug-in
-    assert torch.allclose(means({'low': 0.}) - all_zero, means(None) - means({None: 0.}), atol=1e-5)
+    assert torch.allclose(means({'low': 0.}) - all_zero, means(None) - means({'__standard__': 0.}), atol=1e-5)
 
     # nonzero values must be the same across a nonlinear measure's regimes
     with pytest.warns(UserWarning, match="must be 0 or the same"):
-        means({None: .5, 'low': .3})
+        means({'__standard__': .5, 'low': .3})
 
 
 def test_bias_adjust_validation():
     with pytest.raises(ValueError):
         LogTransform(bias_adjust={'low': 1.5})
+    with pytest.raises(ValueError, match='__standard__'):
+        LogTransform(bias_adjust={None: 1., 'low': 0.})
     assert LogTransform(bias_adjust={'low': 0.}).var_multi('low') == 0.
     assert LogTransform(bias_adjust={'low': 0.}).var_multi(None) == 1.
     assert LogTransform(bias_adjust=.5).var_multi('low') == .5

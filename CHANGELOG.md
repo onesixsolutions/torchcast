@@ -60,7 +60,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
   variance. Custom transforms can override `Transform._expected_inverse()` (a closed form) or
   `Transform._noise_nodes()` (a different noise distribution).
-- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `None`) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
+- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
 - `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
   `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`. `Transform` subclasses
   now implement `transform()` (the forward transformation) as well as `inverse()`.

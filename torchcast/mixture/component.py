@@ -4,6 +4,39 @@ import torch
 
 from torchcast.internals.utils import validate_scalar
 
+#: The ``id`` of a measure's standard regime (reserved: components can't use it). E.g. a key for a per-regime
+#: ``bias_adjust`` (see :class:`.Transform`).
+STANDARD_REGIME_ID = '__standard__'
+
+
+class StandardRegime(torch.nn.Module):
+    """
+    A measure's standard regime -- the usual measurement model, from which a :class:`MixtureComponent` is an offset.
+    Has the same interface as a component, so the regimes of a measure (e.g. in ``MixtureModel.combos``) can be handled
+    alike: zero offset, zero extra variance, and the fixed logit (0) that the components' logits are relative to.
+    (Created by the :class:`.MixtureModel`. Has no parameters: its values are buffers, so they follow ``.to()``.)
+    """
+    is_standard = True
+    id = STANDARD_REGIME_ID
+    predictors = ()
+
+    def __init__(self, measure: str):
+        super().__init__()
+        self.measure = measure
+        self.register_buffer('offset', torch.zeros(()), persistent=False)
+        self.register_buffer('logit', torch.zeros(()), persistent=False)
+        self.register_buffer('extra_var', torch.zeros(()), persistent=False)
+
+    @property
+    def qualified_id(self) -> str:
+        return f'{self.measure}.{self.id}'
+
+    def get_logit(self, X: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.logit
+
+    def __repr__(self) -> str:
+        return f'{type(self).__name__}(measure={repr(self.measure)})'
+
 
 class MixtureComponent(torch.nn.Module):
     """
@@ -17,7 +50,7 @@ class MixtureComponent(torch.nn.Module):
     :param prob_init: Initial value for the component's base-rate, i.e. the long-run probability that an observation
      for ``measure`` comes from this component (exact when it's the only component for this measure). With
      ``predictors``, this is the base-rate when the predictors are zero.
-    :param id: A unique identifier (within the measure).
+    :param id: A unique identifier (within the measure). ``'__standard__'`` is reserved for the standard regime.
     :param predictors: Optional names of predictors of the component's base-rate: each has a learned coefficient,
      added to the component's logit (vs. the standard regime). E.g. a treatment that makes this regime more common.
      The predictors are passed to the model's ``forward()`` as a ``(num_groups, num_timesteps, len(predictors))``
@@ -28,6 +61,8 @@ class MixtureComponent(torch.nn.Module):
      ``LinearModel``). Default 'X'.
     """
 
+    is_standard = False
+
     def __init__(self,
                  measure: str,
                  offset_init: float,
@@ -36,6 +71,8 @@ class MixtureComponent(torch.nn.Module):
                  predictors: Optional[Sequence[str]] = None,
                  model_mat_kwarg_name: str = 'X'):
         super().__init__()
+        if id == STANDARD_REGIME_ID:
+            raise ValueError(f"'{STANDARD_REGIME_ID}' is reserved for the standard regime; pick another `id`.")
         self.measure = measure
         self.id = id
         self.model_mat_kwarg_name = model_mat_kwarg_name

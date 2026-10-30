@@ -43,11 +43,12 @@ def test_mixture_model_combos():
     rm = MixtureModel(components)
     assert rm.mixture_measures == ['a', 'c']
     assert rm.num_combos == 2 * 3
-    assert rm.combos[0] == (None, None)
+    assert all(r.is_standard for r in rm.combos[0])
+    assert rm.regimes('c') == [rm.combos[0][1], *components[1:]]
     base_probs = rm.base_probs()
     assert torch.isclose(base_probs.sum(), torch.tensor(1.))
     # marginal prob of 'a' being non-standard is its prob_init (it's the only component for 'a'):
-    a_weird = torch.tensor([combo[0] is not None for combo in rm.combos])
+    a_weird = torch.tensor([not combo[0].is_standard for combo in rm.combos])
     assert torch.isclose(base_probs[a_weird].sum(), torch.tensor(.1))
 
     # all observed: every combo is distinguishable
@@ -58,9 +59,32 @@ def test_mixture_model_combos():
     effective, mapping = rm.effective_combos(['a', 'b'])
     assert len(effective) == 2
     assert (mapping == a_weird.long()).all()
+
     # measure-indices refer to the observed measures:
     effective, _ = rm.effective_combos(['b', 'c'])
     assert {i for eff in effective for i, _ in eff} == {1}
+
+
+def test_standard_regime():
+    # the standard regime has no parameters (so isn't fit), but its values follow the model's dtype/device
+    rm = MixtureModel([MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')])
+    standard = rm.regimes('a')[0]
+    assert standard.is_standard and standard.id == '__standard__'
+    assert list(rm.parameters()) == list(rm.components.parameters()) + list(rm.transition.parameters())
+    assert not any('standard' in k for k in rm.state_dict())
+    assert rm.double().log_base_probs().dtype == torch.float64
+    # the standard regime's id is reserved:
+    with pytest.raises(ValueError, match='reserved'):
+        MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='__standard__')
+    # pickled before `StandardRegime` (when the combo-table used None for the standard regime):
+    rm = MixtureModel([MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='a1')])
+    state = rm.__dict__.copy()
+    state['_modules'] = {k: v for k, v in state['_modules'].items() if k != 'standard_regimes'}
+    state['combos'] = [(None,), (rm.components[0],)]
+    old = MixtureModel.__new__(MixtureModel)
+    old.__setstate__(state)
+    assert old.combos[0][0].is_standard and old.combos[1][0] is rm.components[0]
+    assert torch.allclose(old.base_probs(), rm.base_probs())
 
 
 def test_mixture_model_validation():
@@ -600,7 +624,7 @@ def test_standard_probs():
             assert torch.allclose(probs[:, j], torch.ones(4))
             continue
         k = rm.mixture_measures.index(m)
-        standard = torch.tensor([combo[k] is None for combo in rm.combos])
+        standard = torch.tensor([combo[k].is_standard for combo in rm.combos])
         assert torch.allclose(probs[:, j], regime_probs[:, standard].sum(-1))
     # at base-probs, matches the base-rate:
     assert torch.allclose(rm.standard_probs(rm.base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
@@ -717,7 +741,7 @@ def test_prediction_outputs():
 
     # per-measure mixture:
     mix = pred.get_mixture('y1')
-    assert mix.labels == ['standard', 'y1_low']
+    assert mix.labels == ['__standard__', 'y1_low']
     assert mix.probs.shape == (G, T, 2)
     assert torch.allclose(mix.probs.sum(-1), torch.ones(G, T))
     with pytest.raises(ValueError, match="no mixture components"):
@@ -734,7 +758,7 @@ def test_prediction_outputs():
 
     # cross-covariance vs. sampling from the mixture, for one group/time:
     labels, probs, combo_means, combo_covs = pred._get_regime_combos()
-    assert labels == [('standard',), ('y1_low',)]
+    assert labels == [('__standard__',), ('y1_low',)]
     g, t = 1, 8
     torch.manual_seed(0)
     n = 400_000
