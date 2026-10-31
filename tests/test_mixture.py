@@ -78,7 +78,7 @@ def test_standard_regime():
     assert standard.is_standard and standard.id == '__standard__'
     assert list(rm.parameters()) == list(rm.components.parameters()) + list(rm.transition.parameters())
     assert not any('standard' in k for k in rm.state_dict())
-    assert rm.double().get_log_base_probs().dtype == torch.float64
+    assert rm.double()._get_log_base_probs().dtype == torch.float64
     # the standard regime's id is reserved:
     with pytest.raises(ValueError, match='reserved'):
         MixtureComponent(measure='a', offset_init=0., prob_init=.1, id='__standard__')
@@ -195,7 +195,10 @@ def test_update_step_univariate():
     R = torch.tensor([[[.3]]])
     for obs in (1.2, -3.5):
         input = torch.tensor([[obs]])
-        state = kf._update_step(input=input, mean=mean, cov=cov, measured_mean=mean, measure_mat=H, measure_cov=R)
+        state = kf._update_step(
+            input=input, mean=mean, cov=cov, measured_mean=mean, measure_mat=H, measure_cov=R,
+            combo_prior=kf.mixture.get_base_probs().expand(1, -1),
+        )
 
         # by hand: the standard regime is the usual update; the component's regime is an update with the residual
         # offset by the component's mean, and the component's variance added to the measurement-noise.
@@ -234,7 +237,10 @@ def test_update_step_unobserved_mixture_measure():
         measure_mat=torch.tensor([[[0., 1.]]]).expand(4, -1, -1),
         measure_cov=torch.full((4, 1, 1), .3),
     )
-    state = kf._update_step(**kwargs, val_idx=torch.tensor([1]))
+    # no fallback to the base-rates: the prior comes from forward()
+    with pytest.raises(ValueError, match='combo_prior'):
+        kf._update_step(**kwargs, val_idx=torch.tensor([1]))
+    state = kf._update_step(**kwargs, val_idx=torch.tensor([1]), combo_prior=kf.mixture.get_base_probs().expand(4, -1))
     expected_mean, expected_cov = kf_plain._update_step(**kwargs, val_idx=torch.tensor([1]))
     assert torch.allclose(state.mean, expected_mean)
     assert torch.allclose(state.cov, expected_cov)
@@ -270,8 +276,7 @@ def test_log_prob_brute_force():
         assert math.isclose(lp[g, t].item(), math.log(total), rel_tol=1e-4)
 
 
-@pytest.mark.parametrize("univariate_prob", [False, True])
-def test_binomial_filter_with_mixture(univariate_prob: bool):
+def test_binomial_filter_with_mixture():
     """
     A binary measure (e.g. 'did they visit') plus a gaussian measure with a mixture component (e.g. 'log-spend'), where
     the gaussian measure is missing whenever the binary one is 0.
@@ -289,10 +294,7 @@ def test_binomial_filter_with_mixture(univariate_prob: bool):
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         binary_measures=['visit'],
-        mixture=MixtureModel(
-            [MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
-            univariate_prob=univariate_prob
-        ),
+        mixture=MixtureModel([MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')]),
     )
     bf.mc_sampling = 50
     pred = bf(y)
@@ -311,34 +313,32 @@ def test_binomial_filter_with_mixture(univariate_prob: bool):
 @torch.no_grad()
 def test_binary_measures_excluded_from_responsibilities():
     """
-    Binary measures don't contribute to regime-probabilities: with only a binary measure besides the mixture measure,
-    scoring all measures is the same as scoring only the mixture measures (``univariate_prob=True``).
+    Binary measures don't score the regime-combos: with a binary measure correlated (in the state) with the mixture
+    measure, changing the binary observation changes the updated state, but not the combo-posterior.
     """
-    torch.manual_seed(1)
-    visit = (torch.rand(3, 12) > .4).float()
-    spend = torch.randn(3, 12).cumsum(1) * .2 + 3.
-    spend[torch.rand(3, 12) > .8] = -1.
-    spend[visit == 0] = float('nan')
-    y = torch.stack([visit, spend], -1)
-
-    preds = {}
-    for univariate_prob in (False, True):
-        torch.manual_seed(2)
-        bf = BinomialFilter(
-            processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
-            measures=['visit', 'spend'],
-            binary_measures=['visit'],
-            mixture=MixtureModel(
-                [MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')],
-                univariate_prob=univariate_prob
-            ),
-        )
-        bf.mc_sampling = 20
-        preds[univariate_prob] = bf(y, include_updates_in_output=True)
-    assert torch.allclose(preds[False].update_combo_probs, preds[True].update_combo_probs)
-    assert torch.allclose(preds[False].state_means, preds[True].state_means)
-    # (and responsibilities are actually informative here:)
-    assert preds[False].update_combo_probs[..., 1].max() > .5
+    bf = BinomialFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
+        measures=['visit', 'spend'],
+        binary_measures=['visit'],
+        mixture=MixtureModel([MixtureComponent(measure='spend', offset_init=-1., prob_init=.1, id='quick')]),
+    )
+    num_groups = 3
+    mean = torch.tensor([[.4, 3.]]).expand(num_groups, -1)
+    kwargs = dict(
+        mean=mean,
+        cov=torch.tensor([[1., .8], [.8, 1.]]).expand(num_groups, -1, -1),
+        measured_mean=torch.stack([torch.sigmoid(mean[:, 0]), mean[:, 1]], -1),
+        measure_mat=torch.eye(2).expand(num_groups, -1, -1),
+        measure_cov=torch.diag(torch.tensor([0., .3])).expand(num_groups, -1, -1),
+        combo_prior=bf.mixture.get_base_probs().expand(num_groups, -1),
+        num_obs=torch.ones(num_groups, 1),
+        binary_idx=[0],
+    )
+    spend = torch.tensor([2., 1., 3.])
+    no_visit = bf._update_step(input=torch.stack([torch.zeros(3), spend], -1), **kwargs)
+    visit = bf._update_step(input=torch.stack([torch.ones(3), spend], -1), **kwargs)
+    assert not torch.allclose(no_visit.mean, visit.mean)
+    assert torch.allclose(no_visit.combo_probs, visit.combo_probs)
 
 
 @torch.no_grad()
@@ -542,7 +542,7 @@ def test_component_predictors_kwargs():
     with pytest.raises(ValueError, match="timesteps"):
         kf(y, X=X[:, :5])
     with pytest.raises(ValueError, match="needs `X`"):
-        kf.mixture.get_log_base_probs()
+        kf.mixture._get_log_base_probs()
     with pytest.raises(ValueError, match="list of strings"):
         MixtureComponent(measure='y1', offset_init=0., prob_init=.1, id='x', predictors='treated')
 
@@ -1024,7 +1024,7 @@ def test_latent_classes_transition():
     nxt = mixture.get_next_prior(posterior, base_probs)
     assert torch.allclose(nxt, posterior @ T, atol=1e-6)
     assert torch.allclose(mixture.get_class_probs(nxt), mixture.get_class_probs(posterior), atol=1e-6)
-    assert torch.allclose(mixture._initial_prior(None, base_probs, 5), base_probs.expand(5, -1), atol=1e-6)
+    assert torch.allclose(mixture._initial_combo_probs(base_probs, 5), base_probs.expand(5, -1), atol=1e-6)
     # per-group base-probs (components with predictors):
     group_base_probs = torch.softmax(torch.randn(5, C), -1)
     expected = torch.stack([posterior[g] @ mixture.get_next_prior(torch.eye(C), group_base_probs[g]) for g in range(5)])

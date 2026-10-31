@@ -57,14 +57,14 @@ class StaticTransition(RegimeTransition):
 
 class StickyTransition(RegimeTransition):
     """
-    Each combo ``i`` persists with probability ``stay_i``; otherwise the next combo is drawn from a shared distribution
-    ``b``. That is, ``T[i, j] = stay_i * (i == j) + (1 - stay_i) * b_j``.
+    Each regime-combo ``i`` persists with probability ``stay_i``; otherwise the next combo is drawn from a shared
+    distribution ``b``.
 
-    Rather than learning ``b`` directly, it's derived so that the stationary distribution of ``T`` is ``base_probs``
-    (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run probability of each
-    combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture where the
-    combo-prior is always ``base_probs`` (as in :class:`StaticTransition`). (If the base-rates vary over time --
-    components with predictors -- then ``base_probs`` is the stationary distribution for the current predictors.)
+    Rather than learning ``b`` directly, it's derived so that the stationary distribution of the transition matrix ``T``
+    is ``base_probs`` (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run
+    probability of each combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture
+    where the combo-prior is always ``base_probs`` (as in :class:`StaticTransition`). (If the base-rates vary over time
+    -- components with predictors -- then ``base_probs`` is the stationary distribution for the current predictors.)
 
     :param num_combos: The number of regime-combos.
     :param stay_init: Initial value for the probability of persisting in the current combo.
@@ -92,6 +92,8 @@ class StickyTransition(RegimeTransition):
         stay = self.get_stay_prob()
         # equivalent to `posterior @ self.get_matrix(base_probs)`, without materializing the matrix:
         leave = (posterior * (1 - stay)).sum(-1, keepdim=True)
+        # for an explanation of why only ``_jump_probs`` takes ``base_probs`` and ``stay`` doesn't, see this
+        # class's main docstring
         return posterior * stay + leave * self._jump_probs(base_probs)
 
     def get_matrix(self, base_probs: torch.Tensor) -> torch.Tensor:

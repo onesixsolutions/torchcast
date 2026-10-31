@@ -183,6 +183,8 @@ class KalmanFilter(StateSpaceModel):
                 measure_mat=measure_mat,
                 measure_cov=measure_cov,
             )
+        if combo_prior is None:
+            raise ValueError("A model with mixture components needs `combo_prior` for its update-step.")
         return self._mixture_update(
             input=input,
             mean=mean,
@@ -252,7 +254,7 @@ class KalmanFilter(StateSpaceModel):
                         measure_mat: torch.Tensor,
                         measure_cov: torch.Tensor,
                         measures: Sequence[str],
-                        combo_prior: Optional[torch.Tensor] = None) -> 'StateTuple':
+                        combo_prior: torch.Tensor) -> 'StateTuple':
         """
         Update step when there are mixture components. Each effective combo (aka hypothesis; see
         ``MixtureModel.get_effective_combos``) offsets the measured-mean of measures in a non-standard regime by their
@@ -260,15 +262,11 @@ class KalmanFilter(StateSpaceModel):
         full kalman update; these are weighted by their posterior probability and collapsed via moment-matching.
 
         :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
-        :param combo_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo. Defaults
-         to the regime-model's base-probs.
+        :param combo_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo (from the
+         regime-transition).
         :return: The collapsed state, with ``combo_probs`` set to the ``(num_groups, num_combos)`` posterior.
         """
-        num_groups = input.shape[0]
-        if combo_prior is None:
-            log_prior = self.mixture.get_log_base_probs().expand(num_groups, -1)
-        else:
-            log_prior = combo_prior.clamp_min(1e-30).log()
+        log_prior = combo_prior.clamp_min(1e-30).log()
 
         effective_combos, mapping = self.mixture.get_effective_combos(measures)
         if len(effective_combos) == 1:
@@ -284,13 +282,10 @@ class KalmanFilter(StateSpaceModel):
             standard.combo_probs = log_prior.exp()
             return standard
 
-        # which measures contribute to the responsibilities. non-gaussian measures (e.g. binary) never do: their
-        # gaussian approximation is crude, and their log-prob is computed separately from the gaussian measures' (so
-        # using their correlation here would be inconsistent with training).
-        if self.mixture.univariate_prob:
-            score_idx = [i for i, m in enumerate(measures) if m in self.mixture.mixture_measures]
-        else:
-            score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        # the measures that score the combos: all but the non-gaussian ones (e.g. binary), whose gaussian approximation
+        # here is crude, and whose log-prob is computed separately from the gaussian measures' (so using their
+        # correlation here would be inconsistent with training).
+        score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
         score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
         # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective
