@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Unreleased
+## v2.0.0 (unreleased)
 
 ### New feature: mixture components (experimental)
 
@@ -18,7 +18,13 @@ inflate the variance. See the new [mixture components example](https://docs.stro
   and `to_dataframe()` use monte-carlo.
 - Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
   a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
-  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`.
+  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`; `StaticTransition`
+  is a static mixture.
+- Latent classes: `MixtureModel(..., classes=[LatentClass('reference'), LatentClass('volatile',
+  relative_rate_init={'y.low': 3.}), ...])` gives groups (e.g. customers) their own base-rates for the components -- a
+  discrete random effect, learned per class (each class after the first, relative to the first). A group's class is
+  fixed but unknown: its posterior (`MixtureModel.get_class_probs(pred.combo_probs)`) accumulates evidence over all of its
+  timesteps and carries into forecasts. The transition is shared by the classes, applied within each one.
 - Binary measures never influence the regime-probabilities (their gaussian approximation in the update-step is
   crude).
 - `Predictions.log_prob()` is the exact marginal likelihood of the mixture.

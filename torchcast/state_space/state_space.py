@@ -103,6 +103,12 @@ class StateSpaceModel(torch.nn.Module):
         if self.mixture is not None:
             self.mixture.validate(measures, non_gaussian_measures=self._non_gaussian_measures)
 
+    def __setstate__(self, state: dict):
+        # models pickled before mixture components existed have no ``mixture`` attribute:
+        if 'mixture' not in state and 'mixture' not in state.get('_modules', {}):
+            state['mixture'] = None
+        super().__setstate__(state)
+
     @property
     def _non_gaussian_measures(self) -> Sequence[str]:
         """
@@ -330,7 +336,7 @@ class StateSpaceModel(torch.nn.Module):
             combous.append(combo_post)
             scaling_statesu.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
             if self.mixture is not None and t + 1 < out_timesteps:
-                combo_prior = self.mixture.transition(combo_post, base_probs[t + 1])
+                combo_prior = self.mixture.get_next_prior(combo_post, base_probs[t + 1])
 
         # 2nd loop to get n_step predicts:
         meanps = {}
@@ -362,7 +368,7 @@ class StateSpaceModel(torch.nn.Module):
                             mask=tmask
                         )
                         if combop is not None:
-                            combop = self.mixture.transition(combop, base_probs[tu_h])
+                            combop = self.mixture.get_next_prior(combop, base_probs[tu_h])
                     if tu_h not in meanps:
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp
@@ -1239,6 +1245,11 @@ class StateSpaceModel(torch.nn.Module):
                  **kwargs):
         """
         Generate simulated state-trajectories from your model.
+
+        For models with mixture components, the regimes are simulated too: at each timestep, a regime-combo is drawn
+        from the combo-prior given the trajectory so far (so stickiness and latent classes carry over), and the
+        output's ``combo_probs`` are these (one-hot) draws. So e.g. ``sample()`` on the output uses the simulated
+        regimes.
 
         :param out_timesteps: The number of timesteps to generate in the output.
         :param initial_state: The initial state of the system: a tuple of `mean`, `cov`. Can be obtained from previous

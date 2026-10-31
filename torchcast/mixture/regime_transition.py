@@ -10,6 +10,13 @@ class RegimeTransition(torch.nn.Module):
     Both receive ``base_probs``, the long-run probability of each combo implied by the :class:`MixtureComponent`
     base-rates: a ``(num_combos,)`` tensor (or, if any components have predictors, a ``(num_groups, num_combos)``
     tensor, for the timestep that the combo-prior is for).
+
+    With latent classes (``MixtureModel(classes=...)``), the transition only sees the combos *within* a class (so
+    ``num_combos`` is the number per class): the :class:`MixtureModel` applies it to each class separately -- to the
+    combo-probabilities given the class, with that class's base-rates (normalized within the class), as if each class
+    of each group were a separate group (``(num_groups * num_classes, num_combos)`` tensors) -- and scales the result
+    by the probability of the class. So groups never change class, and the classes share the transition's
+    parameters, differing only in their base-rates.
     """
 
     def __init__(self, num_combos: int):
@@ -33,8 +40,18 @@ class RegimeTransition(torch.nn.Module):
         raise NotImplementedError
 
 
+
 class StaticTransition(RegimeTransition):
-    def forward(self, posterior, base_probs):
+    """
+    A static mixture: the regimes are independent across timesteps, so the regime-prior at every timestep is
+    ``base_probs`` (whatever the previous posterior). It has no parameters. With latent classes
+    (``MixtureModel(classes=...)``), the regimes are independent across timesteps *given* the class, which stays
+    fixed: each group's base-rates are a mixture over the classes, learned from all of its timesteps.
+
+    :param num_combos: The number of regime-combos.
+    """
+
+    def forward(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         return base_probs.expand(posterior.shape[0], -1)
 
 
@@ -44,10 +61,10 @@ class StickyTransition(RegimeTransition):
     distribution ``b``.
 
     Rather than learning ``b`` directly, it's derived so that the stationary distribution of the transition matrix ``T``
-     is ``base_probs`` (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run
+    is ``base_probs`` (``b ∝ base_probs * (1 - stay)``). So ``base_probs`` keeps its interpretation as the long-run
     probability of each combo, and is also the initial distribution. With ``stay = 0`` this reduces to a static mixture
-    where the combo-prior is always ``base_probs``. (If the base-rates vary over time -- components with predictors --
-    then ``base_probs`` is the stationary distribution for the current predictors.)
+    where the combo-prior is always ``base_probs`` (as in :class:`StaticTransition`). (If the base-rates vary over time
+    -- components with predictors -- then ``base_probs`` is the stationary distribution for the current predictors.)
 
     :param num_combos: The number of regime-combos.
     :param stay_init: Initial value for the probability of persisting in the current combo.
