@@ -450,6 +450,8 @@ class Predictions:
         if not self._is_mixture_model(measurement_model):
             return _log_lik(resid, ll_cov, monte_carlo=monte_carlo)
 
+        if combo_log_prior is None:
+            raise ValueError("A model with mixture components needs `combo_log_prior` for its log-prob.")
         # the marginal log-lik over the (effective) regime-combos. these all share the predicted state, so each just
         # offsets the mean and adds to the diagonal:
         terms = [
@@ -467,21 +469,17 @@ class Predictions:
     def _effective_combo_terms(self,
                                measures: Sequence[str],
                                like: torch.Tensor,
-                               log_prior: Optional[torch.Tensor] = None
-                               ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+                               log_prior: torch.Tensor) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
         are distinguishable given ``measures`` (see ``MixtureModel.get_effective_combos``).
 
         :param like: A ``(batch, ...)`` tensor, for the number of rows, dtype and device.
-        :param log_prior: A ``(batch, num_combos)`` tensor of log prior combo-probabilities. Defaults to the
-         regime-model's base-probs.
+        :param log_prior: A ``(batch, num_combos)`` tensor of log prior combo-probabilities.
         :return: For each effective combo, two ``(len(measures),)`` tensors -- the offset to each measure's
          measured-mean and the variance to add to its measurement-noise -- and the ``(batch,)`` log prior probability
          (pooled over the combos that are indistinguishable given ``measures``).
         """
-        if log_prior is None:
-            log_prior = self.mixture.get_log_base_probs().expand(like.shape[0], -1)
         effective_combos, mapping = self.mixture.get_effective_combos(measures)
         for idx, combo in enumerate(effective_combos):
             shift, extra_var = self.mixture.get_combo_offsets(combo, measures, like=like)
@@ -1315,8 +1313,7 @@ class Predictions:
                             generator: Optional[torch.Generator],
                             shared_noise: bool,
                             observation_measures: Optional[Sequence[str]]
-                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-                                       Optional[torch.Tensor]]:
+                            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         The rest of a sample, given samples of the measured-mean (one per sample of the state): the regime (for
         models with mixture components), then the observations.

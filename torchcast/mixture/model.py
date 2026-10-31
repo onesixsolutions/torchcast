@@ -22,10 +22,6 @@ class MixtureModel(torch.nn.Module):
     :param components: The mixture components. Mixture measures are ordered by their first appearance here.
     :param transition: A :class:`RegimeTransition`, controlling how combo-probabilities evolve over time. Defaults to
      :class:`StickyTransition`.
-    :param univariate_prob: If True, the per-timestep regime-probabilities are computed using only the likelihood of
-     the mixture measures, rather than of all observed measures. This is an approximation (exact if the other
-     measures' residuals are uncorrelated with the mixture measures'), but can be cheaper. (Non-gaussian measures,
-     e.g. binary, never influence the regime-probabilities.)
     :param joseph_form: Whether the update-step for the *non-standard* regime-combos (those with any measure in a
      component's regime) uses the Joseph form of the covariance update. (The standard regime's update follows the
      model's ``joseph_form``.) With mixtures, the update runs once for each regime-combo, and the Joseph form's
@@ -53,7 +49,6 @@ class MixtureModel(torch.nn.Module):
     def __init__(self,
                  components: Sequence[MixtureComponent],
                  transition: Optional[RegimeTransition] = None,
-                 univariate_prob: bool = False,
                  joseph_form: bool = True,
                  classes: Optional[Sequence[LatentClass]] = None):
         super().__init__()
@@ -68,12 +63,11 @@ class MixtureModel(torch.nn.Module):
             if len(ids) != len(set(ids)):
                 raise ValueError(f"Mixture components must have unique ids within a measure, but '{measure}' got {ids}")
 
-        self.mixture_measures = list(by_measure)
+        self.mixture_measures = list(by_measure)  # TODO: just rename to 'measures' after 55 is merged
         self.components = torch.nn.ModuleList([c for m in self.mixture_measures for c in by_measure[m]])
         self._components_by_id = {c.qualified_id: c for c in self.components}
         # (not in `components`: they have no parameters, but their buffers should follow `.to()`)
         self.standard_regimes = torch.nn.ModuleList([StandardRegime(m) for m in self.mixture_measures])
-        self.univariate_prob = univariate_prob
         self.joseph_form = joseph_form
 
         self.classes = list(classes or [])
@@ -236,11 +230,11 @@ class MixtureModel(torch.nn.Module):
 
     def get_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
-        See ``get_log_base_probs()``.
+        See ``_get_log_base_probs()``.
         """
-        return self.get_log_base_probs(component_X).exp()
+        return self._get_log_base_probs(component_X).exp()
 
-    def get_log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
+    def _get_log_base_probs(self, component_X: Optional[Mapping[str, torch.Tensor]] = None) -> torch.Tensor:
         """
         Get the log-probability of each combo of regimes (like ``(measure1='standard', measure2='weird')``). This is
         just the product (the sum, on the log-scale) of each independent regime probability, which can be predicted by a
@@ -354,11 +348,14 @@ class MixtureModel(torch.nn.Module):
         at each timestep (``base_probs[t]``; time-varying if any components have predictors).
 
         :param kwargs: The ``forward()`` kwargs, which may include the components' predictors.
-        :param init_combo_probs: The ``combo_probs`` of ``forward()``'s ``initial_state``, if any (see
-         ``_initial_prior``).
+        :param init_combo_probs: The ``combo_probs`` of ``forward()``'s ``initial_state``, if any (evolved one step by
+         the transition, like the mean/cov of ``initial_state``).
         :return: ``(combo_prior, base_probs, used_keys)``, where ``used_keys`` are the kwargs used.
         """
         component_X, used_keys = self._get_component_X(kwargs)
+
+        # base-probs, the long run probability that the transitioning func converges to (for a given set of predictors)
+        # in the absence of new observations/updates:
         if component_X:
             base_probs = self.get_base_probs(component_X).unbind(1)
             if len(base_probs) < num_timesteps:
@@ -368,7 +365,19 @@ class MixtureModel(torch.nn.Module):
                 )
         else:
             base_probs = [self.get_base_probs()] * num_timesteps
-        combo_prior = self._initial_prior(init_combo_probs, base_probs[0], num_groups)
+
+        # combo-prior: for the most common case of a fresh run, it's just passing base-probs to the transition-func's
+        # ``initial()`` method (within each class, with latent classes; and in the most common case that's just
+        # returning base_probs).
+        # so in most cases, the prior == base_probs.
+        if init_combo_probs is None:
+            combo_prior = self._initial_combo_probs(base_probs[0], num_groups)
+        else:
+            # alternate case: init_combo_probs was passed as part of initial state. like the mean/cov of
+            # ``initial_state``, we treat as the state *before* the first timestep, so they're evolved one step by the
+            # transition.
+            combo_prior = self.get_next_prior(init_combo_probs.expand(num_groups, -1), base_probs[0])
+
         return combo_prior, base_probs, used_keys
 
     def _get_component_X(self, kwargs: Mapping) -> tuple[dict[str, torch.Tensor], set[str]]:
@@ -401,23 +410,3 @@ class MixtureModel(torch.nn.Module):
             out[component.qualified_id] = X
             used.add(key)
         return out, used
-
-    def _initial_prior(self,
-                       init_combo_probs: Optional[torch.Tensor],
-                       base_probs: torch.Tensor,
-                       num_groups: int) -> torch.Tensor:
-        """
-        The combo-prior for the first timestep. ``init_combo_probs`` (from ``initial_state``) are treated like the
-        mean/cov of ``initial_state``: as the state *before* the first timestep, so they're evolved one step by the
-        transition. If not given, the transition's ``initial()`` is used.
-        """
-        if init_combo_probs is None:
-            return self._initial_combo_probs(base_probs, num_groups)
-        if init_combo_probs.ndim != 2 or init_combo_probs.shape[-1] != self.num_combos:
-            raise ValueError(
-                f"Expected `initial_state.combo_probs` to have shape (num_groups, {self.num_combos}), "
-                f"got {tuple(init_combo_probs.shape)}"
-            )
-        if init_combo_probs.shape[0] not in (1, num_groups):
-            raise ValueError(f"Expected `initial_state.combo_probs.shape[0]` to be 1 or {num_groups}")
-        return self.get_next_prior(init_combo_probs.expand(num_groups, -1), base_probs)
