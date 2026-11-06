@@ -1510,11 +1510,9 @@ class Predictions:
         means = [measured_mean + shift[c] for c in range(self.mixture.num_combos)]
         covs = [system_cov + torch.diag(extra_var[c]) for c in range(self.mixture.num_combos)]
         batch_shape = self.state_means.shape[0:2]
-        labels = [tuple(r.id for r in combo) for combo in self.mixture.combos]
-        if self.mixture.num_classes > 1:
-            labels = [(*label, self.mixture.classes[k].id) for label, k in zip(labels, self.mixture.combo_class)]
+
         return (
-            labels,
+            self.mixture.labels,
             self.combo_probs,
             torch.stack(means, 1).view(*batch_shape, self.mixture.num_combos, len(measures)),
             torch.stack(covs, 1).view(*batch_shape, self.mixture.num_combos, len(measures), len(measures)),

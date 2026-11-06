@@ -7,6 +7,7 @@ import torch
 from torchcast.mixture import LatentClass, MixtureComponent, StandardRegime, StickyTransition
 from torchcast.mixture.regime_transition import RegimeTransition
 
+RegimeType = Union[StandardRegime, MixtureComponent]
 
 class MixtureModel(torch.nn.Module):
     """
@@ -31,19 +32,16 @@ class MixtureModel(torch.nn.Module):
      their covariances only matter in proportion to their posterior probability. Default True.
     :param classes: Optional :class:`LatentClass` objects (at least two): latent classes of groups, each with its own
      base-rate for each component (a discrete random effect on the base-rates). Default None (no classes; i.e. one).
-     With ``K`` classes, the table of combos is repeated once per class (class-major: ``self.combos[i]`` is in class
-     ``self.combo_class[i]``), and the base-rates are learned per class: each component's logit gets a per-class offset,
-     and the classes have prior logits (both fixed at 0 for the first class, for identifiability). Otherwise the classes
-     are the same: the ``transition`` is shared, applied within each class with that class's base-rates (see
-     :class:`RegimeTransition`), so its ``num_combos`` is the number of combos per class (``self.num_class_combos``);
-     and groups never change class. The initial values come from each class's ``membership_prob_init`` and
-     ``relative_rate_init``; the latter is required for all but the first class, since otherwise the classes would be
-     symmetric. Only the bookkeeping of combo-probabilities grows with ``K``: combos with the same observable regimes
-     share a state-update and likelihood (see :func:`get_effective_combos`). Use :func:`get_class_probs` for the
-     posterior probability of each class. Note that ``Predictions.sample()`` draws the regime-combo independently at
-     each timestep (as it does the state; samples are not trajectories), so a sample's class can differ across
-     timesteps: the per-timestep distributions are right, but a path from these samples doesn't stay in one class. For
-     trajectories, use ``simulate()``, which simulates the regimes (and so the class) along with the state.
+     With ``K`` classes, the table of combos is repeated once per class (class-major: the first ``num_class_combos``
+     combos are in the first class, and so on; the class id is the last part of each of ``self.labels``), and the
+     base-rates are learned per class: each component's logit gets a per-class offset, and the classes have prior logits
+     (both fixed at 0 for the first class, for identifiability). Otherwise the classes are the same: the ``transition``
+     is shared, applied within each class with that class's base-rates (see :class:`RegimeTransition`), so its
+     ``num_combos`` is the number of combos per class (``self.num_class_combos``); and groups never change class. The
+     initial values come from each class's ``membership_prob_init`` and ``relative_rate_init``; the latter is required
+     for all but the first class, since otherwise the classes would be symmetric. Only the bookkeeping of
+     combo-probabilities grows with ``K``: combos with the same observable regimes share a state-update and likelihood
+     (see :func:`get_effective_combos`). Use :func:`get_class_probs` for the posterior probability of each class.
     """
 
     def __init__(self,
@@ -71,44 +69,55 @@ class MixtureModel(torch.nn.Module):
         self.joseph_form = joseph_form
 
         self.classes = list(classes or [])
-        num_classes = max(len(self.classes), 1)
-        self.num_classes = num_classes
-        # the combos within a class; with latent classes, these are repeated for each class (class-major):
-        class_combos = list(itertools.product(*[self.get_regimes(m) for m in self.mixture_measures]))
-        self.combos: list[tuple[Union[StandardRegime, MixtureComponent], ...]] = class_combos * num_classes
-        self.combo_class: list[int] = [c for c in range(num_classes) for _ in class_combos]
+        self.num_classes = max(len(self.classes), 1)
 
-        self._class_prior_logits = self._class_offsets = None
+        # if no classes, then this is just the combos. if multiple classes, then it's repeated for each class:
+        core_combos = list(itertools.product(*[self.get_regimes(m) for m in self.mixture_measures]))
+
+        self.combos: list[tuple[RegimeType, ...]] = core_combos * self.num_classes  # that repetition (class-major)
+        # a label for each combo: the id of each measure's regime, then (with classes) the class id:
+        core_labels = [tuple(r.id for r in combo) for combo in core_combos]
+        self.labels: list[tuple[str, ...]] = core_labels
         if self.classes:
-            self._init_classes()
+            self.labels = [(*label, cls.id) for cls in self.classes for label in core_labels]
+
+        component_ids = [c.qualified_id for c in self.components]
+        self._validate_latent_classes(classes, component_ids=component_ids)
+        self._class_prior_logits, self._class_offsets = self._init_latent_class_attrs(classes, component_ids)
 
         if transition is None:
             transition = StickyTransition(num_combos=self.num_class_combos)
         elif transition.num_combos != self.num_class_combos:
-            per_class = " per class" if num_classes > 1 else ""
+            per_class = " per class" if self.num_classes > 1 else ""
             raise ValueError(
                 f"`transition` has {transition.num_combos} combos, but expected {self.num_class_combos}{per_class}"
             )
         self.transition = transition
 
-    def _init_classes(self) -> None:
-        classes = self.classes
+    @staticmethod
+    def _validate_latent_classes(classes: Optional[Sequence[LatentClass]], component_ids: Sequence[str]):
+        if not classes:
+            return
+
         if len(classes) < 2:
             raise ValueError("`classes` needs at least two classes (or None, for no classes).")
-        ids = [c.id for c in classes]
-        if len(ids) != len(set(ids)):
-            raise ValueError(f"Latent classes must have unique ids, got {ids}")
+
+        class_ids = [c.id for c in classes]
+
+        if len(class_ids) != len(set(class_ids)):
+            raise ValueError(f"Latent classes must have unique ids, got {class_ids}")
+
         if classes[0].relative_rate_init:
             raise ValueError(
-                f"LatentClass '{ids[0]}' is the first (reference) class, so can't have `relative_rate_init`: the other "
-                f"classes' rates are relative to its."
+                f"LatentClass '{class_ids[0]}' is the first (reference) class, so can't have `relative_rate_init`: the "
+                f"other classes' rates are relative to its."
             )
-        component_ids = [c.qualified_id for c in self.components]
+
         for cls in classes[1:]:
             if not any(ratio != 1 for ratio in cls.relative_rate_init.values()):
                 raise ValueError(
                     f"LatentClass '{cls.id}' needs a `relative_rate_init` with at least one ratio other than 1 (vs. "
-                    f"the reference class '{ids[0]}'); otherwise the classes start out identical."
+                    f"the reference class '{class_ids[0]}'); otherwise the classes start out identical."
                 )
             unknown = set(cls.relative_rate_init) - set(component_ids)
             if unknown:
@@ -116,23 +125,34 @@ class MixtureModel(torch.nn.Module):
                     f"LatentClass '{cls.id}': `relative_rate_init` has unknown components {sorted(unknown)}; expected "
                     f"(a subset of) {component_ids}"
                 )
+
+    @staticmethod
+    def _init_latent_class_attrs(
+            classes: Optional[Sequence[LatentClass]],
+            component_ids: Sequence[str]
+    ) -> tuple[Optional[torch.nn.Parameter], Optional[torch.nn.Parameter]]:
+        if not classes:
+            return None, None
+
         membership = [c.membership_prob_init for c in classes]
         if any(p is None for p in membership) and not all(p is None for p in membership):
             raise ValueError("`membership_prob_init` should be given for all classes, or for none.")
 
-        to = {'dtype': torch.get_default_dtype()}
         # the prior logit of classes 1, ..., K-1 (class 0's is fixed at 0):
-        log_membership = torch.zeros(len(classes), **to)
+        log_membership = torch.zeros(len(classes), dtype=torch.get_default_dtype())
         if membership[0] is not None:
-            log_membership = torch.as_tensor(membership, **to).log()
-        self._class_prior_logits = torch.nn.Parameter(log_membership[1:] - log_membership[0])
+            log_membership = torch.as_tensor(membership, dtype=torch.get_default_dtype()).log()
+        class_prior_logits = torch.nn.Parameter(log_membership[1:] - log_membership[0])
+
         # for each component (in the order of self.components), the offset to its logit in classes 1, ..., K-1 (class
         # 0's is fixed at 0): the log of the ratio of its odds (vs. its measure's standard regime) to class 0's.
-        offsets = torch.zeros(len(self.components), len(classes) - 1, **to)
-        for k, cls in enumerate(classes[1:]):
-            for qualified_id, ratio in cls.relative_rate_init.items():
+        offsets = torch.zeros(len(component_ids), len(classes) - 1, dtype=torch.get_default_dtype())
+        for k, latent_cls in enumerate(classes[1:]):
+            for qualified_id, ratio in latent_cls.relative_rate_init.items():
                 offsets[component_ids.index(qualified_id), k] = math.log(ratio)
-        self._class_offsets = torch.nn.Parameter(offsets)
+        class_offsets = torch.nn.Parameter(offsets)
+
+        return class_prior_logits, class_offsets
 
     def _class_log_prior(self) -> torch.Tensor:
         """
@@ -184,7 +204,8 @@ class MixtureModel(torch.nn.Module):
         class_mass = by_class.sum(-1, keepdim=True)
         return class_mass, (by_class / class_mass.clamp_min(1e-30)).flatten(0, 1)
 
-    def _merge_classes(self, class_mass: torch.Tensor, within: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _merge_classes(class_mass: torch.Tensor, within: torch.Tensor) -> torch.Tensor:
         """
         The inverse of ``_split_classes()``: back to a ``(num_groups, num_combos)`` tensor.
         """
@@ -220,7 +241,7 @@ class MixtureModel(torch.nn.Module):
         """The number of combos within each latent class (``num_combos`` without classes)."""
         return self.num_combos // self.num_classes
 
-    def get_regimes(self, measure: str) -> list[Union[StandardRegime, MixtureComponent]]:
+    def get_regimes(self, measure: str) -> list[RegimeType]:
         """
         :param measure: A mixture measure.
         :return: The measure's regimes: its :class:`.StandardRegime`, then its components.
