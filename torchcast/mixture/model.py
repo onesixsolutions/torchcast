@@ -32,12 +32,12 @@ class MixtureModel(torch.nn.Module):
      their covariances only matter in proportion to their posterior probability. Default True.
     :param classes: Optional :class:`LatentClass` objects (at least two): latent classes of groups, each with its own
      base-rate for each component (a discrete random effect on the base-rates). Default None (no classes; i.e. one).
-     With ``K`` classes, the table of combos is repeated once per class (class-major: the first ``num_class_combos``
+     With ``K`` classes, the table of combos is repeated once per class (class-major: the first ``num_core_combos``
      combos are in the first class, and so on; the class id is the last part of each of ``self.labels``), and the
      base-rates are learned per class: each component's logit gets a per-class offset, and the classes have prior logits
      (both fixed at 0 for the first class, for identifiability). Otherwise the classes are the same: the ``transition``
      is shared, applied within each class with that class's base-rates (see :class:`RegimeTransition`), so its
-     ``num_combos`` is the number of combos per class (``self.num_class_combos``); and groups never change class. The
+     ``num_combos`` is the number of combos per class (``self.num_core_combos``); and groups never change class. The
      initial values come from each class's ``membership_prob_init`` and ``relative_rate_init``; the latter is required
      for all but the first class, since otherwise the classes would be symmetric. Only the bookkeeping of
      combo-probabilities grows with ``K``: combos with the same observable regimes share a state-update and likelihood
@@ -87,11 +87,11 @@ class MixtureModel(torch.nn.Module):
         self._class_prior_logits, self._class_offsets = self._init_latent_class_attrs(classes, component_ids)
 
         if transition is None:
-            transition = StickyTransition(num_combos=self.num_class_combos)
-        elif transition.num_combos != self.num_class_combos:
+            transition = StickyTransition(num_combos=self.num_core_combos)
+        elif transition.num_combos != self.num_core_combos:
             per_class = " per class" if self.num_classes > 1 else ""
             raise ValueError(
-                f"`transition` has {transition.num_combos} combos, but expected {self.num_class_combos}{per_class}"
+                f"`transition` has {transition.num_combos} combos, but expected {self.num_core_combos}{per_class}"
             )
         self.transition = transition
 
@@ -178,14 +178,14 @@ class MixtureModel(torch.nn.Module):
 
     def _by_class(self, probs: torch.Tensor) -> torch.Tensor:
         """
-        Reshape `probs` from a class-major ``(..., num_combos)`` tensor (with num_combos =
-        num_combos_per_class * num_classes) into a ``(..., num_classes, num_combos_per_class)`` tensor.
+        Reshape ``probs`` from a class-major ``(..., num_combos)`` tensor (with ``num_combos =
+        num_core_combos * num_classes``) into a ``(..., num_classes, num_core_combos)`` tensor.
 
-        :param probs: A ``(..., num_combos)`` tensor; ``num_combos`` is class-major (the first ``num_class_combos``
+        :param probs: A ``(..., num_combos)`` tensor; ``num_combos`` is class-major (the first ``num_core_combos``
          combos are in the first class, and so on).
-        :return: A ``(..., num_classes, num_class_combos)`` view.
+        :return: A ``(..., num_classes, num_core_combos)`` view.
         """
-        return probs.unflatten(-1, (self.num_classes, self.num_class_combos))
+        return probs.unflatten(-1, (self.num_classes, self.num_core_combos))
 
     def get_next_prior(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         """
@@ -219,7 +219,7 @@ class MixtureModel(torch.nn.Module):
 
         :param probs: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
         :return: Two items: (1) the ``(num_groups, num_classes, 1)`` probability of each class; (2) the
-         ``(num_groups * num_classes, num_class_combos)`` probabilities of the combos given each class (the classes
+         ``(num_groups * num_classes, num_core_combos)`` probabilities of the combos given each class (the classes
          folded into the rows, so a transition sees them as more groups).
         """
         by_class = self._by_class(probs)
@@ -260,8 +260,10 @@ class MixtureModel(torch.nn.Module):
         return len(self.combos)
 
     @property
-    def num_class_combos(self) -> int:
-        """The number of combos within each latent class (``num_combos`` without classes)."""
+    def num_core_combos(self) -> int:
+        """
+        The number of combos of one regime per measure, i.e. within each latent class (``num_combos`` without classes).
+        """
         return self.num_combos // self.num_classes
 
     def get_regimes(self, measure: str) -> list[RegimeType]:
@@ -318,12 +320,12 @@ class MixtureModel(torch.nn.Module):
 
         # now that we have probs for each regime individually, we compute the probability of each *combo* of regimes.
         # we treat them as independent here, so it's just the product (sum on the log-scale)
-        class_combos = self.combos[:self.num_class_combos]
+        class_combos = self.combos[:self.num_core_combos]
         logs_probs_per_combo = [sum(log_probs_per_regime[r.qualified_id] for r in combo) for combo in class_combos]
         log_probs = torch.stack(logs_probs_per_combo, -1)
         if self.num_classes == 1:
             return log_probs
-        # (..., num_classes, num_class_combos) -> class-major (..., num_combos):
+        # (..., num_classes, num_core_combos) -> class-major (..., num_combos):
         return (self._class_log_prior().unsqueeze(-1) + log_probs).flatten(-2)
 
     def get_effective_combos(self, measures: Sequence[str]) -> tuple[list[tuple[str, ...]], torch.Tensor]:
