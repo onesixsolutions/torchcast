@@ -986,7 +986,9 @@ def test_identical_classes_match_single_class():
     assert torch.allclose(pred1.means, pred2.means, atol=1e-5)
     class_prior = kf2.mixture._class_log_prior().exp()
     assert torch.allclose(class_prior, torch.sigmoid(torch.tensor([-.5, .5])))
-    assert torch.allclose(kf2.mixture.get_class_probs(pred2.combo_probs), class_prior.expand(3, 20, -1), atol=1e-5)
+    assert torch.allclose(pred2.latent_class_probs, class_prior.expand(3, 20, -1), atol=1e-5)
+    with pytest.raises(RuntimeError, match='latent classes'):
+        pred1.latent_class_probs
     rp2 = pred2.combo_probs.unflatten(-1, (2, -1)).sum(-2)
     assert torch.allclose(pred1.combo_probs, rp2, atol=1e-5)
 
@@ -1023,7 +1025,7 @@ def test_latent_classes_transition():
     posterior = torch.softmax(torch.randn(5, C), -1)
     nxt = mixture.get_next_prior(posterior, base_probs)
     assert torch.allclose(nxt, posterior @ T, atol=1e-6)
-    assert torch.allclose(mixture.get_class_probs(nxt), mixture.get_class_probs(posterior), atol=1e-6)
+    assert torch.allclose(mixture._get_class_probs(nxt), mixture._get_class_probs(posterior), atol=1e-6)
     assert torch.allclose(mixture._initial_combo_probs(base_probs, 5), base_probs.expand(5, -1), atol=1e-6)
     # per-group base-probs (components with predictors):
     group_base_probs = torch.softmax(torch.randn(5, C), -1)
@@ -1035,7 +1037,7 @@ def test_latent_classes_transition():
     nxt = mixture.get_next_prior(posterior, base_probs)
     within_base = base_probs.view(num_classes, per_class)
     within_base = within_base / within_base.sum(-1, keepdim=True)
-    expected = (mixture.get_class_probs(posterior).unsqueeze(-1) * within_base).flatten(-2)
+    expected = (mixture._get_class_probs(posterior).unsqueeze(-1) * within_base).flatten(-2)
     assert torch.allclose(nxt, expected, atol=1e-6)
 
 
@@ -1056,7 +1058,7 @@ def test_latent_classes_base_probs():
     base_probs = mixture.get_base_probs({component.qualified_id: X})
     assert base_probs.shape == (2, 4, 6)
     assert torch.allclose(base_probs.sum(-1), torch.ones(2, 4))
-    class_probs = mixture.get_class_probs(base_probs)
+    class_probs = mixture._get_class_probs(base_probs)
     assert torch.allclose(class_probs, mixture._class_log_prior().exp().expand(2, 4, -1))
     offsets = torch.cat([torch.zeros(1), mixture._class_offsets[0]])
     for c in range(3):
@@ -1143,7 +1145,7 @@ def test_latent_classes_with_two_components():
     assert (mixture._class_prior_logits.grad.abs() > 0).all()
 
     with torch.no_grad():
-        class_probs = mixture.get_class_probs(pred.combo_probs)
+        class_probs = pred.latent_class_probs
         # no observations -> no change in class-probabilities:
         assert torch.allclose(class_probs[:, 15:], class_probs[:, 15:16].expand(-1, 5, -1), atol=1e-6)
         assert torch.allclose(pred.get_mixture('y1').probs.sum(-1), torch.ones(3, 20), atol=1e-6)
@@ -1151,7 +1153,7 @@ def test_latent_classes_with_two_components():
         assert len(set(labels)) == mixture.num_combos and labels[-1] == ('high', 'low', 'volatile')
         assert pred.sample(5, shared_noise=False).means.shape == (5, 3, 20, 2)
         # simulated trajectories stay in one class:
-        sim_class = mixture.get_class_probs(kf.simulate(out_timesteps=5, num_groups=2, num_sims=10).combo_probs)
+        sim_class = kf.simulate(out_timesteps=5, num_groups=2, num_sims=10).latent_class_probs
         assert (sim_class == sim_class[:, :1]).all()
 
 
@@ -1182,7 +1184,7 @@ def test_latent_classes_fit():
         assert .15 < rates[1] < .35
 
         pred = kf(y.unsqueeze(-1), out_timesteps=num_times + 10)
-        class_probs = mixture.get_class_probs(pred.combo_probs)  # (G, T, 2)
+        class_probs = pred.latent_class_probs  # (G, T, 2)
         assert ((class_probs[:, num_times - 1, 1] > .5) == frequent).all()
         # forecasts keep each group's class -- the regime-probs don't revert to a shared base-rate:
         p_low = pred.get_mixture('y').probs[:, -1, 1]
@@ -1246,6 +1248,6 @@ def test_simulate_latent_classes():
     assert not list(kf.mixture.transition.parameters())
     kf.mixture._class_offsets.fill_(4.)
     kf.mixture._class_prior_logits.fill_(-1.)
-    sim_class = kf.mixture.get_class_probs(kf.simulate(out_timesteps=30, num_groups=1000).combo_probs)
+    sim_class = kf.simulate(out_timesteps=30, num_groups=1000).latent_class_probs
     assert (sim_class == sim_class[:, :1]).all()
     assert abs(sim_class[:, 0, 1].mean() - torch.sigmoid(torch.tensor(-1.))) < .04

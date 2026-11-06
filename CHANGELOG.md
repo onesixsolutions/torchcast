@@ -23,8 +23,8 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 - Latent classes: `MixtureModel(..., classes=[LatentClass('reference'), LatentClass('volatile',
   relative_rate_init={'y.low': 3.}), ...])` gives groups (e.g. customers) their own base-rates for the components -- a
   discrete random effect, learned per class (each class after the first, relative to the first). A group's class is
-  fixed but unknown: its posterior (`MixtureModel.get_class_probs(pred.combo_probs)`) accumulates evidence over all of its
-  timesteps and carries into forecasts. The transition is shared by the classes, applied within each one.
+  fixed but unknown: its posterior (`Predictions.latent_class_probs`) accumulates evidence over all of its timesteps
+  and carries into forecasts. The transition is shared by the classes, applied within each one.
 - Binary measures never influence the regime-probabilities (their gaussian approximation in the update-step is
   crude).
 - `Predictions.log_prob()` is the exact marginal likelihood of the mixture.

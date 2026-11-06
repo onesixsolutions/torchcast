@@ -41,7 +41,8 @@ class MixtureModel(torch.nn.Module):
      initial values come from each class's ``membership_prob_init`` and ``relative_rate_init``; the latter is required
      for all but the first class, since otherwise the classes would be symmetric. Only the bookkeeping of
      combo-probabilities grows with ``K``: combos with the same observable regimes share a state-update and likelihood
-     (see :func:`get_effective_combos`). Use :func:`get_class_probs` for the posterior probability of each class.
+     (see :func:`get_effective_combos`). Use ``Predictions.latent_class_probs`` for the posterior probability of each
+     class.
     """
 
     def __init__(self,
@@ -156,17 +157,35 @@ class MixtureModel(torch.nn.Module):
 
     def _class_log_prior(self) -> torch.Tensor:
         """
-        :return: A ``(num_classes,)`` tensor: the log prior probability of each latent class (with classes).
+        :return: A ``(num_classes,)`` tensor: the log prior probability of each latent class (with classes), i.e. the
+         learned share of groups in each class, before seeing any of their data. Compare
+         ``Predictions.latent_class_probs``, each group's posterior.
         """
-        logits = self._class_prior_logits
-        return torch.log_softmax(torch.cat([torch.zeros_like(logits[:1]), logits]), 0)
+        all_prior_logits = torch.cat([torch.zeros_like(self._class_prior_logits[:1]), self._class_prior_logits])
+        return torch.log_softmax(all_prior_logits, 0)
 
-    def get_class_probs(self, combo_probs: torch.Tensor) -> torch.Tensor:
+    def _get_class_probs(self, combo_probs: torch.Tensor) -> torch.Tensor:
         """
-        :param combo_probs: A ``(..., num_combos)`` tensor of combo-probabilities (e.g. ``Predictions.combo_probs``).
+        The combo-probabilities are joint probabilities of (the regimes, the class), so a class's probability is the
+        sum over the combos in that class. E.g. with classes ``a`` and ``b`` and one mixture measure, the combos are
+        ``[(std, a), (low, a), (std, b), (low, b)]``, and ``P(a) = P(std, a) + P(low, a)``. See
+        ``Predictions.latent_class_probs``.
+
+        :param combo_probs: A ``(..., num_combos)`` tensor of combo-probabilities.
         :return: A ``(..., num_classes)`` tensor: the probability of each latent class.
         """
-        return combo_probs.unflatten(-1, (self.num_classes, self.num_class_combos)).sum(-1)
+        return self._by_class(combo_probs).sum(-1)
+
+    def _by_class(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Reshape `probs` from a class-major ``(..., num_combos)`` tensor (with num_combos =
+        num_combos_per_class * num_classes) into a ``(..., num_classes, num_combos_per_class)`` tensor.
+
+        :param probs: A ``(..., num_combos)`` tensor; ``num_combos`` is class-major (the first ``num_class_combos``
+         combos are in the first class, and so on).
+        :return: A ``(..., num_classes, num_class_combos)`` view.
+        """
+        return probs.unflatten(-1, (self.num_classes, self.num_class_combos))
 
     def get_next_prior(self, posterior: torch.Tensor, base_probs: torch.Tensor) -> torch.Tensor:
         """
@@ -195,14 +214,18 @@ class MixtureModel(torch.nn.Module):
 
     def _split_classes(self, probs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        Given each ``comboXclass`` probability, split into (1) the probability of each class, (2) the probability of
+        each combo *given* its class.
+
         :param probs: A ``(num_groups, num_combos)`` tensor of combo-probabilities.
-        :return: The ``(num_groups, num_classes, 1)`` probability of each class, and the ``(num_groups * num_classes,
-         num_class_combos)`` probabilities of the combos given the class (the classes folded into the rows, so a
-         transition sees them as more groups).
+        :return: Two items: (1) the ``(num_groups, num_classes, 1)`` probability of each class; (2) the
+         ``(num_groups * num_classes, num_class_combos)`` probabilities of the combos given each class (the classes
+         folded into the rows, so a transition sees them as more groups).
         """
-        by_class = probs.unflatten(-1, (self.num_classes, self.num_class_combos))
+        by_class = self._by_class(probs)
         class_mass = by_class.sum(-1, keepdim=True)
-        return class_mass, (by_class / class_mass.clamp_min(1e-30)).flatten(0, 1)
+        per_class_probs = (by_class / class_mass.clamp_min(1e-30)).flatten(0, 1)
+        return class_mass, per_class_probs
 
     @staticmethod
     def _merge_classes(class_mass: torch.Tensor, within: torch.Tensor) -> torch.Tensor:
@@ -270,12 +293,13 @@ class MixtureModel(torch.nn.Module):
          the class's offsets to the components' logits).
         """
         component_X = component_X or {}
+        component_idx = {c.qualified_id: i for i, c in enumerate(self.components)}
+
         class_offsets = None
         if self.num_classes > 1:
             # for each component, its logit's offset in each class (the first class's is 0); added along a new last
             # dim, (..., num_classes). (the standard regime's logit stays 0 in every class.)
             class_offsets = torch.cat([torch.zeros_like(self._class_offsets[:, :1]), self._class_offsets], 1)
-            component_idx = {c.qualified_id: i for i, c in enumerate(self.components)}
 
         # per measure: get the log-probability of each of its regimes by softmaxing across its logits:
         log_probs_per_regime = {}
