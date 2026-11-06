@@ -955,7 +955,7 @@ def test_latent_classes_parameters():
     """
     kf = _make_kf(['y1', 'y2'], ['y1', 'y2'])
     assert kf.mixture.num_classes == 1 and not any('_class' in k for k in kf.state_dict())
-    assert kf.mixture.combo_class == [0] * kf.mixture.num_combos
+    assert all(len(label) == 2 for label in kf.mixture.labels)  # a regime per measure, no class
 
     kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], classes=_classes(2., 3.))
     assert kf2.mixture.num_combos == 12 and kf2.mixture.num_class_combos == 4
@@ -1048,7 +1048,7 @@ def test_latent_classes_base_probs():
         classes=[LatentClass('a'), LatentClass('b', relative_rate_init={'y.low': 3.}),
                  LatentClass('c', relative_rate_init={'y.low': .5})],
     )
-    assert mixture.num_combos == 6 and mixture.combo_class == [0, 0, 1, 1, 2, 2]
+    assert mixture.num_combos == 6 and [label[-1] for label in mixture.labels] == ['a', 'a', 'b', 'b', 'c', 'c']
     assert [c[0].is_standard for c in mixture.combos] == [True, False] * 3
     mixture._class_prior_logits.normal_()
     X = torch.randn(2, 4, 1)
