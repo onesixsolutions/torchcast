@@ -958,7 +958,7 @@ def test_latent_classes_parameters():
     assert all(len(label) == 2 for label in kf.mixture.labels)  # a regime per measure, no class
 
     kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], classes=_classes(2., 3.))
-    assert kf2.mixture.num_combos == 12 and kf2.mixture.num_core_combos == 4
+    assert kf2.mixture.num_combos == 12 and kf2.mixture._num_core_combos == 4
     assert kf2.mixture.transition._stay_logit.shape == (4,)
     shapes = lambda m: {k: tuple(v.shape) for k, v in m.state_dict().items()}
     extra = shapes(kf2).items() - shapes(kf).items()
