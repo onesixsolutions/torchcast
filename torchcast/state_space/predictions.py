@@ -1432,6 +1432,22 @@ class Predictions:
 
     # Mixture components -----------------------------------------------------------------------------------------------
 
+    @property
+    def latent_class_probs(self) -> torch.Tensor:
+        """
+        For a model with latent classes (``MixtureModel(..., classes=)``), each group's posterior probability of each
+        class. Since a group's class is fixed, these accumulate evidence over time: like ``combo_probs``, they're the
+        prior at each timestep, so ``[:, t]`` uses the data up to ``t - 1``. At the first timestep, before any data,
+        they're the learned prior (the share of groups in each class).
+
+        :return: A ``(num_groups, num_timesteps, num_classes)`` tensor, in the order of ``MixtureModel.classes``.
+        """
+        if self.mixture is None or not self.mixture.classes:
+            raise RuntimeError(
+                "`latent_class_probs` requires a model with latent classes (`MixtureModel(..., classes=)`)."
+            )
+        return self.mixture._get_class_probs(self.combo_probs)
+
     def get_mixture(self, measure: str) -> 'MixtureOfNormals':
         """
         For a measure with mixture components, the predictive distribution as a (univariate) mixture of normals: the
