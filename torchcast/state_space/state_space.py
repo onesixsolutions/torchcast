@@ -452,7 +452,11 @@ class StateSpaceModel(torch.nn.Module):
             try:
                 prog.reset()
                 prog.set_description(f"Epoch {epoch:,}; Loss {train_loss:.4}; Convergence {stopping.convergence}")
-                train_loss = optimizer.step(closure).item()
+                optimizer.step(closure)
+                # the loss at the parameters the step ended on (``step()`` returns the loss where it started): usually
+                # cached, since L-BFGS's line search evaluated that point last; otherwise this evaluates it, and the
+                # next step, which starts by evaluating the same point, gets it from the cache.
+                train_loss = closure().item()
                 for callback in callbacks:
                     callback(train_loss)
 
@@ -886,8 +890,25 @@ class _OptimizerClosure:
         self.get_loss = get_loss
         self._bad_count = 0
         self._max_bad_count = self.optimizer.param_groups[0].get('max_eval', 10)
+        self._params = [p for group in self.optimizer.param_groups for p in group['params']]
+        self._cache = None  # (flat params, loss, grads) of the last successful evaluation
+        self.num_evals = 0
+
+    def _flat_params(self) -> torch.Tensor:
+        return torch.cat([p.detach().reshape(-1) for p in self._params])
 
     def __call__(self):
+        # L-BFGS with ``max_iter=1`` (as ``fit()`` uses it, to check stopping each iteration) starts every ``step()`` by
+        # evaluating the current parameters, which are almost always where the previous step's line search evaluated
+        # last: serve that from the cache instead of another forward/backward pass. The loss only depends on the
+        # parameters here (fixed data; monte-carlo noise is fixed too), so an exact match is the same evaluation.
+        flat_params = self._flat_params()
+        if self._cache is not None and torch.equal(self._cache[0], flat_params):
+            _, loss, grads = self._cache
+            for p, g in zip(self._params, grads):
+                p.grad = None if g is None else g.clone()
+            return loss.clone()
+
         self.optimizer.zero_grad()
         self.kwargs.update({k: v() for k, v in self.callable_kwargs.items()})
 
@@ -908,6 +929,10 @@ class _OptimizerClosure:
         self._bad_count = 0
 
         loss.backward()
+        self.num_evals += 1
+        self._cache = (flat_params,
+                       loss.detach().clone(),
+                       [None if p.grad is None else p.grad.detach().clone() for p in self._params])
         self.prog.update()
         self.prog.set_description(
             f"Epoch {self.stopping.epoch:,}; Loss {loss.item():.4}; Convergence {self.stopping.convergence}"
