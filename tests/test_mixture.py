@@ -44,12 +44,12 @@ def test_mixture_model_combos():
     rm = MixtureModel(components)
     assert rm.mixture_measures == ['a', 'c']
     assert rm.num_combos == 2 * 3
-    assert all(r.is_standard for r in rm.combos[0])
-    assert rm.get_regimes('c') == [rm.combos[0][1], *components[1:]]
+    assert all(r.is_standard for r in rm.core_combos[0])
+    assert rm.get_regimes('c') == [rm.core_combos[0][1], *components[1:]]
     base_probs = rm.get_base_probs()
     assert torch.isclose(base_probs.sum(), torch.tensor(1.))
     # marginal prob of 'a' being non-standard is its prob_init (it's the only component for 'a'):
-    a_weird = torch.tensor([not combo[0].is_standard for combo in rm.combos])
+    a_weird = torch.tensor([not combo[0].is_standard for combo in rm.core_combos])
     assert torch.isclose(base_probs[a_weird].sum(), torch.tensor(.1))
 
     # all observed: every combo is distinguishable
@@ -266,7 +266,7 @@ def test_log_prob_brute_force():
         m = pred.state_means[g, t] @ H.T
         S = H @ pred.state_covs[g, t] @ H.T + R
         total = 0.
-        for combo, prob in zip(rm.combos, pred.combo_probs[g, t]):
+        for combo, prob in zip(rm.core_combos, pred.combo_probs[g, t]):
             # each measure in a component's regime: offset mean, and extra variance
             offset = torch.stack([torch.tensor(0.) if c is None else c.offset for c in combo])
             extra = torch.stack([torch.tensor(0.) if c is None else c.extra_var for c in combo])
@@ -619,7 +619,7 @@ def test_standard_probs():
             assert torch.allclose(probs[:, j], torch.ones(4))
             continue
         k = rm.mixture_measures.index(m)
-        standard = torch.tensor([combo[k].is_standard for combo in rm.combos])
+        standard = torch.tensor([combo[k].is_standard for combo in rm.core_combos])
         assert torch.allclose(probs[:, j], combo_probs[:, standard].sum(-1))
     # at base-probs, matches the base-rate:
     assert torch.allclose(rm.get_standard_probs(rm.get_base_probs().unsqueeze(0), ['a'])[0], torch.tensor([.9]))
@@ -753,7 +753,7 @@ def test_prediction_outputs():
 
     # cross-covariance vs. sampling from the mixture, for one group/time:
     labels, probs, combo_means, combo_covs = pred._get_regime_combos()
-    assert labels == [('__standard__',), ('y1_low',)]
+    assert labels == [('__standard__', None), ('y1_low', None)]
     g, t = 1, 8
     torch.manual_seed(0)
     n = 400_000
@@ -955,14 +955,14 @@ def test_latent_classes_parameters():
     """
     kf = _make_kf(['y1', 'y2'], ['y1', 'y2'])
     assert kf.mixture.num_classes == 1 and not any('_class' in k for k in kf.state_dict())
-    assert all(len(label) == 2 for label in kf.mixture.labels)  # a regime per measure, no class
+    assert all(len(label) == 3 and label[-1] is None for label in kf.mixture.labels)  # a regime per measure, no class
 
     kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], classes=_classes(2., 3.))
     assert kf2.mixture.num_combos == 12 and kf2.mixture._num_core_combos == 4
     assert kf2.mixture.transition._stay_logit.shape == (4,)
     shapes = lambda m: {k: tuple(v.shape) for k, v in m.state_dict().items()}
     extra = shapes(kf2).items() - shapes(kf).items()
-    assert dict(extra) == {'mixture._class_prior_logits': (2,), 'mixture._class_offsets': (2, 2)}
+    assert dict(extra) == {'mixture._class_prior_logits': (2,), 'mixture._class_regime_offsets': (2, 2)}
     with pytest.raises(ValueError, match="per class"):
         _make_kf(['y1', 'y2'], ['y1', 'y2'], classes=_classes(2., 3.), transition=StickyTransition(num_combos=12))
 
@@ -978,13 +978,13 @@ def test_identical_classes_match_single_class():
     kf2 = _make_kf(['y1', 'y2'], ['y1', 'y2'], classes=_classes(2.))
     kf1.mixture.transition._stay_logit.normal_()
     kf2.load_state_dict(kf1.state_dict(), strict=False)
-    kf2.mixture._class_offsets.zero_()
+    kf2.mixture._class_regime_offsets.zero_()
     kf2.mixture._class_prior_logits.fill_(.5)
 
     pred1, pred2 = kf1(y, out_timesteps=20, n_step=2), kf2(y, out_timesteps=20, n_step=2)
     assert torch.allclose(pred1.log_prob(y), pred2.log_prob(y), atol=1e-5)
     assert torch.allclose(pred1.means, pred2.means, atol=1e-5)
-    class_prior = kf2.mixture._class_log_prior().exp()
+    class_prior = kf2.mixture._class_log_prior.exp()
     assert torch.allclose(class_prior, torch.sigmoid(torch.tensor([-.5, .5])))
     assert torch.allclose(pred2.latent_class_probs, class_prior.expand(3, 20, -1), atol=1e-5)
     with pytest.raises(RuntimeError, match='latent classes'):
@@ -1051,7 +1051,7 @@ def test_latent_classes_base_probs():
                  LatentClass('c', relative_rate_init={'y.low': .5})],
     )
     assert mixture.num_combos == 6 and [label[-1] for label in mixture.labels] == ['a', 'a', 'b', 'b', 'c', 'c']
-    assert [c[0].is_standard for c in mixture.combos] == [True, False] * 3
+    assert [label[0] for label in mixture.labels] == ['__standard__', 'low'] * 3
     mixture._class_prior_logits.normal_()
     X = torch.randn(2, 4, 1)
     component = mixture.components[0]
@@ -1059,8 +1059,8 @@ def test_latent_classes_base_probs():
     assert base_probs.shape == (2, 4, 6)
     assert torch.allclose(base_probs.sum(-1), torch.ones(2, 4))
     class_probs = mixture._get_class_probs(base_probs)
-    assert torch.allclose(class_probs, mixture._class_log_prior().exp().expand(2, 4, -1))
-    offsets = torch.cat([torch.zeros(1), mixture._class_offsets[0]])
+    assert torch.allclose(class_probs, mixture._class_log_prior.exp().expand(2, 4, -1))
+    offsets = torch.cat([torch.zeros(1), mixture._class_regime_offsets[0]])
     for c in range(3):
         p_low = base_probs[..., 2 * c + 1] / class_probs[..., c]
         assert torch.allclose(p_low, torch.sigmoid(component.get_logit(X) + offsets[c]), atol=1e-6)
@@ -1079,7 +1079,7 @@ def test_latent_class_init():
         LatentClass('low_value', membership_prob_init=.6),
         LatentClass('high_value', membership_prob_init=.6, relative_rate_init={'y.high': .1}),
     ])
-    assert torch.allclose(mixture._class_log_prior().exp(), torch.tensor([.5, .5]))
+    assert torch.allclose(mixture._class_log_prior.exp(), torch.tensor([.5, .5]))
     # the ratio multiplies the component's odds vs. the standard regime; others are unchanged:
     base_probs = mixture.get_base_probs().view(2, 3)
     odds = base_probs[:, 1:] / base_probs[:, :1]  # (class, component)
@@ -1089,9 +1089,9 @@ def test_latent_class_init():
         LatentClass('a', membership_prob_init=.2),
         LatentClass('b', membership_prob_init=.8, relative_rate_init={'y.low': 2.}),
     ])
-    assert torch.allclose(mixture._class_log_prior().exp(), torch.tensor([.2, .8]))
+    assert torch.allclose(mixture._class_log_prior.exp(), torch.tensor([.2, .8]))
     mixture = MixtureModel(components, classes=_classes(2., component='y.low'))
-    assert torch.allclose(mixture._class_log_prior().exp(), torch.tensor([.5, .5]))
+    assert torch.allclose(mixture._class_log_prior.exp(), torch.tensor([.5, .5]))
 
     def make(classes):
         return MixtureModel(components, classes=classes)
@@ -1141,7 +1141,7 @@ def test_latent_classes_with_two_components():
     y[1, 3:6, 1] = float('nan')
     pred = kf(y, out_timesteps=20)
     pred.log_prob(y).sum().backward()
-    assert (mixture._class_offsets.grad.abs() > 0).all()
+    assert (mixture._class_regime_offsets.grad.abs() > 0).all()
     assert (mixture._class_prior_logits.grad.abs() > 0).all()
 
     with torch.no_grad():
@@ -1179,7 +1179,8 @@ def test_latent_classes_fit():
     kf.fit(y.unsqueeze(-1), stopping={'max_iter': 40}, verbose=0)
     mixture = kf.mixture
     with torch.no_grad():
-        rates = torch.sigmoid(mixture.components[0].logit + torch.cat([torch.zeros(1), mixture._class_offsets[0]]))
+        offsets = torch.cat([torch.zeros(1), mixture._class_regime_offsets[0]])
+        rates = torch.sigmoid(mixture.components[0].logit + offsets)
         assert 0. < rates[0] < .05
         assert .15 < rates[1] < .35
 
@@ -1219,7 +1220,7 @@ def test_simulate_regimes():
     assert ((probs == 0) | (probs == 1)).all() and (probs.sum(-1) == 1).all()
 
     path = probs.argmax(-1)
-    is_low = path == kf.mixture.combos.index((low,))
+    is_low = path == kf.mixture.core_combos.index((low,))
     prev_low, next_low = is_low[:, :-1], is_low[:, 1:]
     stay = kf.mixture.transition.get_stay_prob()[0]
     # P(same as the previous step) = stay + (1 - stay) * base-rate
@@ -1246,7 +1247,7 @@ def test_simulate_latent_classes():
     torch.manual_seed(0)
     kf = _make_kf(['y1', 'y2'], ['y1'], classes=_classes(2.), transition=StaticTransition(num_combos=2))
     assert not list(kf.mixture.transition.parameters())
-    kf.mixture._class_offsets.fill_(4.)
+    kf.mixture._class_regime_offsets.fill_(4.)
     kf.mixture._class_prior_logits.fill_(-1.)
     sim_class = kf.simulate(out_timesteps=30, num_groups=1000).latent_class_probs
     assert (sim_class == sim_class[:, :1]).all()

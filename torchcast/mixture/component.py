@@ -12,8 +12,9 @@ STANDARD_REGIME_ID = '__standard__'
 class StandardRegime(torch.nn.Module):
     """
     A measure's standard regime -- the usual measurement model, from which a :class:`MixtureComponent` is an offset.
-    Has the same interface as a component, so the regimes of a measure (e.g. in ``MixtureModel.combos``) can be handled
-    alike: zero offset, zero extra variance, and the fixed logit (0) that the components' logits are relative to.
+    Has the same interface as a component, so the regimes of a measure (e.g. in ``MixtureModel.core_combos``) can be
+    handled alike: zero offset, zero extra variance, and the fixed logit (0) that the components' logits are relative
+    to.
     (Created by the :class:`.MixtureModel`. Has no parameters: its values are buffers, so they follow ``.to()``.)
     """
     is_standard = True
