@@ -1276,10 +1276,11 @@ class Predictions:
                 measures=measures,
                 like=like,
             )
-            for combo in self.mixture.combos
+            for combo in self.mixture.core_combos
         )
         shift, extra_var = zip(*offsets)
-        return torch.stack(shift), torch.stack(extra_var)
+        # (the class doesn't affect a combo's offsets)
+        return tuple(self.mixture.repeat_per_class(torch.stack(x)) for x in (shift, extra_var))
 
     def _regime_noise_scale_table(self, regime_noise_scale: Mapping[str, float]) -> torch.Tensor:
         """
@@ -1297,16 +1298,18 @@ class Predictions:
             raise ValueError("`regime_noise_scale` values must be non-negative.")
         measures = list(self.measurement_model.measures)
         table = torch.ones(
-            (self.mixture.num_combos, len(measures)), dtype=self.state_means.dtype, device=self.state_means.device
+            (len(self.mixture.core_combos), len(measures)),
+            dtype=self.state_means.dtype,
+            device=self.state_means.device
         )
-        for c, combo in enumerate(self.mixture.combos):
+        for c, combo in enumerate(self.mixture.core_combos):
             for measure, component in zip(self.mixture.mixture_measures, combo):
                 if component.is_standard or measure not in measures:
                     continue
                 scale = regime_noise_scale.get(component.qualified_id, regime_noise_scale.get(component.id))
                 if scale is not None:
                     table[c, measures.index(measure)] = scale
-        return table
+        return self.mixture.repeat_per_class(table)
 
     def _sample_given_state(self,
                             means: torch.Tensor,
@@ -1506,10 +1509,10 @@ class Predictions:
         warning, if any of these are mixture measures).
 
         :return: A tuple of (1) a label for each combo: a tuple with the regime of each mixture measure (its ``id``:
-         ``'__standard__'``, or the component's; with latent classes, followed by the class's id), (2) a ``(num_groups,
-         num_timesteps, num_combos)`` tensor of combo probabilities, (3) a ``(num_groups, num_timesteps, num_combos,
-         num_measures)`` tensor of means, and (4) a ``(num_groups, num_timesteps, num_combos, num_measures,
-         num_measures)`` tensor of covariances.
+         ``'__standard__'``, or the component's), followed by the class's id (None without latent classes), (2) a
+         ``(num_groups, num_timesteps, num_combos)`` tensor of combo probabilities, (3) a ``(num_groups,
+         num_timesteps, num_combos, num_measures)`` tensor of means, and (4) a ``(num_groups, num_timesteps,
+         num_combos, num_measures, num_measures)`` tensor of covariances.
         """
         if self.mixture is None:
             raise RuntimeError("This model has no mixture components.")
@@ -1554,12 +1557,16 @@ class Predictions:
                 dtype=self.state_means.dtype,
                 device=self.state_means.device
             )
-        rm = self.mixture
-        k = rm.mixture_measures.index(measure)
+        midx = self.mixture.mixture_measures.index(measure)
+        # the regime doesn't depend on the class, so sum over the classes first:
+        core_probs = self.mixture._by_class(self.combo_probs).sum(-2)  # (num_groups, num_timesteps, num_core_combos)
         probs = []
-        for regime in rm.get_regimes(measure):
-            in_regime = torch.as_tensor([combo[k] is regime for combo in rm.combos], device=self.combo_probs.device)
-            probs.append(self.combo_probs[..., in_regime].sum(-1))
+        for regime in self.mixture.get_regimes(measure):
+            in_regime = torch.as_tensor(
+                [combo[midx] is regime for combo in self.mixture.core_combos],
+                device=self.combo_probs.device
+            )
+            probs.append(core_probs[..., in_regime].sum(-1))
         return torch.stack(probs, -1)
 
     # States at specific times, and indexing ---------------------------------------------------------------------------
@@ -1994,7 +2001,7 @@ class PredictionSamples:
     :param observations: If ``observation_noise=True``, a ``(num_samples, num_groups, num_timesteps, num_measures)``
      tensor of sampled observations.
     :param combos: For models with mixture components, a ``(num_samples, num_groups, num_timesteps)`` tensor with
-     the index of each sample's regime-combo (into ``MixtureModel.combos``).
+     the index of each sample's regime-combo (as in ``MixtureModel.labels``).
     :param noise_scales: With ``sample(regime_noise_scale=...)``, a ``(num_samples, num_groups, num_timesteps,
      num_measures)`` tensor of the scales applied to each draw's deviation from its regime's center.
     """
