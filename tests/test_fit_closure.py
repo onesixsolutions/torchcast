@@ -2,6 +2,9 @@
 ``StateSpaceModel.fit()``'s closure caches its last evaluation: L-BFGS with ``max_iter=1`` starts each ``step()`` by
 evaluating the point the previous line search accepted, which it almost always evaluated last.
 """
+import math
+
+import pytest
 import torch
 
 from torchcast.kalman_filter import KalmanFilter
@@ -76,3 +79,29 @@ def test_fit_reports_the_current_iterates_loss(monkeypatch):
     # (the loss passed to callbacks and stopping is at the parameters the iteration ended on, not where it started):
     assert abs(losses[-1] - final_loss) < 1e-5
     assert all(later <= earlier + 1e-6 for earlier, later in zip(losses, losses[1:]))
+
+
+@pytest.mark.parametrize('bad', ['nan', 'linalg_error'])
+def test_bad_trial_point_backtracks(bad):
+    # the first trial point of iteration 2's line search is unusable: a nan loss (as when a trial step overflows) or
+    # invalid covariances. the line search backs off from it and the fit carries on (with an infinite loss, the line
+    # search's interpolation made the next trial step nan and the fit failed)
+    y, X = _data()
+    torch.manual_seed(1)
+    kf = _make_kf()
+    calls = {'n': 0}
+
+    def get_loss(pred, _y):
+        calls['n'] += 1
+        loss = -pred.log_prob(_y).mean()
+        if calls['n'] == 3:
+            if bad == 'linalg_error':
+                raise torch.linalg.LinAlgError('simulated')
+            return loss * float('nan')
+        return loss
+
+    losses = []
+    kf.fit(y, X=X, get_loss=get_loss, stopping=Stopping(abstol=0., max_iter=4), callbacks=[losses.append], verbose=0)
+    assert len(losses) == 4 and all(map(math.isfinite, losses)), losses
+    assert all(later <= earlier + 1e-6 for earlier, later in zip(losses, losses[1:]))
+    assert all(torch.isfinite(p).all() for p in kf.parameters())

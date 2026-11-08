@@ -870,6 +870,9 @@ class LossFun:
 
 
 class _OptimizerClosure:
+    # what an unusable evaluation (invalid covariances, or a non-finite loss) returns: far above any real loss, so a
+    # line search backs off from it, but finite (see ``__call__``)
+    BAD_LOSS = 1e10
 
     def __init__(self,
                  ss_model: StateSpaceModel,
@@ -915,9 +918,16 @@ class _OptimizerClosure:
         try:
             pred = self.ss_model(self.y, **self.kwargs)
             loss = self.get_loss(pred, self.y)
+            if not torch.isfinite(loss):
+                # a non-finite loss is as unusable as invalid covs: e.g. an L-BFGS line search's first trial step can
+                # overshoot so far that the loss overflows (in float32, to inf or nan). nan is the dangerous one: every
+                # comparison with it is False, so the line search can *accept* the point, and the fit is lost.
+                raise torch.linalg.LinAlgError(f"non-finite loss ({loss.item()})")
         except torch.linalg.LinAlgError:
-            # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
-            # by back-tracking and trying a different (hopefully more stable) parameter proposal.
+            # linalgerror means bad covs (or a non-finite loss, above). most common case is LBFGS line-search, which
+            # will respond to a very large loss by back-tracking and trying a different (hopefully more stable)
+            # parameter proposal. the loss is large but finite, with zero gradients: an *infinite* loss breaks the
+            # strong-wolfe line search's cubic interpolation (inf - inf), whose next trial step is then nan.
             # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
             self._bad_count += 1
             if self._bad_count > self._max_bad_count:
@@ -925,7 +935,9 @@ class _OptimizerClosure:
                     "Optimizer cannot find a region of param-space where all covs are valid. "
                     "Try again, potentially with a lower learning-rate."
                 )
-            return torch.tensor(float('inf'))
+            for p in self._params:
+                p.grad = torch.zeros_like(p)
+            return torch.tensor(self.BAD_LOSS)
         self._bad_count = 0
 
         loss.backward()
