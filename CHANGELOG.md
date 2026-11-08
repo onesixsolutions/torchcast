@@ -14,7 +14,7 @@ Models saved by older versions keep the old behavior, whether loaded by unpickli
 
 ### Behavior change: the loss passed to `stopping` and `callbacks` is the current iteration's
 
-`optimizer.step()` returns the loss at the parameters the step *started* from, so the loss `fit()` passed to `stopping` and `callbacks` each iteration was the previous iteration's. It's now the loss at the parameters the iteration ended on (usually from the cache above, so it's free). A fit whose stopping rule monitors the loss can therefore stop one iteration earlier than before, and end with slightly different parameters. Stopping on parameter changes (`Stopping(monitor_params=...)`) is unaffected.
+`optimizer.step()` returns the loss at the parameters the step *started* from, so the loss `fit()` passed to `stopping` and `callbacks` each iteration was the previous iteration's. It's now the loss at the parameters the iteration ended on (usually from the cache above, so it's free). A fit whose stopping rule monitors the loss (`Stopping`'s default, also alongside `monitor_params`) can therefore stop at a different iteration than before, and end with slightly different parameters. Only stopping on parameters alone (`monitor_loss=False`) is unaffected.
 
 ### Behavior change: `BinomialPredictions.to_dataframe()` reports observed proportions
 
