@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## Unreleased
+## v1.2.0
 
 ### Behavior change: adaptive scaling starts at "no adjustment"
 
