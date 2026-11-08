@@ -16,7 +16,7 @@ class LatentClass:
      for all of the model's classes (normalized to sum to 1), or for none (equal probabilities).
     :param relative_rate_init: For classes after the first (required, with at least one ratio other than 1): a
      dictionary mapping a component's ``qualified_id`` (``'{measure}.{id}'``) to the initial value of its rate in this
-     class, relative to the reference class -- e.g. ``{'log_theo.high': .1}`` for a 'high' regime ~10x less common.
+     class, relative to the reference class -- e.g. ``{'log_spend.high': .1}`` for a 'high' regime ~10x less common.
      Exactly, it multiplies the component's odds vs. its measure's standard regime (for a rare component, that's about
      the same as multiplying its rate). Components not listed are initialized as in the reference class.
     """
