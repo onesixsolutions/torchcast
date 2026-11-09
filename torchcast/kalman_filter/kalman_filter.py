@@ -166,7 +166,7 @@ class KalmanFilter(StateSpaceModel):
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
                      val_idx: Optional[torch.Tensor] = None,
-                     regime_prior: Optional[torch.Tensor] = None,
+                     combo_prior: Optional[torch.Tensor] = None,
                      **kwargs) -> 'StateTuple':
         input, measured_mean, measure_cov = self._prepare_update(
             input=input,
@@ -183,6 +183,8 @@ class KalmanFilter(StateSpaceModel):
                 measure_mat=measure_mat,
                 measure_cov=measure_cov,
             )
+        if combo_prior is None:
+            raise ValueError("A model with mixture components needs `combo_prior` for its update-step.")
         return self._mixture_update(
             input=input,
             mean=mean,
@@ -191,7 +193,7 @@ class KalmanFilter(StateSpaceModel):
             measure_mat=measure_mat,
             measure_cov=measure_cov,
             measures=self.measures if val_idx is None else [self.measures[i] for i in val_idx.tolist()],
-            regime_prior=regime_prior,
+            combo_prior=combo_prior,
         )
 
     def _prepare_update(self,
@@ -201,7 +203,7 @@ class KalmanFilter(StateSpaceModel):
                         **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Hook for subclasses to validate/adjust the inputs to the update step (e.g. ``BinomialFilter`` adjusts the
-        measure-covariance). Called exactly once per update-step, before any mixture hypotheses are constructed; any
+        measure-covariance). Called exactly once per update-step, before the mixture update's effective combos; any
         update-kwargs from ``_parse_kwargs`` are consumed here.
 
         :return: A tuple of (possibly modified) ``input``, ``measured_mean``, ``measure_cov``.
@@ -252,26 +254,22 @@ class KalmanFilter(StateSpaceModel):
                         measure_mat: torch.Tensor,
                         measure_cov: torch.Tensor,
                         measures: Sequence[str],
-                        regime_prior: Optional[torch.Tensor] = None) -> 'StateTuple':
+                        combo_prior: torch.Tensor) -> 'StateTuple':
         """
-        Update step when there are mixture components. Each (effective) regime-combo implies a hypothesis: for
-        measures in a non-standard regime, the measured-mean is offset by the component's mean, and the component's
-        variance is added to the measurement-noise. Each hypothesis is a full kalman update; they're weighted by their
-        posterior probability and collapsed via moment-matching.
+        Update step when there are mixture components. Each effective combo (aka hypothesis; see
+        ``MixtureModel.get_effective_combos``) offsets the measured-mean of measures in a non-standard regime by their
+        component's offset, and adds the component's variance to their measurement-noise. Each effective combo gets a
+        full kalman update; these are weighted by their posterior probability and collapsed via moment-matching.
 
         :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
-        :param regime_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo. Defaults
-         to the regime-model's base-probs.
-        :return: The collapsed state, with ``regime_probs`` set to the ``(num_groups, num_combos)`` posterior.
+        :param combo_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo (from the
+         regime-transition).
+        :return: The collapsed state, with ``combo_probs`` set to the ``(num_groups, num_combos)`` posterior.
         """
-        num_groups = input.shape[0]
-        if regime_prior is None:
-            log_prior = self.mixture.log_base_probs().expand(num_groups, -1)
-        else:
-            log_prior = regime_prior.clamp_min(1e-30).log()
+        log_prior = combo_prior.clamp_min(1e-30).log()
 
-        effective, mapping = self.mixture.effective_combos(measures)
-        if len(effective) == 1:
+        effective_combos, mapping = self.mixture.get_effective_combos(measures)
+        if len(effective_combos) == 1:
             # no mixture measures observed, so observations are uninformative about the regime:
             standard = self._kalman_update(
                 input=input,
@@ -281,22 +279,20 @@ class KalmanFilter(StateSpaceModel):
                 measure_mat=measure_mat,
                 measure_cov=measure_cov,
             )
-            standard.regime_probs = log_prior.exp()
+            standard.combo_probs = log_prior.exp()
             return standard
 
-        # which measures contribute to the responsibilities. non-gaussian measures (e.g. binary) never do: their
-        # gaussian approximation is crude, and their log-prob is computed separately from the gaussian measures' (so
-        # using their correlation here would be inconsistent with training).
-        if self.mixture.univariate_prob:
-            score_idx = [i for i, m in enumerate(measures) if m in self.mixture.mixture_measures]
-        else:
-            score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        # the measures that score the combos: all but the non-gaussian ones (e.g. binary), whose gaussian approximation
+        # here is crude, and whose log-prob is computed separately from the gaussian measures' (so using their
+        # correlation here would be inconsistent with training).
+        score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
         score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
-        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
-        # updated together, along a leading combo-dimension; tensors that don't depend on the combo broadcast.
+        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective
+        # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
+        # broadcast.
         shifts, extra_vars = zip(*(
-            self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective
+            self.mixture.get_combo_offsets(combo, measures, like=input) for combo in effective_combos
         ))
         shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
         extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)
@@ -330,34 +326,34 @@ class KalmanFilter(StateSpaceModel):
 
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + log_liks[:, mapping]
-        regime_post = torch.softmax(log_post, -1)
+        combo_post = torch.softmax(log_post, -1)
         means, covs = zip(*states)  # (a StateTuple iterates as (mean, cov))
         return self._collapse_states(
             means=means[0] if len(means) == 1 else torch.cat(means),
             covs=covs[0] if len(covs) == 1 else torch.cat(covs),
-            regime_post=regime_post,
+            combo_post=combo_post,
             mapping=mapping,
         )
 
     @staticmethod
     def _collapse_states(means: torch.Tensor,
                          covs: torch.Tensor,
-                         regime_post: torch.Tensor,
+                         combo_post: torch.Tensor,
                          mapping: torch.Tensor) -> 'StateTuple':
         """
         Collapse a mixture of gaussian states into a single gaussian via moment-matching.
 
         :param means: A ``(num_effective, num_groups, state_rank)`` tensor: the (effective-combo) state-means to mix.
         :param covs: A ``(num_effective, num_groups, state_rank, state_rank)`` tensor: their covariances.
-        :param regime_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
+        :param combo_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
         :param mapping: A ``(num_combos,)`` tensor mapping each combo to its index in ``means`` (combos that are
          indistinguishable given the observed measures share a state).
-        :return: The collapsed state, with ``regime_probs`` set to ``regime_post``.
+        :return: The collapsed state, with ``combo_probs`` set to ``combo_post``.
         """
         # the weight of each state is the total probability of the combos that map to it:
-        to = {'dtype': regime_post.dtype, 'device': regime_post.device}
-        weights = torch.zeros((regime_post.shape[0], means.shape[0]), **to)
-        weights = weights.index_add(1, mapping.to(regime_post.device), regime_post)  # (G, num_effective)
+        to = {'dtype': combo_post.dtype, 'device': combo_post.device}
+        weights = torch.zeros((combo_post.shape[0], means.shape[0]), **to)
+        weights = weights.index_add(1, mapping.to(combo_post.device), combo_post)  # (G, num_effective)
         # the mixture's mean is the probability-weighted average of the states' means:
         #   new_mean[g] = sum over e of weights[g, e] * means[e, g]
         # (einsum's notation: g = group, e = effective combo, s = state-element; e is summed over since it's not in
@@ -369,7 +365,7 @@ class KalmanFilter(StateSpaceModel):
         # (here the einsum avoids a second (E, G, S, S) intermediate, which matters: this runs every update step.)
         diff = means - new_mean
         new_cov = torch.einsum('ge,egij->gij', weights, covs + diff.unsqueeze(-1) * diff.unsqueeze(-2))
-        return StateTuple(mean=new_mean, cov=new_cov, regime_probs=regime_post)
+        return StateTuple(mean=new_mean, cov=new_cov, combo_probs=combo_post)
 
     @staticmethod
     def _covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
