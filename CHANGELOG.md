@@ -5,7 +5,7 @@
 ### New feature: mixture components (experimental)
 
 A measure can now have one or more alternative *regimes* -- e.g. for outliers that shouldn't update the state or
-inflate the variance. See the new [mixture components example](https://docs.strong.io/torchcast/examples/mixture_components.html).
+inflate the variance.
 
 - The new `torchcast.mixture` module: `MixtureModel`, `MixtureComponent`, `RegimeTransition`, `StickyTransition`.
 - `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):

@@ -6,4 +6,3 @@ Examples
 
    air_quality
    electricity
-   mixture_components
