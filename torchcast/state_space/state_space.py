@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
-from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
+from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, as_timestep_list
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
 from torchcast.mixture import MixtureModel, MixtureComponent
@@ -213,11 +213,8 @@ class StateSpaceModel(torch.nn.Module):
             nan_groups = [None] * out_timesteps
         # # /
 
-        # todo: update Covariance class to make this less hacky:
-        mcov_kwargs = {}
-        if self.measure_covariance.expected_kwargs:
-            mcov_kwargs = {k: kwargs[k] for k in self.measure_covariance.expected_kwargs}
-        measure_covs = list(self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1))
+        measure_covs, mcov_keys = self.measure_covariance.batch_cov(kwargs, num_groups, out_timesteps)
+        measure_covs = as_timestep_list(measure_covs, num_groups, out_timesteps)
 
         # the adaptive-scaler's state, and the multiplier for the first step: continued from `initial_state` if it
         # carries them (e.g. from `get_state_at_times()`), otherwise fresh.
@@ -238,7 +235,7 @@ class StateSpaceModel(torch.nn.Module):
             measure_covs=measure_covs,
             **kwargs
         )
-        used_keys.update(mcov_kwargs)
+        used_keys.update(mcov_keys)
 
         transition_model = TransitionModel(
             processes=self.processes,
@@ -911,11 +908,11 @@ class StateSpaceModel(torch.nn.Module):
     def _default_initial_cov(self) -> torch.Tensor:
         # the initial covariance is parameterized relative to the measure-scale. note this scaling only applies to the
         # default: a user-supplied cov (e.g. from ``get_state_at_times()``) is already on the right scale.
-        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        init_cov = self.initial_covariance.base_cov().unsqueeze(0)
         return self._apply_cov_scaling(init_cov, scaling=self._get_measure_scaling(), is_process_cov=True)
 
     def _get_measure_scaling(self) -> torch.Tensor:
-        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+        mcov = self.measure_covariance.base_cov()
         # need unbind->modify->stack to avoid modified-inplace error
         measure_diag = list(mcov.diagonal(dim1=-2, dim2=-1).unbind(0))
         # replace 0 with 1 in empties:
