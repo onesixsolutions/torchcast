@@ -588,7 +588,11 @@ class StateSpaceModel(torch.nn.Module):
             try:
                 prog.reset()
                 prog.set_description(f"Epoch {epoch:,}; Loss {train_loss:.4}; Convergence {stopping.convergence}")
-                train_loss = optimizer.step(closure).item()
+                optimizer.step(closure)
+                # the loss at the parameters the step ended on (``step()`` returns the loss where it started): usually
+                # cached, since L-BFGS's line search evaluated that point last; otherwise this evaluates it, and the
+                # next step, which starts by evaluating the same point, gets it from the cache.
+                train_loss = closure().item()
                 for callback in callbacks:
                     callback(train_loss)
 
@@ -1333,6 +1337,9 @@ class LossFun:
 
 
 class _OptimizerClosure:
+    # what an unusable evaluation (invalid covariances, or a non-finite loss) returns: far above any real loss, so a
+    # line search backs off from it, but finite (see ``__call__``)
+    BAD_LOSS = 1e10
 
     def __init__(self,
                  objective: _ChunkedObjective,
@@ -1345,19 +1352,44 @@ class _OptimizerClosure:
         self.stopping = stopping
         self._bad_count = 0
         self._max_bad_count = self.optimizer.param_groups[0].get('max_eval', 10)
+        self._params = [p for group in self.optimizer.param_groups for p in group['params']]
+        self._cache = None  # (flat params, loss, grads) of the last successful evaluation
+        self.num_evals = 0
+
+    def _flat_params(self) -> torch.Tensor:
+        return torch.cat([p.detach().reshape(-1) for p in self._params])
 
     def __call__(self):
+        # L-BFGS with ``max_iter=1`` (as ``fit()`` uses it, to check stopping each iteration) starts every ``step()`` by
+        # evaluating the current parameters, which are almost always where the previous step's line search evaluated
+        # last: serve that from the cache instead of another forward/backward pass. The loss only depends on the
+        # parameters here (fixed data; monte-carlo noise is fixed too), so an exact match is the same evaluation.
+        flat_params = self._flat_params()
+        if self._cache is not None and torch.equal(self._cache[0], flat_params):
+            _, loss, grads = self._cache
+            for p, g in zip(self._params, grads):
+                p.grad = None if g is None else g.clone()
+            return loss.clone()
+
         self.optimizer.zero_grad()
 
         total_loss = 0.
         try:
             for loss in self.objective.chunk_losses():
+                if not torch.isfinite(loss):
+                    # a non-finite loss is as unusable as invalid covs: e.g. an L-BFGS line search's first trial step
+                    # can overshoot so far that the loss overflows (in float32, to inf or nan). nan is the dangerous
+                    # one: every comparison with it is False, so the line search can *accept* the point, and the fit
+                    # is lost.
+                    raise torch.linalg.LinAlgError(f"non-finite loss ({loss.item()})")
                 loss.backward()
                 total_loss += loss.item()
                 del loss
         except torch.linalg.LinAlgError:
-            # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
-            # by back-tracking and trying a different (hopefully more stable) parameter proposal.
+            # linalgerror means bad covs (or a non-finite loss, above). most common case is LBFGS line-search, which
+            # will respond to a very large loss by back-tracking and trying a different (hopefully more stable)
+            # parameter proposal. the loss is large but finite, with zero gradients: an *infinite* loss breaks the
+            # strong-wolfe line search's cubic interpolation (inf - inf), whose next trial step is then nan.
             # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
             self._bad_count += 1
             if self._bad_count > self._max_bad_count:
@@ -1365,12 +1397,18 @@ class _OptimizerClosure:
                     "Optimizer cannot find a region of param-space where all covs are valid. "
                     "Try again, potentially with a lower learning-rate."
                 )
-            self.optimizer.zero_grad()  # discard gradients from earlier chunks
-            return torch.tensor(float('inf'))
-
+            for p in self._params:
+                p.grad = torch.zeros_like(p)  # (also discards gradients from earlier chunks)
+            return torch.tensor(self.BAD_LOSS)
         self._bad_count = 0
+
+        loss = torch.tensor(total_loss)
+        self.num_evals += 1
+        self._cache = (flat_params,
+                       loss.clone(),
+                       [None if p.grad is None else p.grad.detach().clone() for p in self._params])
         self.prog.update()
         self.prog.set_description(
             f"Epoch {self.stopping.epoch:,}; Loss {total_loss:.4}; Convergence {self.stopping.convergence}"
         )
-        return torch.tensor(total_loss)
+        return loss
