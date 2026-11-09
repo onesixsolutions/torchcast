@@ -350,9 +350,9 @@ class StateSpaceModel(torch.nn.Module):
             optimizer: Union[torch.optim.Optimizer, Callable[[Sequence[torch.Tensor]], torch.optim.Optimizer]] = None,
             stopping: Union['Stopping', dict] = None,
             verbose: int = 2,
-            callbacks: Sequence[callable] = (),
-            get_loss: Optional[callable] = None,
-            callable_kwargs: Optional[dict[str, callable]] = None,
+            callbacks: Sequence[Callable] = (),
+            get_loss: Optional[Callable] = None,
+            callable_kwargs: Optional[dict[str, Callable]] = None,
             set_initial_values: bool = True,
             **kwargs):
         """
@@ -369,8 +369,9 @@ class StateSpaceModel(torch.nn.Module):
         :param verbose: If True (default) will print the loss and epoch.
         :param callbacks: A list of functions that will be called at the end of each epoch, which take the current
          epoch's loss value.
-        :param get_loss: A function that takes the ``Predictions` object and the input data and returns the loss.
-         Default is ``lambda pred, y: -pred.log_prob(y).mean()``.
+        :param get_loss: A function that takes the ``Predictions` object and the input data and returns the loss. The
+         default is to use the mean negative log-prob (from ``Predictions.log_prob()``). You can use your own function,
+         or for small modifications (e.g. including weights) pass an instance of :class:`.LossFun`.
         :param set_initial_values: If True, will set the initial mean to sensible value given ``y``, which helps speed
          up training if the data are not centered. Set to False if you are resuming fit on a partially fitted model.
         :param kwargs: Further keyword-arguments passed to :func:`StateSpaceModel.forward()`; but see also
@@ -433,9 +434,7 @@ class StateSpaceModel(torch.nn.Module):
         ) + 1
 
         if get_loss is None:
-            # precompute nan-groups instead of doing it on each call to log_prob:
-            nan_groups_flat = get_nan_groups(torch.isnan(y).reshape(-1, y.shape[-1]))
-            get_loss = lambda _pred, _y: -_pred.log_prob(_y, nan_groups_flat=nan_groups_flat).mean()
+            get_loss = LossFun()
 
         closure = _OptimizerClosure(
             ss_model=self,
@@ -453,7 +452,11 @@ class StateSpaceModel(torch.nn.Module):
             try:
                 prog.reset()
                 prog.set_description(f"Epoch {epoch:,}; Loss {train_loss:.4}; Convergence {stopping.convergence}")
-                train_loss = optimizer.step(closure).item()
+                optimizer.step(closure)
+                # the loss at the parameters the step ended on (``step()`` returns the loss where it started): usually
+                # cached, since L-BFGS's line search evaluated that point last; otherwise this evaluates it, and the
+                # next step, which starts by evaluating the same point, gets it from the cache.
+                train_loss = closure().item()
                 for callback in callbacks:
                     callback(train_loss)
 
@@ -744,19 +747,20 @@ class StateSpaceModel(torch.nn.Module):
 
     def get_laplace_mvnorm(self,
                            y: torch.Tensor,
-                           get_loss: Optional[callable] = None,
+                           get_loss: Optional[Callable] = None,
                            **kwargs) -> tuple[torch.distributions.MultivariateNormal, List[str]]:
         """
         :param y: observed data
         :param get_loss: A function that takes the ``Predictions`` object and the input data and returns the loss; note
          that unlike in :func:`fit()`, this function should return the summed loss (not mean). Default is just
-         ``-pred.log_prob(y).sum()``, but you can override (e.g. for weights).
+         ``-pred.log_prob(y).sum()``, but you can override (e.g. for weights). The most convenient way to override is
+         with :class:`.LossFun`
         :param kwargs: Keyword-arguments to the forward pass.
         :return: The multivariate normal distribution for the Laplace approximation, and the corresponding names of the
          parameters.
         """
         if not get_loss:
-            get_loss = lambda _pred, _y: -_pred.log_prob(_y).sum()
+            get_loss = LossFun(reduce='sum')
 
         pred = self(y, **kwargs)
         loss = get_loss(pred, y)
@@ -837,11 +841,38 @@ class StateSpaceModel(torch.nn.Module):
         )
 
 
-def default_get_loss(pred: 'Predictions', y: torch.Tensor, **kwargs) -> torch.Tensor:
-    return -pred.log_prob(y, **kwargs).mean()
+class LossFun:
+    """
+    Useful for customizing the loss in your model's ``fit()`` calls. For example,
+    ``my_model.fit(get_loss=LossFun(weights=my_weights))``.
+
+    :param weights: A num_groups X num_times tensor of weights.
+    :param reduce: Can be 'mean', 'sum', or None.
+    """
+
+    def __init__(self, weights: Optional[torch.Tensor] = None, reduce: Optional[str] = 'mean'):
+        self.weights = weights
+        self.nan_groups_flat = None
+        self.reduce = reduce
+
+    def __call__(self, pred: 'Predictions', y: torch.Tensor) -> torch.Tensor:
+        if self.nan_groups_flat is None:
+            self.nan_groups_flat = get_nan_groups(torch.isnan(y).reshape(-1, y.shape[-1]))
+
+        neg_log_prob = -pred.log_prob(y, weights=self.weights, nan_groups_flat=self.nan_groups_flat)
+        if not self.reduce:
+            return neg_log_prob
+        if self.reduce == 'mean':
+            return torch.mean(neg_log_prob)
+        if self.reduce == 'sum':
+            return torch.sum(neg_log_prob)
+        raise ValueError(f"Unrecognized `reduce` {self.reduce}")
 
 
 class _OptimizerClosure:
+    # what an unusable evaluation (invalid covariances, or a non-finite loss) returns: far above any real loss, so a
+    # line search backs off from it, but finite (see ``__call__``)
+    BAD_LOSS = 1e10
 
     def __init__(self,
                  ss_model: StateSpaceModel,
@@ -850,8 +881,8 @@ class _OptimizerClosure:
                  prog: tqdm,
                  stopping: 'Stopping',
                  kwargs: dict,
-                 callable_kwargs: dict[str, callable],
-                 get_loss: callable):
+                 callable_kwargs: dict[str, Callable],
+                 get_loss: Callable):
         self.ss_model = ss_model
         self.y = y
         self.optimizer = optimizer
@@ -862,17 +893,41 @@ class _OptimizerClosure:
         self.get_loss = get_loss
         self._bad_count = 0
         self._max_bad_count = self.optimizer.param_groups[0].get('max_eval', 10)
+        self._params = [p for group in self.optimizer.param_groups for p in group['params']]
+        self._cache = None  # (flat params, loss, grads) of the last successful evaluation
+        self.num_evals = 0
+
+    def _flat_params(self) -> torch.Tensor:
+        return torch.cat([p.detach().reshape(-1) for p in self._params])
 
     def __call__(self):
+        # L-BFGS with ``max_iter=1`` (as ``fit()`` uses it, to check stopping each iteration) starts every ``step()`` by
+        # evaluating the current parameters, which are almost always where the previous step's line search evaluated
+        # last: serve that from the cache instead of another forward/backward pass. The loss only depends on the
+        # parameters here (fixed data; monte-carlo noise is fixed too), so an exact match is the same evaluation.
+        flat_params = self._flat_params()
+        if self._cache is not None and torch.equal(self._cache[0], flat_params):
+            _, loss, grads = self._cache
+            for p, g in zip(self._params, grads):
+                p.grad = None if g is None else g.clone()
+            return loss.clone()
+
         self.optimizer.zero_grad()
         self.kwargs.update({k: v() for k, v in self.callable_kwargs.items()})
 
         try:
             pred = self.ss_model(self.y, **self.kwargs)
             loss = self.get_loss(pred, self.y)
+            if not torch.isfinite(loss):
+                # a non-finite loss is as unusable as invalid covs: e.g. an L-BFGS line search's first trial step can
+                # overshoot so far that the loss overflows (in float32, to inf or nan). nan is the dangerous one: every
+                # comparison with it is False, so the line search can *accept* the point, and the fit is lost.
+                raise torch.linalg.LinAlgError(f"non-finite loss ({loss.item()})")
         except torch.linalg.LinAlgError:
-            # linalgerror means bad covs. most common case is LBFGS line-search, which will respond to infinite loss
-            # by back-tracking and trying a different (hopefully more stable) parameter proposal.
+            # linalgerror means bad covs (or a non-finite loss, above). most common case is LBFGS line-search, which
+            # will respond to a very large loss by back-tracking and trying a different (hopefully more stable)
+            # parameter proposal. the loss is large but finite, with zero gradients: an *infinite* loss breaks the
+            # strong-wolfe line search's cubic interpolation (inf - inf), whose next trial step is then nan.
             # for simpler optimizers, will stall out and falsely converge, but that would have happened anyways.
             self._bad_count += 1
             if self._bad_count > self._max_bad_count:
@@ -880,10 +935,16 @@ class _OptimizerClosure:
                     "Optimizer cannot find a region of param-space where all covs are valid. "
                     "Try again, potentially with a lower learning-rate."
                 )
-            return torch.tensor(float('inf'))
+            for p in self._params:
+                p.grad = torch.zeros_like(p)
+            return torch.tensor(self.BAD_LOSS)
         self._bad_count = 0
 
         loss.backward()
+        self.num_evals += 1
+        self._cache = (flat_params,
+                       loss.detach().clone(),
+                       [None if p.grad is None else p.grad.detach().clone() for p in self._params])
         self.prog.update()
         self.prog.set_description(
             f"Epoch {self.stopping.epoch:,}; Loss {loss.item():.4}; Convergence {self.stopping.convergence}"
