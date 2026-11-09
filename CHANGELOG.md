@@ -1,12 +1,42 @@
 # CHANGELOG
 
-## Unreleased
+## v1.2.0
 
 ### Behavior change: adaptive scaling starts at "no adjustment"
 
 `EWMAdaptiveScaler` (used by `adaptive_scaling=True`) now starts its running mean of squared residuals at 1 instead of 0. Before, a group with no observations kept a running variance of `eps`, so its standard deviations were multiplied by `sqrt(eps) ** weight` (often ~0.2–0.3): its forecast intervals were arbitrarily narrow. And groups with only a few observations were shrunk towards zero variance unless the learned initial step-size (`rho`) was close to 1. Now a group with no observations gets a multiplier of exactly 1 (no adjustment), and a group with few observations is shrunk towards no adjustment.
 
 Models saved by older versions keep the old behavior, whether loaded by unpickling (`torch.load` of the whole model) or via `load_state_dict()` (state-dicts without the new `adaptive_scaling._extra_state` entry). Note that state-dicts saved by this version have that extra entry, so they can't be loaded with `strict=True` into older versions of torchcast.
+
+### Faster `fit()`: L-BFGS no longer re-evaluates each iteration's starting point
+
+`fit()` runs one L-BFGS iteration per `optimizer.step()`, so that stopping and callbacks run every iteration. But torch's L-BFGS starts every `step()` by evaluating the loss and gradient at the current parameters, which the previous iteration's line search has almost always just evaluated. So nearly every iteration repeated a full forward and backward pass. `fit()`'s closure now caches its last evaluation and serves an exact match from it. Fits are unchanged (the same parameters, iteration by iteration), with roughly 40% fewer forward passes (e.g. 26 -> 15 over 12 iterations).
+
+### Behavior change: the loss passed to `stopping` and `callbacks` is the current iteration's
+
+`optimizer.step()` returns the loss at the parameters the step *started* from, so the loss `fit()` passed to `stopping` and `callbacks` each iteration was the previous iteration's. It's now the loss at the parameters the iteration ended on (usually from the cache above, so it's free). A fit whose stopping rule monitors the loss (`Stopping`'s default, also alongside `monitor_params`) can therefore stop at a different iteration than before, and end with slightly different parameters. Only stopping on parameters alone (`monitor_loss=False`) is unaffected.
+
+### Behavior change: `BinomialPredictions.to_dataframe()` reports observed proportions
+
+With `observed_counts=True`, the `actual` column of `to_dataframe()` (and with `type='states'` or `'observed_states'`) for binary measures was the observed count, while the predictions are probabilities. It's now the observed proportion (count / `num_obs`), so actuals and predictions are on the same scale.
+
+Relatedly, `BinomialFilter` now raises if a binary measure's input exceeds 1 also when `observed_counts=False` (inputs are proportions then); before, the check only ran on counts.
+
+### New: `LossFun` for customizing `fit()`'s loss
+
+`torchcast.state_space.LossFun` makes common changes to the loss easy, without writing a `get_loss` function: e.g. `my_model.fit(y, get_loss=LossFun(weights=my_weights))` for a weighted loss, where `weights` has shape `(num_groups, num_times)`. `reduce` can be `'mean'` (the default), `'sum'` or None. `fit()` and `get_laplace_mvnorm()` now use it by default (`LossFun()` and `LossFun(reduce='sum')`), with the same results as before. The undocumented module-level function `default_get_loss` was removed.
+
+### Bug fixes
+
+- `Predictions.log_prob(weights=...)` reshaped `weights` as if they had one value per measure. Weights are now one per group and timestep (shape `(num_groups, num_times)`), as documented, and other shapes raise.
+- `BinomialFilter` with more than one binary measure: the log-probability of timesteps where only some of the binary measures were observed used the measurement model for all of them, rather than the observed ones.
+- `BinomialFilter(measure_covariance={...})`: a dict of `Covariance` keyword-arguments without `init_diag_multi` didn't get the default multiplier (`DEFAULT_MCOV_MULTI`) that `measure_covariance=None` gets.
+- `fit()` could fail when a line search tried an unusable point: invalid covariances (`LinAlgError`) made the loss infinite, which breaks the strong-Wolfe line search's interpolation (`inf - inf`), so its next trial step was nan and the fit raised "Optimizer cannot find a region of param-space where all covs are valid". A non-finite loss (e.g. a trial step that overflows in float32, as can happen on GPU) was worse: every comparison with nan is False, so the line search could accept the point. Both now return a large but finite loss (`_OptimizerClosure.BAD_LOSS`, 1e10) with zero gradients, so the line search backs off.
+
+### Other changes
+
+- `TimeSeriesDataset.tensor_to_dataframe()` (used by `Predictions.to_dataframe()`) is much faster: vectorized instead of one DataFrame per group.
+- `Predictions.to_dataframe()` warns when it doesn't know the groups' names (it falls back to `group_0`, `group_1`, ...): call `predictions.set_metadata()` to set them.
 
 ## v1.1.3 (2026-10-07)
 
