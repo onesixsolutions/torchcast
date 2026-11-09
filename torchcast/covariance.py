@@ -70,11 +70,20 @@ class Covariance(nn.Module):
                        processes: Sequence[Process],
                        cov_type: str = 'process',
                        predict_variance: Union[bool, nn.Module, None] = None,
+                       corr_groups: Optional[Sequence[Sequence[str]]] = None,
                        **kwargs) -> 'Covariance':
         """
         :param processes: The ``processes`` used in your :class:`.StateSpaceModel`.
         :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process').
         :param predict_variance: Deprecated, use ``predict_std``.
+        :param corr_groups: Optionally, groups of process ids whose processes are uncorrelated with those in other
+         groups (within a group, and within each process, they stay correlated). Processes not in any group form one
+         more group together. E.g. with processes 'level_a', 'transient_a', 'level_b', 'transient_b':
+         ``corr_groups=[['transient_a', 'transient_b']]`` makes the transients correlated with each other, and the
+         levels correlated with each other, but no transient correlated with any level. Note that "uncorrelated" has
+         to be transitive this way: you can't make 'transient_a' uncorrelated with 'level_a' only, while both stay
+         correlated with 'level_b' (masking can't guarantee a valid covariance for that pattern). For other masks, see
+         ``corr_mask`` in :func:`Covariance.__init__`.
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`, e.g. ``predict_std``,
          ``predict_corr``, ``predictor_kwargs``. Note that the outputs of a ``predict_std`` module have
          ``param_rank`` columns, i.e. one for each state-element with a variance (not ``empty_idx``).
@@ -82,6 +91,14 @@ class Covariance(nn.Module):
         """
         if cov_type not in {'initial', 'process'}:
             raise ValueError(f"Unrecognized cov_type {cov_type}, expected 'initial' or 'process'.")
+        if corr_groups is not None:
+            if 'corr_mask' in kwargs:
+                raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
+            kwargs['corr_mask'] = _corr_groups_to_mask(
+                element_ids=[p.id for p in processes for _ in p.state_elements],
+                corr_groups=corr_groups,
+                kind='process id'
+            )
         state_rank = 0
         no_cov_idx = []
         for p in processes:
@@ -101,10 +118,13 @@ class Covariance(nn.Module):
     def from_measures(cls,
                       measures: Sequence[str],
                       predict_variance: Union[bool, nn.Module, None] = None,
+                      corr_groups: Optional[Sequence[Sequence[str]]] = None,
                       **kwargs) -> 'Covariance':
         """
         :param measures: The ``measures`` used in your :class:`.StateSpaceModel`.
         :param predict_variance: Deprecated, use ``predict_std``.
+        :param corr_groups: Optionally, groups of measures that are uncorrelated with those in other groups; measures
+         not in any group form one more group together. See :func:`Covariance.from_processes`.
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`, e.g. ``predict_std``,
          ``predict_corr``, ``predictor_kwargs``.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
@@ -115,6 +135,11 @@ class Covariance(nn.Module):
         elif not isinstance(measures[0], str):
             # not good duck-typing, but too easy to accidentally pass dataset.measures instead of dataset.measures[0]
             raise RuntimeError(f"`measures[0]` is {type(measures[0])}, expected str")
+        if corr_groups is not None:
+            if 'corr_mask' in kwargs:
+                raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
+            kwargs['corr_mask'] = _corr_groups_to_mask(element_ids=list(measures), corr_groups=corr_groups,
+                                                       kind='measure')
         if 'method' not in kwargs:
             if kwargs.get('predict_corr') is not None:
                 kwargs['method'] = 'sd_corr'
@@ -136,7 +161,8 @@ class Covariance(nn.Module):
                  predictor_kwargs: Sequence[Union[str, ProcessKwarg]] = (),
                  id: Optional[str] = None,
                  predict_variance: Optional[nn.Module] = None,
-                 expected_kwargs: Optional[Sequence[str]] = None):
+                 expected_kwargs: Optional[Sequence[str]] = None,
+                 corr_mask: Optional[Tensor] = None):
         """
         You should rarely call this directly. Instead, call :func:`Covariance.from_measures` and
         :func:`Covariance.from_processes`.
@@ -157,10 +183,10 @@ class Covariance(nn.Module):
          element. Unlike "log_cholesky" (where off-diagonal entries are in absolute units, and also change the
          variances), each parameter is dimensionless and the variances are set by ``log_std_devs`` alone; this is
          better conditioned for optimization when elements have very different scales, and lets you freeze variances
-         and correlations separately (see :func:`Covariance.param_idx` and :func:`Covariance.off_diag_idx`). Note
-         that a zero ``corr_unconstrained`` is a zero *partial* correlation (given the earlier elements): element
-         ``i`` is uncorrelated with all others when every entry in its row *and* column is zero. Existing modules
-         can be converted with :func:`Covariance.to_method`.
+         and correlations separately (see :func:`Covariance.get_param_idx` and
+         :func:`Covariance.get_off_diag_idx`). Note that a zero ``corr_unconstrained`` is a zero *partial* correlation
+         (given the earlier elements): element ``i`` is uncorrelated with all others when every entry in its row *and*
+         column is zero. Existing modules can be converted with :func:`Covariance.to_method`.
         :param empty_idx: In some cases (e.g. process-covariance) we will have some elements with no variance.
         :param predict_std: A module predicting (strictly positive) multipliers on the std-devs, with ``param_rank``
          columns. See the class docstring.
@@ -168,12 +194,19 @@ class Covariance(nn.Module):
          ``param_rank * (param_rank - 1) / 2`` columns. Requires ``method='sd_corr'``. See the class docstring.
         :param predictor_kwargs: The names of the keyword-arguments passed to the model's ``forward()`` that are
          inputs to ``predict_std``/``predict_corr``. A string is a tensor whose first dimension is the group (e.g.
-         ``group_ids``, or a ``(num_groups, num_times, ...)`` tensor), which ``fit(chunk_size=...)`` splits into
-         chunks; for inputs that aren't group-indexed, pass ``ProcessKwarg(name, is_group_time_tensor=False)``.
+         ``group_ids``, or a ``(num_groups, num_times, ...)`` tensor); for inputs that aren't group-indexed, pass
+         ``ProcessKwarg(name, is_group_time_tensor=False)``.
         :param id: Identifier for this covariance. Typically left ``None`` and set when passed to the
          :class:`.StateSpaceModel`.
         :param predict_variance: Deprecated, use ``predict_std``.
         :param expected_kwargs: Deprecated, use ``predictor_kwargs``.
+        :param corr_mask: Optionally, a ``(rank, rank)`` tensor that the covariance is multiplied by elementwise, e.g.
+         with zeros to force some pairs of elements to be uncorrelated. It must be symmetric, with ones on the
+         diagonal, and positive semi-definite, which guarantees the masked covariance is too (Schur product theorem).
+         For the typical case, groups of elements that are uncorrelated with each other, it's easier to pass
+         ``corr_groups`` to :func:`Covariance.from_processes` or :func:`Covariance.from_measures`, which builds
+         this. The parameters for masked-out entries are still there but get no gradient. It also applies to
+         ``predict_corr``'s adjusted covariances.
         """
 
         super().__init__()
@@ -202,6 +235,9 @@ class Covariance(nn.Module):
         self.param_rank = self.rank - len(self.empty_idx)
         mask = mini_cov_mask(rank=self.rank, empty_idx=self.empty_idx)
         self.register_buffer('mask', mask)
+
+        if corr_mask is not None:
+            self.register_buffer('corr_mask', self._validate_corr_mask(corr_mask, rank=self.rank))
 
         self._set_params(method, init_diag_multi)
 
@@ -243,6 +279,23 @@ class Covariance(nn.Module):
     @property
     def non_empty_idx(self) -> List[int]:
         return [i for i in range(self.rank) if i not in self.empty_idx]
+
+    @staticmethod
+    def _validate_corr_mask(corr_mask: Tensor, rank: int) -> Tensor:
+        corr_mask = torch.as_tensor(corr_mask, dtype=torch.get_default_dtype()).detach().clone()
+        if corr_mask.shape != (rank, rank):
+            raise ValueError(f"Expected ``corr_mask`` to have shape {(rank, rank)}, got {tuple(corr_mask.shape)}.")
+        if not torch.equal(corr_mask, corr_mask.t()):
+            raise ValueError("``corr_mask`` must be symmetric.")
+        if not (corr_mask.diagonal() == 1).all():
+            raise ValueError("``corr_mask`` must have ones on the diagonal.")
+        if torch.linalg.eigvalsh(corr_mask.to(torch.float64)).min() < -1e-8:
+            raise ValueError(
+                "``corr_mask`` must be positive semi-definite (otherwise the masked covariance may not be), e.g. a "
+                "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
+            )
+        return corr_mask
+
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -338,6 +391,8 @@ class Covariance(nn.Module):
         else:
             raise NotImplementedError(self.method)
 
+        mini_cov = self._apply_corr_mask(mini_cov)
+
         if is_near_zero(mini_cov.diagonal(dim1=-2, dim2=-1), atol=1e-12).any():
             warn(
                 f"`{self.id}` has near-zero along the diagonal. Will add 1e-12 to the diagonal. "
@@ -346,11 +401,11 @@ class Covariance(nn.Module):
             mini_cov = mini_cov + torch.eye(mini_cov.shape[-1], device=mini_cov.device, dtype=mini_cov.dtype) * 1e-12
         return mini_cov
 
-    def corr_cholesky(self) -> Tensor:
+    def get_corr_cholesky(self) -> Tensor:
         """
         The cholesky factor of the correlation matrix (of the ``param_rank`` block, i.e. excluding ``empty_idx``, and
         before any ``predict_variance``). E.g. for an LKJ prior:
-        ``torch.distributions.LKJCholesky(cov.param_rank, eta).log_prob(cov.corr_cholesky())``.
+        ``torch.distributions.LKJCholesky(cov.param_rank, eta).log_prob(cov.get_corr_cholesky())``.
         """
         if self.method == 'sd_corr':
             return corr_cholesky_from_unconstrained(self.corr_unconstrained, rank=self.param_rank)
@@ -433,7 +488,7 @@ class Covariance(nn.Module):
         out._set_params(method, init_diag_multi=1.0)
         return out.set_matrix_(self._get_mini_cov().detach())
 
-    def param_idx(self, i: int) -> int:
+    def get_param_idx(self, i: int) -> int:
         """
         The index of element ``i`` (of ``0..rank-1``) in the per-element parameters (``log_std_devs`` for
         "sd_corr"/"low_rank", ``cholesky_log_diag`` for "log_cholesky"), accounting for ``empty_idx``. E.g., to
@@ -443,10 +498,10 @@ class Covariance(nn.Module):
 
             cov = Covariance.from_processes(processes, cov_type='initial', method='sd_corr')
             keep_std = torch.ones_like(cov.log_std_devs)
-            keep_std[cov.param_idx(3)] = 0
+            keep_std[cov.get_param_idx(3)] = 0
             cov.log_std_devs.register_hook(lambda g: g * keep_std)
             keep_corr = torch.ones_like(cov.corr_unconstrained)
-            keep_corr[cov.off_diag_idx(3, 0)] = 0
+            keep_corr[cov.get_off_diag_idx(3, 0)] = 0
             cov.corr_unconstrained.register_hook(lambda g: g * keep_corr)
 
         For "sd_corr", these entries are interpretable on their own; for "log_cholesky" they're entries of the
@@ -458,16 +513,24 @@ class Covariance(nn.Module):
             raise IndexError(f"Element {i} out of range for rank {self.rank}.")
         return self.non_empty_idx.index(i)
 
-    def off_diag_idx(self, i: int, j: int) -> int:
+    def get_off_diag_idx(self, i: int, j: int) -> int:
         """
         The index of the pair of elements ``(i, j)`` (in either order, of ``0..rank-1``) in the off-diagonal
         parameters (``corr_unconstrained`` for "sd_corr", ``cholesky_off_diag`` for "log_cholesky"), accounting for
-        ``empty_idx``. See :func:`Covariance.param_idx`.
+        ``empty_idx``. See :func:`Covariance.get_param_idx`.
         """
-        row, col = sorted((self.param_idx(i), self.param_idx(j)), reverse=True)
+        row, col = sorted((self.get_param_idx(i), self.get_param_idx(j)), reverse=True)
         if row == col:
             raise ValueError("``i`` and ``j`` must be different elements.")
         return row * (row - 1) // 2 + col
+
+    def _apply_corr_mask(self, mini_cov: Tensor) -> Tensor:
+        # (``getattr``: modules pickled before ``corr_mask`` existed don't have the buffer)
+        corr_mask = getattr(self, 'corr_mask', None)
+        if corr_mask is None:
+            return mini_cov
+        idx = self.non_empty_idx
+        return mini_cov * corr_mask[idx][:, idx]
 
     def base_cov(self) -> Tensor:
         """
@@ -535,7 +598,7 @@ class Covariance(nn.Module):
             L = std.unsqueeze(-1) * corr_cholesky_from_unconstrained(
                 self.corr_unconstrained + corr_delta, rank=self.param_rank
             )
-            mini_cov = L @ L.transpose(-1, -2)
+            mini_cov = self._apply_corr_mask(L @ L.transpose(-1, -2))
         return self._embed(mini_cov)
 
     def _validate_prediction(self, pred: Tensor, name: str, num_cols: int, num_groups: int, num_times: int) -> Tensor:
@@ -635,6 +698,31 @@ def cov2corr(cov: Tensor) -> Tensor:
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
     # TODO: cov / std_.unsqueeze(-1) / std_.unsqueeze(-2)
     return cov / (std_.unsqueeze(-1) @ std_.unsqueeze(-2))
+
+
+def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
+    """
+    A ``corr_mask`` from ``corr_groups`` (see :func:`Covariance.from_processes`).
+
+    :param element_ids: For each element (row/column) of the covariance, the id it's grouped by (e.g. its process's
+     id); can repeat.
+    :param corr_groups: Groups of ids. Ids not in any group form one more group together.
+    :param kind: What the ids are, for error messages.
+    """
+    if isinstance(corr_groups, str) or any(isinstance(g, str) for g in corr_groups):
+        raise TypeError(f"``corr_groups`` should be a list of lists of {kind}s, e.g. ``[['a', 'b']]``.")
+    known = list(dict.fromkeys(element_ids))
+    group_of = {}
+    for g, ids in enumerate(corr_groups):
+        for id_ in ids:
+            if id_ not in known:
+                raise ValueError(f"``corr_groups`` has unknown {kind} '{id_}'; expected one of {known}.")
+            if id_ in group_of:
+                raise ValueError(f"``corr_groups`` has {kind} '{id_}' in more than one group.")
+            group_of[id_] = g
+    rest = len(corr_groups)
+    groups = torch.tensor([group_of.get(id_, rest) for id_ in element_ids])
+    return (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
 
 
 def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:

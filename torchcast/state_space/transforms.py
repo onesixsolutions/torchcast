@@ -2,10 +2,12 @@
 Transforms for mapping predictions from the scale a measure is modeled on (e.g. log) back to its original scale.
 """
 import math
-from typing import Optional, TYPE_CHECKING, Mapping
+from typing import Optional, TYPE_CHECKING, Mapping, Union
 
 import numpy as np
 import torch
+
+from torchcast.mixture.component import STANDARD_REGIME_ID
 
 if TYPE_CHECKING:
     from .predictions import Predictions
@@ -27,23 +29,36 @@ class Transform(torch.nn.Module):
      back-transformed mean is computed with the variance scaled by this: 1 (the default, ``None``) gives the mean of
      the back-transformed distribution; 0 gives no bias-adjustment (i.e. the back-transformed median). Doesn't affect
      intervals. For monte-carlo means (e.g. ``use_map=False`` for nonlinear measures), the variance of the sampled state
-     is scaled too. Ignored (with a warning) for ``Predictions.to_dataframe(derived=...)``, which back-transforms
-     samples.
+     is scaled too. For a measure with mixture components, this can be a dictionary by regime: ``{component_id:
+     value}`` (``'__standard__'`` for the standard regime; regimes that aren't in it get 1) -- e.g. ``{'low': 0.}``
+     for the median of a low-outlier regime. (For a measure with a nonlinear measured-mean, a regime's value must be
+     0, or the same as its other regimes' nonzero values.) Ignored (with a warning) for
+     ``Predictions.to_dataframe(derived=...)``, which back-transforms samples.
     """
     num_nodes: int = 32
     # the quadrature's intermediates have (number of elements) x (number of nodes) values: it's computed in chunks of
     # elements, so they stay below about this many (e.g. for many monte-carlo samples x rows):
     max_quadrature_size: int = 2 ** 24
 
-    def __init__(self, bias_adjust: Optional[float] = None):
+    def __init__(self, bias_adjust: Union[float, Mapping[str, float], None] = None):
         super().__init__()
-        if bias_adjust is not None and not 0 <= bias_adjust <= 1:
+        if isinstance(bias_adjust, Mapping) and None in bias_adjust:
+            raise ValueError(f"`bias_adjust`: use '{STANDARD_REGIME_ID}' (not None) for the standard regime.")
+        values = bias_adjust.values() if isinstance(bias_adjust, Mapping) else [bias_adjust]
+        if any(v is not None and not 0 <= v <= 1 for v in values):
             raise ValueError("`bias_adjust` must be between 0 and 1.")
-        self.bias_adjust = bias_adjust
+        self.bias_adjust = dict(bias_adjust) if isinstance(bias_adjust, Mapping) else bias_adjust
 
-    @property
-    def var_multi(self) -> float:
-        return 1. if self.bias_adjust is None else self.bias_adjust
+    def get_var_multi(self, regime: str = STANDARD_REGIME_ID) -> float:
+        """
+        :param regime: For a measure with mixture components: the ``id`` of the regime (``'__standard__'``, or a
+         component's).
+        :return: The factor the variance is scaled by, for the back-transformed mean (see ``bias_adjust``).
+        """
+        bias_adjust = self.bias_adjust
+        if isinstance(bias_adjust, dict):
+            bias_adjust = bias_adjust.get(regime)
+        return 1. if bias_adjust is None else float(bias_adjust)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -63,7 +78,7 @@ class Transform(torch.nn.Module):
                      mean: torch.Tensor,
                      var: torch.Tensor,
                      adjust_bias: bool = True,
-                     regime: Optional[str] = None) -> torch.Tensor:
+                     regime: str = STANDARD_REGIME_ID) -> torch.Tensor:
         """
         The mean on the original scale, ``E[inverse(Y)]``, for ``Y`` on the modeled scale with the given mean and
         variance -- with the variance scaled by ``bias_adjust``, unless ``adjust_bias=False``.
@@ -72,14 +87,17 @@ class Transform(torch.nn.Module):
         :param var: The variance of ``Y``, same shape as ``mean`` (or broadcastable to it).
         :param adjust_bias: Whether to apply ``bias_adjust`` (False: the mean of the back-transformed distribution,
          whatever ``bias_adjust`` is).
-        :param regime: For a measure with mixture components, the regime that ``mean`` and ``var`` are for: None for
-         the standard regime, else the component's ``id``. Only matters for a transform whose noise-distribution
+        :param regime: For a measure with mixture components, the ``id`` of the regime that ``mean`` and ``var`` are
+         for (``'__standard__'``, or a component's). Only matters for a transform whose noise-distribution
          differs by regime (a :class:`SmearingTransform` from :func:`SmearingTransform.from_predictions`).
         :return: A tensor with the same shape as ``mean``.
         """
-        return self._expected_inverse(mean, var * (self.var_multi if adjust_bias else 1.), regime=regime)
+        return self._expected_inverse(mean, var * (self.get_var_multi(regime) if adjust_bias else 1.), regime=regime)
 
-    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
+    def _expected_inverse(self,
+                          mean: torch.Tensor,
+                          var: torch.Tensor,
+                          regime: str = STANDARD_REGIME_ID) -> torch.Tensor:
         """
         ``E[inverse(mean + sqrt(var) * Z)]``, with ``Z`` from ``_noise_nodes``: by quadrature (in chunks, see
         ``max_quadrature_size``). The hook for subclasses to override with a closed form (``inverse_mean`` applies
@@ -99,7 +117,7 @@ class Transform(torch.nn.Module):
     def _noise_nodes(self,
                      dtype: torch.dtype,
                      device: torch.device,
-                     regime: Optional[str] = None) -> tuple[torch.Tensor, torch.Tensor]:
+                     regime: str = STANDARD_REGIME_ID) -> tuple[torch.Tensor, torch.Tensor]:
         """
         The distribution of the standardized noise ``Z`` (see ``_expected_inverse``), as nodes and weights: by
         default, gauss-hermite quadrature for a standard normal (for every regime).
@@ -121,7 +139,10 @@ class _IdentityTransform(Transform):
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
-    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
+    def _expected_inverse(self,
+                          mean: torch.Tensor,
+                          var: torch.Tensor,
+                          regime: str = STANDARD_REGIME_ID) -> torch.Tensor:
         return mean
 
 
@@ -129,28 +150,37 @@ class LogTransform(Transform):
     """
     For a measure that was log-transformed before modeling.
 
+    :param offset: A value to be added before transforming (e.g. to prevent passing zero to log) and removed after
+     back-transforming.
     :param base: The base of the logarithm; defaults to e.
     :param bias_adjust: See :class:`Transform`.
     """
 
-    def __init__(self, base: float = math.e, bias_adjust: Optional[float] = None):
+    def __init__(self,
+                 offset: float = 0.0,
+                 base: float = math.e,
+                 bias_adjust: Union[float, Mapping[Optional[str], float], None] = None):
         super().__init__(bias_adjust=bias_adjust)
         assert base > 0
-        self.base = base
+        self._log_base = math.log(base)
+        assert offset >= 0
+        self.offset = offset
 
-    @property
-    def _log_base(self) -> float:
-        return math.log(self.base)
+    def _remove_offset(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.clip(x - self.offset, min=0.0)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.log(x) / self._log_base
+        return torch.log(x + self.offset) / self._log_base
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.exp(x * self._log_base)
+        return self._remove_offset(torch.exp(x * self._log_base))
 
-    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
+    def _expected_inverse(self,
+                          mean: torch.Tensor,
+                          var: torch.Tensor,
+                          regime: str = STANDARD_REGIME_ID) -> torch.Tensor:
         # closed-form (lognormal)
-        return torch.exp(mean * self._log_base + var * self._log_base ** 2 / 2)
+        return self._remove_offset(torch.exp(mean * self._log_base + var * self._log_base ** 2 / 2))
 
 
 class BoxCoxTransform(Transform):
@@ -163,7 +193,7 @@ class BoxCoxTransform(Transform):
     :param bias_adjust: See :class:`Transform`.
     """
 
-    def __init__(self, lmbda: float, bias_adjust: Optional[float] = None):
+    def __init__(self, lmbda: float, bias_adjust: Union[float, Mapping[Optional[str], float], None] = None):
         super().__init__(bias_adjust=bias_adjust)
         if lmbda < 0:
             raise ValueError("`lmbda` must be non-negative.")
@@ -180,7 +210,10 @@ class BoxCoxTransform(Transform):
         # the inverse only exists where (lmbda * x + 1) > 0; clamp the (far-tail) region where it doesn't:
         return (self.lmbda * x + 1).clamp_min(0) ** (1 / self.lmbda)
 
-    def _expected_inverse(self, mean: torch.Tensor, var: torch.Tensor, regime: Optional[str] = None) -> torch.Tensor:
+    def _expected_inverse(self,
+                          mean: torch.Tensor,
+                          var: torch.Tensor,
+                          regime: str = STANDARD_REGIME_ID) -> torch.Tensor:
         if self.lmbda == 0:
             return torch.exp(mean + var / 2)
         return super()._expected_inverse(mean, var, regime=regime)
@@ -329,7 +362,7 @@ class SmearingTransform(Transform):
     def _noise_nodes(self,
                      dtype: torch.dtype,
                      device: torch.device,
-                     regime: Optional[str] = None) -> tuple[torch.Tensor, torch.Tensor]:
-        if regime is not None and regime in self.component_residuals:
+                     regime: str = STANDARD_REGIME_ID) -> tuple[torch.Tensor, torch.Tensor]:
+        if regime in self.component_residuals:
             return self.component_residuals[regime]._noise_nodes(dtype=dtype, device=device)
         return self.residuals.to(dtype=dtype, device=device), self.weights.to(dtype=dtype, device=device)

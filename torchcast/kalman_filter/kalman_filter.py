@@ -5,17 +5,36 @@ algorithm (or optionally extended-kalman filtering, if any measure-funs or nonli
 This class inherits most of its methods from :class:`torchcast.state_space.StateSpaceModel`.
 """
 from typing import Sequence
+from warnings import warn
 
 from torchcast.covariance import Covariance
 from torchcast.internals.utils import update_tensor, mvnorm_log_prob, as_timestep_list
 from torchcast.process import Process
+from torchcast.process.utils import StateElement, FixedValue
 
-from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+from torchcast.mixture import MixtureModel, MixtureComponent
 from torchcast.state_space.state_space import StateSpaceModel, StateTuple
 
 from typing import Optional, Union
 
 import torch
+
+
+def _is_level_like(se: StateElement) -> bool:
+    """
+    Whether a state element acts as a (possibly decaying) level on its measure: it has process-noise, a fixed non-zero
+    weight in the measurement, and transitions only to itself. E.g. ``LocalLevel``'s level and ``LocalTrend``'s
+    position; not seasons (whose elements rotate into each other) or regression coefficients (weighted by predictors).
+    """
+    if not se.has_process_variance or not isinstance(se._measure_multi, FixedValue):
+        return False
+    return bool(se._measure_multi.value != 0) and set(se.transitions_to) == {se.name}
+
+
+def _has_decay(se: StateElement) -> bool:
+    """Whether a state element's transition to itself is (or may be learned to be) less than 1."""
+    multi = se.transitions_to[se.name]
+    return not (isinstance(multi, FixedValue) and bool(multi.value == 1))
 
 
 class KalmanFilter(StateSpaceModel):
@@ -66,6 +85,58 @@ class KalmanFilter(StateSpaceModel):
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
         self.joseph_form = joseph_form
+        self._warn_correlated_levels()
+
+    def _warn_correlated_levels(self):
+        """
+        Two level-like processes (e.g. a random-walk and a decaying level) on the same measure, with correlated
+        process-noise, are poorly identified: only their sum is observed, and correlated shocks let many combinations
+        of their variances fit equally well.
+        """
+        corr_mask = getattr(self.process_covariance, 'corr_mask', None)
+        level_idx = {}  # process id -> index of its level-like state element
+        decaying = set()
+        start = 0
+        for pid, p in self.processes.items():
+            for i, se in enumerate(p.state_elements.values()):
+                if pid not in level_idx and _is_level_like(se):
+                    level_idx[pid] = start + i
+                    if _has_decay(se):
+                        decaying.add(pid)
+            start += p.rank
+        by_measure = {}
+        for pid in level_idx:
+            by_measure.setdefault(self.processes[pid].measure, []).append(pid)
+
+        correlated = [
+            (a, b) for pids in by_measure.values() for i, a in enumerate(pids) for b in pids[i + 1:]
+            if corr_mask is None or corr_mask[level_idx[a], level_idx[b]] != 0
+        ]
+        if not correlated:
+            return
+        msg = (
+            f"These pairs of level-like processes are on the same measure and have correlated process-noise: "
+            f"{correlated}. That's poorly identified: only their sum is observed, and correlated shocks let many "
+            f"combinations of their variances fit equally well."
+        )
+        # suggestion: decaying levels in one group (correlated across measures), the non-decaying ones in the other:
+        separable = [(a, b) for a, b in correlated if (a in decaying) != (b in decaying)]
+        if separable:
+            suggestion = [[pid for pid in level_idx if pid in decaying]]
+            msg += (
+                f" Consider making the decaying levels uncorrelated with the others, e.g.:\n"
+                f"  process_covariance=Covariance.from_processes(processes, corr_groups={suggestion})\n"
+                f"(The processes in each group are correlated with each other, but not with those in other groups; "
+                f"processes not in any group form one more group together.)"
+            )
+        inseparable = [pair for pair in correlated if pair not in separable]
+        if inseparable:
+            msg += (
+                f" {inseparable} are both decaying or both not, so this doesn't separate them (e.g. two random walks "
+                f"on one measure act as one); consider removing one, or giving them different decay ranges and "
+                f"separate ``corr_groups``."
+            )
+        warn(msg)
 
     def __setstate__(self, state: dict):
         state.setdefault('joseph_form', True)  # (missing in models pickled before it existed)
@@ -95,7 +166,7 @@ class KalmanFilter(StateSpaceModel):
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
                      val_idx: Optional[torch.Tensor] = None,
-                     regime_prior: Optional[torch.Tensor] = None,
+                     combo_prior: Optional[torch.Tensor] = None,
                      **kwargs) -> 'StateTuple':
         input, measured_mean, measure_cov = self._prepare_update(
             input=input,
@@ -112,6 +183,8 @@ class KalmanFilter(StateSpaceModel):
                 measure_mat=measure_mat,
                 measure_cov=measure_cov,
             )
+        if combo_prior is None:
+            raise ValueError("A model with mixture components needs `combo_prior` for its update-step.")
         return self._mixture_update(
             input=input,
             mean=mean,
@@ -120,7 +193,7 @@ class KalmanFilter(StateSpaceModel):
             measure_mat=measure_mat,
             measure_cov=measure_cov,
             measures=self.measures if val_idx is None else [self.measures[i] for i in val_idx.tolist()],
-            regime_prior=regime_prior,
+            combo_prior=combo_prior,
         )
 
     def _prepare_update(self,
@@ -130,7 +203,7 @@ class KalmanFilter(StateSpaceModel):
                         **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Hook for subclasses to validate/adjust the inputs to the update step (e.g. ``BinomialFilter`` adjusts the
-        measure-covariance). Called exactly once per update-step, before any mixture hypotheses are constructed; any
+        measure-covariance). Called exactly once per update-step, before the mixture update's effective combos; any
         update-kwargs from ``_parse_kwargs`` are consumed here.
 
         :return: A tuple of (possibly modified) ``input``, ``measured_mean``, ``measure_cov``.
@@ -181,26 +254,22 @@ class KalmanFilter(StateSpaceModel):
                         measure_mat: torch.Tensor,
                         measure_cov: torch.Tensor,
                         measures: Sequence[str],
-                        regime_prior: Optional[torch.Tensor] = None) -> 'StateTuple':
+                        combo_prior: torch.Tensor) -> 'StateTuple':
         """
-        Update step when there are mixture components. Each (effective) regime-combo implies a hypothesis: for
-        measures in a non-standard regime, the measured-mean is offset by the component's mean, and the component's
-        variance is added to the measurement-noise. Each hypothesis is a full kalman update; they're weighted by their
-        posterior probability and collapsed via moment-matching.
+        Update step when there are mixture components. Each effective combo (aka hypothesis; see
+        ``MixtureModel.get_effective_combos``) offsets the measured-mean of measures in a non-standard regime by their
+        component's offset, and adds the component's variance to their measurement-noise. Each effective combo gets a
+        full kalman update; these are weighted by their posterior probability and collapsed via moment-matching.
 
         :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
-        :param regime_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo. Defaults
-         to the regime-model's base-probs.
-        :return: The collapsed state, with ``regime_probs`` set to the ``(num_groups, num_combos)`` posterior.
+        :param combo_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo (from the
+         regime-transition).
+        :return: The collapsed state, with ``combo_probs`` set to the ``(num_groups, num_combos)`` posterior.
         """
-        num_groups = input.shape[0]
-        if regime_prior is None:
-            log_prior = self.mixture.log_base_probs().expand(num_groups, -1)
-        else:
-            log_prior = regime_prior.clamp_min(1e-30).log()
+        log_prior = combo_prior.clamp_min(1e-30).log()
 
-        effective, mapping = self.mixture.effective_combos(measures)
-        if len(effective) == 1:
+        effective_combos, mapping = self.mixture.get_effective_combos(measures)
+        if len(effective_combos) == 1:
             # no mixture measures observed, so observations are uninformative about the regime:
             standard = self._kalman_update(
                 input=input,
@@ -210,22 +279,20 @@ class KalmanFilter(StateSpaceModel):
                 measure_mat=measure_mat,
                 measure_cov=measure_cov,
             )
-            standard.regime_probs = log_prior.exp()
+            standard.combo_probs = log_prior.exp()
             return standard
 
-        # which measures contribute to the responsibilities. non-gaussian measures (e.g. binary) never do: their
-        # gaussian approximation is crude, and their log-prob is computed separately from the gaussian measures' (so
-        # using their correlation here would be inconsistent with training).
-        if self.mixture.univariate_prob:
-            score_idx = [i for i, m in enumerate(measures) if m in self.mixture.mixture_measures]
-        else:
-            score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        # the measures that score the combos: all but the non-gaussian ones (e.g. binary), whose gaussian approximation
+        # here is crude, and whose log-prob is computed separately from the gaussian measures' (so using their
+        # correlation here would be inconsistent with training).
+        score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
         score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
-        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all combos are
-        # updated together, along a leading combo-dimension; tensors that don't depend on the combo broadcast.
+        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective
+        # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
+        # broadcast.
         shifts, extra_vars = zip(*(
-            self.mixture.effective_offsets(eff, len(measures), like=input) for eff in effective
+            self.mixture.get_combo_offsets(combo, measures, like=input) for combo in effective_combos
         ))
         shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
         extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)
@@ -259,34 +326,34 @@ class KalmanFilter(StateSpaceModel):
 
         # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
         log_post = log_prior + log_liks[:, mapping]
-        regime_post = torch.softmax(log_post, -1)
+        combo_post = torch.softmax(log_post, -1)
         means, covs = zip(*states)  # (a StateTuple iterates as (mean, cov))
         return self._collapse_states(
             means=means[0] if len(means) == 1 else torch.cat(means),
             covs=covs[0] if len(covs) == 1 else torch.cat(covs),
-            regime_post=regime_post,
+            combo_post=combo_post,
             mapping=mapping,
         )
 
     @staticmethod
     def _collapse_states(means: torch.Tensor,
                          covs: torch.Tensor,
-                         regime_post: torch.Tensor,
+                         combo_post: torch.Tensor,
                          mapping: torch.Tensor) -> 'StateTuple':
         """
         Collapse a mixture of gaussian states into a single gaussian via moment-matching.
 
         :param means: A ``(num_effective, num_groups, state_rank)`` tensor: the (effective-combo) state-means to mix.
         :param covs: A ``(num_effective, num_groups, state_rank, state_rank)`` tensor: their covariances.
-        :param regime_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
+        :param combo_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
         :param mapping: A ``(num_combos,)`` tensor mapping each combo to its index in ``means`` (combos that are
          indistinguishable given the observed measures share a state).
-        :return: The collapsed state, with ``regime_probs`` set to ``regime_post``.
+        :return: The collapsed state, with ``combo_probs`` set to ``combo_post``.
         """
         # the weight of each state is the total probability of the combos that map to it:
-        to = {'dtype': regime_post.dtype, 'device': regime_post.device}
-        weights = torch.zeros((regime_post.shape[0], means.shape[0]), **to)
-        weights = weights.index_add(1, mapping.to(regime_post.device), regime_post)  # (G, num_effective)
+        to = {'dtype': combo_post.dtype, 'device': combo_post.device}
+        weights = torch.zeros((combo_post.shape[0], means.shape[0]), **to)
+        weights = weights.index_add(1, mapping.to(combo_post.device), combo_post)  # (G, num_effective)
         # the mixture's mean is the probability-weighted average of the states' means:
         #   new_mean[g] = sum over e of weights[g, e] * means[e, g]
         # (einsum's notation: g = group, e = effective combo, s = state-element; e is summed over since it's not in
@@ -298,7 +365,7 @@ class KalmanFilter(StateSpaceModel):
         # (here the einsum avoids a second (E, G, S, S) intermediate, which matters: this runs every update step.)
         diff = means - new_mean
         new_cov = torch.einsum('ge,egij->gij', weights, covs + diff.unsqueeze(-1) * diff.unsqueeze(-2))
-        return StateTuple(mean=new_mean, cov=new_cov, regime_probs=regime_post)
+        return StateTuple(mean=new_mean, cov=new_cov, combo_probs=combo_post)
 
     @staticmethod
     def _covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:

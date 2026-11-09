@@ -601,6 +601,24 @@ def test_sigmoid_legacy_jacobian_unpickling():
 
 
 @torch.no_grad()
+def test_unpickling_model_from_before_mixtures():
+    """Models pickled before mixture components existed have no `mixture` attribute; they should still predict."""
+    import pickle
+    from torchcast.kalman_filter import BinomialFilter
+
+    torch.manual_seed(0)
+    y = torch.randn(3, 10, 2)
+    y[..., 0] = (y[..., 0] > 0).float()
+    kf = BinomialFilter(processes=[LocalLevel(id='lv', measure='v'), LocalLevel(id='ls', measure='s')],
+                        measures=['v', 's'], binary_measures=['v'])
+    expected = kf(y).means
+    del kf.mixture  # simulate an older pickle
+    loaded = pickle.loads(pickle.dumps(kf))
+    assert loaded.mixture is None
+    assert torch.allclose(loaded(y).means, expected)
+
+
+@torch.no_grad()
 def test_joseph_form_option():
     """`joseph_form=False` uses the simpler covariance update -- the same, in exact arithmetic."""
     from torchcast.kalman_filter import BinomialFilter
@@ -664,7 +682,7 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
     With adaptive scaling, the scaler's state (and the multiplier for the next step) is carried in the `StateTuple`,
     so forecasting from ``get_state_at_times()`` matches a single pass exactly -- including the first step.
     """
-    from torchcast.state_space import MixtureComponent
+    from torchcast.mixture.component import MixtureComponent
 
     torch.manual_seed(0)
     measures = ['y1', 'y2']
@@ -701,11 +719,6 @@ def test_initial_state_continuation_adaptive_scaling(with_mixture: bool):
     pred_n = kf(y, n_step=3, include_updates_in_output=True)
     for k in ('running', 'time', 'multiplier'):
         assert torch.equal(pred_n.scaling_states[k][:, 10], pred_n.update_scaling_states[k][:, 7])
-
-    # chunked fitting subsets it with the rest of `initial_state`:
-    from torchcast.state_space.chunking import _subset_groups
-    sub = _subset_groups(state, slice(0, 2), num_groups=3)
-    assert all(v.shape[0] == 2 for v in sub.scaling.values())
 
     # models without adaptive scaling don't produce it, and reject it:
     kf_plain = KalmanFilter(processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures], measures=measures)

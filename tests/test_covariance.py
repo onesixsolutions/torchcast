@@ -1,5 +1,6 @@
 import copy
 import math
+import warnings
 from collections import OrderedDict
 from typing import Optional
 
@@ -9,9 +10,9 @@ import torch
 
 from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag
 from torchcast.kalman_filter import BinomialFilter, KalmanFilter
-from torchcast.process import LocalLevel
+from torchcast.process import LocalLevel, LocalTrend
 from torchcast.internals.utils import as_timestep_list
-from torchcast.process.utils import Identity, ProcessKwarg
+from torchcast.process.utils import Identity
 
 
 @torch.no_grad()
@@ -125,7 +126,7 @@ def test_sd_corr_correlations():
     i = 3
     for j in range(rank):
         if j != i:
-            module.corr_unconstrained[module.off_diag_idx(i, j)] = 0.
+            module.corr_unconstrained[module.get_off_diag_idx(i, j)] = 0.
     cov = module({}, 1, 1)[0, 0]
     assert (cov[i, [j for j in range(rank) if j != i]] == 0).all()
     # (... but only zeroing the row is a zero *partial* correlation, not a zero marginal correlation)
@@ -137,7 +138,7 @@ def test_corr_cholesky():
     std = cov.diagonal().sqrt()
     L_expected = torch.linalg.cholesky(cov / std.outer(std))
     for method in ('log_cholesky', 'sd_corr'):
-        _assert_close(Covariance.from_matrix(cov, method=method).corr_cholesky(), L_expected)
+        _assert_close(Covariance.from_matrix(cov, method=method).get_corr_cholesky(), L_expected)
 
 
 @torch.no_grad()
@@ -145,8 +146,8 @@ def test_sd_corr_index_helpers():
     module = Covariance(rank=5, empty_idx=[1], init_diag_multi=1., method='sd_corr')
     module.corr_unconstrained.zero_()
     module.log_std_devs.zero_()
-    module.corr_unconstrained[module.off_diag_idx(0, 3)] = 1.
-    module.log_std_devs[module.param_idx(4)] = math.log(2.)
+    module.corr_unconstrained[module.get_off_diag_idx(0, 3)] = 1.
+    module.log_std_devs[module.get_param_idx(4)] = math.log(2.)
     cov = module({}, 1, 1)[0, 0]
     expected = torch.eye(5)
     expected[1, 1] = 0
@@ -154,9 +155,9 @@ def test_sd_corr_index_helpers():
     expected[0, 3] = expected[3, 0] = math.tanh(1.)
     _assert_close(cov, expected)
     with pytest.raises(ValueError):
-        module.param_idx(1)
+        module.get_param_idx(1)
     with pytest.raises(ValueError):
-        module.off_diag_idx(2, 2)
+        module.get_off_diag_idx(2, 2)
 
 
 @pytest.mark.parametrize('scale', [0., 1., 30.])
@@ -181,14 +182,14 @@ def test_sd_corr_derivatives(scale: float):
 def test_sd_corr_freezing_hooks():
     module = Covariance(rank=4, init_diag_multi=1., method='sd_corr')
     keep_std = torch.ones_like(module.log_std_devs)
-    keep_std[module.param_idx(2)] = 0
+    keep_std[module.get_param_idx(2)] = 0
     module.log_std_devs.register_hook(lambda g: g * keep_std)
     keep_corr = torch.ones_like(module.corr_unconstrained)
-    keep_corr[module.off_diag_idx(2, 0)] = 0
+    keep_corr[module.get_off_diag_idx(2, 0)] = 0
     module.corr_unconstrained.register_hook(lambda g: g * keep_corr)
     (module({}, 1, 1) ** 2).sum().backward()
-    assert module.log_std_devs.grad[module.param_idx(2)] == 0
-    assert module.corr_unconstrained.grad[module.off_diag_idx(2, 0)] == 0
+    assert module.log_std_devs.grad[module.get_param_idx(2)] == 0
+    assert module.corr_unconstrained.grad[module.get_off_diag_idx(2, 0)] == 0
     assert (module.log_std_devs.grad != 0).sum() == 3
     assert (module.corr_unconstrained.grad != 0).sum() == num_off_diag(4) - 1
 
@@ -422,10 +423,6 @@ def test_model_predictor_kwargs():
         # time-varying measure-cov:
         R = kf.measure_covariance({'X': X}, 3, 10)
         assert not torch.allclose(R[0, 0], R[0, 1])
-    # covariance kwargs are declared as group-indexed (for ``fit(chunk_size=...)``), unless marked otherwise:
-    assert {'X', 'measure_covariance__X'} <= kf._group_kwarg_names()
-    kf.measure_covariance.predictor_kwargs = [ProcessKwarg('X', is_group_time_tensor=False)]
-    assert 'X' not in kf._group_kwarg_names()
 
 
 def test_fit_time_varying_correlation():
@@ -500,3 +497,120 @@ def test_load_older_version():
     assert [k.name for k in unpickled.predictor_kwargs] == ['X']
     X = torch.randn(2, 3, 1)
     assert torch.equal(unpickled({'X': X}, 2, 3), new({'X': X}, 2, 3))
+
+
+def test_corr_groups_from_processes():
+    processes = [LocalLevel(id='a'), LocalTrend(id='b'), LocalLevel(id='c'), LocalLevel(id='d')]
+    # elements: a.position, b.position, b.velocity, c.position, d.position
+    cov = Covariance.from_processes(processes, corr_groups=[['b', 'c']])
+    expected = torch.tensor([[1., 0., 0., 0., 1.],
+                             [0., 1., 1., 1., 0.],
+                             [0., 1., 1., 1., 0.],
+                             [0., 1., 1., 1., 0.],
+                             [1., 0., 0., 0., 1.]])  # 'a' and 'd' are unlisted, so in one group together
+    assert torch.equal(cov.corr_mask, expected)
+
+
+def test_corr_groups_from_measures():
+    cov = Covariance.from_measures(['x', 'y', 'z'], corr_groups=[['x'], ['y']])
+    assert torch.equal(cov.corr_mask, torch.eye(3))
+
+
+@pytest.mark.parametrize('corr_groups,match', [
+    ([['a', 'nope']], "unknown process id 'nope'"),
+    ([['a'], ['a', 'b']], "'a' in more than one group"),
+    (['a', 'b'], "list of lists"),
+])
+def test_corr_groups_errors(corr_groups: list, match: str):
+    processes = [LocalLevel(id='a'), LocalLevel(id='b')]
+    with pytest.raises((ValueError, TypeError), match=match):
+        Covariance.from_processes(processes, corr_groups=corr_groups)
+    with pytest.raises(TypeError, match="not both"):
+        Covariance.from_processes(processes, corr_groups=[['a']], corr_mask=torch.eye(2))
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+@pytest.mark.parametrize('empty_idx', [(), (1,)])
+def test_corr_mask(method: str, empty_idx: tuple):
+    torch.manual_seed(0)
+    rank = 5
+    corr_mask = torch.tensor([[1., 0., 1., 0., 1.],
+                              [0., 1., 0., 1., 0.],
+                              [1., 0., 1., 0., 1.],
+                              [0., 1., 0., 1., 0.],
+                              [1., 0., 1., 0., 1.]])
+    module = Covariance(rank=rank, init_diag_multi=1., method=method, empty_idx=list(empty_idx), corr_mask=corr_mask)
+    unmasked = Covariance(rank=rank, init_diag_multi=1., method=method, empty_idx=list(empty_idx))
+    unmasked.load_state_dict({k: v for k, v in module.state_dict().items() if k != 'corr_mask'})
+    with torch.no_grad():
+        cov = module({}, num_groups=1, num_times=1).squeeze()
+        cov_unmasked = unmasked({}, num_groups=1, num_times=1).squeeze()
+    # masked entries are zero, others (and empty rows/cols) as without the mask:
+    assert torch.allclose(cov, cov_unmasked * corr_mask)
+    assert torch.linalg.eigvalsh(cov).min() > -1e-6
+    # no gradient flows through masked-out entries:
+    module({}, num_groups=1, num_times=1)[0, 0, 0, 3].backward()
+    assert all(p.grad is None or (p.grad == 0).all() for p in module.parameters())
+    # the mask is carried through conversions and the state-dict:
+    assert torch.allclose(module.to_method('sd_corr')({}, num_groups=1, num_times=1).squeeze(), cov, atol=1e-5)
+    assert 'corr_mask' in module.state_dict()
+
+
+def test_corr_mask_validation():
+    with pytest.raises(ValueError, match="symmetric"):
+        Covariance(rank=2, init_diag_multi=1., corr_mask=torch.tensor([[1., 1.], [0., 1.]]))
+    with pytest.raises(ValueError, match="diagonal"):
+        Covariance(rank=2, init_diag_multi=1., corr_mask=torch.tensor([[1., 0.], [0., 0.]]))
+    with pytest.raises(ValueError, match="positive semi-definite"):
+        # 0 and 2 uncorrelated, but both correlated with 1: not PSD
+        Covariance(rank=3, init_diag_multi=1., corr_mask=torch.tensor([[1., 1., 0.], [1., 1., 1.], [0., 1., 1.]]))
+
+
+def test_corr_mask_absent_buffer():
+    # modules pickled before ``corr_mask`` existed don't have the buffer:
+    module = Covariance(rank=3, init_diag_multi=1.)
+    assert 'corr_mask' not in module._buffers
+    module({}, num_groups=1, num_times=1)
+
+
+def test_corr_groups_in_kalman_filter():
+    processes = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=['y'],
+        process_covariance=Covariance.from_processes(processes, corr_groups=[['transient']])
+    )
+    y = torch.randn(3, 20, 1).cumsum(1)
+    kf(y).log_prob(y).mean().backward()
+    pcov = kf.process_covariance({}, num_groups=1, num_times=1).squeeze()
+    assert pcov[0, 1] == 0 and pcov[1, 0] == 0
+
+
+def test_warn_correlated_levels():
+    def make(**kwargs):
+        processes = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
+        if kwargs.pop('uncorrelated', False):
+            kwargs['process_covariance'] = Covariance.from_processes(processes, corr_groups=[['transient']])
+        return KalmanFilter(processes=processes, measures=['y'], **kwargs)
+
+    with pytest.warns(UserWarning, match=r"corr_groups=\[\['transient'\]\]"):
+        make()
+    with pytest.warns(UserWarning, match="both decaying or both not"):
+        KalmanFilter(processes=[LocalLevel(id='a'), LocalLevel(id='b')], measures=['y'])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        make(uncorrelated=True)
+        KalmanFilter(processes=[LocalLevel(id='a', measure='x'), LocalLevel(id='b', measure='y')], measures=['x', 'y'])
+
+
+@torch.no_grad()
+def test_corr_mask_with_predict_corr():
+    # predicted correlations are masked too: masked-out pairs stay uncorrelated whatever the adjustment
+    corr_mask = torch.tensor([[1., 1., 0.], [1., 1., 0.], [0., 0., 1.]])
+    module = Covariance(rank=3, init_diag_multi=1., predict_corr=Identity(), predictor_kwargs=['d'], corr_mask=corr_mask)
+    module.corr_unconstrained.normal_()
+    delta = torch.randn(2, 4, num_off_diag(3))
+    out = module({'d': delta}, 2, 4)
+    assert (out[..., 2, :2] == 0).all() and (out[..., :2, 2] == 0).all()
+    assert (out[..., 0, 1] != 0).all()
+    assert (torch.linalg.eigvalsh(out) > 0).all()

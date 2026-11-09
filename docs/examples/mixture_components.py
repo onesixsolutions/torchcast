@@ -18,7 +18,7 @@ import torch
 
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.process import LocalLevel
-from torchcast.state_space import MixtureComponent
+from torchcast.mixture import MixtureComponent
 from torchcast.utils.data import TimeSeriesDataset
 from plotnine.exceptions import PlotnineWarning
 
@@ -117,7 +117,7 @@ component = kf_mixture.mixture.components[0]
 pd.Series({
     'component offset': component.offset.item(),
     'component (extra) std': component.extra_var.sqrt().item(),
-    'component probability': kf_mixture.mixture.base_probs()[1].item(),
+    'component probability': kf_mixture.mixture.get_base_probs()[1].item(),
     'stickiness (standard, quick)': kf_mixture.mixture.transition.get_stay_prob().detach().numpy().round(3),
     'measurement std (mixture model)': kf_mixture.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),
     'measurement std (standard model)': kf_standard.measure_covariance({}, 1, 1)[0, 0, 0, 0].sqrt().item(),
@@ -198,5 +198,5 @@ pred_mixture.plot(df_pred.query("group == 'customer_3'"), split_dt=SPLIT_DT, fig
 #   `LinearModel`'s `X`) to the model, covering the forecast horizon.
 # - Passing a list of components is shorthand for `mixture=MixtureModel(components)`. To configure it, pass the
 #   `MixtureModel` yourself: e.g. `MixtureModel(components, transition=...)`. The default `StickyTransition` learns
-#   a "stickiness" that controls how regime-probabilities persist over time; you can also write your own
-#   `RegimeTransition`.
+#   a "stickiness" that controls how regime-probabilities persist over time; `StaticTransition` is a static mixture;
+#   you can also write your own `RegimeTransition`.

@@ -211,6 +211,18 @@ def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tup
     return out
 
 
+def validate_scalar(value, name: Optional[str] = None) -> torch.Tensor:
+    # (a 0-dim tensor: e.g. a one-element array from data would otherwise give the parameter a shape that doesn't
+    # match the other measures' offsets / variances)
+    value = torch.as_tensor(value, dtype=torch.get_default_dtype())
+    if value.numel() != 1:
+        raise ValueError("{}should be a single number, got shape {}.".format(
+            f'`{name}` ' if name else '',
+            tuple(value.shape)
+        ))
+    return value.reshape(())
+
+
 def validate_gt_shape(
         tensor: torch.Tensor,
         num_groups: int,

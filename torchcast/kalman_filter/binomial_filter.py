@@ -17,7 +17,7 @@ from torchcast.internals.batch_design import MeasurementModel, Sigmoid
 
 if TYPE_CHECKING:
     from torchcast.process import Process
-    from torchcast.state_space.mixture import MixtureComponent, MixtureModel
+    from torchcast.mixture import MixtureModel, MixtureComponent
     from torchcast.state_space import StateTuple
     from torchcast.state_space.transforms import Transform
     from torchcast.utils import TimeSeriesDataset
@@ -184,9 +184,6 @@ class BinomialFilter(KalmanFilter):
             measure=measure,
             **kwargs
         )
-
-    def _group_kwarg_names(self) -> set[str]:
-        return super()._group_kwarg_names() | {'num_obs'}
 
     def _parse_kwargs(self,
                       num_groups: int,
@@ -508,7 +505,7 @@ class BinomialPredictions(Predictions):
                   measure_cov: torch.Tensor,
                   measurement_model: 'MeasurementModel',
                   num_obs: Optional[torch.Tensor] = None,
-                  regime_log_prior: Optional[torch.Tensor] = None,
+                  combo_log_prior: Optional[torch.Tensor] = None,
                   **kwargs) -> torch.Tensor:
         if kwargs:
             raise TypeError(f"`_log_prob()` does not accept additional keyword arguments, got {set(kwargs)}")
@@ -528,7 +525,7 @@ class BinomialPredictions(Predictions):
                 state_covs=state_covs,
                 measure_cov=measure_cov[mask2d],
                 measurement_model=measurement_model.subset(measures=gaussian_measures),
-                regime_log_prior=regime_log_prior,
+                combo_log_prior=combo_log_prior,
             )
         else:
             gaussian_lp = 0
