@@ -11,9 +11,12 @@ from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
 from torchcast.covariance import Covariance
-from torchcast.state_space.predictions import Predictions
-from torchcast.state_space.adaptive_scaling import EWMAdaptiveScaler, AdaptiveScaler
 from torchcast.process.regression import Process
+from torchcast.mixture import MixtureModel, MixtureComponent
+
+from .state import StateTuple, _as_state_tuple
+from .predictions import Predictions
+from .adaptive_scaling import EWMAdaptiveScaler, AdaptiveScaler
 
 if TYPE_CHECKING:
     from torchcast.utils.stopping import Stopping
@@ -29,6 +32,9 @@ class StateSpaceModel(torch.nn.Module):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
+    :param mixture: Experimental. A :class:`.MixtureModel` of alternative regimes for one or more measures -- e.g. for
+     outliers, which are then explained by a mixture component rather than updating the state. Can also pass a list of
+     :class:`.MixtureComponent` objects, as shorthand for ``MixtureModel(components)``.
     """
 
     def __init__(self,
@@ -36,7 +42,8 @@ class StateSpaceModel(torch.nn.Module):
                  measures: Sequence[str],
                  measure_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
-                 adaptive_scaling: Union[bool, AdaptiveScaler] = False):
+                 adaptive_scaling: Union[bool, AdaptiveScaler] = False,
+                 mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
         super().__init__()
 
         # measures:
@@ -86,6 +93,26 @@ class StateSpaceModel(torch.nn.Module):
                 else:
                     self.dt_unit = process.dt_unit
 
+        if mixture is not None and not isinstance(mixture, MixtureModel):
+            mixture = MixtureModel(mixture)
+        self.mixture: Optional[MixtureModel] = mixture
+        if self.mixture is not None:
+            self.mixture.validate(measures, non_gaussian_measures=self._non_gaussian_measures)
+
+    def __setstate__(self, state: dict):
+        # models pickled before mixture components existed have no ``mixture`` attribute:
+        if 'mixture' not in state and 'mixture' not in state.get('_modules', {}):
+            state['mixture'] = None
+        super().__setstate__(state)
+
+    @property
+    def _non_gaussian_measures(self) -> Sequence[str]:
+        """
+        Measures whose likelihood isn't gaussian. These can't have mixture components, and are excluded when scoring
+        regime-probabilities.
+        """
+        return ()
+
     def forward(self,
                 y: Optional[torch.Tensor] = None,
                 n_step: Union[int, float] = 1,
@@ -96,6 +123,7 @@ class StateSpaceModel(torch.nn.Module):
                 include_updates_in_output: bool = False,
                 simulate: Optional[int] = None,
                 prediction_kwargs: Optional[dict] = None,
+                generator: Optional[torch.Generator] = None,
                 **kwargs) -> 'Predictions':
         """
         Generate n-step-ahead predictions from the model.
@@ -114,7 +142,9 @@ class StateSpaceModel(torch.nn.Module):
          tensors you might extract from a previous call to forward (see ``include_updates_in_output`` below); you would
          have a ``Predictions`` object, which you can call :func:`get_state_at_times()` on. If left unset, will learn
          the initial state from the data. You can also pass a mean but not a cov, in situations where you want to
-         predict the initial state mean but use the default cov.
+         predict the initial state mean but use the default cov. For models with mixture components, pass the
+         :class:`.StateTuple` returned by ``get_state_at_times()`` to also carry over the combo-probabilities (with a
+         plain ``(mean, cov)`` tuple, the combo-probabilities start from the transition's ``initial()``).
         :param every_step: By default, ``n_step`` ahead predictions will be generated at every timestep. If
          ``every_step=False``, then these predictions will only be generated every `n_step` timesteps. For example,
          with hourly data, ``n_step=24`` and ``every_step=True``, each timepoint would be a forecast generated with
@@ -125,7 +155,11 @@ class StateSpaceModel(torch.nn.Module):
         :param include_updates_in_output: If False, only the ``n_step`` ahead predictions are included in the output.
          This means that we cannot use this output to generate the ``initial_state`` for subsequent forward-passes. Set
          to True to allow this -- False by default to reduce memory.
-        :param simulate: If specified, will generate `simulate` samples from the model.
+        :param simulate: If specified, will generate `simulate` state-trajectories from the model (see
+         :func:`simulate`): the output's states are the simulated ones (rather than predictions). Requires
+         ``n_step=1``.
+        :param generator: With ``simulate``, an optional :class:`torch.Generator` for the simulation's draws, for
+         reproducibility.
         :param prediction_kwargs: A dictionary of kwargs to pass to initialize ``Predictions()``.
         :param kwargs: Further arguments passed to the `processes`. For example, the :class:`.LinearModel` expects an
          ``X`` argument for predictors.
@@ -133,6 +167,8 @@ class StateSpaceModel(torch.nn.Module):
          :func:`Predictions.to_dataframe()` methods.
         """
 
+        init_combo_probs = getattr(initial_state, 'combo_probs', None)
+        init_scaling = getattr(initial_state, 'scaling', None)
         initial_state = self._prepare_initial_state(
             initial_state,
             start_offsets=start_offsets,
@@ -140,6 +176,10 @@ class StateSpaceModel(torch.nn.Module):
         if simulate and simulate > 1:
             init_mean, init_cov = initial_state
             initial_state = repeat(init_mean, simulate, dim=0), repeat(init_cov, simulate, dim=0)
+            if init_combo_probs is not None:
+                init_combo_probs = repeat(init_combo_probs, simulate, dim=0)
+            if init_scaling is not None:
+                init_scaling = {k: repeat(v, simulate, dim=0) for k, v in init_scaling.items()}
             if start_offsets is not None:  # need to repeat for passing to predictions.set_metadata
                 start_offsets = repeat(np.asarray(start_offsets), simulate, dim=0)
 
@@ -147,9 +187,16 @@ class StateSpaceModel(torch.nn.Module):
                 k: (repeat(v, simulate, dim=0) if isinstance(v, (torch.Tensor, np.ndarray)) else v)
                 for k, v in kwargs.items()
             }
+            if prediction_kwargs:  # (e.g. BinomialFilter's num_obs)
+                prediction_kwargs = {
+                    k: (repeat(v, simulate, dim=0) if isinstance(v, (torch.Tensor, np.ndarray)) else v)
+                    for k, v in prediction_kwargs.items()
+                }
 
         n_step = int(n_step)
         assert n_step > 0
+        if simulate and n_step > 1:
+            raise ValueError("`simulate` requires `n_step=1`: the output's states are the simulated ones.")
 
         meanu, covu, inputs, num_groups, out_timesteps = self._standardize_input(
             y,
@@ -172,8 +219,17 @@ class StateSpaceModel(torch.nn.Module):
             mcov_kwargs = {k: kwargs[k] for k in self.measure_covariance.expected_kwargs}
         measure_covs = list(self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1))
 
+        # the adaptive-scaler's state, and the multiplier for the first step: continued from `initial_state` if it
+        # carries them (e.g. from `get_state_at_times()`), otherwise fresh.
+        init_multiplier = None
         if self.adaptive_scaling:
             self.adaptive_scaling.reset()
+            if init_scaling is not None:
+                init_scaling = dict(init_scaling)
+                init_multiplier = init_scaling.pop('multiplier')
+                self.adaptive_scaling.set_state(init_scaling)
+        elif init_scaling is not None:
+            raise ValueError("`initial_state` has a `scaling` state, but this model has no `adaptive_scaling`.")
 
         #
         predict_kwargs, update_kwargs, used_keys = self._parse_kwargs(
@@ -199,17 +255,26 @@ class StateSpaceModel(torch.nn.Module):
             **kwargs
         )
         used_keys = used_keys.union(measurement_model.used_keys)
+        # (None without mixture components)
+        combo_prior, base_probs, mixture_keys = self._prepare_combos(
+            kwargs, init_combo_probs=init_combo_probs, num_groups=num_groups, num_timesteps=out_timesteps
+        )
+        used_keys.update(mixture_keys)
         unused_kwargs = set(kwargs) - used_keys
         if unused_kwargs:
             raise RuntimeError(f"Unexpected kwargs in {type(self).__name__}.forward(): {set(unused_kwargs)})")
 
         # first loop through to do predict -> update
-        scaling1step = None
+        scaling1step = init_multiplier
         scale1s = []
+        scaling_states1 = []  # the scaler's state (incl. the multiplier) before each step's update
+        scaling_statesu = []  # ... and after
         meanus = []
         covus = []
         mean1s = []
         cov1s = []
+        combo1s = []
+        combous = []
         for t in range(out_timesteps):
             tmask = (t <= last_measured_per_group)
             mean1step, transition_mat = transition_model(meanu, time=t, mask=tmask)
@@ -223,14 +288,29 @@ class StateSpaceModel(torch.nn.Module):
             mean1s.append(mean1step)
             cov1s.append(cov1step)
             scale1s.append(scaling1step)
+            scaling_states1.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
+            combo1s.append(combo_prior)
 
+            combo_post = combo_prior  # unless updated below
             if simulate:
-                meanu = torch.distributions.MultivariateNormal(mean1step, cov1step, validate_args=False).sample()
-                covu = torch.eye(meanu.shape[-1]).expand(num_groups, -1, -1) * 1e-6
+                z = torch.randn(mean1step.shape, generator=generator, dtype=mean1step.dtype, device=mean1step.device)
+                meanu = mean1step + (torch.linalg.cholesky(cov1step) @ z.unsqueeze(-1)).squeeze(-1)
+                covu = torch.eye(meanu.shape[-1], dtype=meanu.dtype, device=meanu.device) * 1e-6
+                covu = covu.expand(num_groups, -1, -1)
+                # the observations at t are generated from the simulated state (not from a fresh draw of the
+                # prior, which would ignore the process-noise that the trajectory carries forward), so it's the
+                # output's state for t:
+                mean1s[-1], cov1s[-1] = meanu, covu
+                if combo_prior is not None:
+                    # likewise the regime: drawn from the prior, then rolled forward (so e.g. a sticky regime
+                    # persists, as in the model)
+                    combo = torch.multinomial(combo_prior, 1, generator=generator).squeeze(-1)
+                    combo_post = torch.nn.functional.one_hot(combo, combo_prior.shape[-1]).to(combo_prior.dtype)
+                    combo1s[-1] = combo_post
             elif t < len(inputs):
                 measured_mean, measure_mat = measurement_model(mean1step, time=t)
                 measure_cov = self._apply_cov_scaling(measure_covs[t], scaling1step)
-                meanu, covu = self._update_step_with_nans(
+                state = self._update_step_with_nans(
                     input=inputs[t],
                     mean=mean1step,
                     cov=cov1step,
@@ -238,18 +318,27 @@ class StateSpaceModel(torch.nn.Module):
                     measure_mat=measure_mat,
                     measure_cov=measure_cov,
                     nan_groups=nan_groups[t],
+                    combo_prior=combo_prior,
                     **{k: v[t] for k, v in update_kwargs.items()}
                 )
-                scaling1step = self._get_scaling_multi(measured_mean, inputs[t])
+                meanu, covu = state
+                combo_post = state.combo_probs
+                scaling1step = self._get_scaling_multi(measured_mean, inputs[t], combo_probs=combo_post)
             else:
                 meanu, covu = mean1step, cov1step
 
             meanus.append(meanu)
             covus.append(covu)
+            combous.append(combo_post)
+            scaling_statesu.append(self._get_scaling_state(scaling1step, num_groups, like=mean1step))
+            if self.mixture is not None and t + 1 < out_timesteps:
+                combo_prior = self.mixture.get_next_prior(combo_post, base_probs[t + 1])
 
         # 2nd loop to get n_step predicts:
         meanps = {}
         covps = {}
+        combops = {}
+        scalingps = {}  # (the state of the update each prediction was rolled forward from)
         for t1 in range(out_timesteps):
             # tu: time of update
             # t1: time of 1step
@@ -258,7 +347,8 @@ class StateSpaceModel(torch.nn.Module):
             # - if every_step, we run this loop every iter
             # - if not every_step, we run this loop every nth iter
             if every_step or (t1 % n_step) == 0:
-                meanp, covp, scaling = mean1s[t1], cov1s[t1], scale1s[t1]  # already had to generate h=1 above
+                # already had to generate h=1 above:
+                meanp, covp, scaling, combop = mean1s[t1], cov1s[t1], scale1s[t1], combo1s[t1]
                 for h in range(1, n_step + 1):
                     tu_h = tu + h
                     if tu_h >= out_timesteps:
@@ -273,9 +363,13 @@ class StateSpaceModel(torch.nn.Module):
                             scaling=scaling,
                             mask=tmask
                         )
+                        if combop is not None:
+                            combop = self.mixture.get_next_prior(combop, base_probs[tu_h])
                     if tu_h not in meanps:
                         meanps[tu_h] = meanp
                         covps[tu_h] = covp
+                        combops[tu_h] = combop
+                        scalingps[tu_h] = scaling_states1[t1]
                         measure_covs[tu_h] = self._apply_cov_scaling(measure_covs[tu_h], scaling)
                     else:
                         # n_step>1 generally should only assign to meanps when tu_h = tu + n_step;
@@ -283,10 +377,16 @@ class StateSpaceModel(torch.nn.Module):
                         # timepoint in the input
                         assert every_step
 
-        preds = [meanps[t] for t in range(out_timesteps)], [covps[t] for t in range(out_timesteps)]
+        preds = [
+            StateTuple(meanps[t], covps[t], combo_probs=combops[t], scaling=scalingps[t])
+            for t in range(out_timesteps)
+        ]
 
         if include_updates_in_output:
-            updates = meanus, covus
+            updates = [
+                StateTuple(m, c, combo_probs=r, scaling=s)
+                for m, c, r, s in zip(meanus, covus, combous, scaling_statesu)
+            ]
         else:
             updates = None
 
@@ -328,15 +428,41 @@ class StateSpaceModel(torch.nn.Module):
             assert cov.shape[-1] == len(self.measures)
         return cov * scaling.unsqueeze(-2) * scaling.unsqueeze(-1)
 
+    def _get_scaling_state(self,
+                           multiplier: Optional[torch.Tensor],
+                           num_groups: int,
+                           like: torch.Tensor) -> Optional[dict[str, torch.Tensor]]:
+        """
+        The adaptive-scaler's current state, plus the ``multiplier`` it produced for the next step -- for
+        ``StateTuple.scaling``. None without adaptive-scaling (or if the scaler doesn't support it).
+        """
+        if not self.adaptive_scaling:
+            return None
+        state = self.adaptive_scaling.get_state(num_groups, like=like)
+        if state is None:
+            return None
+        if multiplier is None:  # (no update yet: no scaling)
+            multiplier = torch.ones((num_groups, len(self.measures)), dtype=like.dtype, device=like.device)
+        return {**state, 'multiplier': multiplier}
+
     def _get_scaling_multi(self,
                            measured_mean: torch.Tensor,
-                           input: torch.Tensor) -> Optional[torch.Tensor]:
-
+                           input: torch.Tensor,
+                           combo_probs: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """
+        :param combo_probs: If the model has mixture components, the ``(num_groups, num_combos)`` posterior
+         combo-probabilities from the update-step. Residuals are then weighted by the probability that each measure
+         is in its standard regime, so that residuals explained by a mixture component don't inflate the scaling.
+        """
         if self.adaptive_scaling:
             idx = self.measure_covariance.non_empty_idx
             nan_mask = input[..., idx].isnan()
             resid = input[..., idx].nan_to_num() - measured_mean[..., idx]
-            multi = self.adaptive_scaling(resid, nan_mask)
+            if self.mixture is None or combo_probs is None:
+                multi = self.adaptive_scaling(resid, nan_mask)
+            else:
+                weights = self.mixture.get_standard_probs(combo_probs, [self.measures[i] for i in idx])
+                multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
 
             # Handle empty measures (those not in the covariance structure)
             multi_padded = torch.ones_like(input)
@@ -494,8 +620,8 @@ class StateSpaceModel(torch.nn.Module):
         self._mc_sampling = mc_sampling
 
     def _generate_predictions(self,
-                              preds: tuple[list[torch.Tensor], list[torch.Tensor]],
-                              updates: Optional[tuple[list[torch.Tensor], list[torch.Tensor]]],
+                              preds: Sequence[StateTuple],
+                              updates: Optional[Sequence[StateTuple]],
                               measure_covs: torch.Tensor,
                               measurement_model: 'MeasurementModel',
                               nan_groups: Optional[List[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]]] = None,
@@ -509,7 +635,26 @@ class StateSpaceModel(torch.nn.Module):
             states=preds,
             measure_covs=measure_covs,
             updates=updates,
-            mc_white_noise=self.mc_sampling if self.is_nonlinear else None
+            mc_white_noise=self.mc_sampling if self.is_nonlinear else None,
+            mixture=self.mixture,
+        )
+
+    def _prepare_combos(self,
+                         kwargs: dict,
+                         init_combo_probs: Optional[torch.Tensor],
+                         num_groups: int,
+                         num_timesteps: int) -> tuple[Optional[torch.Tensor], Optional[Sequence[torch.Tensor]], set]:
+        """
+        For models with mixture components: see ``MixtureModel.prepare``.
+
+        :return: ``(combo_prior, base_probs, used_keys)``; ``(None, None, set())`` without mixture components.
+        """
+        if self.mixture is None:
+            if init_combo_probs is not None:
+                raise ValueError("`initial_state` has `combo_probs`, but this model has no mixture components.")
+            return None, None, set()
+        return self.mixture.prepare(
+            kwargs, init_combo_probs=init_combo_probs, num_groups=num_groups, num_timesteps=num_timesteps
         )
 
     def _parse_kwargs(self,
@@ -581,14 +726,27 @@ class StateSpaceModel(torch.nn.Module):
                                measure_mat: torch.Tensor,
                                measure_cov: torch.Tensor,
                                nan_groups: Optional[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]] = None,
-                               **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+                               combo_prior: Optional[torch.Tensor] = None,
+                               **kwargs) -> StateTuple:
+        """
+        Calls ``_update_step()`` once for each group of rows sharing a pattern of missing measures, with the
+        measurement tensors subset to the observed measures.
+
+        :param combo_prior: If the model has mixture components, a ``(num_groups, num_combos)`` tensor of prior
+         combo-probabilities.
+        :return: A ``StateTuple``. If ``combo_prior`` was passed, its ``combo_probs`` is the posterior (rows with no
+         observed measures keep their prior).
+        """
+        if combo_prior is not None:
+            kwargs['combo_prior'] = combo_prior
+
         if nan_groups is None:
             nan_groups = get_nan_groups(torch.isnan(input))
         if len(nan_groups) == 1:
             group_idx, masks = nan_groups[0]
             if len(group_idx) == len(input) and masks is None:
                 # no nans, no masking:
-                return self._update_step(
+                return _as_state_tuple(self._update_step(
                     input=input,
                     mean=mean,
                     cov=cov,
@@ -596,13 +754,14 @@ class StateSpaceModel(torch.nn.Module):
                     measure_mat=measure_mat,
                     measure_cov=measure_cov,
                     **kwargs
-                )
+                ))
         elif not len(nan_groups):
             # all nans, nothing to do:
-            return mean, cov
+            return StateTuple(mean, cov, combo_probs=combo_prior)
 
         new_mean = mean.clone()
         new_cov = cov.clone()
+        new_combo_post = None if combo_prior is None else combo_prior.clone()
         for groups, masks in nan_groups:
             masked = self._mask_mats(
                 groups,
@@ -613,14 +772,20 @@ class StateSpaceModel(torch.nn.Module):
                 measure_cov=measure_cov,
                 **kwargs
             )
+            if combo_prior is not None:
+                # handled here, since `_mask_mats` only subsets extra kwargs when masks is None:
+                masked['combo_prior'] = combo_prior[groups]
 
-            new_mean[groups], new_cov[groups] = self._update_step(
+            state = _as_state_tuple(self._update_step(
                 mean=mean[groups],
                 cov=cov[groups],
                 **masked,
                 **{k: v for k, v in kwargs.items() if k not in masked}
-            )
-        return new_mean, new_cov
+            ))
+            new_mean[groups], new_cov[groups] = state
+            if new_combo_post is not None:
+                new_combo_post[groups] = state.combo_probs
+        return StateTuple(new_mean, new_cov, combo_probs=new_combo_post)
 
     def _mask_mats(self,
                    groups: torch.Tensor,
@@ -632,6 +797,7 @@ class StateSpaceModel(torch.nn.Module):
                 out[nm] = mat[groups]
         else:
             val_idx, m1d, m2d = masks
+            out['val_idx'] = val_idx
             for nm, mat in kwargs.items():
                 if nm in ('input', 'measured_mean', 'measure_mat'):
                     out[nm] = mat[m1d]
@@ -646,7 +812,23 @@ class StateSpaceModel(torch.nn.Module):
                      measured_mean: torch.Tensor,
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
-                     **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+                     val_idx: Optional[torch.Tensor] = None,
+                     **kwargs) -> 'StateTuple':
+        """
+        :param input: A (n_groups, n_measures) tensor of observations.
+        :param mean: A (n_groups, n_states) tensor for the state-means.
+        :param cov: A (n_groups, n_states, n_states) tensor for the state-cov.
+        :param measured_mean: A (n_groups, n_measures) tensor for the measured-mean (state-mean converted to measurement
+         -space).
+        :param measure_mat: A (n_groups, n_measures, n_states) tensor for converting state tensors to
+         measurement-space.
+        :param measure_cov: A (n_groups, n_measures, n_measures) tensor with measurement covariance.
+        :param val_idx: An optional indexing tensor. If not None, this indicates which dims from the original state
+         were selected for this update (with the others presumably getting dropped in ``_update_step_with_nans``). If
+         None then nothing was dropped. Useful if you want to know (e.g.) which measures are being used in the current
+         call to _update_step().
+        :return: A StateTuple capturing the updated mean/cov.
+        """
         raise NotImplementedError
 
     @staticmethod
@@ -802,9 +984,15 @@ class StateSpaceModel(torch.nn.Module):
                  start_offsets: Optional[Sequence] = None,
                  num_sims: int = 1,
                  num_groups: Optional[int] = None,
+                 generator: Optional[torch.Generator] = None,
                  **kwargs):
         """
         Generate simulated state-trajectories from your model.
+
+        For models with mixture components, the regimes are simulated too: at each timestep, a regime-combo is drawn
+        from the combo-prior given the trajectory so far (so stickiness and latent classes carry over), and the
+        output's ``combo_probs`` are these (one-hot) draws. So e.g. ``sample()`` on the output uses the simulated
+        regimes.
 
         :param out_timesteps: The number of timesteps to generate in the output.
         :param initial_state: The initial state of the system: a tuple of `mean`, `cov`. Can be obtained from previous
@@ -817,8 +1005,14 @@ class StateSpaceModel(torch.nn.Module):
          etc.). Tensors associated with this output can be reshaped with ``tensor.reshape(num_sims, num_groups, ...)``.
         :param num_groups: The number of groups; if `None` will be inferred from the shape of `initial_state` and/or
          ``start_offsets``.
+        :param generator: An optional :class:`torch.Generator` for the simulation's draws, for reproducibility.
         :param kwargs: Further arguments passed to the `processes`.
-        :return: A :class:`.Predictions` object with zero state-covariance.
+        :return: A :class:`.Predictions` object whose states are the simulated ones (with zero covariance, up to a
+         small jitter), so e.g. its ``means`` are the measured-means of the trajectories, and :func:`Predictions.sample`
+         draws observations around them. (With ``include_updates_in_output=True``, the ``update_*`` attributes are the
+         same states.) For models with mixture components, the regimes are simulated too: each timestep's
+         ``combo_probs`` are one-hot, for the simulated regime-combo (drawn from the prior given the previous one), so
+         :func:`Predictions.sample` draws observations in that regime.
         """
 
         if num_groups is not None:
@@ -837,6 +1031,7 @@ class StateSpaceModel(torch.nn.Module):
             out_timesteps=out_timesteps,
             initial_state=initial_state,
             simulate=num_sims,
+            generator=generator,
             **kwargs
         )
 
