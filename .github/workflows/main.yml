@@ -39,7 +39,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version-file: 'pyproject.toml'
+          # (the newest version the tests run on: with `python-version-file`, requires-python >= 3.9 picked the newest
+          # Python available, and the docs' notebooks crashed on 3.15)
+          python-version: '3.14'
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v6
