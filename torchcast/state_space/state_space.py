@@ -519,9 +519,10 @@ class StateSpaceModel(torch.nn.Module):
          line-search and convergence behave the same. Group-indexed kwargs (and outputs of ``callable_kwargs``) are
          split into chunks along with ``y``: e.g. ``start_offsets``, ``initial_state`` and processes' model-matrices
          (``X``); for kwargs used by covariance-modules (e.g. ``group_ids``), this is inferred from their shape (first
-         dimension equals the number of groups). A custom ``get_loss`` should be
-         a mean over groups (like the default), since chunks' losses are combined as a weighted mean by the number of
-         groups; a :class:`.LossFun` (e.g. with ``weights``) is split into chunks automatically.
+         dimension equals the number of groups). A :class:`.LossFun` (e.g. with
+         ``weights``) is split into chunks automatically, and gives exactly the unchunked loss. A custom ``get_loss``
+         should be a mean over groups, since chunks' losses are then combined as a weighted mean by their number of
+         groups.
         :param newton_finish: If True (or a dict of keyword-arguments to :func:`newton_refine()`), after the optimizer
          stops, refine the parameters with Newton steps; useful when the optimizer is slow along ridges. The result is
          stored as ``self.newton_result`` (a :class:`.NewtonResult`). Skipped if fitting is interrupted.
@@ -839,8 +840,10 @@ class StateSpaceModel(torch.nn.Module):
         Split ``y`` and the forward-kwargs into chunks of groups (see ``fit(chunk_size=...)``), precomputing the
         nan-groups for each.
 
-        :param reduce: 'mean' if ``get_loss`` returns a mean over groups (as in ``fit()``), so chunks' losses are
-         combined as a weighted mean by the number of groups; or 'sum' if it returns a sum, so they're summed.
+        :param reduce: 'mean' if ``get_loss`` returns a mean (as in ``fit()``), so chunks' losses are combined into the
+         mean over all of them: for a :class:`.LossFun`, each chunk's summed loss is divided by the total of
+         :func:`LossFun.get_denominator` (the sum of the weights) over all chunks; for other ``get_loss`` functions,
+         chunks' means are weighted by their number of groups. Or 'sum' if it returns a sum, so they're summed.
         :param group_idx: Optionally, only use this subset of groups (e.g. ``newton_refine(hessian_subsample=...)``).
          With 'mean', the chunks' losses are then a mean over this subset.
         :param group_weights: Optionally, relative weights for the groups in ``group_idx`` (e.g. inverse inclusion
@@ -868,6 +871,7 @@ class StateSpaceModel(torch.nn.Module):
             group_slices = [torch.as_tensor(group_idx)[group_slice] for group_slice in group_slices]
 
         chunks = []
+        denominators = []
         for group_slice, weight_slice in zip(group_slices, weight_slices):
             y_chunk = y[group_slice]
             chunk_kwargs = self._subset_kwargs(kwargs, group_slice, num_groups)
@@ -897,8 +901,22 @@ class StateSpaceModel(torch.nn.Module):
                 y=y_chunk,
                 kwargs=chunk_kwargs,
                 get_loss=chunk_get_loss,
-                weight=y_chunk.shape[0] / num_used if reduce == 'mean' else 1.,
+                weight=1.,
             ))
+            if isinstance(chunk_get_loss, LossFun):
+                denominators.append(float(chunk_get_loss.get_denominator(y_chunk)))
+            else:
+                denominators.append(float(y_chunk.shape[0]))
+        if reduce == 'mean' and len(chunks) > 1:
+            total = sum(denominators)
+            for i, (chunk, denominator) in enumerate(zip(chunks, denominators)):
+                if isinstance(chunk.get_loss, LossFun):
+                    # sum within each chunk, divided by the total over all chunks (so a chunk whose weights are all
+                    # zero contributes zero, rather than 0 / 0):
+                    get_loss_sum = LossFun(weights=chunk.get_loss.weights, reduce='sum')
+                    chunks[i] = chunk._replace(get_loss=get_loss_sum, weight=1. / total)
+                else:
+                    chunks[i] = chunk._replace(weight=denominator / total)
         return chunks
 
     def _group_kwarg_names(self) -> set[str]:
@@ -1303,7 +1321,8 @@ class LossFun:
     ``my_model.fit(get_loss=LossFun(weights=my_weights))``.
 
     :param weights: A num_groups X num_times tensor of weights.
-    :param reduce: Can be 'mean', 'sum', or None.
+    :param reduce: Can be 'mean', 'sum', or None. With ``weights``, 'mean' is the weighted mean: the sum of the
+     weighted losses divided by the sum of the ``weights``.
     """
 
     def __init__(self, weights: Optional[torch.Tensor] = None, reduce: Optional[str] = 'mean'):
@@ -1319,10 +1338,19 @@ class LossFun:
         if not self.reduce:
             return neg_log_prob
         if self.reduce == 'mean':
-            return torch.mean(neg_log_prob)
+            return torch.sum(neg_log_prob) / self.get_denominator(y)
         if self.reduce == 'sum':
             return torch.sum(neg_log_prob)
         raise ValueError(f"Unrecognized `reduce` {self.reduce}")
+
+    def get_denominator(self, y: torch.Tensor) -> Union[torch.Tensor, int]:
+        """
+        What ``reduce='mean'`` divides the summed loss by: the sum of ``weights``, or without weights, the number of
+        group X timestep elements.
+        """
+        if self.weights is None:
+            return y.shape[0] * y.shape[1]
+        return self.weights.sum()
 
     def subset(self, group_slice: Union[slice, torch.Tensor], num_groups: int) -> 'LossFun':
         """

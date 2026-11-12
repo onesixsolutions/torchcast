@@ -128,6 +128,7 @@ inflate the variance. See the new [mixture components example](https://docs.stro
 
 - `fit(chunk_size=...)` runs each evaluation of the loss on chunks of groups, accumulating the gradient, so only one chunk's computation-graph is in memory at a time. This is not mini-batching: the optimizer sees the full-batch loss and gradient, so the result is the same (up to floating-point error). Group-indexed kwargs (e.g. `start_offsets`, `initial_state`, model-matrices, `num_obs`) and `LossFun(weights=...)` are split with `y`. `get_laplace_mvnorm(chunk_size=...)` does the same for the hessian.
 - `newton_refine()` (or `fit(newton_finish=True)`) refines fitted parameters with (saddle-free) Newton steps using the exact hessian, for when the optimizer is slow along ridges. `hessian_subsample` estimates the hessian from a subset of groups; the result is a `NewtonResult`, with diagnostics and `get_laplace_mvnorm()`.
+- Behavior change: `LossFun(weights=...)` with `reduce='mean'` (the default) is now the weighted mean: the sum of the weighted losses divided by the sum of the weights. Before, it was divided by the number of group X timestep elements, so the loss's scale depended on the weights' scale. The optimum is the same (the loss only changes by a constant factor), but the loss values differ, so a fit with loss-based stopping (`Stopping`'s default `abstol`) can stop at a different point. With `chunk_size`, chunks are combined so that the result equals the unchunked loss, including chunks whose weights are all zero.
 
 ### New option: `joseph_form`
 

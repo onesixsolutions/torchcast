@@ -1,5 +1,6 @@
 import copy
 import warnings
+from typing import Union
 
 import numpy as np
 import pytest
@@ -81,10 +82,12 @@ def _prepare_y(y: torch.Tensor, variant: str) -> torch.Tensor:
 
 
 @pytest.mark.parametrize('chunk_size', [1, 3, 11, 50])
-@pytest.mark.parametrize('use_weights', [False, True])
+@pytest.mark.parametrize('use_weights', [False, True, 'zero_chunk'])
 @pytest.mark.parametrize('variant', ['kf', 'adaptive', 'sigmoid', 'binomial', 'group_cov', 'mixture', 'mixture_adaptive'])
-def test_chunked_loss_and_grad(chunk_size: int, use_weights: bool, variant: str):
+def test_chunked_loss_and_grad(chunk_size: int, use_weights: Union[bool, str], variant: str):
     y, X, start_offsets, weights = _make_data()
+    if use_weights == 'zero_chunk':
+        weights[:3] = 0.  # the first chunk (for chunk_size <= 3) has no weight at all
     y = _prepare_y(y, variant)
     kwargs = {'X': X, 'start_offsets': start_offsets}
     if variant == 'group_cov':
@@ -214,3 +217,19 @@ def test_subset_kwargs_mixture():
     assert isinstance(out['initial_state'], StateTuple)
     assert torch.equal(out['initial_state'].combo_probs, combo_probs[2:4])
     assert out['initial_state'].mean.shape == (2, 5) and out['initial_state'].cov.shape == (2, 5, 5)
+
+
+def test_loss_fun_weighted_mean():
+    y, X, start_offsets, weights = _make_data()
+    model = _make_model()
+    with torch.no_grad():
+        pred = model(y, X=X, start_offsets=start_offsets)
+        neg_lp = -pred.log_prob(y)
+        loss = LossFun(weights=weights)(pred, y)
+        # the weighted mean: weighted sum / sum of the weights (not / the number of elements)
+        assert loss == pytest.approx(((neg_lp * weights).sum() / weights.sum()).item(), rel=1e-6)
+        # so it doesn't depend on the weights' scale:
+        assert LossFun(weights=weights * 7.)(pred, y) == pytest.approx(loss.item(), rel=1e-6)
+        # ones are the unweighted mean:
+        assert LossFun(weights=torch.ones_like(weights))(pred, y) == pytest.approx(neg_lp.mean().item(), rel=1e-6)
+        assert LossFun(weights=weights, reduce='sum')(pred, y) == pytest.approx((neg_lp * weights).sum().item(), rel=1e-6)
