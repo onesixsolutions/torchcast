@@ -124,6 +124,12 @@ inflate the variance.
 - The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
   uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
   larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+### New feature: chunked fitting and Newton refinement
+
+- `fit(chunk_size=...)` runs each evaluation of the loss on chunks of groups, accumulating the gradient, so only one chunk's computation-graph is in memory at a time. This is not mini-batching: the optimizer sees the full-batch loss and gradient, so the result is the same (up to floating-point error). Group-indexed kwargs (e.g. `start_offsets`, `initial_state`, model-matrices, `num_obs`) and `LossFun(weights=...)` are split with `y`. `get_laplace_mvnorm(chunk_size=...)` does the same for the hessian.
+- `newton_refine()` (or `fit(newton_finish=True)`) refines fitted parameters with (saddle-free) Newton steps using the exact hessian, for when the optimizer is slow along ridges. `hessian_subsample` estimates the hessian from a subset of groups; the result is a `NewtonResult`, with diagnostics and `get_laplace_mvnorm()`.
+- Behavior change: `LossFun(weights=...)` with `reduce='mean'` (the default) is now the weighted mean: the sum of the weighted losses divided by the sum of the weights. Before, it was divided by the number of group X timestep elements, so the loss's scale depended on the weights' scale. The optimum is the same (the loss only changes by a constant factor), but the loss values differ, so a fit with loss-based stopping (`Stopping`'s default `abstol`) can stop at a different point. With `chunk_size`, chunks are combined so that the result equals the unchunked loss, including chunks whose weights are all zero.
+
 ### New option: `joseph_form`
 
 `KalmanFilter(joseph_form=False)` (and `BinomialFilter`) uses the simpler covariance update `P - K H P` (symmetrized) instead of the Joseph form `(I - K H) P (I - K H)' + K R K'`. It uses less memory during training (in a test with a state-size of 44: ~20-25% less peak memory for forward + backward) and is faster, but it's less numerically robust: errors in the kalman gain have a first-order (rather than second-order) effect on the covariance, which can lose positive-definiteness. The default is unchanged (`joseph_form=True`), as are models saved by older versions.
