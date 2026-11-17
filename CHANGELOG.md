@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## Unreleased
+
+### Overridable design models
+
+`StateSpaceModel.forward()` now builds its transition and measurement models through two methods,
+`_make_transition_model(num_groups, num_timesteps)` and `_make_measurement_model(num_groups, num_timesteps, **kwargs)`,
+instead of constructing `TransitionModel` and `MeasurementModel` inline. The defaults are unchanged. A subclass can
+override them to change the design matrices without copying `forward()`: e.g. a transition from one process's state
+to another's, which the default block-diagonal (by process) transition matrix can't express.
+
 ## v1.2.0
 
 ### Behavior change: adaptive scaling starts at "no adjustment"
