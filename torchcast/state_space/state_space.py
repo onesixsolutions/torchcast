@@ -240,20 +240,8 @@ class StateSpaceModel(torch.nn.Module):
         )
         used_keys.update(mcov_kwargs)
 
-        transition_model = TransitionModel(
-            processes=self.processes,
-            measures=self.measures,
-            num_groups=num_groups,
-            num_timesteps=out_timesteps,
-        )
-        measurement_model = MeasurementModel(
-            processes=self.processes,
-            measures=self.measures,
-            num_groups=num_groups,
-            num_timesteps=out_timesteps,
-            measure_funs=self.measure_funs,
-            **kwargs
-        )
+        transition_model = self._make_transition_model(num_groups=num_groups, num_timesteps=out_timesteps)
+        measurement_model = self._make_measurement_model(num_groups=num_groups, num_timesteps=out_timesteps, **kwargs)
         used_keys = used_keys.union(measurement_model.used_keys)
         # (None without mixture components)
         combo_prior, base_probs, mixture_keys = self._prepare_combos(
@@ -401,6 +389,35 @@ class StateSpaceModel(torch.nn.Module):
         return preds.set_metadata(
             start_offsets=start_offsets if start_offsets is not None else np.zeros(num_groups, dtype='int'),
             dt_unit=self.dt_unit
+        )
+
+    def _make_transition_model(self, num_groups: int, num_timesteps: int) -> TransitionModel:
+        """
+        The transition model for a forward pass. By default it's block-diagonal by process (each process's states
+        transition only among themselves); subclasses can override this, e.g. to add transitions from one process's
+        states to another's.
+        """
+        return TransitionModel(
+            processes=self.processes,
+            measures=self.measures,
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+        )
+
+    def _make_measurement_model(self, num_groups: int, num_timesteps: int, **kwargs) -> MeasurementModel:
+        """
+        The measurement model for a forward pass: each process's states measured by its own measure. Subclasses can
+        override this, e.g. to have a measure load on another measure's states.
+
+        :param kwargs: ``forward()``'s keyword-arguments (e.g. the processes' predictors).
+        """
+        return MeasurementModel(
+            processes=self.processes,
+            measures=self.measures,
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+            measure_funs=self.measure_funs,
+            **kwargs
         )
 
     def _apply_cov_scaling(self,
