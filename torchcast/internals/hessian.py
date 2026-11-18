@@ -1,4 +1,5 @@
 from typing import Sequence, Optional
+from warnings import warn
 
 import torch
 
@@ -72,3 +73,21 @@ def _gradient(outputs: Sequence[torch.Tensor],
     grads = [x if x is not None else torch.zeros_like(y) for x, y in zip(grads, inputs)]
 
     return torch.cat([x.contiguous().view(-1) for x in grads])
+
+def mvnorm_from_hessian(means: torch.Tensor, hess: torch.Tensor) -> torch.distributions.MultivariateNormal:
+    """
+    Laplace approximation from the hessian of the (summed) negative log-likelihood. If it's not positive definite,
+    warns and falls back to a diagonal covariance.
+    """
+    with torch.no_grad():
+        try:
+            return torch.distributions.MultivariateNormal(means, precision_matrix=hess, validate_args=True)
+        except (RuntimeError, ValueError) as e:
+            warn(
+                f"Unable to get valid covariance from optimized parameters (see error below)."
+                f"If you haven't already tried, scale your data, and fit the model with ``monitor_params=True`` "
+                f"(see the ``stopping`` argument of ``fit()``), or ``newton_finish=True``."
+                f"\n{str(e)}"
+            )
+            fake_cov = torch.diag(torch.diag(hess).pow(-1).clip(min=1E-5))
+            return torch.distributions.MultivariateNormal(means, covariance_matrix=fake_cov)
