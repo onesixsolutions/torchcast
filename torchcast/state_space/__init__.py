@@ -9,4 +9,6 @@ This class is abstract; see :class:`torchcast.kalman_filter.KalmanFilter` for th
 """
 
 from .state_space import StateSpaceModel, LossFun
-from .predictions import Predictions
+from .state import StateTuple
+from .predictions import Predictions, PredictionSamples, MixtureOfNormals
+from .transforms import Transform, LogTransform, BoxCoxTransform, SmearingTransform

@@ -5,15 +5,36 @@ algorithm (or optionally extended-kalman filtering, if any measure-funs or nonli
 This class inherits most of its methods from :class:`torchcast.state_space.StateSpaceModel`.
 """
 from typing import Sequence
+from warnings import warn
 
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor
+from torchcast.internals.utils import update_tensor, mvnorm_log_prob
 from torchcast.process import Process
-from torchcast.state_space.state_space import StateSpaceModel
+from torchcast.process.utils import StateElement, FixedValue
 
-from typing import Optional
+from torchcast.mixture import MixtureModel, MixtureComponent
+from torchcast.state_space.state_space import StateSpaceModel, StateTuple
+
+from typing import Optional, Union
 
 import torch
+
+
+def _is_level_like(se: StateElement) -> bool:
+    """
+    Whether a state element acts as a (possibly decaying) level on its measure: it has process-noise, a fixed non-zero
+    weight in the measurement, and transitions only to itself. E.g. ``LocalLevel``'s level and ``LocalTrend``'s
+    position; not seasons (whose elements rotate into each other) or regression coefficients (weighted by predictors).
+    """
+    if not se.has_process_variance or not isinstance(se._measure_multi, FixedValue):
+        return False
+    return bool(se._measure_multi.value != 0) and set(se.transitions_to) == {se.name}
+
+
+def _has_decay(se: StateElement) -> bool:
+    """Whether a state element's transition to itself is (or may be learned to be) less than 1."""
+    multi = se.transitions_to[se.name]
+    return not (isinstance(multi, FixedValue) and bool(multi.value == 1))
 
 
 class KalmanFilter(StateSpaceModel):
@@ -26,7 +47,16 @@ class KalmanFilter(StateSpaceModel):
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
+    :param joseph_form: If True (the default), the update-step uses the Joseph form of the covariance update,
+     ``(I - K H) P (I - K H)' + K R K'``. This keeps the covariance positive semi-definite even with numerical error in
+     the kalman gain ``K`` (which then only has a second-order effect). ``False`` uses the simpler ``P - K H P``
+     (symmetrized): less memory during training (its intermediate results, kept for the backward pass, are smaller)
+     and faster, but errors in ``K`` have a first-order effect, so the covariance can lose positive-definiteness --
+     e.g. with float32, long series, near-zero process-variances, or very precise measurements.
+    :param mixture: Experimental. A :class:`.MixtureModel` (or a list of :class:`.MixtureComponent` objects); see
+     :class:`.StateSpaceModel`.
     """
+
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Sequence[str],
@@ -34,7 +64,9 @@ class KalmanFilter(StateSpaceModel):
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,
                  measure_funs: Optional[dict[str, str]] = None,
-                 adaptive_scaling: bool = False):
+                 adaptive_scaling: bool = False,
+                 joseph_form: bool = True,
+                 mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
 
         if initial_covariance is None:
             initial_covariance = Covariance.from_processes(processes, cov_type='initial')
@@ -48,9 +80,67 @@ class KalmanFilter(StateSpaceModel):
             measure_covariance=measure_covariance,
             measure_funs=measure_funs,
             adaptive_scaling=adaptive_scaling,
+            mixture=mixture,
         )
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
+        self.joseph_form = joseph_form
+        self._warn_correlated_levels()
+
+    def _warn_correlated_levels(self):
+        """
+        Two level-like processes (e.g. a random-walk and a decaying level) on the same measure, with correlated
+        process-noise, are poorly identified: only their sum is observed, and correlated shocks let many combinations
+        of their variances fit equally well.
+        """
+        corr_mask = getattr(self.process_covariance, 'corr_mask', None)
+        level_idx = {}  # process id -> index of its level-like state element
+        decaying = set()
+        start = 0
+        for pid, p in self.processes.items():
+            for i, se in enumerate(p.state_elements.values()):
+                if pid not in level_idx and _is_level_like(se):
+                    level_idx[pid] = start + i
+                    if _has_decay(se):
+                        decaying.add(pid)
+            start += p.rank
+        by_measure = {}
+        for pid in level_idx:
+            by_measure.setdefault(self.processes[pid].measure, []).append(pid)
+
+        correlated = [
+            (a, b) for pids in by_measure.values() for i, a in enumerate(pids) for b in pids[i + 1:]
+            if corr_mask is None or corr_mask[level_idx[a], level_idx[b]] != 0
+        ]
+        if not correlated:
+            return
+        msg = (
+            f"These pairs of level-like processes are on the same measure and have correlated process-noise: "
+            f"{correlated}. That's poorly identified: only their sum is observed, and correlated shocks let many "
+            f"combinations of their variances fit equally well."
+        )
+        # suggestion: decaying levels in one group (correlated across measures), the non-decaying ones in the other:
+        separable = [(a, b) for a, b in correlated if (a in decaying) != (b in decaying)]
+        if separable:
+            suggestion = [[pid for pid in level_idx if pid in decaying]]
+            msg += (
+                f" Consider making the decaying levels uncorrelated with the others, e.g.:\n"
+                f"  process_covariance=Covariance.from_processes(processes, corr_groups={suggestion})\n"
+                f"(The processes in each group are correlated with each other, but not with those in other groups; "
+                f"processes not in any group form one more group together.)"
+            )
+        inseparable = [pair for pair in correlated if pair not in separable]
+        if inseparable:
+            msg += (
+                f" {inseparable} are both decaying or both not, so this doesn't separate them (e.g. two random walks "
+                f"on one measure act as one); consider removing one, or giving them different decay ranges and "
+                f"separate ``corr_groups``."
+            )
+        warn(msg)
+
+    def __setstate__(self, state: dict):
+        state.setdefault('joseph_form', True)  # (missing in models pickled before it existed)
+        super().__setstate__(state)
 
     def _predict_cov(self,
                      cov: torch.Tensor,
@@ -75,29 +165,228 @@ class KalmanFilter(StateSpaceModel):
                      measured_mean: torch.Tensor,
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
-                     **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+                     val_idx: Optional[torch.Tensor] = None,
+                     combo_prior: Optional[torch.Tensor] = None,
+                     **kwargs) -> 'StateTuple':
+        input, measured_mean, measure_cov = self._prepare_update(
+            input=input,
+            measured_mean=measured_mean,
+            measure_cov=measure_cov,
+            **kwargs
+        )
+        if self.mixture is None:
+            return self._kalman_update(
+                input=input,
+                mean=mean,
+                cov=cov,
+                measured_mean=measured_mean,
+                measure_mat=measure_mat,
+                measure_cov=measure_cov,
+            )
+        if combo_prior is None:
+            raise ValueError("A model with mixture components needs `combo_prior` for its update-step.")
+        return self._mixture_update(
+            input=input,
+            mean=mean,
+            cov=cov,
+            measured_mean=measured_mean,
+            measure_mat=measure_mat,
+            measure_cov=measure_cov,
+            measures=self.measures if val_idx is None else [self.measures[i] for i in val_idx.tolist()],
+            combo_prior=combo_prior,
+        )
+
+    def _prepare_update(self,
+                        input: torch.Tensor,
+                        measured_mean: torch.Tensor,
+                        measure_cov: torch.Tensor,
+                        **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Hook for subclasses to validate/adjust the inputs to the update step (e.g. ``BinomialFilter`` adjusts the
+        measure-covariance). Called exactly once per update-step, before the mixture update's effective combos; any
+        update-kwargs from ``_parse_kwargs`` are consumed here.
+
+        :return: A tuple of (possibly modified) ``input``, ``measured_mean``, ``measure_cov``.
+        """
         if kwargs:
             raise TypeError(f"`{type(self).__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
+        return input, measured_mean, measure_cov
+
+    def _kalman_update(self,
+                       input: torch.Tensor,
+                       mean: torch.Tensor,
+                       cov: torch.Tensor,
+                       measured_mean: torch.Tensor,
+                       measure_mat: torch.Tensor,
+                       measure_cov: torch.Tensor,
+                       measured_cov: Optional[torch.Tensor] = None,
+                       system_cov: Optional[torch.Tensor] = None,
+                       joseph: Optional[bool] = None) -> 'StateTuple':
+        """
+        The kalman-filter update equations. ``measured_cov`` (P @ H.T) and ``system_cov`` (H @ P @ H.T + R) can be
+        passed if already computed. ``joseph=False`` uses the simpler covariance update ``P - K @ H @ P`` instead of
+        the Joseph form: less memory and compute, but less numerically robust. Defaults to the model's
+        ``joseph_form``.
+
+        The tensors can have any number of leading batch-dimensions (``(G, ...)`` as usual, or e.g. ``(E, G, ...)``
+        for the mixture update's regime-combos), and broadcast against each other.
+        """
         resid = input - measured_mean
-        K = self._kalman_gain(cov=cov, H=measure_mat, R=measure_cov)
+        if measured_cov is None:
+            measured_cov = cov @ measure_mat.transpose(-1, -2)
+        if system_cov is None:
+            system_cov = measure_mat @ measured_cov + measure_cov
+        K = self._kalman_gain(measured_cov=measured_cov, system_cov=system_cov)
         new_mean = self._mean_update(mean=mean, K=K, resid=resid)
-        new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
-        return new_mean, new_cov
+        if joseph is None:
+            joseph = self.joseph_form
+        if joseph:
+            new_cov = self._covariance_update(cov=cov, K=K, H=measure_mat, R=measure_cov)
+        else:
+            new_cov = self._simple_covariance_update(cov=cov, K=K, H=measure_mat)
+        return StateTuple(new_mean, new_cov)
+
+    def _mixture_update(self,
+                        input: torch.Tensor,
+                        mean: torch.Tensor,
+                        cov: torch.Tensor,
+                        measured_mean: torch.Tensor,
+                        measure_mat: torch.Tensor,
+                        measure_cov: torch.Tensor,
+                        measures: Sequence[str],
+                        combo_prior: torch.Tensor) -> 'StateTuple':
+        """
+        Update step when there are mixture components. Each effective combo (aka hypothesis; see
+        ``MixtureModel.get_effective_combos``) offsets the measured-mean of measures in a non-standard regime by their
+        component's offset, and adds the component's variance to their measurement-noise. Each effective combo gets a
+        full kalman update; these are weighted by their posterior probability and collapsed via moment-matching.
+
+        :param measures: The measures in ``input`` (i.e. excluding any dropped because they were nan).
+        :param combo_prior: A ``(num_groups, num_combos)`` tensor with the prior probability of each combo (from the
+         regime-transition).
+        :return: The collapsed state, with ``combo_probs`` set to the ``(num_groups, num_combos)`` posterior.
+        """
+        log_prior = combo_prior.clamp_min(1e-30).log()
+
+        effective_combos, mapping = self.mixture.get_effective_combos(measures)
+        if len(effective_combos) == 1:
+            # no mixture measures observed, so observations are uninformative about the regime:
+            standard = self._kalman_update(
+                input=input,
+                mean=mean,
+                cov=cov,
+                measured_mean=measured_mean,
+                measure_mat=measure_mat,
+                measure_cov=measure_cov,
+            )
+            standard.combo_probs = log_prior.exp()
+            return standard
+
+        # the measures that score the combos: all but the non-gaussian ones (e.g. binary), whose gaussian approximation
+        # here is crude, and whose log-prob is computed separately from the gaussian measures' (so using their
+        # correlation here would be inconsistent with training).
+        score_idx = [i for i, m in enumerate(measures) if m not in self._non_gaussian_measures]
+        score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
+
+        # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective
+        # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
+        # broadcast.
+        shifts, extra_vars = zip(*(
+            self.mixture.get_combo_offsets(combo, measures, like=input) for combo in effective_combos
+        ))
+        shift = torch.stack(shifts).unsqueeze(1)  # (num_effective, 1, num_measures)
+        extra_cov = torch.diag_embed(torch.stack(extra_vars)).unsqueeze(1)  # (num_effective, 1, M, M)
+        measured_cov = cov @ measure_mat.transpose(-1, -2)
+        system_cov = measure_mat @ measured_cov + measure_cov + extra_cov  # (num_effective, G, M, M)
+        combo_input = input - shift  # (num_effective, G, M)
+        combo_measure_cov = measure_cov + extra_cov  # (num_effective, G, M, M)
+        # the standard combo (the first) uses the model's covariance-update; the others, the mixture's:
+        if self.joseph_form == self.mixture.joseph_form:
+            groups = [(slice(None), self.joseph_form)]
+        else:
+            groups = [(slice(0, 1), self.joseph_form), (slice(1, None), self.mixture.joseph_form)]
+        states = [
+            self._kalman_update(
+                input=combo_input[idx],
+                mean=mean,
+                cov=cov,
+                measured_mean=measured_mean,
+                measure_mat=measure_mat,
+                measure_cov=combo_measure_cov[idx],
+                measured_cov=measured_cov,
+                system_cov=system_cov[idx],
+                joseph=joseph,
+            )
+            for idx, joseph in groups
+        ]
+        log_liks = mvnorm_log_prob(
+            resid=(input - shift - measured_mean)[..., score_idx],
+            cov=system_cov[..., score_idx.unsqueeze(-1), score_idx.unsqueeze(0)]
+        ).T  # (G, num_effective)
+
+        # posterior over the full combo-table; combos that are indistinguishable given `measures` share a likelihood
+        log_post = log_prior + log_liks[:, mapping]
+        combo_post = torch.softmax(log_post, -1)
+        means, covs = zip(*states)  # (a StateTuple iterates as (mean, cov))
+        return self._collapse_states(
+            means=means[0] if len(means) == 1 else torch.cat(means),
+            covs=covs[0] if len(covs) == 1 else torch.cat(covs),
+            combo_post=combo_post,
+            mapping=mapping,
+        )
+
+    @staticmethod
+    def _collapse_states(means: torch.Tensor,
+                         covs: torch.Tensor,
+                         combo_post: torch.Tensor,
+                         mapping: torch.Tensor) -> 'StateTuple':
+        """
+        Collapse a mixture of gaussian states into a single gaussian via moment-matching.
+
+        :param means: A ``(num_effective, num_groups, state_rank)`` tensor: the (effective-combo) state-means to mix.
+        :param covs: A ``(num_effective, num_groups, state_rank, state_rank)`` tensor: their covariances.
+        :param combo_post: A ``(num_groups, num_combos)`` tensor of posterior probabilities over the full combo-table.
+        :param mapping: A ``(num_combos,)`` tensor mapping each combo to its index in ``means`` (combos that are
+         indistinguishable given the observed measures share a state).
+        :return: The collapsed state, with ``combo_probs`` set to ``combo_post``.
+        """
+        # the weight of each state is the total probability of the combos that map to it:
+        to = {'dtype': combo_post.dtype, 'device': combo_post.device}
+        weights = torch.zeros((combo_post.shape[0], means.shape[0]), **to)
+        weights = weights.index_add(1, mapping.to(combo_post.device), combo_post)  # (G, num_effective)
+        # the mixture's mean is the probability-weighted average of the states' means:
+        #   new_mean[g] = sum over e of weights[g, e] * means[e, g]
+        # (einsum's notation: g = group, e = effective combo, s = state-element; e is summed over since it's not in
+        # the output. same as `(weights.T[..., None] * means).sum(0)`, without the (E, G, S) intermediate product.)
+        new_mean = torch.einsum('ge,egs->gs', weights, means)
+        # its covariance is the weighted average of each state's covariance plus the outer product of its offset from
+        # the mixture's mean (the law of total variance):
+        #   new_cov[g] = sum over e of weights[g, e] * (covs[e, g] + diff[e, g] diff[e, g]^T)
+        # (here the einsum avoids a second (E, G, S, S) intermediate, which matters: this runs every update step.)
+        diff = means - new_mean
+        new_cov = torch.einsum('ge,egij->gij', weights, covs + diff.unsqueeze(-1) * diff.unsqueeze(-2))
+        return StateTuple(mean=new_mean, cov=new_cov, combo_probs=combo_post)
 
     @staticmethod
     def _covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-        I = torch.eye(cov.shape[1], dtype=cov.dtype, device=cov.device).unsqueeze(0)
+        I = torch.eye(cov.shape[-1], dtype=cov.dtype, device=cov.device)
         ikh = I - K @ H
-        return ikh @ cov @ ikh.permute(0, 2, 1) + K @ R @ K.permute(0, 2, 1)
+        return ikh @ cov @ ikh.transpose(-1, -2) + K @ R @ K.transpose(-1, -2)
 
     @staticmethod
-    def _kalman_gain(cov: torch.Tensor, H: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-        measured_cov = cov @ H.permute(0, 2, 1)
-        system_cov = H @ measured_cov + R
-        A = system_cov.permute(0, 2, 1)
-        B = measured_cov.permute(0, 2, 1)
-        Kt = torch.linalg.solve(A, B)
-        K = Kt.permute(0, 2, 1)
+    def _simple_covariance_update(cov: torch.Tensor, K: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+        new_cov = cov - K @ (H @ cov)
+        return .5 * (new_cov + new_cov.transpose(-1, -2))  # (symmetric in exact arithmetic)
+
+    @staticmethod
+    def _kalman_gain(measured_cov: torch.Tensor, system_cov: torch.Tensor) -> torch.Tensor:
+        A = system_cov.transpose(-1, -2)
+        B = measured_cov.transpose(-1, -2)
+        # (broadcast the batch-dims explicitly: if B had one fewer dim than A, `solve` would treat it as a batch of
+        # vectors rather than of matrices)
+        batch_shape = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+        Kt = torch.linalg.solve(A.expand(*batch_shape, *A.shape[-2:]), B.expand(*batch_shape, *B.shape[-2:]))
+        K = Kt.transpose(-1, -2)
         return K
 
     def _parse_kwargs(self,
@@ -132,3 +421,80 @@ class KalmanFilter(StateSpaceModel):
             predict_kwargs['Q'] = [Qs] * num_timesteps
 
         return predict_kwargs, update_kwargs, used_keys
+
+
+def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_common: float = 0.5):
+    from torchcast.process import LocalLevel
+    from torchcast.utils import TimeSeriesDataset
+    import pandas as pd
+    from plotnine import geom_line, aes, ggtitle, theme
+    torch.manual_seed(1234)
+
+    measures = ['dim1']
+    latent_common = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, 1)), dim=1)
+    latent_ind = torch.cumsum(.05 * torch.randn((num_groups, num_timesteps, len(measures))), dim=1)
+    assert 0 <= prop_common <= 1
+    latent = (
+            (1 - prop_common) * latent_ind  # per-measure trajectories
+            + prop_common * latent_common.expand(num_groups, num_timesteps, len(measures))  # cross-measure traj
+            + bias  # global bias
+            + torch.randn((num_groups, 1, len(measures)))  # group-level starting-points
+    )
+
+    y = []
+    for i, m in enumerate(measures):
+        y.append(torch.distributions.Normal(loc=latent[..., i], scale=.5).sample())
+        y[-1][torch.randn((num_groups, num_timesteps)) > 1.5] -= 5  # some random outliers
+        # y[-1][torch.randn((num_groups, num_timesteps)) > 1.5] = float('nan')  # some random missings
+    y = torch.stack(y, dim=-1)
+    # first tensor in dataset is observed
+    # second tensor is ground truth
+    dataset = TimeSeriesDataset(
+        y,
+        latent,
+        group_names=[f'group_{i}' for i in range(num_groups)],
+        start_times=[pd.Timestamp('2023-01-01')] * num_groups,
+        measures=[measures, [x.replace('dim', 'latent') for x in measures]],
+        dt_unit='D'
+    )
+
+    bf = KalmanFilter(
+        processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+        #          + [Season(id=f'season_{m}', measure=m, dt_unit='D', period=7, K=2) for m in measures]
+        ,
+        measures=measures,
+        mixture=[
+            MixtureComponent(measure='dim1', offset_init=-5, prob_init=0.1, id='dim1_low'),
+        ]
+    )
+
+    y = dataset.tensors[0]
+    bf.fit(y, start_offsets=dataset.start_offsets,
+           stopping={'monitor_params': True},
+           )
+    _kwargs = {}
+    preds = bf(
+        dataset.tensors[0],
+        start_offsets=dataset.start_offsets,
+        **_kwargs,
+    )
+    df_preds = preds.to_dataframe(dataset)
+    df_latent = (dataset.to_dataframe()
+                 .drop(columns=measures)
+                 .melt(id_vars=['group', 'time'], var_name='measure', value_name='latent')
+                 .assign(measure=lambda _df: _df['measure'].str.replace('latent', 'dim')))
+
+    df_plot = df_preds.merge(df_latent, how='left', on=['group', 'time', 'measure'])
+    # group.drop_duplicates().sample(5)
+    for g, _df in df_plot.query("group.isin(['group_2','group_41'])").groupby('group'):
+        (
+                preds.plot(_df)
+                + geom_line(aes(y='latent'), color='purple')
+                + ggtitle(g)
+                + theme(figure_size=(6, 4))
+        ).show()
+    print(bf.state_dict())
+
+
+if __name__ == '__main__':
+    main()
