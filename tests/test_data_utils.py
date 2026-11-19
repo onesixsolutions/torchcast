@@ -204,3 +204,31 @@ def test_tensor_to_dataframe_times_assigned_correctly():
     )
 
 
+
+
+def test_add_sensor_outages():
+    from torchcast.utils.datasets import _add_sensor_outages
+
+    n = 20_000
+    df = pd.DataFrame({
+        'station': np.repeat(['b', 'a'], n),  # (unsorted, to check rows/outages stay aligned)
+        'date': np.tile(pd.date_range('2000-01-01', periods=n), 2),
+        'PM2p5': 1.,
+        'PM10': 2.,
+        'other': 3.,
+    }).sample(frac=1., random_state=1)
+    kwargs = dict(cols=('PM2p5', 'PM10'), prob=.15, persistence=.9, corr=-.6, seed=123)
+    out = _add_sensor_outages(df, **kwargs)
+    assert out.equals(_add_sensor_outages(df, **kwargs))  # deterministic given seed
+    assert not df.isna().any().any()  # input untouched
+    assert out[['station', 'date']].equals(df.sort_values(['station', 'date'])[['station', 'date']].reset_index(drop=True))
+    assert not out['other'].isna().any()
+
+    is_out = out[['PM2p5', 'PM10']].isna().to_numpy()
+    assert np.allclose(is_out.mean(0), .15, atol=.03)
+    # negatively correlated, so both-down is rarer than independence:
+    assert is_out.all(1).mean() < .15 ** 2
+    # persistent within each station:
+    for _, g in out.groupby('station'):
+        x = g['PM10'].isna().to_numpy()
+        assert (x[1:] & x[:-1]).mean() / x[:-1].mean() > .6
