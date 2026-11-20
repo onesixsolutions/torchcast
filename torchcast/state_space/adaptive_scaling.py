@@ -111,9 +111,19 @@ class EWMAdaptiveScaler(AdaptiveScaler):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
-        # state-dicts saved by older versions have no extra-state; those params were fit with a running-init of 0:
+        # state-dicts saved by older versions have no extra-state; those params were fit with a running-init of 0. But
+        # so does a newer state-dict that lost its extra-state (e.g. filtered to tensors), and loading it with the old
+        # behavior silently changes the model's predictions -- so say so:
         extra_state_key = prefix + '_extra_state'
         if extra_state_key not in state_dict:
+            warnings.warn(
+                f"The state-dict has no '{extra_state_key}', so this `EWMAdaptiveScaler` is loaded with the behavior "
+                f"of torchcast < 1.2.0: its running mean of squared residuals starts at 0 instead of 1. That's right "
+                f"for a state-dict saved by an older version. If it was saved by torchcast >= 1.2.0 and lost its "
+                f"extra-state (e.g. it was filtered to tensors), include '{extra_state_key}' (from "
+                f"`state_dict()`) -- otherwise the loaded model's predictions will differ from the saved one's.",
+                stacklevel=2,
+            )
             state_dict = {**state_dict, extra_state_key: {'running_init': 0.0}}
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs

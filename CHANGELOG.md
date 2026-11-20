@@ -100,6 +100,10 @@ inflate the variance.
 
 ### Other changes
 
+- `load_state_dict()` warns when an `EWMAdaptiveScaler`'s state-dict has no `adaptive_scaling._extra_state`. It still
+  loads it with the pre-1.2.0 behavior (a running mean starting at 0), which is right for state-dicts saved by older
+  versions -- but a newer state-dict that lost that entry (e.g. filtered to tensors) silently got the old behavior too,
+  and different predictions.
 - `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of
   computing intervals; `Predictions.get_means(transform=..., use_map=...)` returns them as a
   `(num_groups, num_timesteps, num_measures)` tensor.
