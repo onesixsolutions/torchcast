@@ -518,6 +518,60 @@ def test_sample_outputs_chunked(nonlinear: bool, monkeypatch):
 
 
 @torch.no_grad()
+def test_output_seed():
+    """
+    Sample-based outputs' seed comes from ``torch.initial_seed()``: ``torch.manual_seed()`` controls them, repeated
+    calls agree (also across predictions objects), torch's global random state isn't drawn from, and a ``generator``
+    overrides the seed for one call.
+    """
+    from torchcast.utils.data import TimeSeriesDataset
+
+    torch.manual_seed(0)
+    model = BinomialFilter(
+        measures=['b', 'y'],
+        processes=[LocalLevel(id=f'lvl_{m}', measure=m) for m in ('b', 'y')],
+        binary_measures=['b'],
+    )
+    y = torch.cat([torch.randint(0, 2, (3, 8, 1)), torch.randn(3, 8, 1)], -1)
+    dataset = TimeSeriesDataset(
+        y, group_names=['g0', 'g1', 'g2'], start_times=[0] * 3, measures=[['b', 'y']], dt_unit=None
+    )
+    kwargs = {'use_map': False, 'num_samples': 20}
+
+    def get_means(seed: int) -> torch.Tensor:
+        pred = model(y)
+        torch.manual_seed(seed)  # (after predicting: the seed is only set when a sample-based output needs one)
+        return pred.get_means(**kwargs)
+
+    # torch.manual_seed controls them:
+    assert torch.equal(get_means(1), get_means(1))
+    assert not torch.equal(get_means(1), get_means(2))
+
+    # repeated calls agree, also across predictions objects (e.g. ``.means``, monte-carlo for a nonlinear model):
+    pred = model(y)
+    assert torch.equal(pred.means, model(y).means)
+    # ... without drawing from torch's global random state:
+    rng_state = torch.get_rng_state()
+    means = pred.get_means(**kwargs)
+    assert torch.equal(torch.get_rng_state(), rng_state)
+    # ... and once set, the same predictions keep their seed, even if torch is re-seeded:
+    torch.manual_seed(99)
+    assert torch.equal(pred.get_means(**kwargs), means)
+    df_own = pred.to_dataframe(dataset, conf=.9, **kwargs)
+    assert np.allclose(df_own.query("measure == 'b'")['mean'].values, means[..., 0].reshape(-1).numpy())
+
+    # a generator overrides the seed for that call only, for get_means and to_dataframe:
+    means_gen = pred.get_means(**kwargs, generator=_gen(7))
+    assert torch.equal(means_gen, model(y).get_means(**kwargs, generator=_gen(7)))
+    assert not torch.equal(means_gen, means)
+    df_gen = pred.to_dataframe(dataset, conf=.9, **kwargs, generator=_gen(7))
+    pd.testing.assert_frame_equal(df_gen, model(y).to_dataframe(dataset, conf=.9, **kwargs, generator=_gen(7)))
+    assert np.allclose(df_gen.query("measure == 'b'")['mean'].values, means_gen[..., 0].reshape(-1).numpy())
+    # (and the predictions' own seed is unchanged:)
+    assert torch.equal(pred.get_means(**kwargs), means)
+
+
+@torch.no_grad()
 def test_derived_mean_control_variates():
     # derived means use the measures (whose means are exact) as control variates: for a sum, the result is exact, even
     # with few samples -- the sum of the measures' back-transformed means (without bias_adjust, which `derived` ignores)

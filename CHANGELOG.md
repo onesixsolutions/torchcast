@@ -79,7 +79,7 @@ inflate the variance.
   `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
   `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
   `transform={'log_spend': LogTransform()}`. The derived means use the measures with exact means as control variates, which reduces their monte-carlo error (e.g. a sum of measures is exact). The functions should compute each group and timestep from its own values (not e.g. a total across groups).
-- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000), with a seed drawn at import so repeated calls agree. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
+- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000). Their seed comes from `torch.initial_seed()`: the seed last set by `torch.manual_seed()`, which makes them reproducible across processes, or else a random one fixed for the process. Either way, repeated calls within a process agree, and torch's global random state isn't drawn from. Or pass `generator=` (a `torch.Generator`) to `to_dataframe()` or `get_means()` for one call. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
 
 ### Behavior change: `simulate()`
 
