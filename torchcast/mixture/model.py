@@ -9,6 +9,10 @@ from torchcast.mixture.regime_transition import RegimeTransition
 
 RegimeType = Union[StandardRegime, MixtureComponent]
 
+# a floor on a latent class's probability-mass, when dividing by it (see ``MixtureModel._split_classes``): its cube is
+# still representable in float32 (whose smallest normal is ~1e-38)
+_CLASS_MASS_FLOOR = 1e-12
+
 
 class MixtureModel(torch.nn.Module):
     """
@@ -394,7 +398,12 @@ class MixtureModel(torch.nn.Module):
         """
         by_class = self._by_class(probs)
         class_mass = by_class.sum(-1, keepdim=True)
-        per_class_probs = (by_class / class_mass.clamp_min(1e-30)).flatten(0, 1)
+        # (the floor: a group can be (numerically) certain of its class, e.g. after many observations, so the other
+        # classes' masses underflow. The derivatives of the division involve the mass squared and cubed, so the floor
+        # must be large enough for those to be representable in float32 -- otherwise the gradient survives but the
+        # hessian is nan, e.g. for `newton_refine()`. Below the floor, a class's within-probabilities sum to less than
+        # one, but they're multiplied by its (even smaller) mass in `_merge_classes`.)
+        per_class_probs = (by_class / class_mass.clamp_min(_CLASS_MASS_FLOOR)).flatten(0, 1)
         return class_mass, per_class_probs
 
     @staticmethod
