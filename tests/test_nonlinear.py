@@ -239,6 +239,34 @@ def test_binomial_fit_recovers_probability():
     assert abs(mean_prob - true_prob) < .05
 
 
+def test_mc_sampling_seeded_by_torch():
+    """
+    A model's default monte-carlo noise (for the log-prob) is seeded from ``torch.initial_seed()``, so
+    ``torch.manual_seed()`` before creating the model makes a fit reproducible.
+    """
+    noise = lambda: FixedWhiteNoise(20)(3, torch.float32, torch.device('cpu'))
+    torch.manual_seed(1)
+    a = noise()
+    torch.manual_seed(1)
+    torch.rand(10)  # (it doesn't depend on torch's random state, only on the seed)
+    assert torch.equal(noise(), a)
+    torch.manual_seed(2)
+    assert not torch.equal(noise(), a)
+
+    y = (torch.rand(10, 20, 1) < .3).float()
+
+    def fit(seed: int) -> dict:
+        torch.manual_seed(seed)
+        bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['y'])
+        bf.mc_sampling = 50
+        bf.fit(y, stopping={'max_iter': 3}, verbose=0)
+        return {k: v.clone() for k, v in bf.state_dict().items() if torch.is_tensor(v)}
+
+    fit1, fit1_again, fit2 = fit(1), fit(1), fit(2)
+    assert all(torch.equal(fit1[k], fit1_again[k]) for k in fit1)
+    assert any(not torch.equal(fit1[k], fit2[k]) for k in fit1)
+
+
 # mixture components on measures with a nonlinear measurement --------------------------------------------------------
 
 # the 'low' component: an offset from the standard regime's (sigmoid) mean, with extra noise

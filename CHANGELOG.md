@@ -100,6 +100,10 @@ inflate the variance.
 
 ### Other changes
 
+- A model's default monte-carlo noise for the log-prob (`mc_sampling`, a `FixedWhiteNoise`) is seeded from
+  `torch.initial_seed()` instead of numpy's unseeded random state, so `torch.manual_seed()` before creating the model
+  makes a fit with a monte-carlo loss (e.g. a `BinomialFilter`'s) reproducible. Before, each model got different
+  noise, so refits of the same model on the same data landed at different parameters.
 - `load_state_dict()` warns when an `EWMAdaptiveScaler`'s state-dict has no `adaptive_scaling._extra_state`. It still
   loads it with the pre-1.2.0 behavior (a running mean starting at 0), which is right for state-dicts saved by older
   versions -- but a newer state-dict that lost that entry (e.g. filtered to tensors) silently got the old behavior too,
