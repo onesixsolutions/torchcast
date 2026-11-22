@@ -203,7 +203,7 @@ def test_state_dict_across_methods():
     with pytest.raises(RuntimeError, match=r"saved with method='sd_corr'"):
         lc2.load_state_dict(sc.state_dict())
     lr = Covariance(rank=3, init_diag_multi=1., method='low_rank')
-    with pytest.raises(RuntimeError, match=r"saved with method='low_rank'"):
+    with pytest.raises(RuntimeError, match=r"saved with method='low_rank1'"):  # (with the number of factors)
         Covariance(rank=3, init_diag_multi=1., method='sd_corr').load_state_dict(lr.state_dict())
 
 
@@ -853,13 +853,12 @@ def test_default_methods():
     big, small = _make_seasonal_processes(3), _make_seasonal_processes(2)
     cov = Covariance.from_processes(big, cov_type='initial')
     assert cov.method == 'low_rank' and cov.param_rank == 15 and cov.lr_mat.shape == (15, 3)
-    assert cov._default_method
     assert Covariance.from_processes(small, cov_type='initial').method == 'log_cholesky'
     # not with ``corr_groups``, nor for the process-covariance, nor when ``method`` is passed:
     assert Covariance.from_processes(big, cov_type='initial', corr_groups=[['level0']]).method == 'log_cholesky'
     assert Covariance.from_processes(big).method == 'log_cholesky'
     explicit = Covariance.from_processes(big, cov_type='initial', method='log_cholesky')
-    assert explicit.method == 'log_cholesky' and not explicit._default_method
+    assert explicit.method == 'log_cholesky'
     # stationary elements don't count:
     decaying = big + [LocalLevel(id='transient', measure='y0', decay=(.5, .95))]
     assert Covariance.from_processes(decaying, cov_type='initial').method == 'low_rank'
@@ -879,14 +878,14 @@ def test_default_methods():
     assert kf.process_covariance.method == 'log_cholesky'
 
 
-def test_default_method_loads_older_state_dicts():
+def test_older_default_state_dicts_raise_with_fix():
     torch.manual_seed(0)
     measures = [f'y{i}' for i in range(3)]
 
     def make(**kwargs) -> KalmanFilter:
         return KalmanFilter(processes=_make_seasonal_processes(3), measures=measures, **kwargs)
 
-    # saved under the old defaults: a full initial covariance, and (with > 5 measures) a low_rank measure-covariance
+    # saved under the old defaults: a full initial covariance (and, with > 5 measures, a low_rank measure-covariance)
     old = make(
         initial_covariance=Covariance.from_processes(
             _make_seasonal_processes(3), cov_type='initial', method='log_cholesky'
@@ -896,25 +895,32 @@ def test_default_method_loads_older_state_dicts():
     start_offsets = np.zeros(2, dtype='int')
     with torch.no_grad():
         old_pred = old(y, start_offsets=start_offsets)
+
+    # a model built with the new defaults raises, saying how to load it:
     new = make()
     assert new.initial_covariance.method == 'low_rank'
-    new.load_state_dict(old.state_dict())
-    assert new.initial_covariance.method == 'log_cholesky'
+    with pytest.raises(RuntimeError, match=r"from_processes\(\.\.\., method='log_cholesky'\).*torchcast 2\.0"):
+        new.load_state_dict(old.state_dict())
+    # following that, it loads with the same predictions:
+    fixed = make(
+        initial_covariance=Covariance.from_processes(
+            _make_seasonal_processes(3), cov_type='initial', method='log_cholesky'
+        )
+    )
+    fixed.load_state_dict(old.state_dict())
     with torch.no_grad():
-        new_pred = new(y, start_offsets=start_offsets)
+        new_pred = fixed(y, start_offsets=start_offsets)
     torch.testing.assert_close(new_pred.means, old_pred.means)
     torch.testing.assert_close(new_pred.covs, old_pred.covs)
 
+    # the message names the number of factors for low_rank:
     many = [f'y{i}' for i in range(7)]
     old_mcov = Covariance.from_measures(many, method='low_rank')
-    new_mcov = Covariance.from_measures(many)
-    new_mcov.load_state_dict(old_mcov.state_dict())
-    assert new_mcov.method == 'low_rank'
-    torch.testing.assert_close(new_mcov._get_mini_cov(), old_mcov._get_mini_cov())
-
-    # but an explicitly chosen method still raises:
-    with pytest.raises(RuntimeError, match="saved with method='low_rank'"):
-        Covariance.from_measures(many, method='log_cholesky').load_state_dict(old_mcov.state_dict())
+    with pytest.raises(RuntimeError, match=r"from_measures\(\.\.\., method='low_rank2'\)"):
+        Covariance.from_measures(many).load_state_dict(old_mcov.state_dict())
+    fixed_mcov = Covariance.from_measures(many, method='low_rank2')
+    fixed_mcov.load_state_dict(old_mcov.state_dict())
+    torch.testing.assert_close(fixed_mcov._get_mini_cov(), old_mcov._get_mini_cov())
 
 
 def test_prepare_for_hessian_hook(monkeypatch):

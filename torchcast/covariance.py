@@ -107,8 +107,7 @@ class Covariance(nn.Module):
         :param method: The parameterization, see :func:`Covariance.__init__`. If not given: "low_rank" for an initial
          covariance with 15 or more elements with parameters (not counting ``stationary`` ones) and no
          ``corr_groups``/``corr_mask``, since it's weakly informed (mainly by the start of each series) and grows
-         quadratically with the state; otherwise "log_cholesky". (When the method is chosen this way, loading a
-         state-dict saved with another method switches to that method, e.g. for models saved under older defaults.)
+         quadratically with the state; otherwise "log_cholesky".
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
@@ -148,8 +147,7 @@ class Covariance(nn.Module):
                     nonstationary_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
 
-        default_method = method is None
-        if default_method:
+        if method is None:
             # a large initial covariance is weakly informed (mainly by the start of each series) and grows quadratically
             # with the state, so by default it's a factor model:
             param_rank = state_rank - len(no_cov_idx) - len(stationary_idx)
@@ -171,7 +169,7 @@ class Covariance(nn.Module):
             kwargs['stationary_idx'] = stationary_idx
         if nonstationary_idx:
             kwargs['nonstationary_idx'] = nonstationary_idx
-        out = cls(
+        return cls(
             rank=state_rank,
             empty_idx=no_cov_idx,
             id=f'{cov_type}_covariance',
@@ -179,8 +177,6 @@ class Covariance(nn.Module):
             method=method,
             **kwargs
         )
-        out._default_method = default_method
-        return out
 
     @classmethod
     def from_measures(cls,
@@ -199,9 +195,7 @@ class Covariance(nn.Module):
          ``(num_groups, num_times, len(measures))``.
         :param corr_groups: Optionally, groups of measures that are uncorrelated with those in other groups; measures
          not in any group form one more group together. See :func:`Covariance.from_processes`.
-        :param method: The parameterization, see :func:`Covariance.__init__`. If not given, "log_cholesky". (When the
-         method is chosen this way, loading a state-dict saved with another method switches to that method, e.g. for
-         models saved under older defaults.)
+        :param method: The parameterization, see :func:`Covariance.__init__`. If not given, "log_cholesky".
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
@@ -216,8 +210,7 @@ class Covariance(nn.Module):
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
             kwargs['corr_mask'] = _corr_groups_to_mask(element_ids=list(measures), corr_groups=corr_groups,
                                                        kind='measure')
-        default_method = method is None
-        if default_method:
+        if method is None:
             method = 'log_cholesky'
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
@@ -227,11 +220,9 @@ class Covariance(nn.Module):
             if 'expected_kwargs' not in kwargs:
                 kwargs['expected_kwargs'] = [f'measure_var_multi']
 
-        out = cls(
+        return cls(
             rank=len(measures), id='measure_covariance', predict_variance=predict_variance, method=method, **kwargs
         )
-        out._default_method = default_method
-        return out
 
     def __init__(self,
                  rank: int,
@@ -321,9 +312,6 @@ class Covariance(nn.Module):
             self.register_buffer('corr_mask', self._validate_corr_mask(corr_mask, rank=self.rank))
 
         self._set_params(method, init_diag_multi)
-        # whether ``method`` was chosen by default (by ``from_processes()``/``from_measures()``); if so, a state-dict
-        # saved with another method (e.g. under an older default) is loaded by switching to that method:
-        self._default_method = False
 
         self.var_predict_module = predict_variance
 
@@ -493,17 +481,18 @@ class Covariance(nn.Module):
         expected = set(_METHOD_PARAMS.get(self.method, ()))
         if not expected <= present:
             saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
-            if saved_with and getattr(self, '_default_method', False):
-                # the method was a default, which may have changed since the state-dict was saved: use the saved one
-                method = saved_with[0]
-                if method == 'low_rank':
-                    method = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
-                self._set_params(method, init_diag_multi=1.)
-            elif saved_with:
+            if saved_with:
+                saved = saved_with[0]
+                if saved == 'low_rank':
+                    saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
                 error_msgs.append(
                     f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
-                    f"with method='{saved_with[0]}'. Load it into a module with method='{saved_with[0]}', then "
-                    f"convert with ``.to_method('{self.method}')``."
+                    f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
+                    f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
+                    f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
+                    f"(torchcast 2.0 changed the default methods: \"low_rank\" for an initial covariance with "
+                    f"{LOW_RANK_MIN_INITIAL} or more elements with parameters, and \"log_cholesky\" for every "
+                    f"measure-covariance.)"
                 )
                 return
         self._pack_saved_off_diag(state_dict, prefix)
@@ -532,7 +521,6 @@ class Covariance(nn.Module):
         # (pickled before these existed)
         self.__dict__.setdefault('stationary_idx', [])
         self.__dict__.setdefault('nonstationary_idx', [])
-        self.__dict__.setdefault('_default_method', False)
         # pickled before a binary ``corr_mask`` applied to the cholesky factor: see ``_pack_saved_off_diag()``
         keep = self._get_off_diag_keep()
         if keep is None or bool(keep.all()):
@@ -702,7 +690,6 @@ class Covariance(nn.Module):
         """
         out = copy.deepcopy(self)
         out._set_params(method, init_diag_multi=1.0)
-        out._default_method = False
         return out.set_matrix_(self._get_mini_cov().detach())
 
     def get_param_idx(self, i: int) -> int:
