@@ -129,7 +129,7 @@ class Covariance(nn.Module):
         if corr_groups is not None:
             if 'corr_mask' in kwargs:
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
-            kwargs['corr_mask'] = _corr_groups_to_mask(
+            kwargs['corr_mask'] = cls._corr_groups_to_mask(
                 element_ids=[p.id for p in processes for _ in p.state_elements],
                 corr_groups=corr_groups,
                 kind='process id'
@@ -210,8 +210,9 @@ class Covariance(nn.Module):
         if corr_groups is not None:
             if 'corr_mask' in kwargs:
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
-            kwargs['corr_mask'] = _corr_groups_to_mask(element_ids=list(measures), corr_groups=corr_groups,
-                                                       kind='measure')
+            kwargs['corr_mask'] = cls._corr_groups_to_mask(
+                element_ids=list(measures), corr_groups=corr_groups, kind='measure'
+            )
         if method is None:
             method = 'log_cholesky'
         if 'init_diag_multi' not in kwargs:
@@ -225,6 +226,31 @@ class Covariance(nn.Module):
         return cls(
             rank=len(measures), id='measure_covariance', predict_variance=predict_variance, method=method, **kwargs
         )
+
+    @staticmethod
+    def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
+        """
+        A ``corr_mask`` from ``corr_groups`` (see :func:`Covariance.from_processes`).
+
+        :param element_ids: For each element (row/column) of the covariance, the id it's grouped by (e.g. its process's
+         id); can repeat.
+        :param corr_groups: Groups of ids. Ids not in any group form one more group together.
+        :param kind: What the ids are, for error messages.
+        """
+        if isinstance(corr_groups, str) or any(isinstance(g, str) for g in corr_groups):
+            raise TypeError(f"``corr_groups`` should be a list of lists of {kind}s, e.g. ``[['a', 'b']]``.")
+        known = list(dict.fromkeys(element_ids))
+        group_of = {}
+        for g, ids in enumerate(corr_groups):
+            for id_ in ids:
+                if id_ not in known:
+                    raise ValueError(f"``corr_groups`` has unknown {kind} '{id_}'; expected one of {known}.")
+                if id_ in group_of:
+                    raise ValueError(f"``corr_groups`` has {kind} '{id_}' in more than one group.")
+                group_of[id_] = g
+        rest = len(corr_groups)
+        groups = torch.tensor([group_of.get(id_, rest) for id_ in element_ids])
+        return (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
 
     def __init__(self,
                  rank: int,
@@ -311,7 +337,7 @@ class Covariance(nn.Module):
         self.register_buffer('mask', mask)
 
         if corr_mask is not None:
-            self.register_buffer('corr_mask', _validate_corr_mask(corr_mask, rank=self.rank))
+            self.register_buffer('corr_mask', self._validate_corr_mask(corr_mask, rank=self.rank))
 
         self._set_params(method, init_diag_multi)
 
@@ -322,6 +348,22 @@ class Covariance(nn.Module):
         if isinstance(expected_kwargs, str):
             expected_kwargs = [expected_kwargs]
         self.expected_kwargs: Optional[List[str]] = None if expected_kwargs is None else list(expected_kwargs)
+
+    @staticmethod
+    def _validate_corr_mask(corr_mask: Tensor, rank: int) -> Tensor:
+        corr_mask = torch.as_tensor(corr_mask, dtype=torch.get_default_dtype()).detach().clone()
+        if corr_mask.shape != (rank, rank):
+            raise ValueError(f"Expected ``corr_mask`` to have shape {(rank, rank)}, got {tuple(corr_mask.shape)}.")
+        if not torch.equal(corr_mask, corr_mask.t()):
+            raise ValueError("``corr_mask`` must be symmetric.")
+        if not (corr_mask.diagonal() == 1).all():
+            raise ValueError("``corr_mask`` must have ones on the diagonal.")
+        if torch.linalg.eigvalsh(corr_mask.to(torch.float64)).min() < -1e-8:
+            raise ValueError(
+                "``corr_mask`` must be positive semi-definite (otherwise the masked covariance may not be), e.g. a "
+                "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
+            )
+        return corr_mask
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -436,7 +478,10 @@ class Covariance(nn.Module):
         off_diag = self.cholesky_off_diag if self.method == 'log_cholesky' else self.corr_unconstrained
         assert off_diag is not None
         keep = self._get_off_diag_keep()
-        return off_diag if keep is None else _unpack_off_diag(off_diag, keep)
+        if keep is None:
+            return off_diag
+        free = keep.nonzero().squeeze(-1).to(off_diag.device)
+        return off_diag.new_zeros(keep.shape).index_put((free,), off_diag)
 
     def _get_binary_mini_mask(self) -> Optional[Tensor]:
         """
@@ -736,12 +781,6 @@ def num_off_diag(rank: int) -> int:
     return int(rank * (rank - 1) / 2)
 
 
-def _unpack_off_diag(packed: Tensor, keep: Tensor) -> Tensor:
-    """Scatter ``packed`` into the positions where ``keep`` is non-zero, with zeros elsewhere."""
-    free = keep.nonzero().squeeze(-1).to(packed.device)
-    return packed.new_zeros(keep.shape).index_put((free,), packed)
-
-
 def _log_cosh(x: Tensor) -> Tensor:
     # stable for large |x|, and smooth (exact second derivative at 0, unlike formulas using abs(x))
     return x + F.softplus(-2. * x) - math.log(2.)
@@ -803,47 +842,6 @@ def _cholesky(cov: Tensor) -> Tensor:
 def cov2corr(cov: Tensor) -> Tensor:
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
     return cov / (std_.unsqueeze(-1) * std_.unsqueeze(-2))
-
-
-def _validate_corr_mask(corr_mask: Tensor, rank: int) -> Tensor:
-    corr_mask = torch.as_tensor(corr_mask, dtype=torch.get_default_dtype()).detach().clone()
-    if corr_mask.shape != (rank, rank):
-        raise ValueError(f"Expected ``corr_mask`` to have shape {(rank, rank)}, got {tuple(corr_mask.shape)}.")
-    if not torch.equal(corr_mask, corr_mask.t()):
-        raise ValueError("``corr_mask`` must be symmetric.")
-    if not (corr_mask.diagonal() == 1).all():
-        raise ValueError("``corr_mask`` must have ones on the diagonal.")
-    if torch.linalg.eigvalsh(corr_mask.to(torch.float64)).min() < -1e-8:
-        raise ValueError(
-            "``corr_mask`` must be positive semi-definite (otherwise the masked covariance may not be), e.g. a "
-            "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
-        )
-    return corr_mask
-
-
-def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
-    """
-    A ``corr_mask`` from ``corr_groups`` (see :func:`Covariance.from_processes`).
-
-    :param element_ids: For each element (row/column) of the covariance, the id it's grouped by (e.g. its process's
-     id); can repeat.
-    :param corr_groups: Groups of ids. Ids not in any group form one more group together.
-    :param kind: What the ids are, for error messages.
-    """
-    if isinstance(corr_groups, str) or any(isinstance(g, str) for g in corr_groups):
-        raise TypeError(f"``corr_groups`` should be a list of lists of {kind}s, e.g. ``[['a', 'b']]``.")
-    known = list(dict.fromkeys(element_ids))
-    group_of = {}
-    for g, ids in enumerate(corr_groups):
-        for id_ in ids:
-            if id_ not in known:
-                raise ValueError(f"``corr_groups`` has unknown {kind} '{id_}'; expected one of {known}.")
-            if id_ in group_of:
-                raise ValueError(f"``corr_groups`` has {kind} '{id_}' in more than one group.")
-            group_of[id_] = g
-    rest = len(corr_groups)
-    groups = torch.tensor([group_of.get(id_, rest) for id_ in element_ids])
-    return (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
 
 
 def _get_pivot_order(V: Tensor) -> List[int]:
