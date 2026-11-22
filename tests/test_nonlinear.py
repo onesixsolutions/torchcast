@@ -598,6 +598,19 @@ def test_post_hoc_correction_auto_in_fit(num_obs, expected):
     bf(y, **kwargs)
 
 
+def test_post_hoc_correction_kept_across_fits():
+    # fitting a model whose correction is already chosen (explicitly, or by an earlier fit) keeps it
+    torch.manual_seed(0)
+    y = (torch.rand(3, 10, 1) > .5).float()
+    for mode in ('static', 'num_obs', 'auto'):
+        bf = _make_binomial(do_post_hoc_correction=mode)
+        bf.fit(y, stopping={'max_iter': 1}, verbose=0)
+        module = bf.post_correction_module
+        assert module is not None
+        bf.fit(y, stopping={'max_iter': 1}, verbose=0, set_initial_values=False)
+        assert bf.post_correction_module is module
+
+
 def test_post_hoc_correction_loading():
     import pickle
     torch.manual_seed(0)

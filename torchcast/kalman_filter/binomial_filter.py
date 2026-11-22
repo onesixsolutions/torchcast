@@ -30,20 +30,12 @@ class BinomialFilter(KalmanFilter):
     :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
     :param binary_measures: A subset of ``measures`` with binary (binomial) outcomes.
     :param observed_counts: If True, then ``y`` is interpreted as counts; if False then as probabilities 0-1.
-    :param do_post_hoc_correction: Whether and how to correct the binary residuals during the update step, to
-     compensate for the linearization error introduced by the EKF approximation; the correction's sharpness is
-     learned. One of:
-
-     - ``'static'``: one learned sharpness.
-     - ``'num_obs'``: a learned sharpness that also changes with ``log(num_obs)`` (a learned slope). Only use this
-       when ``num_obs`` varies in the data: otherwise the slope can't be identified (with ``num_obs=1``, as for
-       binary data, it has no effect at all).
-     - ``'auto'`` (the default): ``'static'`` or ``'num_obs'``, chosen by :func:`BinomialFilter.fit` from whether the
-       ``num_obs`` passed to it varies. Calling the model before that (e.g. when training with your own loop) raises
-       an error asking you to choose; loading a state-dict also chooses, to match the saved parameters.
-     - ``'none'``: no correction.
-
-     ``True`` and ``False`` are deprecated (with a warning), meaning ``'auto'`` and ``'none'``.
+    :param do_post_hoc_correction: ``BinomialFilter`` uses the EKF approximation, which isn't terribly accurate for
+     binomial data, especially when ``num_obs`` is low. This option allows the module to apply a correction factor for
+     the filter, learned from the data. If 'static', then a single correction-factor is applied to all data; if
+     'num_obs', it changes with ``log(num_obs)`` (a learned slope, only use if ``num_obs`` varies in your data); if
+     'auto' (the default), then 'static' or 'num_obs' will be chosen at fit time, depending on whether the provided
+     data has varying ``num_obs``; if ``'none'`` then no correction.
     :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
     :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
     :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
@@ -102,10 +94,9 @@ class BinomialFilter(KalmanFilter):
             raise ValueError(
                 f"``do_post_hoc_correction`` should be one of {_POST_HOC_CORRECTIONS}, got {do_post_hoc_correction!r}."
             )
-        self.post_correction_module: Optional[torch.nn.Module] = None
-        self._set_post_hoc_correction(do_post_hoc_correction)
+        self.post_correction_module = self._set_post_hoc_correction(do_post_hoc_correction)
 
-    def _set_post_hoc_correction(self, mode: str):
+    def _set_post_hoc_correction(self, mode: str) -> torch.nn.Module:
         """Set ``post_hoc_correction`` and create its parameters (with the device and dtype of the others)."""
         self.post_hoc_correction = mode
         param = next(self.parameters(), None)
@@ -119,17 +110,20 @@ class BinomialFilter(KalmanFilter):
             module = _StaticCorrection(**fkw)
         else:
             module = None
-        self.post_correction_module = module
+        return module
 
-    def _resolve_post_hoc_correction(self, num_obs: Union[torch.Tensor, int, None]):
-        """For ``'auto'``: choose ``'num_obs'`` if ``num_obs`` varies, else ``'static'``."""
+    def _resolve_post_hoc_correction(self, num_obs: Union[torch.Tensor, int, None]) -> Optional[torch.nn.Module]:
+        """
+        For ``'auto'``: choose ``'num_obs'`` if ``num_obs`` varies, else ``'static'``, and return its (new) module.
+        Otherwise (already chosen), return the existing module.
+        """
         if self.post_hoc_correction != 'auto':
-            return
+            return self.post_correction_module
         varies = False
         if isinstance(num_obs, torch.Tensor):
             values = num_obs[torch.isfinite(num_obs)]
             varies = values.numel() > 0 and bool((values != values.reshape(-1)[0]).any())
-        self._set_post_hoc_correction('num_obs' if varies else 'static')
+        return self._set_post_hoc_correction('num_obs' if varies else 'static')
 
     def fit(self, y: torch.Tensor, **kwargs) -> 'BinomialFilter':
         """
@@ -140,7 +134,7 @@ class BinomialFilter(KalmanFilter):
         callable_kwargs = kwargs.get('callable_kwargs') or {}
         if 'num_obs' in callable_kwargs:
             num_obs = callable_kwargs['num_obs']()
-        self._resolve_post_hoc_correction(num_obs)
+        self.post_correction_module = self._resolve_post_hoc_correction(num_obs)
         return super().fit(y, **kwargs)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
@@ -151,7 +145,7 @@ class BinomialFilter(KalmanFilter):
         saved_mode = 'num_obs' if 'post_correction_module.weight' in saved else \
             'static' if 'post_correction_module.bias' in saved else 'none'
         if self.post_hoc_correction == 'auto':
-            self._set_post_hoc_correction(saved_mode)
+            self.post_correction_module = self._set_post_hoc_correction(saved_mode)
         elif self.post_hoc_correction != saved_mode and (strict or saved_mode != 'none'):
             error_msgs.append(
                 f"The model has ``do_post_hoc_correction='{self.post_hoc_correction}'``, but the state-dict was saved "
