@@ -1,4 +1,5 @@
 import math
+import pickle
 import warnings
 from typing import Optional
 
@@ -479,3 +480,128 @@ def test_stationary_initial_variance_default_unchanged():
         icov = kf.initial_covariance({}, num_groups=1, num_times=1).squeeze()
         scale2 = kf._get_measure_scaling()[0] ** 2
         torch.testing.assert_close(kf._default_initial_cov().squeeze(0), icov * scale2)
+
+
+def _make_masked_cov(method: str) -> Covariance:
+    # elements 0, 3 in one group, 1, 4 in another; 2 has no variance:
+    groups = torch.tensor([0, 1, 0, 0, 1])
+    corr_mask = (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
+    return Covariance(rank=5, init_diag_multi=.5, method=method, empty_idx=[2], corr_mask=corr_mask)
+
+
+def _get_masked_pairs(cov: Covariance) -> torch.Tensor:
+    return (cov._get_off_diag_keep() == 0).nonzero().squeeze(-1)
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+def test_corr_mask_masks_factor(method: str):
+    torch.manual_seed(0)
+    cov = _make_masked_cov(method)
+    off_diag_name = 'cholesky_off_diag' if method == 'log_cholesky' else 'corr_unconstrained'
+    off_diag = getattr(cov, off_diag_name)
+    masked = _get_masked_pairs(cov)
+    assert len(masked) == 4  # (0 or 3) x (1 or 4), among the non-empty elements
+    assert (off_diag[masked] == 0).all()
+
+    # masked factor entries get exactly zero gradient, from the whole covariance:
+    mini_cov = cov._get_mini_cov()
+    (mini_cov * torch.randn_like(mini_cov)).sum().backward()
+    assert (off_diag.grad[masked] == 0).all()
+    keep = torch.ones_like(off_diag, dtype=torch.bool)
+    keep[masked] = False
+    assert (off_diag.grad[keep] != 0).all()
+
+    # and changing them doesn't change the covariance (no redundant directions):
+    with torch.no_grad():
+        off_diag[masked] = 1.
+    torch.testing.assert_close(cov._get_mini_cov(), mini_cov.detach(), rtol=0, atol=0)
+
+    # e.g. with ``corr_groups`` in a model:
+    processes = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
+    pcov = Covariance.from_processes(processes, corr_groups=[['transient']], method=method)
+    assert (getattr(pcov, off_diag_name) == 0).all()
+    pcov({}, num_groups=1, num_times=1).sum().backward()
+    assert (getattr(pcov, off_diag_name).grad == 0).all()
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+def test_corr_mask_representable_covs_unchanged(method: str):
+    torch.manual_seed(1)
+    cov = _make_masked_cov(method)
+    idx = cov.non_empty_idx
+    mini_mask = cov.corr_mask[idx][:, idx]
+    A = torch.randn(4, 6, dtype=torch.float64)
+    target = (A @ A.t() + torch.eye(4, dtype=torch.float64)) * mini_mask.to(torch.float64)
+    cov.set_matrix_(target)
+    torch.testing.assert_close(cov._get_mini_cov().detach().to(torch.float64), target, rtol=1e-5, atol=1e-6)
+    off_diag = cov._get_off_diag(masked=False)
+    assert (off_diag[_get_masked_pairs(cov)] == 0).all()
+
+
+def _make_old_style(cov: Covariance) -> torch.Tensor:
+    """Give ``cov`` non-zero masked factor entries, as fitted before the factor was masked; return its old cov."""
+    off_diag = cov._get_off_diag(masked=False)
+    with torch.no_grad():
+        off_diag[_get_masked_pairs(cov)] = torch.tensor([.3, -.2, .5, .1])
+    return cov._get_mini_cov(_mask_factor=False).detach()
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+def test_corr_mask_loads_old_state_dict(method: str):
+    torch.manual_seed(2)
+    old = _make_masked_cov(method)
+    old_cov = _make_old_style(old)
+    # (the old covariance differs from what the new code would compute from the same parameters:)
+    assert not torch.allclose(old._get_mini_cov().detach(), old_cov)
+
+    state_dict = old.state_dict()
+    state_dict._metadata[''] = {'version': 1}
+    new = _make_masked_cov(method)
+    new.load_state_dict(state_dict)
+    torch.testing.assert_close(new._get_mini_cov().detach(), old_cov)
+    assert (new._get_off_diag(masked=False)[_get_masked_pairs(new)] == 0).all()
+
+    # a current state-dict loads as is:
+    new2 = _make_masked_cov(method)
+    new2.load_state_dict(new.state_dict())
+    torch.testing.assert_close(new2._get_mini_cov(), new._get_mini_cov(), rtol=0, atol=0)
+
+    # pickled before the change (no ``_factor_masked``):
+    old2 = _make_masked_cov(method)
+    old_cov2 = _make_old_style(old2)
+    del old2._factor_masked
+    unpickled = pickle.loads(pickle.dumps(old2))
+    torch.testing.assert_close(unpickled._get_mini_cov().detach(), old_cov2)
+    assert unpickled._factor_masked
+
+
+def test_corr_mask_old_model_same_predictions(monkeypatch):
+    torch.manual_seed(3)
+    processes = [
+        LocalLevel(id='level', measure='y'),
+        LocalLevel(id='transient', measure='y', decay=(.5, .95), stationary_initial_variance=True)
+    ]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=['y'],
+        process_covariance=Covariance.from_processes(processes, corr_groups=[['transient']])
+    )
+    y = torch.randn(2, 15, 1)
+    # emulate the old behavior (mask only applied to the covariance), with non-zero masked factor entries:
+    with monkeypatch.context() as m:
+        m.setattr(Covariance, '_get_off_diag_keep', lambda self: None)
+        with torch.no_grad():
+            kf.process_covariance.cholesky_off_diag.fill_(.4)
+        with torch.no_grad():
+            old_pred = kf(y)
+        state_dict = kf.state_dict()
+    state_dict._metadata['process_covariance']['version'] = 1
+    # (without converting, the new code gives different predictions from the same parameters:)
+    with torch.no_grad():
+        assert not torch.allclose(kf(y).covs, old_pred.covs)
+
+    kf.load_state_dict(state_dict)
+    with torch.no_grad():
+        new_pred = kf(y)
+    torch.testing.assert_close(new_pred.means, old_pred.means)
+    torch.testing.assert_close(new_pred.covs, old_pred.covs)

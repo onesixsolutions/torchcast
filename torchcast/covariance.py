@@ -57,6 +57,9 @@ class Covariance(nn.Module):
 
     """
 
+    # version 2: a binary ``corr_mask`` also masks the cholesky factor (see ``_load_from_state_dict``)
+    _version = 2
+
     @classmethod
     def from_processes(cls,
                        processes: Sequence[Process],
@@ -209,7 +212,14 @@ class Covariance(nn.Module):
          diagonal, and positive semi-definite, which guarantees the masked covariance is too (Schur product theorem).
          For the typical case, groups of elements that are uncorrelated with each other, it's easier to pass
          ``corr_groups`` to :func:`Covariance.from_processes` or :func:`Covariance.from_measures`, which builds
-         this. The parameters for masked-out entries are still there but get no gradient.
+         this. For a mask of zeros and ones (which, being positive semi-definite, is always such a grouping, up to the
+         order of elements), "log_cholesky" and "sd_corr" apply it to the cholesky factor too (to the correlation's
+         cholesky factor for "sd_corr"): the factor's entries for masked-out pairs are fixed at zero (they're still
+         parameters, but always zero, with zero gradient), so they can't feed the variances or other correlations.
+         This loses nothing: a covariance that's zero across groups has a cholesky factor that's zero there too. With
+         other masks (e.g. entries of 0.5), and with "low_rank" (whose parameters are redundant anyway: only
+         ``lr_mat @ lr_mat.t()`` matters), the mask only applies to the covariance, and the parameters for masked-out
+         entries are redundant (they don't change the masked covariance's zeros, but do change its other entries).
         """
 
         super().__init__()
@@ -227,6 +237,8 @@ class Covariance(nn.Module):
             self.register_buffer('corr_mask', self._validate_corr_mask(corr_mask, rank=self.rank))
 
         self._set_params(method, init_diag_multi)
+        # (see ``__setstate__``: modules from before the factor was masked are converted when unpickled)
+        self._factor_masked = True
 
         self.var_predict_module = predict_variance
 
@@ -256,6 +268,27 @@ class Covariance(nn.Module):
             )
         return corr_mask
 
+    def _get_off_diag_keep(self) -> Optional[Tensor]:
+        """
+        For a binary ``corr_mask`` and a cholesky-based ``method``: the mask for the off-diagonal parameters
+        (``cholesky_off_diag`` or ``corr_unconstrained``), in their ``tril_indices`` order. ``None`` otherwise.
+        """
+        corr_mask = getattr(self, 'corr_mask', None)
+        if corr_mask is None or self.method not in ('log_cholesky', 'sd_corr'):
+            return None
+        if not ((corr_mask == 0) | (corr_mask == 1)).all():
+            return None
+        idx = self.non_empty_idx
+        mini_mask = corr_mask[idx][:, idx]
+        rows, cols = torch.tril_indices(len(idx), len(idx), offset=-1).to(mini_mask.device)
+        return mini_mask[rows, cols]
+
+    def _get_off_diag(self, masked: bool = True) -> Tensor:
+        """The off-diagonal parameters (``cholesky_off_diag`` or ``corr_unconstrained``), with masked pairs zeroed."""
+        off_diag = self.cholesky_off_diag if self.method == 'log_cholesky' else self.corr_unconstrained
+        assert off_diag is not None
+        keep = self._get_off_diag_keep() if masked else None
+        return off_diag if keep is None else off_diag * keep
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -286,6 +319,10 @@ class Covariance(nn.Module):
             )
         else:
             raise NotImplementedError(method)
+        keep = self._get_off_diag_keep()
+        if keep is not None:
+            with torch.no_grad():
+                getattr(self, _METHOD_PARAMS[self.method][1]).mul_(keep)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
@@ -302,9 +339,36 @@ class Covariance(nn.Module):
                     f"convert with ``.to_method('{self.method}')``."
                 )
                 return
+        num_errors = len(error_msgs), len(missing_keys)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
+        # state-dicts saved before the cholesky factor was masked (version < 2) can have non-zero masked entries that
+        # fed the in-group variances/correlations; convert to the same covariance with those entries at zero:
+        loaded = (len(error_msgs), len(missing_keys)) == num_errors
+        if loaded and (local_metadata.get('version') or 1) < 2:
+            self._convert_unmasked_factor_()
+
+    def __setstate__(self, state: dict):
+        super().__setstate__(state)
+        if not state.get('_factor_masked', False):
+            # (pickled before the cholesky factor was masked: see ``_load_from_state_dict``)
+            self._convert_unmasked_factor_()
+            self._factor_masked = True
+
+    @torch.no_grad()
+    def _convert_unmasked_factor_(self):
+        """
+        Re-parameterize a module whose masked factor entries may be non-zero (from before they were masked), keeping
+        its covariance unchanged: set it from the covariance computed the old way, with the factor unmasked.
+        """
+        keep = self._get_off_diag_keep()
+        if keep is None:
+            return
+        off_diag = getattr(self, _METHOD_PARAMS[self.method][1])
+        if (off_diag * (1 - keep)).abs().max() == 0:
+            return
+        self.set_matrix_(self._get_mini_cov(_mask_factor=False))
 
     @jit.ignore
     def set_id(self, id: str) -> 'Covariance':
@@ -325,17 +389,15 @@ class Covariance(nn.Module):
         L2[mask[0], mask[1]] = off_diag
         return L1 + L2
 
-    def _get_mini_cov(self) -> Tensor:
+    def _get_mini_cov(self, _mask_factor: bool = True) -> Tensor:
         if self.method == 'log_cholesky':
             assert self.cholesky_log_diag is not None
-            assert self.cholesky_off_diag is not None
-            L = self.log_chol_to_chol(self.cholesky_log_diag, self.cholesky_off_diag)
+            L = self.log_chol_to_chol(self.cholesky_log_diag, self._get_off_diag(masked=_mask_factor))
             mini_cov = L @ L.t()
         elif self.method == 'sd_corr':
             assert self.log_std_devs is not None
-            assert self.corr_unconstrained is not None
             L = self.log_std_devs.exp().unsqueeze(-1) * corr_cholesky_from_unconstrained(
-                self.corr_unconstrained, rank=self.param_rank
+                self._get_off_diag(masked=_mask_factor), rank=self.param_rank
             )
             mini_cov = L @ L.t()
         elif self.method == 'low_rank':
@@ -348,7 +410,8 @@ class Covariance(nn.Module):
         else:
             raise NotImplementedError(self.method)
 
-        # (``getattr``: modules pickled before ``corr_mask`` existed don't have the buffer)
+        # (``getattr``: modules pickled before ``corr_mask`` existed don't have the buffer). With a masked factor, this
+        # is redundant but makes the zeros exact:
         corr_mask = getattr(self, 'corr_mask', None)
         if corr_mask is not None:
             idx = self.non_empty_idx
@@ -369,7 +432,7 @@ class Covariance(nn.Module):
         ``torch.distributions.LKJCholesky(cov.param_rank, eta).log_prob(cov.get_corr_cholesky())``.
         """
         if self.method == 'sd_corr':
-            return corr_cholesky_from_unconstrained(self.corr_unconstrained, rank=self.param_rank)
+            return corr_cholesky_from_unconstrained(self._get_off_diag(), rank=self.param_rank)
         mini_cov = self._get_mini_cov()
         std = mini_cov.diagonal(dim1=-2, dim2=-1).sqrt()
         return torch.linalg.cholesky(mini_cov / (std.unsqueeze(-1) * std.unsqueeze(-2)))
@@ -413,6 +476,10 @@ class Covariance(nn.Module):
             values = std.log(), corr_cholesky_to_unconstrained(L_corr)
         else:
             raise NotImplementedError(f"``set_matrix_()`` isn't supported for method='{self.method}'.")
+        keep = self._get_off_diag_keep()
+        if keep is not None:
+            # (``cov`` should be zero across groups, so these are zero up to floating-point error anyway)
+            values = values[0], values[1] * keep.to(values[1])
         for name, value in zip(_METHOD_PARAMS[self.method], values):
             getattr(self, name).copy_(value)
         return self

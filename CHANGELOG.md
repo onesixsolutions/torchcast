@@ -151,6 +151,12 @@ A parameterization that separates scale from correlation: `diag(std) @ R @ diag(
 
 - `KalmanFilter` now warns when a level-like process has a learned decay (that can't reach 1) and a free initial variance. Pass `stationary_initial_variance=True` to fix it, or `False` to keep the free initial variance and silence the warning. The default (`None`) behaves as before.
 
+### Behavior change: `corr_mask`/`corr_groups` mask the cholesky factor, removing redundant parameters
+
+Previously the mask was applied to the covariance after `L @ L.t()`, so the factor's entries for masked-out pairs were still parameters that fed the in-group entries (e.g. a variance is `exp(2 * log_diag[i]) + sum_j L[i, j]^2`, including masked `j`). That left exact ridges: e.g. shrinking a `cholesky_log_diag` while growing a masked `cholesky_off_diag` left the model unchanged, which shows up as a singular or indefinite Hessian (in a fitted model with `corr_groups`, the Hessian's most negative eigenvector loaded on one process-variance and the masked off-diagonal entries), slow L-BFGS convergence, and poor Laplace approximations. Now, for a binary `corr_mask` (as `corr_groups` builds; a positive semi-definite 0/1 mask is always a grouping), "log_cholesky" and "sd_corr" (on the correlation's cholesky factor) also mask the factor: those entries are fixed at zero and get zero gradient. The representable covariances are unchanged (a covariance that's zero across groups has a cholesky factor that's zero there too), so fitted predictions aren't affected, only the optimization. Other masks, and "low_rank" (whose parameters are redundant regardless), behave as before.
+
+- Back-compatibility: state-dicts (saved before this change, i.e. `Covariance` version 1) and pickled models are converted on load to the same covariance (re-parameterized with the masked entries at zero), so old models' predictions are unchanged.
+
 ### Overridable design models
 
 `StateSpaceModel.forward()` now builds its transition and measurement models through two methods,
