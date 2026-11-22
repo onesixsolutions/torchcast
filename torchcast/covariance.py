@@ -66,13 +66,11 @@ class Covariance(nn.Module):
                        predict_variance: Union[bool, nn.Module] = None,
                        corr_groups: Optional[Sequence[Sequence[str]]] = None,
                        stationary: Union[Sequence[str], Dict[str, bool], None] = None,
+                       method: Optional[str] = None,
                        **kwargs) -> 'Covariance':
         """
         :param processes: The ``processes`` used in your :class:`.StateSpaceModel`.
-        :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process'). Unless you pass
-         ``method``, an initial covariance with 15 or more elements with parameters (and no ``corr_groups``/
-         ``corr_mask``) uses ``method='low_rank'``: it's weakly informed (mainly by the start of each series) and grows
-         quadratically with the state. Otherwise the default is "log_cholesky".
+        :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process').
         :param predict_variance: Will the variance be predicted upon calling ``forward()``? This is implemented as a
          multiplier on the base variance given from the 'method'. You can either pass ``True`` in which case it is
          expected you will pass multipliers as 'process_var_multi' when ``forward()`` is called; *or* you can pass a
@@ -106,6 +104,11 @@ class Covariance(nn.Module):
          its ``mask`` buffer (both shrink), so a state-dict saved without it won't load into one with it: to warm-start,
          drop all of the saved ``initial_covariance.*`` entries, and set the free block with
          :func:`Covariance.set_matrix_` if needed.
+        :param method: The parameterization, see :func:`Covariance.__init__`. If not given: "low_rank" for an initial
+         covariance with 15 or more elements with parameters (not counting ``stationary`` ones) and no
+         ``corr_groups``/``corr_mask``, since it's weakly informed (mainly by the start of each series) and grows
+         quadratically with the state; otherwise "log_cholesky". (When the method is chosen this way, loading a
+         state-dict saved with another method switches to that method, e.g. for models saved under older defaults.)
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
@@ -145,13 +148,13 @@ class Covariance(nn.Module):
                     nonstationary_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
 
-        default_method = 'method' not in kwargs
-        if default_method and cov_type == 'initial' and 'corr_mask' not in kwargs:
+        default_method = method is None
+        if default_method:
             # a large initial covariance is weakly informed (mainly by the start of each series) and grows quadratically
             # with the state, so by default it's a factor model:
             param_rank = state_rank - len(no_cov_idx) - len(stationary_idx)
-            if param_rank >= LOW_RANK_MIN_INITIAL:
-                kwargs['method'] = 'low_rank'
+            use_low_rank = cov_type == 'initial' and 'corr_mask' not in kwargs and param_rank >= LOW_RANK_MIN_INITIAL
+            method = 'low_rank' if use_low_rank else 'log_cholesky'
 
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
@@ -173,6 +176,7 @@ class Covariance(nn.Module):
             empty_idx=no_cov_idx,
             id=f'{cov_type}_covariance',
             predict_variance=predict_variance,
+            method=method,
             **kwargs
         )
         out._default_method = default_method
@@ -247,10 +251,8 @@ class Covariance(nn.Module):
          ``exp(log_std_devs) ** 2``. This suits a large covariance that's weakly informed by the data, e.g. one
          dominated by a few common factors; it's the default for a large initial covariance (see
          :func:`Covariance.from_processes`). K defaults to ``int(sqrt(G))`` (an arbitrary rule of thumb: pass e.g.
-         "low_rank3" for 3 factors). The factor-loadings start at a scale comparable to ``D`` (half the initial
-         variance each), not near zero, which is a saddle-point the factors are slow to leave. Rotations of ``V``
-         leave ``V @ V.t()`` unchanged; that's harmless for fitting (and constraining ``V`` to remove them slows it
-         down), but makes the hessian singular, so for :func:`StateSpaceModel.get_laplace_mvnorm`,
+         "low_rank3" for 3 factors). Rotations of ``V`` leave ``V @ V.t()`` unchanged; that's harmless for fitting,
+         but makes the hessian singular, so for :func:`StateSpaceModel.get_laplace_mvnorm`,
          :func:`Covariance.prepare_for_hessian_` rotates ``V`` to a canonical form and leaves out the entries that pin
          the rotation.
          Finally, "sd_corr" separates scale from correlation: ``diag(std) @ R @ diag(std)``, with parameters
