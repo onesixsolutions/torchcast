@@ -417,11 +417,13 @@ class BinomialPredictions(Predictions):
                              extra_vars: Optional[torch.Tensor],
                              generator: Optional[torch.Generator],
                              measures: Optional[Sequence[str]] = None,
-                             shared_noise: bool = False) -> torch.Tensor:
+                             shared_noise: bool = False,
+                             draws: Optional[dict[str, torch.Tensor]] = None) -> torch.Tensor:
         """
         Gaussian measures are sampled as usual (their observation noise is uncorrelated with the binary measures');
         binary measures are sampled from a binomial, then (like the rest of ``BinomialPredictions``) returned as
-        proportions. (The binomial draws are always independent across rows, even with ``shared_noise``.)
+        proportions. (The binomial draws are always monte-carlo from ``generator``, independent across rows, even with
+        ``shared_noise`` or ``draws``.)
         """
         all_measures = list(self.measurement_model.measures)
         if measures is None:
@@ -430,7 +432,7 @@ class BinomialPredictions(Predictions):
 
         # sample the gaussian measures:
         observations = super()._sample_observations(
-            means, extra_vars, measures=gaussian_measures, generator=generator, shared_noise=shared_noise
+            means, extra_vars, measures=gaussian_measures, generator=generator, shared_noise=shared_noise, draws=draws
         )
 
         # sample the remaining (binary) measures:
