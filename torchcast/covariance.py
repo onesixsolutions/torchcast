@@ -102,7 +102,10 @@ class Covariance(nn.Module):
          Either a list of process ids (all stationary) or a dict of process ids to ``True``/``False``, where ``False``
          keeps free parameters on purpose (silencing the warning): e.g. for a decaying level that captures how far
          series start from their long-run level after a common start event (sign-up, launch), whose initial spread
-         is larger than its stationary one.
+         is larger than its stationary one. Note that listing processes here changes this covariance's parameters and
+         its ``mask`` buffer (both shrink), so a state-dict saved without it won't load into one with it: to warm-start,
+         drop all of the saved ``initial_covariance.*`` entries, and set the free block with
+         :func:`Covariance.set_matrix_` if needed.
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
