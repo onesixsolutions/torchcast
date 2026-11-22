@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag
+from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag, cov2corr
 from torchcast.kalman_filter import BinomialFilter, KalmanFilter
 from torchcast.process import LocalLevel, LocalTrend, Season
 from torchcast.internals.utils import as_timestep_list
@@ -823,6 +823,17 @@ def test_corr_mask_packed_params(method: str):
 
 
 @pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+def test_corr_mask_set_matrix_rejects_masked_entries(method: str):
+    # a non-zero entry for a masked-out pair can't be represented (and dropping its cholesky entry would also change
+    # the entries within groups), so it raises
+    cov = _make_masked_cov(method)
+    idx = cov.non_empty_idx
+    target = torch.eye(4, dtype=torch.float64) + .3 * (1 - cov.corr_mask[idx][:, idx].to(torch.float64))
+    with pytest.raises(ValueError, match="masked out by ``corr_mask``"):
+        cov.set_matrix_(target)
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
 def test_corr_mask_representable_covs_unchanged(method: str):
     torch.manual_seed(1)
     cov = _make_masked_cov(method)
@@ -837,71 +848,6 @@ def test_corr_mask_representable_covs_unchanged(method: str):
     converted = cov.to_method(other)
     assert getattr(converted, _get_param_names(other)[1]).numel() == 2
     torch.testing.assert_close(converted._get_mini_cov(), cov._get_mini_cov(), rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
-def test_corr_mask_loads_old_format(method: str):
-    torch.manual_seed(2)
-    diag_name, off_diag_name = _get_param_names(method)
-    # the old format: a parameter for every pair, with the mask applied to the covariance afterwards
-    unmasked = _make_masked_cov(method, corr_mask=False)
-    new = _make_masked_cov(method)
-    idx = new.non_empty_idx
-    old_cov = unmasked._get_mini_cov().detach() * new.corr_mask[idx][:, idx]
-    state_dict = {**unmasked.state_dict(), 'corr_mask': new.corr_mask}
-    new.load_state_dict(state_dict)
-    assert getattr(new, off_diag_name).numel() == 2
-    torch.testing.assert_close(new._get_mini_cov().detach(), old_cov)
-    # a current state-dict loads as is:
-    new2 = _make_masked_cov(method)
-    new2.load_state_dict(new.state_dict())
-    torch.testing.assert_close(new2._get_mini_cov(), new._get_mini_cov(), rtol=0, atol=0)
-
-    # pickled in the old format:
-    old = _make_masked_cov(method)
-    setattr(old, off_diag_name, torch.nn.Parameter(getattr(unmasked, off_diag_name).detach().clone()))
-    with torch.no_grad():
-        getattr(old, diag_name).copy_(getattr(unmasked, diag_name))
-    unpickled = pickle.loads(pickle.dumps(old))
-    assert getattr(unpickled, off_diag_name).numel() == 2
-    torch.testing.assert_close(unpickled._get_mini_cov().detach(), old_cov)
-
-
-def test_corr_mask_old_model_same_predictions(monkeypatch):
-    def make() -> KalmanFilter:
-        processes = [
-            LocalLevel(id='level', measure='y'),
-            LocalLevel(id='transient', measure='y', decay=(.5, .95)),
-            LocalLevel(id='transient2', measure='y', decay=(.5, .95))
-        ]
-        return KalmanFilter(
-            processes=processes,
-            measures=['y'],
-            process_covariance=Covariance.from_processes(processes, corr_groups=[['transient', 'transient2']]),
-            initial_covariance=Covariance.from_processes(
-                processes, cov_type='initial', stationary=['transient', 'transient2']
-            )
-        )
-
-    torch.manual_seed(3)
-    y = torch.randn(2, 15, 1)
-    # emulate the old format (a parameter for every pair, the mask applied to the covariance afterwards):
-    with monkeypatch.context() as m:
-        m.setattr(Covariance, '_get_off_diag_keep', lambda self: None)
-        old = make()
-        with torch.no_grad():
-            old.process_covariance.cholesky_off_diag.fill_(.4)
-            old_pred = old(y)
-        state_dict = old.state_dict()
-    assert state_dict['process_covariance.cholesky_off_diag'].numel() == 3
-
-    new = make()
-    assert new.process_covariance.cholesky_off_diag.numel() == 1
-    new.load_state_dict(state_dict)
-    with torch.no_grad():
-        new_pred = new(y)
-    torch.testing.assert_close(new_pred.means, old_pred.means)
-    torch.testing.assert_close(new_pred.covs, old_pred.covs)
 
 
 def _make_low_rank(**kwargs) -> Covariance:
@@ -938,15 +884,24 @@ def test_low_rank_init_and_rotation():
     redundant = cov._get_lr_redundant(order)
     assert redundant.sum() == 3 and redundant[5, 1] and redundant[5, 2] and redundant[3, 2]
     assert (cov.lr_mat[redundant] != 0).any()
-    cov.rotate_low_rank_()
+    cov._rotate_low_rank_(order)
     assert (cov.lr_mat[redundant] == 0).all()
     torch.testing.assert_close(cov._get_mini_cov().detach(), before)
     assert cov._get_lr_order() == order
 
+    # the canonical form is unique: equivalent loadings (differing by a rotation) give the same result, with a
+    # non-negative diagonal
+    other = _make_low_rank()
+    with torch.no_grad():
+        other.lr_mat.copy_(cov.lr_mat @ torch.linalg.qr(torch.randn(3, 3))[0])
+    other._rotate_low_rank_(other._get_lr_order())
+    torch.testing.assert_close(other.lr_mat, cov.lr_mat)
+    assert (cov.lr_mat[order[:3], [0, 1, 2]] >= 0).all()
+
     with pytest.raises(ValueError, match="number of factors"):
         Covariance(rank=3, init_diag_multi=1., method='low_rank4')
     with pytest.raises(TypeError, match="low_rank"):
-        Covariance(rank=3, init_diag_multi=1.).rotate_low_rank_()
+        Covariance(rank=3, init_diag_multi=1.)._rotate_low_rank_([0, 1, 2])
 
 
 def test_low_rank_set_matrix_round_trip():
@@ -1028,7 +983,7 @@ def test_low_rank_identified_after_rotation():
     target = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) + .2)
     cov.set_matrix_(target)
     order = cov._get_lr_order()
-    cov.rotate_low_rank_(order)
+    cov._rotate_low_rank_(order)
     lr0, std0 = cov.lr_mat.detach().clone(), cov.log_std_devs.detach().clone()
 
     def nll(flat: torch.Tensor) -> torch.Tensor:
@@ -1176,7 +1131,7 @@ def test_prepare_for_hessian_hook(monkeypatch):
 
     # a non-callable ``prepare_for_hessian_`` is a mistake, not something to skip:
     monkeypatch.setattr(kf.processes['level'], 'prepare_for_hessian_', {'initial_mean': True}, raising=False)
-    with pytest.raises(TypeError, match="should be a method"):
+    with pytest.raises(TypeError, match="not callable"):
         kf.get_laplace_mvnorm(torch.randn(2, 10, 1))
 
     # other covariance methods leave everything in:
@@ -1187,3 +1142,56 @@ def test_prepare_for_hessian_hook(monkeypatch):
     masked = Covariance(rank=6, init_diag_multi=1., method='low_rank2', corr_mask=corr_mask)
     with pytest.warns(UserWarning, match="each group's factor-loadings can be rotated separately"):
         masked.prepare_for_hessian_()
+
+
+def test_cov2corr():
+    cov = _random_cov(4, torch.tensor([1., .1, 3., 2.], dtype=torch.float64))
+    corr = cov2corr(cov)
+    std = cov.diagonal().sqrt()
+    torch.testing.assert_close(corr, cov / std.outer(std))
+    torch.testing.assert_close(corr.diagonal(), torch.ones(4, dtype=torch.float64))
+    # batched:
+    torch.testing.assert_close(cov2corr(torch.stack([cov, 2 * cov])), torch.stack([corr, corr]))
+
+
+def test_log_chol_to_chol_deprecated_alias():
+    from torchcast.covariance import log_chol_to_chol
+    log_diag, off_diag = torch.randn(3), torch.randn(3)
+    with pytest.warns(FutureWarning, match="use ``torchcast.covariance.log_chol_to_chol"):
+        L = Covariance.log_chol_to_chol(log_diag, off_diag)
+    torch.testing.assert_close(L, log_chol_to_chol(log_diag, off_diag))
+
+
+def test_covariance_base_shim():
+    import torchcast.covariance.base as base
+    with pytest.warns(FutureWarning, match="covariance.base.Covariance` is deprecated"):
+        assert base.Covariance is Covariance
+    # missing attributes raise AttributeError (so ``getattr(..., default)`` works), and dunders don't warn:
+    assert getattr(base, 'does_not_exist', None) is None
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert getattr(base, '__sphinx_mock__', None) is None
+        base.__file__
+
+
+def test_covariance_in_the_wrong_slot_raises():
+    processes = [LocalLevel(id='level', measure='y')]
+    # e.g. forgetting ``cov_type='initial'``, which makes a process-covariance (different elements get parameters):
+    with pytest.raises(ValueError, match=r"created as ``process_covariance``.*cov_type='initial'"):
+        KalmanFilter(
+            processes=processes, measures=['y'], initial_covariance=Covariance.from_processes(processes)
+        )
+    with pytest.raises(ValueError, match=r"created as ``initial_covariance``.*cov_type='process'"):
+        KalmanFilter(
+            processes=processes,
+            measures=['y'],
+            process_covariance=Covariance.from_processes(processes, cov_type='initial')
+        )
+    with pytest.raises(ValueError, match=r"used as ``measure_covariance``.*from_measures"):
+        KalmanFilter(
+            processes=processes, measures=['y'], measure_covariance=Covariance.from_processes(processes)
+        )
+    # a covariance with a custom id is renamed, with a warning, as before:
+    custom = Covariance(rank=1, init_diag_multi=1., id='my_covariance')
+    with pytest.warns(UserWarning, match="Id already set to my_covariance"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance=custom)

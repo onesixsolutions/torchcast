@@ -246,6 +246,34 @@ def test_binomial_fit_recovers_probability():
     assert abs(mean_prob - true_prob) < .05
 
 
+def test_mc_sampling_seeded_by_torch():
+    """
+    A model's default monte-carlo noise (for the log-prob) is seeded from ``torch.initial_seed()``, so
+    ``torch.manual_seed()`` before creating the model makes a fit reproducible.
+    """
+    noise = lambda: FixedWhiteNoise(20)(3, torch.float32, torch.device('cpu'))
+    torch.manual_seed(1)
+    a = noise()
+    torch.manual_seed(1)
+    torch.rand(10)  # (it doesn't depend on torch's random state, only on the seed)
+    assert torch.equal(noise(), a)
+    torch.manual_seed(2)
+    assert not torch.equal(noise(), a)
+
+    y = (torch.rand(10, 20, 1) < .3).float()
+
+    def fit(seed: int) -> dict:
+        torch.manual_seed(seed)
+        bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['y'])
+        bf.mc_sampling = 50
+        bf.fit(y, stopping={'max_iter': 3}, verbose=0)
+        return {k: v.clone() for k, v in bf.state_dict().items() if torch.is_tensor(v)}
+
+    fit1, fit1_again, fit2 = fit(1), fit(1), fit(2)
+    assert all(torch.equal(fit1[k], fit1_again[k]) for k in fit1)
+    assert any(not torch.equal(fit1[k], fit2[k]) for k in fit1)
+
+
 # mixture components on measures with a nonlinear measurement --------------------------------------------------------
 
 # the 'low' component: an offset from the standard regime's (sigmoid) mean, with extra noise
@@ -341,9 +369,13 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     standard_mean = _gauss_hermite_expectation(lambda z: torch.sigmoid(z.clamp(-8, 8)), z_mean, z_var)
     expected_mean = standard_mean + probs[:, 1] * _COMPONENT_OFFSET
 
-    assert np.allclose(pred.means.reshape(-1).numpy(), expected_mean.numpy(), atol=.003)
+    # (`.means` uses the default 1000 samples -- the same draws as `get_means()` -- too few for this tolerance)
+    assert torch.equal(pred.means, pred.get_means(use_map=False))
+    means_20k = pred.get_means(use_map=False, num_samples=20_000)
+    assert np.allclose(means_20k[..., 0].reshape(-1).numpy(), expected_mean.numpy(), atol=.003)
 
-    df = pred.to_dataframe(conf=.9, use_map=False)
+    # (20k samples, for the intervals' tolerance below; the default 1000 gives ~1.5 standard-errors)
+    df = pred.to_dataframe(conf=.9, use_map=False, num_samples=20_000)
     assert np.allclose(df['mean'].values, expected_mean.numpy(), atol=.003)
 
     def cdf_at(q):
@@ -365,13 +397,13 @@ def test_mixture_nonlinear_predictions_match_quadrature():
     assert np.allclose(cdf_at(df['lower'].values).numpy(), .05, atol=.01)
     assert np.allclose(cdf_at(df['upper'].values).numpy(), .95, atol=.01)
 
-    df_map = pred.to_dataframe(conf=.9, use_map=True)
+    df_map = pred.to_dataframe(conf=.9, use_map=True, num_samples=20_000)
     map_mean = torch.sigmoid(z_mean.double()) + probs[:, 1] * _COMPONENT_OFFSET
     assert np.allclose(df_map['mean'].values, map_mean.numpy(), atol=1e-5)
     assert np.allclose(df_map['lower'].values, df['lower'].values)
 
     # with a transform, the draws are back-transformed (so the mean is E[exp(Y)] under the mixture):
-    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=False)
+    df_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=False, num_samples=20_000)
     standard_exp = _gauss_hermite_expectation(lambda z: torch.exp(torch.sigmoid(z.clamp(-8, 8))), z_mean, z_var)
     expected_exp = standard_exp * (
         probs[:, 0] * torch.exp(r / 2) +
@@ -388,7 +420,7 @@ def test_mixture_nonlinear_predictions_match_quadrature():
         probs[:, 0] * torch.exp(p_map + lin_var / 2) +
         probs[:, 1] * torch.exp(p_map + _COMPONENT_OFFSET + (lin_var + _COMPONENT_SD ** 2) / 2)
     )
-    df_map_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=True)
+    df_map_exp = pred.to_dataframe(conf=.9, transform=LogTransform(), use_map=True, num_samples=20_000)
     assert np.allclose(df_map_exp['mean'].values, expected_map_exp.numpy(), rtol=1e-4)
     assert np.array_equal(df_map_exp['lower'].values, df_exp['lower'].values)  # (intervals: monte-carlo either way)
     # ... and `bias_adjust=0` gives the plug-in exp(MAP):
@@ -514,8 +546,8 @@ def test_mixture_nonlinear_multivariate_negligible():
 @torch.no_grad()
 def test_output_samples_separate_from_mc_sampling():
     """
-    Sample-based outputs use `num_samples` draws with a fixed seed -- not the model's `mc_sampling`, which is only for
-    the log-prob. `derived` doesn't depend on whether intervals are computed.
+    Sample-based outputs use `num_samples` draws with the predictions' seed -- not the model's `mc_sampling`, which is
+    only for the log-prob. `derived` doesn't depend on whether intervals are computed.
     """
     torch.manual_seed(0)
     kf = KalmanFilter(

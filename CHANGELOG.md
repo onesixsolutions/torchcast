@@ -79,7 +79,7 @@ inflate the variance.
   `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
   `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
   `transform={'log_spend': LogTransform()}`. The derived means use the measures with exact means as control variates, which reduces their monte-carlo error (e.g. a sum of measures is exact). The functions should compute each group and timestep from its own values (not e.g. a total across groups).
-- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000), with a seed drawn at import so repeated calls agree. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
+- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000). Their seed comes from `torch.initial_seed()`: the seed last set by `torch.manual_seed()`, which makes them reproducible across processes, or else a random one fixed for the process. Either way, repeated calls within a process agree, and torch's global random state isn't drawn from. Or pass `generator=` (a `torch.Generator`) to `to_dataframe()` or `get_means()` for one call. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
 
 ### Behavior change: `simulate()`
 
@@ -100,7 +100,18 @@ inflate the variance.
 
 ### Other changes
 
+- Passing a `Covariance` created for one role as another now raises a `ValueError` that says how to create the right one: e.g. `initial_covariance=Covariance.from_processes(processes)` (which makes a process-covariance, whose elements without process-noise get no parameters, so a fixed season would get zero initial variance) used to warn only `Id already set to process_covariance, overwriting`.
+- The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
+- `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
 - Deprecation warnings are now `FutureWarning` instead of `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code). This covers the old `torchcast.covariance.base` import path, `fit(tol=, patience=, max_iter=)`, `Stopping.from_dict(tol=)` (previously a plain `UserWarning`), `Predictions` arguments `start_offsets`/`dt_unit` and `type='components'`, `complete_times()` arguments `group_colname` and `global_max=True`, and `BinomialFilter(do_post_hoc_correction=True/False)`.
+- A model's default monte-carlo noise for the log-prob (`mc_sampling`, a `FixedWhiteNoise`) is seeded from
+  `torch.initial_seed()` instead of numpy's unseeded random state, so `torch.manual_seed()` before creating the model
+  makes a fit with a monte-carlo loss (e.g. a `BinomialFilter`'s) reproducible. Before, each model got different
+  noise, so refits of the same model on the same data landed at different parameters.
+- `load_state_dict()` warns when an `EWMAdaptiveScaler`'s state-dict has no `adaptive_scaling._extra_state`. It still
+  loads it with the pre-1.2.0 behavior (a running mean starting at 0), which is right for state-dicts saved by older
+  versions -- but a newer state-dict that lost that entry (e.g. filtered to tensors) silently got the old behavior too,
+  and different predictions.
 - `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of
   computing intervals; `Predictions.get_means(transform=..., use_map=...)` returns them as a
   `(num_groups, num_timesteps, num_measures)` tensor.
@@ -166,8 +177,6 @@ A `Covariance` can now predict how *correlations* vary by group/time, not just v
 ### Behavior change: `corr_mask`/`corr_groups` mask the cholesky factor, removing redundant parameters
 
 Previously the mask was applied to the covariance after `L @ L.t()`, so the factor's entries for masked-out pairs were still parameters that fed the in-group entries (e.g. a variance is `exp(2 * log_diag[i]) + sum_j L[i, j]^2`, including masked `j`). That left exact ridges: e.g. shrinking a `cholesky_log_diag` while growing a masked `cholesky_off_diag` left the model unchanged, which shows up as a singular or indefinite Hessian (in a fitted model with `corr_groups`, the Hessian's most negative eigenvector loaded on one process-variance and the masked off-diagonal entries), slow L-BFGS convergence, and poor Laplace approximations. Now, for a binary `corr_mask` (as `corr_groups` builds; a positive semi-definite 0/1 mask is always a grouping), "log_cholesky" and "sd_corr" (on the correlation's cholesky factor) have no parameters for masked-out pairs: `cholesky_off_diag`/`corr_unconstrained` hold one entry per pair that isn't masked out, scattered into the factor (`get_off_diag_idx()` accounts for this, and raises for a masked-out pair). The representable covariances are unchanged (a covariance that's zero across groups has a cholesky factor that's zero there too), so fitted predictions aren't affected, only the optimization. Other masks, and "low_rank", behave as before.
-
-- Back-compatibility: state-dicts and pickled models in the old format (a parameter for every pair) are converted on load to the same covariance, so old models' predictions are unchanged.
 
 ### Improved `Covariance(method='low_rank')`: initialization, `set_matrix_()`, and Laplace approximations
 

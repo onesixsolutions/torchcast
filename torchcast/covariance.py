@@ -17,6 +17,12 @@ from torchcast.process.process import Process
 DEFAULT_MCOV_MULTI = 1.0
 DEFAULT_PCOV_MULTI = 0.1  # less than measure-cov by default
 DEFAULT_ICOV_MULTI = 0.5  # somewhere in between
+# the ids that ``Covariance.from_processes()``/``from_measures()`` give, and how to create each (see ``set_id()``):
+_HOW_TO_CREATE = {
+    'process_covariance': "Covariance.from_processes(processes, cov_type='process', ...)",
+    'initial_covariance': "Covariance.from_processes(processes, cov_type='initial', ...)",
+    'measure_covariance': "Covariance.from_measures(measures, ...)",
+}
 # ``Covariance.from_processes(cov_type='initial')`` uses method='low_rank' by default from this many elements on:
 LOW_RANK_MIN_INITIAL = 15
 
@@ -136,7 +142,7 @@ class Covariance(nn.Module):
         if corr_groups is not None:
             if 'corr_mask' in kwargs:
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
-            kwargs['corr_mask'] = _corr_groups_to_mask(
+            kwargs['corr_mask'] = cls._corr_groups_to_mask(
                 element_ids=[p.id for p in processes for _ in p.state_elements],
                 corr_groups=corr_groups,
                 kind='process id'
@@ -202,8 +208,9 @@ class Covariance(nn.Module):
         if corr_groups is not None:
             if 'corr_mask' in kwargs:
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
-            kwargs['corr_mask'] = _corr_groups_to_mask(element_ids=list(measures), corr_groups=corr_groups,
-                                                       kind='measure')
+            kwargs['corr_mask'] = cls._corr_groups_to_mask(
+                element_ids=list(measures), corr_groups=corr_groups, kind='measure'
+            )
         if method is None:
             method = 'sd_corr' if kwargs.get('predict_corr') is not None else 'log_cholesky'
         if 'init_diag_multi' not in kwargs:
@@ -211,6 +218,31 @@ class Covariance(nn.Module):
         _deprecated_predict_variance(predict_variance, kwargs, default_kwarg='measure_var_multi')
 
         return cls(rank=len(measures), id='measure_covariance', method=method, **kwargs)
+
+    @staticmethod
+    def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
+        """
+        A ``corr_mask`` from ``corr_groups`` (see :func:`Covariance.from_processes`).
+
+        :param element_ids: For each element (row/column) of the covariance, the id it's grouped by (e.g. its process's
+         id); can repeat.
+        :param corr_groups: Groups of ids. Ids not in any group form one more group together.
+        :param kind: What the ids are, for error messages.
+        """
+        if isinstance(corr_groups, str) or any(isinstance(g, str) for g in corr_groups):
+            raise TypeError(f"``corr_groups`` should be a list of lists of {kind}s, e.g. ``[['a', 'b']]``.")
+        known = list(dict.fromkeys(element_ids))
+        group_of = {}
+        for g, ids in enumerate(corr_groups):
+            for id_ in ids:
+                if id_ not in known:
+                    raise ValueError(f"``corr_groups`` has unknown {kind} '{id_}'; expected one of {known}.")
+                if id_ in group_of:
+                    raise ValueError(f"``corr_groups`` has {kind} '{id_}' in more than one group.")
+                group_of[id_] = g
+        rest = len(corr_groups)
+        groups = torch.tensor([group_of.get(id_, rest) for id_ in element_ids])
+        return (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
 
     def __init__(self,
                  rank: int,
@@ -235,14 +267,14 @@ class Covariance(nn.Module):
          This can be useful to provide intelligent starting-values to speed up optimization.
         :param method: The parameterization for the covariance. The default, "log_cholesky" (or "sd_corr" if
          ``predict_corr`` is passed), parameterizes the covariance using the cholesky factorization (which is itself
-         split into two tensors: the log-transformed diagonal elements and the off-diagonal). The other currently supported option is "low_rank", a factor
-         model: the covariance is ``V @ V.t() + D``, with ``V`` (``lr_mat``) a G*K matrix of factor-loadings (G the
-         number of elements with variance, K the number of factors) and ``D`` a diagonal matrix of
-         ``exp(log_std_devs) ** 2``. This suits a large covariance that's weakly informed by the data, e.g. one
-         dominated by a few common factors; it's the default for a large initial covariance (see
+         split into two tensors: the log-transformed diagonal elements and the off-diagonal). The other currently
+         supported option is "low_rank", a factor model: the covariance is ``V @ V.t() + D``, with ``V`` (``lr_mat``) a
+         G*K matrix of factor-loadings (G the number of elements with variance, K the number of factors) and ``D`` a
+         diagonal matrix of ``exp(log_std_devs) ** 2``. This suits a large covariance that's weakly informed by the
+         data, e.g. one dominated by a few common factors; it's the default for a large initial covariance (see
          :func:`Covariance.from_processes`). K defaults to ``int(sqrt(G))`` (an arbitrary rule of thumb: pass e.g.
-         "low_rank3" for 3 factors). Rotations of ``V`` leave ``V @ V.t()`` unchanged; that's harmless for fitting,
-         but makes the hessian singular, so for :func:`StateSpaceModel.get_laplace_mvnorm`,
+         "low_rank3" for 3 factors). Rotations of ``V`` leave ``V @ V.t()`` unchanged; that's harmless for fitting, but
+         makes the hessian singular, so for :func:`StateSpaceModel.get_laplace_mvnorm`,
          :func:`Covariance.prepare_for_hessian_` rotates ``V`` to a canonical form and leaves out the entries that pin
          the rotation.
          Finally, "sd_corr" separates scale from correlation: ``diag(std) @ R @ diag(std)``, with parameters
@@ -321,7 +353,7 @@ class Covariance(nn.Module):
         self.empty_idx = set(empty_idx) | set(self.stationary_idx)
         assert all(isinstance(x, int) for x in self.empty_idx)
         self.param_rank = self.rank - len(self.empty_idx)
-        mask = mini_cov_mask(rank=self.rank, empty_idx=self.empty_idx)
+        mask = self._get_mini_cov_mask(rank=self.rank, empty_idx=self.empty_idx)
         self.register_buffer('mask', mask)
 
         if corr_mask is not None:
@@ -357,6 +389,21 @@ class Covariance(nn.Module):
                 "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
             )
         return corr_mask
+
+    @staticmethod
+    def _get_mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
+        """
+        A ``(rank, param_rank)`` matrix that embeds the covariance of the elements with parameters (the "mini-cov")
+        into the full ``(rank, rank)`` covariance, with zero rows/columns for ``empty_idx``.
+        """
+        param_rank = rank - len(empty_idx)
+        mask = torch.zeros((rank, param_rank), **kwargs)
+        c = 0
+        for r in range(rank):
+            if r not in empty_idx:
+                mask[r, c] = 1.
+                c += 1
+        return mask
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -396,6 +443,12 @@ class Covariance(nn.Module):
     @jit.ignore
     def set_id(self, id: str) -> 'Covariance':
         if self.id and id != self.id:
+            if self.id in _HOW_TO_CREATE:
+                # e.g. ``Covariance.from_processes(processes)`` (a process-covariance) passed as an initial covariance:
+                raise ValueError(
+                    f"This covariance was created as ``{self.id}``, but it's being used as ``{id}``. "
+                    f"Create the ``{id}`` with ``{_HOW_TO_CREATE.get(id, 'Covariance.from_processes()')}``."
+                )
             warn(f"Id already set to {self.id}, overwriting")
         self.id = id
         return self
@@ -412,6 +465,7 @@ class Covariance(nn.Module):
     def expected_kwargs(self) -> Optional[List[str]]:
         warn("``expected_kwargs`` is deprecated, use ``predictor_kwargs``.", FutureWarning, stacklevel=2)
         return [k.name for k in self.predictor_kwargs] or None
+
 
     # The covariance matrix --------------------------------------------------------------------------------------------
 
@@ -531,7 +585,7 @@ class Covariance(nn.Module):
     def _get_mini_cov(self) -> Tensor:
         if self.method == 'log_cholesky':
             assert self.cholesky_log_diag is not None
-            L = self.log_chol_to_chol(self.cholesky_log_diag, self._get_off_diag())
+            L = log_chol_to_chol(self.cholesky_log_diag, self._get_off_diag())
             mini_cov = L @ L.t()
         elif self.method == 'sd_corr':
             assert self.log_std_devs is not None
@@ -565,18 +619,6 @@ class Covariance(nn.Module):
         idx = self.non_empty_idx
         return mini_cov * corr_mask[idx][:, idx]
 
-    @staticmethod
-    def log_chol_to_chol(log_diag: torch.Tensor, off_diag: torch.Tensor) -> torch.Tensor:
-        assert log_diag.shape[:-1] == off_diag.shape[:-1]
-
-        rank = log_diag.shape[-1]
-        L1 = torch.diag_embed(torch.exp(log_diag))
-
-        L2 = torch.zeros_like(L1)
-        mask = torch.tril_indices(rank, rank, offset=-1)
-        L2[mask[0], mask[1]] = off_diag
-        return L1 + L2
-
     def _get_off_diag(self) -> Tensor:
         """
         The off-diagonal entries for the cholesky factor (the correlation's, for "sd_corr"), in ``tril_indices``
@@ -588,19 +630,26 @@ class Covariance(nn.Module):
         keep = self._get_off_diag_keep()
         return off_diag if keep is None else _unpack_off_diag(off_diag, keep)
 
+    def _get_binary_mini_mask(self) -> Optional[Tensor]:
+        """
+        A binary (0/1) ``corr_mask`` restricted to the elements with parameters (``(param_rank, param_rank)``), or
+        ``None`` if there's no ``corr_mask`` or it isn't binary.
+        """
+        # (``getattr``: modules pickled before ``corr_mask`` existed don't have the buffer)
+        corr_mask = getattr(self, 'corr_mask', None)
+        if corr_mask is None or not ((corr_mask == 0) | (corr_mask == 1)).all():
+            return None
+        return corr_mask[self.non_empty_idx][:, self.non_empty_idx]
+
     def _get_off_diag_keep(self) -> Optional[Tensor]:
         """
         For a binary ``corr_mask`` and a cholesky-based ``method``: the mask for the off-diagonal parameters
         (``cholesky_off_diag`` or ``corr_unconstrained``), in their ``tril_indices`` order. ``None`` otherwise.
         """
-        corr_mask = getattr(self, 'corr_mask', None)
-        if corr_mask is None or self.method not in ('log_cholesky', 'sd_corr'):
+        mini_mask = self._get_binary_mini_mask()
+        if mini_mask is None or self.method not in ('log_cholesky', 'sd_corr'):
             return None
-        if not ((corr_mask == 0) | (corr_mask == 1)).all():
-            return None
-        idx = self.non_empty_idx
-        mini_mask = corr_mask[idx][:, idx]
-        rows, cols = torch.tril_indices(len(idx), len(idx), offset=-1).to(mini_mask.device)
+        rows, cols = torch.tril_indices(self.param_rank, self.param_rank, offset=-1).to(mini_mask.device)
         return mini_mask[rows, cols]
 
     def _get_num_off_diag_params(self) -> int:
@@ -610,7 +659,8 @@ class Covariance(nn.Module):
     def get_corr_cholesky(self) -> Tensor:
         """
         The cholesky factor of the correlation matrix (of the ``param_rank`` block, i.e. excluding ``empty_idx``, and
-        before any ``predict_std``/``predict_corr``). E.g. for an LKJ prior:
+        before any ``predict_std``/``predict_corr``). Not used by torchcast internally, but can be useful if (e.g.) you
+        want to set up an LKJ prior for your model:
         ``torch.distributions.LKJCholesky(cov.param_rank, eta).log_prob(cov.get_corr_cholesky())``.
         """
         if self.method == 'sd_corr':
@@ -619,7 +669,7 @@ class Covariance(nn.Module):
         std = mini_cov.diagonal(dim1=-2, dim2=-1).sqrt()
         return torch.linalg.cholesky(mini_cov / (std.unsqueeze(-1) * std.unsqueeze(-2)))
 
-    # Setting from a matrix, and converting ----------------------------------------------------------------------------
+    # Setting parameters, and converting between methods ---------------------------------------------------------------
 
     @torch.no_grad()
     def set_matrix_(self, cov: Tensor) -> 'Covariance':
@@ -629,8 +679,9 @@ class Covariance(nn.Module):
         (by principal-axis factoring: alternating the top-K eigendecomposition of ``cov - D`` with the residual
         diagonal ``D``, kept positive), which is exact if ``cov`` has that structure, and an approximation otherwise.
 
-        :param cov: A ``(rank, rank)`` covariance matrix, whose rows/columns in ``empty_idx`` are zero; or just the
-         ``(param_rank, param_rank)`` block for the non-empty elements.
+        :param cov: A ``(rank, rank)`` covariance matrix, whose rows/columns in ``empty_idx`` are zero (as are its
+         entries masked out by a binary ``corr_mask``); or just the ``(param_rank, param_rank)`` block for the
+         non-empty elements.
         :return: This module.
         """
         cov = torch.as_tensor(cov).detach()
@@ -648,12 +699,26 @@ class Covariance(nn.Module):
                 f"Expected ``cov`` to have shape {(self.rank, self.rank)} or {(self.param_rank, self.param_rank)}, "
                 f"got {tuple(cov.shape)}."
             )
-        for name, value in zip(_METHOD_PARAMS[self.method], self._get_params_for_matrix(mini_cov)):
+        self._validate_masked_entries(mini_cov)
+        for name, value in self._get_params_for_matrix(mini_cov).items():
             getattr(self, name).copy_(value)
         return self
 
-    def _get_params_for_matrix(self, mini_cov: Tensor) -> tuple[Tensor, Tensor]:
-        """The values of the parameters (in ``_METHOD_PARAMS`` order) for a ``(param_rank, param_rank)`` covariance."""
+    def _validate_masked_entries(self, mini_cov: Tensor):
+        """
+        Raise if a ``(param_rank, param_rank)`` covariance has non-zero entries for pairs masked out by a binary
+        ``corr_mask``: they can't be represented (and for a cholesky-based method, dropping the factor's entries
+        behind them would also change the entries within groups).
+        """
+        mini_mask = self._get_binary_mini_mask()
+        if mini_mask is None:
+            return
+        tol = 1e-8 * mini_cov.diagonal().abs().max()
+        if ((mini_cov * (1 - mini_mask.to(mini_cov))).abs() > tol).any():
+            raise ValueError("``cov`` has non-zero entries for pairs of elements masked out by ``corr_mask``.")
+
+    def _get_params_for_matrix(self, mini_cov: Tensor) -> Dict[str, Tensor]:
+        """The parameters' values (by name, as float64 on cpu) for a ``(param_rank, param_rank)`` covariance."""
         # converting in float64 so that the round-trip is exact up to the module's dtype (on cpu: no float64 on mps;
         # the caller moves the results back):
         mini_cov = mini_cov.detach().cpu().to(torch.float64)
@@ -672,9 +737,10 @@ class Covariance(nn.Module):
             raise NotImplementedError(f"``set_matrix_()`` isn't supported for method='{self.method}'.")
         keep = self._get_off_diag_keep()
         if keep is not None:
-            # (``cov`` should be zero across groups, so the dropped entries are zero up to floating-point error)
+            # (only the pairs that aren't masked out are parameters; with ``cov`` zero across groups, as
+            # ``set_matrix_()`` checks, the dropped entries are zero up to floating-point error)
             values = values[0], values[1][keep.cpu().bool()]
-        return values
+        return dict(zip(_METHOD_PARAMS[self.method], values))
 
     @classmethod
     def from_matrix(cls,
@@ -707,6 +773,54 @@ class Covariance(nn.Module):
         out = copy.deepcopy(self)
         out._set_params(method, init_diag_multi=1.0)
         return out.set_matrix_(self._get_mini_cov().detach())
+
+    def _load_from_state_dict(self,
+                              state_dict,
+                              prefix,
+                              local_metadata,
+                              strict,
+                              missing_keys,
+                              unexpected_keys,
+                              error_msgs):
+        # (older versions called ``predict_std`` ``var_predict_module``:)
+        for k in [k for k in state_dict if k.startswith(f'{prefix}var_predict_module.')]:
+            state_dict[k.replace(f'{prefix}var_predict_module.', f'{prefix}predict_std.', 1)] = state_dict.pop(k)
+        # a state-dict saved with a different ``method`` would otherwise fail with a generic missing/unexpected-keys
+        # error (or, for ``log_std_devs``, which 'low_rank' and 'sd_corr' share, partially load):
+        present = {k[len(prefix):] for k in state_dict if k.startswith(prefix)}
+        expected = set(_METHOD_PARAMS.get(self.method, ()))
+        if not expected <= present:
+            saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
+            if saved_with:
+                saved = saved_with[0]
+                if saved == 'low_rank':
+                    saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
+                error_msgs.append(
+                    f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
+                    f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
+                    f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
+                    f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
+                    f"(torchcast 2.0 changed the default methods: \"low_rank\" for an initial covariance with "
+                    f"{LOW_RANK_MIN_INITIAL} or more elements with parameters, and \"log_cholesky\" for every "
+                    f"measure-covariance.)"
+                )
+                return
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    def __setstate__(self, state: dict):
+        # unpickling a module saved by an older version (``var_predict_module``, ``expected_kwargs``):
+        modules = state.get('_modules', {})
+        if 'var_predict_module' in modules:
+            modules['predict_std'] = modules.pop('var_predict_module')
+        modules.setdefault('predict_std', None)
+        modules.setdefault('predict_corr', None)
+        if 'predictor_kwargs' not in state:
+            state['predictor_kwargs'] = [
+                ProcessKwarg(name=k, is_group_time_tensor=True) for k in (state.pop('expected_kwargs', None) or [])
+            ]
+        super().__setstate__(state)
 
     # Indexing the parameters ------------------------------------------------------------------------------------------
 
@@ -763,40 +877,34 @@ class Covariance(nn.Module):
         them up to a symmetry along which the likelihood is flat (so the hessian is singular there).
 
         For "low_rank", rotations of the factor-loadings ``V`` leave the covariance unchanged: this rotates ``V`` to
-        lower-trapezoidal form (see :func:`Covariance.rotate_low_rank_`) and leaves out the entries above the
+        lower-trapezoidal form (see ``Covariance._rotate_low_rank_()``) and leaves out the entries above the
         diagonal. (With a binary ``corr_mask``, each group of elements can be rotated separately; only one rotation
         is pinned, so the hessian stays singular, with a warning.) Other methods have no such symmetry.
         """
         if self.method != 'low_rank':
             return {}
-        corr_mask = getattr(self, 'corr_mask', None)
-        if corr_mask is not None:
-            idx = self.non_empty_idx
-            corr_mask = corr_mask[idx][:, idx]
-        if corr_mask is not None and ((corr_mask == 0) | (corr_mask == 1)).all() and (corr_mask == 0).any():
+        mini_mask = self._get_binary_mini_mask()
+        if mini_mask is not None and (mini_mask == 0).any():
             warn(
                 f"`{self.id}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
                 f"rotated separately; only one rotation is pinned for the hessian, which stays singular."
             )
         order = self._get_lr_order()
-        self.rotate_low_rank_(order)
+        self._rotate_low_rank_(order)
         return {'lr_mat': self._get_lr_redundant(order)}
 
     @torch.no_grad()
-    def rotate_low_rank_(self, order: Optional[Sequence[int]] = None) -> 'Covariance':
+    def _rotate_low_rank_(self, order: Sequence[int]) -> 'Covariance':
         """
         For "low_rank": rotate the factor-loadings ``V`` (in-place) to lower-trapezoidal form (``V[i, j] = 0`` for
-        ``j > i``, with the elements in ``order``; by default leading with those whose loadings are the most linearly
-        independent), by an LQ decomposition. This leaves the covariance unchanged (exactly, up to floating-point
-        error) and pins down the rotation, which is otherwise arbitrary: e.g. for a hessian (see
-        :func:`Covariance.prepare_for_hessian_`), where the entries above the diagonal are then left out.
+        ``j > i``, with the elements in ``order``, e.g. from ``_get_lr_order()``), by an LQ decomposition, with a
+        non-negative diagonal. This leaves the covariance unchanged (exactly, up to floating-point error) and pins down
+        the rotation, which is otherwise arbitrary: equivalent loadings give the same result. See
+        :func:`Covariance.prepare_for_hessian_`.
         """
         if self.method != 'low_rank':
-            raise TypeError(f"``rotate_low_rank_()`` is for method='low_rank', not '{self.method}'.")
-        order = self._get_lr_order() if order is None else list(order)
-        _, R = torch.linalg.qr(self.lr_mat[order].t().cpu().to(torch.float64))
-        rotated = torch.zeros_like(R.t())
-        rotated[order] = R.t()
+            raise TypeError(f"``_rotate_low_rank_()`` is for method='low_rank', not '{self.method}'.")
+        rotated = _to_lower_trapezoidal(self.lr_mat.detach().cpu().to(torch.float64), order)
         self.lr_mat.copy_(rotated.masked_fill(self._get_lr_redundant(order).cpu(), 0.))
         return self
 
@@ -813,7 +921,7 @@ class Covariance(nn.Module):
     def _get_lr_redundant(self, order: Optional[Sequence[int]] = None) -> Tensor:
         """
         For "low_rank": a ``(param_rank, K)`` boolean mask of the entries of ``lr_mat`` above the diagonal, in
-        ``order`` (default: :func:`Covariance._get_lr_order`). After :func:`Covariance.rotate_low_rank_` they're zero,
+        ``order`` (default: :func:`Covariance._get_lr_order`). After ``Covariance._rotate_low_rank_()`` they're zero,
         and they span the rotations.
         """
         assert self.lr_mat is not None
@@ -822,96 +930,16 @@ class Covariance(nn.Module):
         position[order] = torch.arange(self.param_rank)
         return (position.unsqueeze(-1) < torch.arange(self.lr_mat.shape[-1])).to(self.lr_mat.device)
 
-    # Loading state-dicts and unpickling -------------------------------------------------------------------------------
+    # Deprecated -------------------------------------------------------------------------------------------------------
 
-    def _load_from_state_dict(self,
-                              state_dict,
-                              prefix,
-                              local_metadata,
-                              strict,
-                              missing_keys,
-                              unexpected_keys,
-                              error_msgs):
-        # (older versions called ``predict_std`` ``var_predict_module``:)
-        for k in [k for k in state_dict if k.startswith(f'{prefix}var_predict_module.')]:
-            state_dict[k.replace(f'{prefix}var_predict_module.', f'{prefix}predict_std.', 1)] = state_dict.pop(k)
-        # a state-dict saved with a different ``method`` would otherwise fail with a generic missing/unexpected-keys
-        # error (or, for ``log_std_devs``, which 'low_rank' and 'sd_corr' share, partially load):
-        present = {k[len(prefix):] for k in state_dict if k.startswith(prefix)}
-        expected = set(_METHOD_PARAMS.get(self.method, ()))
-        if not expected <= present:
-            saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
-            if saved_with:
-                saved = saved_with[0]
-                if saved == 'low_rank':
-                    saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
-                error_msgs.append(
-                    f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
-                    f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
-                    f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
-                    f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
-                    f"(torchcast 2.0 changed the default methods: \"low_rank\" for an initial covariance with "
-                    f"{LOW_RANK_MIN_INITIAL} or more elements with parameters, and \"log_cholesky\" for every "
-                    f"measure-covariance.)"
-                )
-                return
-        self._pack_saved_off_diag(state_dict, prefix)
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    @staticmethod
+    def log_chol_to_chol(log_diag: Tensor, off_diag: Tensor) -> Tensor:
+        """Deprecated: use :func:`torchcast.covariance.log_chol_to_chol`."""
+        warn(
+            "``Covariance.log_chol_to_chol()`` is deprecated, use ``torchcast.covariance.log_chol_to_chol()``.",
+            FutureWarning
         )
-
-    def _pack_saved_off_diag(self, state_dict: dict, prefix: str):
-        """
-        A state-dict saved before a binary ``corr_mask`` applied to the cholesky factor has an entry in
-        ``cholesky_off_diag``/``corr_unconstrained`` for every pair, whose masked-out ones fed the other entries.
-        Replace its parameters (in-place) with ones for the same covariance in the current format.
-        """
-        keep = self._get_off_diag_keep()
-        if keep is None or bool(keep.all()):
-            return
-        diag_key, off_diag_key = (prefix + nm for nm in _METHOD_PARAMS[self.method])
-        diag, off_diag = state_dict.get(diag_key), state_dict.get(off_diag_key)
-        if diag is None or off_diag is None or off_diag.numel() != keep.numel():
-            return
-        values = self._get_params_for_matrix(self._get_unpacked_mini_cov(diag, off_diag))
-        state_dict[diag_key], state_dict[off_diag_key] = (v.to(off_diag) for v in values)
-
-    def __setstate__(self, state: dict):
-        # unpickling a module saved by an older version (``var_predict_module``, ``expected_kwargs``):
-        modules = state.get('_modules', {})
-        if 'var_predict_module' in modules:
-            modules['predict_std'] = modules.pop('var_predict_module')
-        modules.setdefault('predict_std', None)
-        modules.setdefault('predict_corr', None)
-        if 'predictor_kwargs' not in state:
-            state['predictor_kwargs'] = [
-                ProcessKwarg(name=k, is_group_time_tensor=True) for k in (state.pop('expected_kwargs', None) or [])
-            ]
-        super().__setstate__(state)
-        # (pickled before these existed)
-        self.__dict__.setdefault('stationary_idx', [])
-        self.__dict__.setdefault('nonstationary_idx', [])
-        # pickled before a binary ``corr_mask`` applied to the cholesky factor: see ``_pack_saved_off_diag()``
-        keep = self._get_off_diag_keep()
-        if keep is None or bool(keep.all()):
-            return
-        diag_name, off_diag_name = _METHOD_PARAMS[self.method]
-        diag, off_diag = getattr(self, diag_name), getattr(self, off_diag_name)
-        if off_diag.numel() == keep.numel():
-            with torch.no_grad():
-                values = self._get_params_for_matrix(self._get_unpacked_mini_cov(diag, off_diag))
-            for name, value in zip((diag_name, off_diag_name), values):
-                setattr(self, name, nn.Parameter(value.to(off_diag)))
-
-    def _get_unpacked_mini_cov(self, diag: Tensor, off_diag: Tensor) -> Tensor:
-        """The covariance from parameters with an entry for every pair (the format before ``_pack_saved_off_diag``)."""
-        diag, off_diag = diag.detach(), off_diag.detach()
-        if self.method == 'log_cholesky':
-            L = self.log_chol_to_chol(diag, off_diag)
-        else:
-            L = diag.exp().unsqueeze(-1) * corr_cholesky_from_unconstrained(off_diag, rank=self.param_rank)
-        idx = self.non_empty_idx
-        return L @ L.t() * self.corr_mask[idx][:, idx].to(L)
+        return log_chol_to_chol(log_diag, off_diag)
 
 
 def num_off_diag(rank: int) -> int:
@@ -927,6 +955,27 @@ def _unpack_off_diag(packed: Tensor, keep: Tensor) -> Tensor:
 def _log_cosh(x: Tensor) -> Tensor:
     # stable for large |x|, and smooth (exact second derivative at 0, unlike formulas using abs(x))
     return x + F.softplus(-2. * x) - math.log(2.)
+
+
+def log_chol_to_chol(log_diag: torch.Tensor, off_diag: torch.Tensor) -> torch.Tensor:
+    """
+    A lower-triangular cholesky factor from its log-diagonal and its off-diagonal entries (filled into the strict lower
+    triangle in the order of ``torch.tril_indices(rank, rank, -1)``), as parameterized by
+    ``Covariance(method='log_cholesky')``.
+
+    :param log_diag: Tensor whose last dim is ``rank``.
+    :param off_diag: Tensor whose last dim is ``rank * (rank - 1) / 2``.
+    :return: Tensor with trailing dims ``(rank, rank)``.
+    """
+    assert log_diag.shape[:-1] == off_diag.shape[:-1]
+
+    rank = log_diag.shape[-1]
+    L1 = torch.diag_embed(torch.exp(log_diag))
+
+    L2 = torch.zeros_like(L1)
+    mask = torch.tril_indices(rank, rank, offset=-1)
+    L2[mask[0], mask[1]] = off_diag
+    return L1 + L2
 
 
 def corr_cholesky_from_unconstrained(u: Tensor, rank: int) -> Tensor:
@@ -971,34 +1020,9 @@ def _cholesky(cov: Tensor) -> Tensor:
 
 
 def cov2corr(cov: Tensor) -> Tensor:
+    """The correlation matrix (or matrices, over leading dims) of a covariance matrix."""
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
-    # TODO: cov / std_.unsqueeze(-1) / std_.unsqueeze(-2)
-    return cov / (std_.unsqueeze(-1) @ std_.unsqueeze(-2))
-
-
-def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
-    """
-    A ``corr_mask`` from ``corr_groups`` (see :func:`Covariance.from_processes`).
-
-    :param element_ids: For each element (row/column) of the covariance, the id it's grouped by (e.g. its process's
-     id); can repeat.
-    :param corr_groups: Groups of ids. Ids not in any group form one more group together.
-    :param kind: What the ids are, for error messages.
-    """
-    if isinstance(corr_groups, str) or any(isinstance(g, str) for g in corr_groups):
-        raise TypeError(f"``corr_groups`` should be a list of lists of {kind}s, e.g. ``[['a', 'b']]``.")
-    known = list(dict.fromkeys(element_ids))
-    group_of = {}
-    for g, ids in enumerate(corr_groups):
-        for id_ in ids:
-            if id_ not in known:
-                raise ValueError(f"``corr_groups`` has unknown {kind} '{id_}'; expected one of {known}.")
-            if id_ in group_of:
-                raise ValueError(f"``corr_groups`` has {kind} '{id_}' in more than one group.")
-            group_of[id_] = g
-    rest = len(corr_groups)
-    groups = torch.tensor([group_of.get(id_, rest) for id_ in element_ids])
-    return (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
+    return cov / (std_.unsqueeze(-1) * std_.unsqueeze(-2))
 
 
 def _get_pivot_order(V: Tensor) -> List[int]:
@@ -1019,6 +1043,20 @@ def _get_pivot_order(V: Tensor) -> List[int]:
         q = residual[i] / norms[i].sqrt()
         residual = residual - (residual @ q).unsqueeze(-1) * q
     return lead + [i for i in range(V.shape[0]) if i not in lead]
+
+
+def _to_lower_trapezoidal(V: Tensor, order: Sequence[int]) -> Tensor:
+    """
+    Rotate ``V`` (``(rank, K)``) to the lower-trapezoidal form with the rows in ``order`` (``V[order[i], j] = 0`` for
+    ``j > i``), by an LQ decomposition, which leaves ``V @ V.t()`` unchanged. The diagonal (``V[order[j], j]``) is made
+    non-negative, which makes this form unique: equivalent ``V``s (differing by a rotation) give the same result.
+    """
+    order = list(order)
+    _, R = torch.linalg.qr(V[order].t())
+    signs = torch.where(R.diagonal() < 0, -1., 1.).to(R)
+    out = torch.zeros_like(V)
+    out[order] = R.t() * signs
+    return out
 
 
 def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) -> tuple[Tensor, Tensor]:
@@ -1060,24 +1098,7 @@ def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) 
             opt.step(closure)
         V, uniq = V.detach(), log_uniq.detach().exp()
 
-    # rotate to lower-trapezoidal (leading with the most independent rows) with an LQ decomposition, which leaves
-    # ``V @ V.t()`` unchanged:
-    order = _get_pivot_order(V)
-    _, R = torch.linalg.qr(V[order].t())
-    V_lower = torch.empty_like(V)
-    V_lower[order] = R.t()
-    return V_lower, uniq.sqrt()
-
-
-def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
-    param_rank = rank - len(empty_idx)
-    mask = torch.zeros((rank, param_rank), **kwargs)
-    c = 0
-    for r in range(rank):
-        if r not in empty_idx:
-            mask[r, c] = 1.
-            c += 1
-    return mask
+    return _to_lower_trapezoidal(V, _get_pivot_order(V)), uniq.sqrt()
 
 
 def _deprecated_predict_variance(predict_variance: Union[bool, nn.Module, None], kwargs: dict, default_kwarg: str):
@@ -1096,7 +1117,11 @@ def _deprecated_predict_variance(predict_variance: Union[bool, nn.Module, None],
 # backwards compat shim
 class _DeprecatedBase(types.ModuleType):
     def __getattr__(self, name):
-        if name != '__file__':
+        if name not in globals():
+            # (an ``AttributeError``, as ``getattr(module, name, default)`` and tools probing modules expect)
+            raise AttributeError(f"module 'torchcast.covariance' has no attribute '{name}'")
+        # (no warning for dunders such as ``__file__``, which tools like sphinx look up)
+        if not (name.startswith('__') and name.endswith('__')):
             warn(
                 f"`torchcast.covariance.base.{name}` is deprecated, instead just import from "
                 f"`torchcast.covariance.{name}`.",
