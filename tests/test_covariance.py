@@ -1,6 +1,8 @@
+import copy
 import math
 import pickle
 import warnings
+from collections import OrderedDict
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -10,12 +12,13 @@ import torch
 from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag, cov2corr
 from torchcast.kalman_filter import BinomialFilter, KalmanFilter
 from torchcast.process import LocalLevel, LocalTrend, Season
+from torchcast.internals.utils import as_timestep_list
 from torchcast.process.utils import Identity
 
 
 @torch.no_grad()
 def test_from_log_cholesky():
-    module = Covariance(id='test', rank=3, init_diag_multi=0.1)
+    module = Covariance(rank=3, init_diag_multi=0.1)
 
     module.state_dict()['cholesky_log_diag'][:] = torch.arange(1., 3.1)
     module.state_dict()['cholesky_off_diag'][:] = torch.arange(1., 3.1)
@@ -29,7 +32,7 @@ def test_from_log_cholesky():
 
 @torch.no_grad()
 def test_empty_idx():
-    module = Covariance(id='test', rank=3, empty_idx=[0], init_diag_multi=0.1)
+    module = Covariance(rank=3, empty_idx=[0], init_diag_multi=0.1)
     cov = module({}, num_groups=1, num_times=1)
     cov = cov.squeeze()
     assert (cov[0, :] == 0).all()
@@ -94,7 +97,7 @@ def test_sd_corr_empty_idx(predict: bool):
 
     kwargs = {}
     if predict:
-        kwargs = {'predict_variance': Identity(), 'expected_kwargs': ['multi']}
+        kwargs = {'predict_std': Identity(), 'predictor_kwargs': ['multi']}
     lc = Covariance.from_matrix(cov, method='log_cholesky', empty_idx=empty_idx, **kwargs)
     sc = Covariance.from_matrix(cov, method='sd_corr', empty_idx=empty_idx, **kwargs)
     inputs = {'multi': torch.rand(2, 4, len(non_empty)) + .5} if predict else {}
@@ -193,7 +196,7 @@ def test_sd_corr_freezing_hooks():
 
 
 def test_state_dict_across_methods():
-    lc = Covariance(rank=3, init_diag_multi=1., id='initial_covariance')
+    lc = Covariance(rank=3, init_diag_multi=1., role='initial')
     lc2 = Covariance(rank=3, init_diag_multi=1.)
     lc2.load_state_dict(lc.state_dict())  # same method: unchanged
     assert torch.equal(lc2.cholesky_off_diag, lc.cholesky_off_diag)
@@ -285,6 +288,218 @@ def test_binomial_filter_accepts_covariance():
         measure_covariance=Covariance(rank=2, empty_idx=[0], init_diag_multi=1., method='sd_corr')
     )
     assert bf.measure_covariance.method == 'sd_corr'
+
+
+class _Linear(torch.nn.Module):
+    """A linear model of the predictors, zero-initialized (so it starts at the base covariance)."""
+
+    def __init__(self, num_in: int, num_out: int, positive: bool = False):
+        super().__init__()
+        self.linear = torch.nn.Linear(num_in, num_out, bias=False)
+        torch.nn.init.zeros_(self.linear.weight)
+        self.positive = positive
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        out = self.linear(X)
+        return out.exp() if self.positive else out
+
+
+def _cov_with_u(module: Covariance, u: torch.Tensor, std_multi: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The covariance ``module`` would have with ``corr_unconstrained=u`` (and std-devs multiplied by ``std_multi``)."""
+    out = module.to_method('sd_corr')
+    out.predict_corr = out.predict_std = None
+    out.predictor_kwargs = []
+    with torch.no_grad():
+        out.corr_unconstrained.copy_(u)
+        if std_multi is not None:
+            out.log_std_devs.add_(std_multi.log())
+    return out.base_cov()
+
+
+@torch.no_grad()
+def test_predict_std():
+    module = Covariance(rank=3, init_diag_multi=1., method='sd_corr', predict_std=Identity(), predictor_kwargs=['m'])
+    m = torch.rand(2, 4, 3) + .5
+    _assert_close(module({'m': m}, 2, 4), module.base_cov() * m.unsqueeze(-1) * m.unsqueeze(-2))
+    with pytest.raises(RuntimeError, match='<0'):
+        module({'m': -m}, 2, 4)
+    with pytest.raises(ValueError, match='3 columns'):
+        module({'m': m[..., :2]}, 2, 4)
+
+
+@torch.no_grad()
+def test_predict_corr():
+    rank, empty_idx = 4, [1]
+    module = Covariance(
+        rank=rank, empty_idx=empty_idx, init_diag_multi=1., predict_corr=Identity(), predictor_kwargs=['d']
+    )
+    assert module.method == 'sd_corr'  # the default with predict_corr
+    module.corr_unconstrained.normal_()
+    delta = torch.randn(2, 4, num_off_diag(3))
+
+    out = module({'d': delta}, 2, 4)
+    assert out.shape == (2, 4, rank, rank)
+    assert (out[..., 1, :] == 0).all() and (out[..., :, 1] == 0).all()
+    for g, t in [(0, 0), (1, 3)]:
+        _assert_close(out[g, t], _cov_with_u(module, module.corr_unconstrained + delta[g, t]))
+    # variances are unchanged; zero adjustment is the base covariance:
+    _assert_close(out.diagonal(dim1=-2, dim2=-1), module.base_cov().diagonal().expand(2, 4, -1))
+    _assert_close(module({'d': torch.zeros_like(delta)}, 2, 4), module.base_cov().expand(2, 4, -1, -1))
+
+    # group-only predictions don't vary over time, and ``batch_cov`` doesn't expand them:
+    cov, used = module.batch_cov({'d': delta[:, 0]}, num_groups=2, num_times=4)
+    assert cov.shape == (2, 1, rank, rank) and used == {'d'}
+    _assert_close(cov[:, 0], out[:, 0])
+    # without predictions:
+    static, used = Covariance(rank=rank, init_diag_multi=1.).batch_cov({}, num_groups=2, num_times=4)
+    assert static.shape == (1, 1, rank, rank) and used == set()
+
+
+@torch.no_grad()
+def test_predict_std_and_corr():
+    class _Pick(torch.nn.Module):
+        def __init__(self, i: int):
+            super().__init__()
+            self.i = i
+
+        def forward(self, *args):
+            return args[self.i]
+
+    module = Covariance(
+        rank=3, init_diag_multi=1., predict_std=_Pick(0), predict_corr=_Pick(1), predictor_kwargs=['m', 'd']
+    )
+    module.corr_unconstrained.normal_()
+    m = torch.rand(2, 3) + .5  # by group
+    d = torch.randn(2, 5, 3)  # by group and time
+    out, _ = module.batch_cov({'m': m, 'd': d}, num_groups=2, num_times=5)
+    assert out.shape == (2, 5, 3, 3)
+    _assert_close(out[1, 2], _cov_with_u(module, module.corr_unconstrained + d[1, 2], std_multi=m[1]))
+
+
+def test_predict_corr_requires_sd_corr():
+    with pytest.raises(ValueError, match="requires ``method='sd_corr'``"):
+        Covariance(rank=3, init_diag_multi=1., method='log_cholesky', predict_corr=Identity(), predictor_kwargs=['d'])
+    # from_measures picks sd_corr when predict_corr is passed:
+    measures = list('abcdefg')
+    assert Covariance.from_measures(measures, predict_corr=Identity(), predictor_kwargs=['d']).method == 'sd_corr'
+    module = Covariance.from_measures(['a', 'b'], predict_corr=Identity(), predictor_kwargs=['d'])
+    with pytest.raises(ValueError, match="requires ``method='sd_corr'``"):
+        module.to_method('log_cholesky')
+    with pytest.raises(ValueError, match='predictor_kwargs'):
+        Covariance(rank=3, init_diag_multi=1., predict_corr=Identity())
+    with pytest.raises(ValueError, match='no ``predict_std`` or ``predict_corr``'):
+        Covariance(rank=3, init_diag_multi=1., predictor_kwargs=['d'])
+
+
+def test_as_timestep_list():
+    x = torch.randn(1, 1, 3, 3)
+    out = as_timestep_list(x, num_groups=4, num_times=5)
+    assert len(out) == 5 and all(o is out[0] for o in out) and out[0].shape == (4, 3, 3)
+    x = torch.randn(4, 5, 3, 3)
+    out = as_timestep_list(x, num_groups=4, num_times=5)
+    assert torch.equal(torch.stack(out, 1), x)
+    with pytest.raises(ValueError):
+        as_timestep_list(x, num_groups=4, num_times=6)
+
+
+def test_model_predictor_kwargs():
+    torch.manual_seed(0)
+    measures = ['a', 'b']
+    processes = [LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=measures,
+        measure_covariance=Covariance.from_measures(measures, predict_corr=_Linear(1, 1), predictor_kwargs=['X']),
+    )
+    y = torch.randn(3, 10, 2)
+    X = torch.randn(3, 10, 1)
+    with torch.no_grad():
+        kf.measure_covariance.predict_corr.linear.weight.fill_(1.)
+        pred = kf(y, X=X)
+        # a kwarg named ``{id}__{name}`` overrides ``name``:
+        pred2 = kf(y, measure_covariance__X=X)
+        assert torch.equal(pred.means, pred2.means)
+        with pytest.raises(TypeError, match='`X`'):
+            kf(y)
+        with pytest.raises(RuntimeError, match='Unexpected kwargs'):
+            kf(y, X=X, Z=X)
+        # time-varying measure-cov:
+        R = kf.measure_covariance({'X': X}, 3, 10)
+        assert not torch.allclose(R[0, 0], R[0, 1])
+
+
+def test_fit_time_varying_correlation():
+    """
+    The noise-correlation between two measures flips between two regimes; a ``predict_corr`` linear in the regime
+    indicator recovers both.
+    """
+    torch.manual_seed(1)
+    measures = ['a', 'b']
+    num_groups, num_times = 10, 100
+    regime = (torch.arange(num_times) // 25 % 2).float()  # alternating blocks of 25 timesteps
+    corr = torch.where(regime.bool(), -.3, .8)
+    std = torch.tensor([1., .5])
+    z = torch.randn(num_groups, num_times, 2)
+    noise = torch.stack([z[..., 0], corr * z[..., 0] + (1 - corr ** 2).sqrt() * z[..., 1]], -1) * std
+    y = torch.randn(num_groups, 1, 2) + torch.randn(num_groups, num_times, 2).cumsum(1) * .05 + noise
+    X = torch.stack([1 - regime, regime], -1).expand(num_groups, -1, -1)
+
+    processes = [LocalLevel(id=f'level_{m}', measure=m) for m in measures]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=measures,
+        measure_covariance=Covariance.from_measures(measures, predict_corr=_Linear(2, 1), predictor_kwargs=['X']),
+    )
+    kf.fit(y, X=X, verbose=0)
+    with torch.no_grad():
+        R = kf.measure_covariance({'X': X}, num_groups, num_times)[0]
+    learned_corr = R[:, 0, 1] / (R[:, 0, 0] * R[:, 1, 1]).sqrt()
+    assert abs(learned_corr[regime == 0].mean() - .8) < .1
+    assert abs(learned_corr[regime == 1].mean() + .3) < .1
+
+
+def test_deprecated_predict_variance():
+    with pytest.warns(FutureWarning, match='predict_variance'):
+        old = Covariance.from_measures(['a', 'b'], predict_variance=True)
+    assert [k.name for k in old.predictor_kwargs] == ['measure_var_multi']
+    with pytest.warns(FutureWarning, match='predict_variance'):
+        old = Covariance.from_processes([LocalLevel(id='level', measure='a')], predict_variance=True)
+    assert [k.name for k in old.predictor_kwargs] == ['process_var_multi']
+
+    with pytest.warns(FutureWarning):
+        old = Covariance.from_measures(['a', 'b'], predict_variance=Identity(), expected_kwargs=['m'])
+    new = Covariance.from_measures(['a', 'b'], predict_std=Identity(), predictor_kwargs=['m'])
+    new.load_state_dict(old.state_dict())
+    m = torch.rand(2, 3, 2) + .5
+    assert torch.equal(old({'m': m}, 2, 3), new({'m': m}, 2, 3))
+    with pytest.warns(FutureWarning):
+        assert old.expected_kwargs == ['m']
+
+
+def test_load_older_version():
+    new = Covariance.from_measures(
+        ['a', 'b'], predict_std=_Linear(1, 2, positive=True), predictor_kwargs=['X']
+    )
+    with torch.no_grad():
+        new.predict_std.linear.weight.normal_()
+
+    # a state-dict saved by an older version (``var_predict_module``):
+    old_state = {k.replace('predict_std.', 'var_predict_module.'): v for k, v in new.state_dict().items()}
+    loaded = Covariance.from_measures(['a', 'b'], predict_std=_Linear(1, 2, positive=True), predictor_kwargs=['X'])
+    loaded.load_state_dict(old_state)
+    assert torch.equal(loaded.predict_std.linear.weight, new.predict_std.linear.weight)
+
+    # an unpickled module from an older version:
+    state = copy.copy(new.__dict__)
+    state['_modules'] = OrderedDict(var_predict_module=new.predict_std)
+    state['expected_kwargs'] = ['X']
+    del state['predictor_kwargs']
+    unpickled = Covariance.__new__(Covariance)
+    unpickled.__setstate__(state)
+    assert unpickled.predict_std is new.predict_std and unpickled.predict_corr is None
+    assert [k.name for k in unpickled.predictor_kwargs] == ['X']
+    X = torch.randn(2, 3, 1)
+    assert torch.equal(unpickled({'X': X}, 2, 3), new({'X': X}, 2, 3))
 
 
 def test_corr_groups_from_processes():
@@ -394,7 +609,7 @@ def test_warn_correlated_levels():
             kwargs['process_covariance'] = Covariance.from_processes(processes, corr_groups=[['transient']])
         return KalmanFilter(processes=processes, measures=['y'], **kwargs)
 
-    with pytest.warns(UserWarning, match=r"corr_groups=\[\['transient'\]\]"):
+    with pytest.warns(UserWarning, match=r"'corr_groups': \[\['transient'\]\]"):
         make()
     with pytest.warns(UserWarning, match="both decaying or both not"):
         KalmanFilter(processes=[LocalLevel(id='a'), LocalLevel(id='b')], measures=['y'])
@@ -403,6 +618,25 @@ def test_warn_correlated_levels():
         make(uncorrelated=True)
         KalmanFilter(processes=[LocalLevel(id='a', measure='x'), LocalLevel(id='b', measure='y')], measures=['x', 'y'])
 
+
+@torch.no_grad()
+def test_corr_mask_with_predict_corr():
+    # predicted correlations are masked too: masked-out pairs stay uncorrelated whatever the adjustment. with a binary
+    # mask, the prediction has one column per entry of ``corr_unconstrained`` (pairs that aren't masked out)
+    corr_mask = torch.tensor([[1., 1., 0.], [1., 1., 0.], [0., 0., 1.]])
+    module = Covariance(
+        rank=3, init_diag_multi=1., predict_corr=Identity(), predictor_kwargs=['d'], corr_mask=corr_mask
+    )
+    assert module.corr_unconstrained.numel() == 1
+    module.corr_unconstrained.normal_()
+    with pytest.raises(ValueError, match="should output 1 columns"):
+        module({'d': torch.randn(2, 4, num_off_diag(3))}, 2, 4)
+    delta = torch.randn(2, 4, 1)
+    out = module({'d': delta}, 2, 4)
+    assert (out[..., 2, :2] == 0).all() and (out[..., :2, 2] == 0).all()
+    corr = out[..., 0, 1] / (out[..., 0, 0] * out[..., 1, 1]).sqrt()
+    assert torch.allclose(corr, torch.tanh(module.corr_unconstrained + delta[..., 0]), atol=1e-6)
+    assert (torch.linalg.eigvalsh(out) > 0).all()
 
 
 def _make_decaying_kf(stationary: Union[Sequence[str], dict] = (), decay=(.5, .95), **kwargs) -> KalmanFilter:
@@ -507,7 +741,7 @@ def test_warn_free_decay_initial_variance():
     match = r"learned decay and a free initial variance: \['transient_a', 'transient_b'\]"
     with pytest.warns(UserWarning, match=match):
         _make_decaying_kf()
-    with pytest.warns(UserWarning, match=r"stationary=\['transient_b'\]"):
+    with pytest.warns(UserWarning, match=r"initial_covariance={'stationary': \['transient_b'\]}"):
         _make_decaying_kf(stationary=['transient_a'])
     with pytest.warns(UserWarning, match=match):
         _make_decaying_kf(decay=(.9, 1.0))  # a learned decay bounded at 1 counts too
@@ -711,21 +945,178 @@ def test_covariance_base_shim():
 def test_covariance_in_the_wrong_slot_raises():
     processes = [LocalLevel(id='level', measure='y')]
     # e.g. forgetting ``cov_type='initial'``, which makes a process-covariance (different elements get parameters):
-    with pytest.raises(ValueError, match=r"created as ``process_covariance``.*cov_type='initial'"):
+    with pytest.raises(ValueError, match=r"created as a ``process`` covariance.*cov_type='initial'"):
         KalmanFilter(
             processes=processes, measures=['y'], initial_covariance=Covariance.from_processes(processes)
         )
-    with pytest.raises(ValueError, match=r"created as ``initial_covariance``.*cov_type='process'"):
+    with pytest.raises(ValueError, match=r"created as a ``initial`` covariance.*cov_type='process'"):
         KalmanFilter(
             processes=processes,
             measures=['y'],
             process_covariance=Covariance.from_processes(processes, cov_type='initial')
         )
-    with pytest.raises(ValueError, match=r"used as ``measure_covariance``.*from_measures"):
+    with pytest.raises(ValueError, match=r"used as the ``measure`` covariance.*from_measures"):
         KalmanFilter(
             processes=processes, measures=['y'], measure_covariance=Covariance.from_processes(processes)
         )
-    # a covariance with a custom id is renamed, with a warning, as before:
-    custom = Covariance(rank=1, init_diag_multi=1., id='my_covariance')
-    with pytest.warns(UserWarning, match="Id already set to my_covariance"):
-        KalmanFilter(processes=processes, measures=['y'], initial_covariance=custom)
+
+
+def test_covariance_elements_must_match_the_model():
+    processes = [LocalLevel(id='a', measure='y'), LocalTrend(id='b', measure='y')]
+    kf = KalmanFilter(processes=processes, measures=['y'])
+    names = ['a.level', 'b.position', 'b.velocity']
+    assert kf.process_covariance.element_names == names
+    assert kf.initial_covariance.element_names == names
+    assert kf.measure_covariance.element_names == ['y']
+    assert (kf.process_covariance.role, kf.process_covariance.id) == ('process', 'process_covariance')
+
+    # created from other processes, or in another order (same rank):
+    other = [LocalTrend(id='b', measure='y'), LocalLevel(id='a', measure='y')]
+    with pytest.raises(ValueError, match=r"created for the state-elements \['b.position'.*in the same order"):
+        KalmanFilter(processes=processes, measures=['y'], process_covariance=Covariance.from_processes(other))
+    with pytest.raises(ValueError, match="created for the measures"):
+        KalmanFilter(processes=processes, measures=['y'], measure_covariance=Covariance.from_measures(['z']))
+
+    # a covariance created directly gets its role and names from the model, if its rank matches:
+    direct = Covariance(rank=3, init_diag_multi=1.)
+    assert direct.role is None and direct.id is None
+    kf = KalmanFilter(processes=processes, measures=['y'], initial_covariance=direct)
+    assert kf.initial_covariance is direct
+    assert (direct.role, direct.element_names) == ('initial', names)
+    with pytest.raises(ValueError, match="has rank 2, but the model has 3 state-elements"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance=Covariance(rank=2, init_diag_multi=1.))
+    # now that it's bound, it can't be used in another role:
+    with pytest.raises(ValueError, match="created as a ``initial`` covariance"):
+        KalmanFilter(processes=processes, measures=['y'], process_covariance=direct)
+
+    # copies keep them:
+    assert direct.to_method('sd_corr').element_names == names
+    assert copy.deepcopy(direct).role == 'initial'
+
+    with pytest.raises(ValueError, match="``role`` should be one of"):
+        Covariance(rank=3, init_diag_multi=1., role='measures')
+    with pytest.raises(ValueError, match="expected 3"):
+        Covariance(rank=3, init_diag_multi=1., element_names=['a', 'b'])
+
+
+def test_deprecated_id():
+    with pytest.warns(FutureWarning, match=r"Covariance\(id=...\)"):
+        cov = Covariance(rank=1, init_diag_multi=1., id='initial_covariance')
+    assert cov.role == 'initial'
+    with pytest.warns(FutureWarning, match=r"Covariance\(id=...\)"):
+        cov = Covariance(rank=1, init_diag_multi=1., id='my_covariance')
+    assert cov.role is None
+    with pytest.warns(FutureWarning, match="set_id"):
+        cov.set_id('measure_covariance')
+    assert cov.id == 'measure_covariance'
+
+    # a module pickled before ``role`` existed (it had an ``id`` attribute instead):
+    cov = Covariance.from_measures(['y'])
+    state = cov.__dict__.copy()
+    del state['role'], state['element_names']
+    state['id'] = 'measure_covariance'
+    old = Covariance.__new__(Covariance)
+    old.__setstate__(state)
+    assert (old.role, old.element_names, old.id) == ('measure', None, 'measure_covariance')
+    kf = KalmanFilter(processes=[LocalLevel(id='a', measure='y')], measures=['y'], measure_covariance=old)
+    assert old.element_names == ['y']
+
+
+def test_covariance_from_dict_spec():
+    processes = [
+        LocalLevel(id='level', measure='y'),
+        Season(id='season', measure='y', period=7, dt_unit=None, K=1, fixed=True)
+    ]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=['y'],
+        initial_covariance={'method': 'sd_corr'},
+        process_covariance={'init_diag_multi': .2},
+        measure_covariance={'method': 'sd_corr'},
+    )
+    # created with the right ``cov_type``: the fixed season has initial variance, but no process variance
+    assert kf.initial_covariance.role == 'initial' and kf.initial_covariance.method == 'sd_corr'
+    assert kf.initial_covariance.empty_idx == set()
+    assert kf.process_covariance.empty_idx == {1, 2}
+    assert kf.measure_covariance.method == 'sd_corr'
+    with pytest.raises(TypeError, match="can't include ``cov_type``"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance={'cov_type': 'process'})
+    with pytest.raises(TypeError, match="should be a ``Covariance``, a dict"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance='sd_corr')
+
+    # BinomialFilter sets the binary measures' ``empty_idx``; old-style dicts (``Covariance.__init__``'s kwargs) work
+    bf = BinomialFilter(
+        processes=[LocalLevel(id='a', measure='a'), LocalLevel(id='b', measure='b')],
+        measures=['a', 'b'],
+        binary_measures=['a'],
+        measure_covariance={'rank': 2, 'method': 'sd_corr'},
+    )
+    assert bf.measure_covariance.empty_idx == {0}
+    assert bf.measure_covariance.method == 'sd_corr'
+    assert bf.measure_covariance.element_names == ['a', 'b']
+
+
+def test_smoothing_matrix_names():
+    from torchcast.exp_smooth import ExpSmoother, SmoothingMatrix
+    processes = [LocalLevel(id='a', measure='y'), LocalTrend(id='b', measure='y')]
+    es = ExpSmoother(processes=processes, measures=['y'], smoothing_matrix={'method': 'low_rank1'})
+    assert es.smoothing_matrix.method == 'low_rank'
+    assert es.smoothing_matrix.state_element_names == ['a.level', 'b.position', 'b.velocity']
+    assert es.smoothing_matrix.measures == ['y']
+    assert es.smoothing_matrix.id == 'smoothing_matrix'
+
+    other = [LocalTrend(id='b', measure='y'), LocalLevel(id='a', measure='y')]
+    with pytest.raises(ValueError, match="created for the state-elements"):
+        ExpSmoother(
+            processes=processes,
+            measures=['y'],
+            smoothing_matrix=SmoothingMatrix.from_measures_and_processes(['y'], other)
+        )
+    direct = SmoothingMatrix(measure_rank=1, state_rank=3)
+    ExpSmoother(processes=processes, measures=['y'], smoothing_matrix=direct)
+    assert direct.measures == ['y']
+    with pytest.raises(ValueError, match="has 2 state-elements, but the model has 3"):
+        ExpSmoother(processes=processes, measures=['y'], smoothing_matrix=SmoothingMatrix(measure_rank=1, state_rank=2))
+
+    with pytest.warns(FutureWarning, match="set_id"):
+        direct.set_id('x')
+    # pickled before ``id`` became a property:
+    state = direct.__dict__.copy()
+    del state['state_element_names'], state['measures']
+    state['id'] = 'smoothing_matrix'
+    old = SmoothingMatrix.__new__(SmoothingMatrix)
+    old.__setstate__(state)
+    assert (old.id, old.measures) == ('smoothing_matrix', None)
+
+
+def test_covariance_dict_options_are_validated():
+    processes = [LocalLevel(id='level', measure='y')]
+
+    def make(**kwargs):
+        return KalmanFilter(processes=processes, measures=['y'], **kwargs)
+
+    with pytest.raises(TypeError, match=r"``initial_covariance`` got an unknown option 'methd'. Did you mean 'method'"):
+        make(initial_covariance={'methd': 'sd_corr'})
+    with pytest.raises(TypeError, match=r"Options: corr_groups, stationary, method, init_diag_multi, corr_mask\.$"):
+        make(initial_covariance={'nonsense': 1})
+    with pytest.raises(TypeError, match="can't include ``cov_type``: the model sets it"):
+        make(initial_covariance={'cov_type': 'process'})
+    with pytest.raises(TypeError, match="can't include ``stationary``: it's only for the ``initial_covariance``"):
+        make(process_covariance={'stationary': ['level']})
+    with pytest.raises(TypeError, match="can't include ``empty_idx``"):
+        make(process_covariance={'empty_idx': [0]})
+    with pytest.raises(TypeError, match="initial covariance applies before any data"):
+        make(initial_covariance={'predict_std': Identity(), 'predictor_kwargs': ['x']})
+    # (also for a Covariance object, whose prediction would have no effect:)
+    with pytest.raises(ValueError, match="applies before any data"):
+        make(initial_covariance=Covariance(rank=1, init_diag_multi=1., predict_std=Identity(), predictor_kwargs=['x']))
+
+    # deprecated options still work, and aren't suggested:
+    with pytest.warns(FutureWarning, match="predict_variance"):
+        make(measure_covariance={'predict_variance': True})
+    with pytest.raises(TypeError) as e:
+        make(measure_covariance={'nonsense': 1})
+    assert 'predict_variance' not in str(e.value) and 'predict_corr' in str(e.value)
+    # BinomialFilter sets ``empty_idx`` itself:
+    with pytest.raises(TypeError, match=r"'nonsense'.*Options: corr_groups, method, init_diag_multi, predict_std"):
+        BinomialFilter(processes=processes, measures=['y'], measure_covariance={'nonsense': 1})

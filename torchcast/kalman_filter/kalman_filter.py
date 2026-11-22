@@ -7,8 +7,8 @@ This class inherits most of its methods from :class:`torchcast.state_space.State
 from typing import Sequence
 from warnings import warn
 
-from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor, mvnorm_log_prob
+from torchcast.covariance import Covariance, get_state_element_names, _make_covariance
+from torchcast.internals.utils import update_tensor, mvnorm_log_prob, as_timestep_list
 from torchcast.process import Process
 from torchcast.process.utils import StateElement, FixedValue
 
@@ -55,9 +55,14 @@ class KalmanFilter(StateSpaceModel):
     """
     :param processes: A list of :class:`.Process` modules.
     :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
-    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
-    :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
-    :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
+    :param measure_covariance: A dict of options for :func:`Covariance.from_measures` (e.g.
+     ``{'method': 'sd_corr'}``), or a :class:`.Covariance` created with it. Default: its defaults.
+    :param process_covariance: A dict of options for :func:`Covariance.from_processes` (e.g.
+     ``{'corr_groups': [...]}``), or a :class:`.Covariance` created with ``cov_type='process'``. Default: its
+     defaults.
+    :param initial_covariance: A dict of options for :func:`Covariance.from_processes` (e.g.
+     ``{'stationary': [...]}``), or a :class:`.Covariance` created with ``cov_type='initial'``. Default: its
+     defaults.
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
@@ -74,19 +79,16 @@ class KalmanFilter(StateSpaceModel):
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Sequence[str],
-                 measure_covariance: Optional[Covariance] = None,
-                 process_covariance: Optional[Covariance] = None,
-                 initial_covariance: Optional[Covariance] = None,
+                 measure_covariance: Union[Covariance, dict, None] = None,
+                 process_covariance: Union[Covariance, dict, None] = None,
+                 initial_covariance: Union[Covariance, dict, None] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: bool = False,
                  joseph_form: bool = True,
                  mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
 
-        if initial_covariance is None:
-            initial_covariance = Covariance.from_processes(processes, cov_type='initial')
-
-        if process_covariance is None:
-            process_covariance = Covariance.from_processes(processes, cov_type='process')
+        initial_covariance = _make_covariance(initial_covariance, role='initial', processes=processes)
+        process_covariance = _make_covariance(process_covariance, role='process', processes=processes)
 
         super().__init__(
             processes=processes,
@@ -96,8 +98,9 @@ class KalmanFilter(StateSpaceModel):
             adaptive_scaling=adaptive_scaling,
             mixture=mixture,
         )
-        self.process_covariance = process_covariance.set_id('process_covariance')
-        self.initial_covariance = initial_covariance.set_id('initial_covariance')
+        state_element_names = get_state_element_names(self.processes.values())
+        self.process_covariance = process_covariance._bind('process', state_element_names)
+        self.initial_covariance = initial_covariance._bind('initial', state_element_names)
         self.joseph_form = joseph_form
         self._validate_stationary_initial_variance()
         self._warn_correlated_levels()
@@ -163,20 +166,20 @@ class KalmanFilter(StateSpaceModel):
             f"slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the "
             f"whole series. Consider tying their initial covariance to their stationary covariance (computed from "
             f"the process-covariance and the decays), e.g.:\n"
-            f"  initial_covariance=Covariance.from_processes(processes, cov_type='initial', stationary={free})\n"
+            f"  initial_covariance={{'stationary': {free}}}\n"
             f"That assumes series start in their usual, steady-state behavior. If instead a decaying process captures "
             f"how far series start from their long-run level after a common start event (e.g. sign-up), keep its "
             f"free initial variance on purpose, which silences this warning, with e.g. "
-            f"``stationary={{{free[0]!r}: False}}``."
+            f"``initial_covariance={{'stationary': {{{free[0]!r}: False}}}}``."
         )
 
     def _default_initial_cov(self) -> torch.Tensor:
-        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        init_cov = self.initial_covariance.base_cov().unsqueeze(0)
         stationary_idx = self._get_stationary_idx()
         if stationary_idx:
             # the stationary covariance of the decaying elements, ``Q[i, j] / (1 - decay_i * decay_j)``, from the base
-            # process-covariance (ignoring any ``predict_variance``, as the initial covariance does):
-            pcov = self.process_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+            # process-covariance (ignoring any ``predict_std``/``predict_corr``, as the initial covariance does):
+            pcov = self.process_covariance.base_cov()
             elements = _get_elements_by_idx(self.processes)
             decays = []
             for idx in stationary_idx:
@@ -234,7 +237,7 @@ class KalmanFilter(StateSpaceModel):
             suggestion = [[pid for pid in level_idx if pid in decaying]]
             msg += (
                 f" Consider making the decaying levels uncorrelated with the others, e.g.:\n"
-                f"  process_covariance=Covariance.from_processes(processes, corr_groups={suggestion})\n"
+                f"  process_covariance={{'corr_groups': {suggestion}}}\n"
                 f"(The processes in each group are correlated with each other, but not with those in other groups; "
                 f"processes not in any group form one more group together.)"
             )
@@ -511,23 +514,10 @@ class KalmanFilter(StateSpaceModel):
         )
 
         # process-variance:
-        pcov_kwargs = {}
-        if self.process_covariance.expected_kwargs:
-            pcov_kwargs = {k: kwargs[k] for k in self.process_covariance.expected_kwargs}
-        used_keys |= set(pcov_kwargs)
-
-        measure_scaling = self._get_measure_scaling()
-
-        # todo: instead of branching here, clean up Covariance.forward():
-        if pcov_kwargs:
-            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=num_timesteps)
-            Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_scaling, is_process_cov=True)
-            predict_kwargs['Q'] = Qs.unbind(1)
-        else:
-            # faster if not time-varying
-            pcov_raw = self.process_covariance(pcov_kwargs, num_groups=num_groups, num_times=1).squeeze(1)
-            Qs = self._apply_cov_scaling(pcov_raw, scaling=measure_scaling, is_process_cov=True)
-            predict_kwargs['Q'] = [Qs] * num_timesteps
+        pcov_raw, pcov_keys = self.process_covariance.batch_cov(kwargs, num_groups=num_groups, num_times=num_timesteps)
+        used_keys |= pcov_keys
+        Qs = self._apply_cov_scaling(pcov_raw, scaling=self._get_measure_scaling(), is_process_cov=True)
+        predict_kwargs['Q'] = as_timestep_list(Qs, num_groups=num_groups, num_times=num_timesteps)
 
         return predict_kwargs, update_kwargs, used_keys
 

@@ -11,7 +11,7 @@ import torch
 from torch.distributions import Binomial
 from typing import Sequence, TYPE_CHECKING, Optional, Union, Literal
 
-from torchcast.covariance import Covariance, DEFAULT_MCOV_MULTI
+from torchcast.covariance import Covariance, _make_covariance
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.state_space.predictions import Predictions, DatasetMetadata, _DEFAULT_NUM_SAMPLES
 from torchcast.internals.batch_design import MeasurementModel, Sigmoid
@@ -36,9 +36,11 @@ class BinomialFilter(KalmanFilter):
      'num_obs', it changes with ``log(num_obs)`` (a learned slope, only use if ``num_obs`` varies in your data); if
      'auto' (the default), then 'static' or 'num_obs' will be chosen at fit time, depending on whether the provided
      data has varying ``num_obs``; if ``'none'`` then no correction.
-    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
-    :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
-    :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
+    :param measure_covariance: A dict of options for :func:`Covariance.from_measures`, or a :class:`.Covariance`. The
+     binary measures have no learned variance (their variance comes from the binomial), so a :class:`.Covariance`
+     needs them in ``empty_idx``; with a dict, the filter sets that.
+    :param process_covariance: See :class:`.KalmanFilter`.
+    :param initial_covariance: See :class:`.KalmanFilter`.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
     :param joseph_form: See :class:`.KalmanFilter`. (Binary measures whose probability is near 0 or 1 have a small
@@ -52,9 +54,9 @@ class BinomialFilter(KalmanFilter):
                  binary_measures: Optional[Sequence[str]] = None,
                  observed_counts: Optional[bool] = None,
                  do_post_hoc_correction: Union[Literal['none', 'static', 'num_obs', 'auto'], bool] = 'auto',
-                 measure_covariance: Optional[Union[Covariance, dict]] = None,
-                 process_covariance: Optional[Covariance] = None,
-                 initial_covariance: Optional[Covariance] = None,
+                 measure_covariance: Union[Covariance, dict, None] = None,
+                 process_covariance: Union[Covariance, dict, None] = None,
+                 initial_covariance: Union[Covariance, dict, None] = None,
                  adaptive_scaling: bool = False,
                  joseph_form: bool = True,
                  mixture: Union['MixtureModel', Sequence['MixtureComponent'], None] = None):
@@ -187,27 +189,19 @@ class BinomialFilter(KalmanFilter):
             raise RuntimeError(f"Some `binary_measures` not in `measures`: {unexpected}")
 
         mcov_empty_idx = [i for i, m in enumerate(measures) if m in binary_measures]
-        if measure_covariance is None:
-            measure_covariance = {}
-        if isinstance(measure_covariance, dict):
-            measure_covariance['id'] = 'measure_covariance'
-            measure_covariance['rank'] = len(measures)
-            measure_covariance['empty_idx'] = mcov_empty_idx
-            measure_covariance['init_diag_multi'] = measure_covariance.get('init_diag_multi', DEFAULT_MCOV_MULTI)
-
-        if isinstance(measure_covariance, Covariance):  # todo: we should be able to eliminate this mess
+        if isinstance(measure_covariance, Covariance):
             if set(measure_covariance.empty_idx) != set(mcov_empty_idx):
                 raise ValueError(
                     f"Expected ``empty_idx`` to correspond to binary measures (i.e. {mcov_empty_idx}) but they did not "
-                    f"(i.e. got {measure_covariance.empty_idx}). To resolve this, you could instead supply for the "
-                    f"`measure_covariance` argument the keyword arguments for initializing a ``Covariance`` object "
-                    f"(rather than passing the ``Covariance`` itself), then {cls.__name__} will figure out the "
-                    f"empty-idx for you."
+                    f"(i.e. got {measure_covariance.empty_idx}). To resolve this, you could instead pass a dict of "
+                    f"options for ``Covariance.from_measures()`` as the ``measure_covariance``, and {cls.__name__} "
+                    f"will set the ``empty_idx`` for you."
                 )
-        else:
-            measure_covariance = Covariance(**measure_covariance)
-
-        return measure_covariance
+            return measure_covariance
+        if isinstance(measure_covariance, dict):
+            # (this dict used to be ``Covariance.__init__``'s kwargs, whose ``rank``/``id``/``empty_idx`` were replaced)
+            measure_covariance = {k: v for k, v in measure_covariance.items() if k not in ('rank', 'id', 'empty_idx')}
+        return _make_covariance(measure_covariance, role='measure', measures=measures, empty_idx=mcov_empty_idx)
 
     def _generate_predictions(self,
                               preds: Sequence['StateTuple'],

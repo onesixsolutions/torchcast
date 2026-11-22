@@ -9,8 +9,8 @@ from tqdm.auto import tqdm
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
-from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
-from torchcast.covariance import Covariance
+from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, as_timestep_list
+from torchcast.covariance import Covariance, _make_covariance
 from torchcast.process.regression import Process
 from torchcast.mixture import MixtureModel, MixtureComponent
 
@@ -28,7 +28,9 @@ class StateSpaceModel(torch.nn.Module):
 
     :param processes: A list of :class:`.Process` modules.
     :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
-    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
+    :param measure_covariance: A dict of options for :func:`Covariance.from_measures` (e.g.
+     ``{'method': 'sd_corr'}``), or a :class:`.Covariance` created with it. Default: ``Covariance.from_measures()``'s
+     defaults.
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
@@ -40,7 +42,7 @@ class StateSpaceModel(torch.nn.Module):
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Sequence[str],
-                 measure_covariance: Optional[Covariance] = None,
+                 measure_covariance: Union[Covariance, dict, None] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: Union[bool, AdaptiveScaler] = False,
                  mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
@@ -50,11 +52,8 @@ class StateSpaceModel(torch.nn.Module):
         assert isinstance(measures, (tuple, list)), "`measures` must be a list/tuple"
         self.measures = measures
 
-        if measure_covariance is None:
-            measure_covariance = Covariance.from_measures(measures)
-        else:
-            assert measure_covariance.rank == 1 or measure_covariance.rank == len(measures)
-        self.measure_covariance = measure_covariance.set_id('measure_covariance')
+        measure_covariance = _make_covariance(measure_covariance, role='measure', measures=measures)
+        self.measure_covariance = measure_covariance._bind('measure', measures)
 
         self.measure_funs = {}
         for m, alias in (measure_funs or {}).items():
@@ -213,11 +212,8 @@ class StateSpaceModel(torch.nn.Module):
             nan_groups = [None] * out_timesteps
         # # /
 
-        # todo: update Covariance class to make this less hacky:
-        mcov_kwargs = {}
-        if self.measure_covariance.expected_kwargs:
-            mcov_kwargs = {k: kwargs[k] for k in self.measure_covariance.expected_kwargs}
-        measure_covs = list(self.measure_covariance(mcov_kwargs, num_groups, out_timesteps).unbind(1))
+        measure_covs, mcov_keys = self.measure_covariance.batch_cov(kwargs, num_groups, out_timesteps)
+        measure_covs = as_timestep_list(measure_covs, num_groups, out_timesteps)
 
         # the adaptive-scaler's state, and the multiplier for the first step: continued from `initial_state` if it
         # carries them (e.g. from `get_state_at_times()`), otherwise fresh.
@@ -238,7 +234,7 @@ class StateSpaceModel(torch.nn.Module):
             measure_covs=measure_covs,
             **kwargs
         )
-        used_keys.update(mcov_kwargs)
+        used_keys.update(mcov_keys)
 
         transition_model = self._make_transition_model(num_groups=num_groups, num_timesteps=out_timesteps)
         measurement_model = self._make_measurement_model(num_groups=num_groups, num_timesteps=out_timesteps, **kwargs)
@@ -928,11 +924,11 @@ class StateSpaceModel(torch.nn.Module):
     def _default_initial_cov(self) -> torch.Tensor:
         # the initial covariance is parameterized relative to the measure-scale. note this scaling only applies to the
         # default: a user-supplied cov (e.g. from ``get_state_at_times()``) is already on the right scale.
-        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        init_cov = self.initial_covariance.base_cov().unsqueeze(0)
         return self._apply_cov_scaling(init_cov, scaling=self._get_measure_scaling(), is_process_cov=True)
 
     def _get_measure_scaling(self) -> torch.Tensor:
-        mcov = self.measure_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+        mcov = self.measure_covariance.base_cov()
         # need unbind->modify->stack to avoid modified-inplace error
         measure_diag = list(mcov.diagonal(dim1=-2, dim2=-1).unbind(0))
         # replace 0 with 1 in empties:
