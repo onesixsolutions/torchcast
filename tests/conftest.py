@@ -1,13 +1,12 @@
 import pytest
+import torch
 
 
 @pytest.fixture(autouse=True)
-def _pin_derived_seed(monkeypatch):
+def _seed_torch():
     """
     ``Predictions`` draws the seed for its sample-based outputs (e.g. ``to_dataframe()`` intervals for nonlinear
-    measures, ``derived``) at import, so it differs between test-runs. Pin it, so that tests with monte-carlo
-    tolerances are deterministic.
+    measures, ``derived``) from torch's global random state. Seed it, so that tests with monte-carlo tolerances are
+    deterministic even if they don't seed it themselves.
     """
-    from torchcast.state_space import predictions
-
-    monkeypatch.setattr(predictions, '_OUTPUT_SEED', 12345)
+    torch.manual_seed(12345)

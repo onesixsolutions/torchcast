@@ -1,3 +1,4 @@
+import contextlib
 import math
 import numbers
 from math import log
@@ -24,11 +25,16 @@ if TYPE_CHECKING:
     from torchcast.internals.batch_design import MeasurementModel
     from torchcast.internals.monte_carlo import FixedWhiteNoise
 
-# seed for sample-based outputs (``to_dataframe()``'s monte-carlo means and intervals, ``derived``, states), drawn at
-# import: repeated calls within a process give the same results. (Separate from the model's ``mc_sampling``, which is
-# only for the monte-carlo log-prob, fixed so that it's a deterministic function of the parameters.) Draws of the
-# state, and draws given the state, use separate seeds (see ``Predictions._output_generator``).
-_OUTPUT_SEED = int(np.random.RandomState().randint(0, 2 ** 31 - 1))
+# sample-based outputs (``to_dataframe()``'s monte-carlo means and intervals, ``derived``, states, and the ``means`` of
+# nonlinear models) use a seed derived from ``torch.initial_seed()``: the seed last set by ``torch.manual_seed()``, or
+# a random one fixed for the process if it was never called. So ``torch.manual_seed()`` makes them reproducible, and
+# without it, repeated calls within a process agree -- also across ``Predictions`` objects (e.g. ``model(y).means``
+# twice) -- without drawing from (and so changing) torch's global random state. (Separate from the model's
+# ``mc_sampling``, which is only for the monte-carlo log-prob, fixed so that it's a deterministic function of the
+# parameters.) Draws of the state, and draws given the state, use separate seeds (see
+# ``Predictions._output_generator``). The largest seed used for the draws of the state (one more is used for the draws
+# given the state):
+_MAX_OUTPUT_SEED = 2 ** 31 - 3
 # the default number of samples for sample-based outputs:
 _DEFAULT_NUM_SAMPLES = 1000
 # sample-based outputs are computed in chunks of groups, so that their samples have at most about this many elements
@@ -93,6 +99,9 @@ class Predictions:
         self.mixture = mixture
         if self.mixture is not None and self.combo_probs is None:
             raise ValueError("If `mixture` is passed, `states` must carry `combo_probs`.")
+
+        # the seed for sample-based outputs, set when first needed (see ``_get_output_seed``):
+        self._output_seed: Optional[int] = None
 
     @property
     def num_groups(self) -> int:
@@ -204,16 +213,21 @@ class Predictions:
     def get_means(self,
                   transform: Union['Transform', dict[str, 'Transform'], None] = None,
                   use_map: Optional[bool] = None,
-                  num_samples: int = _DEFAULT_NUM_SAMPLES) -> torch.Tensor:
+                  num_samples: int = _DEFAULT_NUM_SAMPLES,
+                  generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """
         The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform``,
-        ``use_map`` and ``num_samples`` -- without computing any intervals.
+        ``use_map``, ``num_samples`` and ``generator`` -- without computing any intervals.
 
         :param transform: See :func:`to_dataframe`.
         :param use_map: See :func:`to_dataframe`.
         :param num_samples: See :func:`to_dataframe`.
+        :param generator: See :func:`to_dataframe`.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
+        if generator is not None:
+            with self._output_seed_from(generator):
+                return self.get_means(transform=transform, use_map=use_map, num_samples=num_samples)
         use_map = self._resolve_use_map(use_map)
         transforms = self._standardize_transforms(transform)
         return self._map_group_chunks(
@@ -502,7 +516,8 @@ class Predictions:
                      use_map: Optional[bool] = None,
                      transform: Union['Transform', dict[str, 'Transform'], None] = None,
                      derived: Optional[dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]]] = None,
-                     num_samples: int = _DEFAULT_NUM_SAMPLES) -> pd.DataFrame:
+                     num_samples: int = _DEFAULT_NUM_SAMPLES,
+                     generator: Optional[torch.Generator] = None) -> pd.DataFrame:
         """
         :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
         :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
@@ -539,9 +554,26 @@ class Predictions:
          that aren't in ``dataset`` are all-nan). Only for ``type='predictions'``.
         :param num_samples: The number of monte-carlo samples, for the outputs that need them: the means (with
          ``use_map=False`` or a ``transform``) and intervals of measures with a nonlinear measured-mean, ``derived``,
-         and ``type='states'``/``'observed_states'`` for nonlinear models. Drawn with a fixed seed, so repeated calls
-         agree. (Separate from the model's ``mc_sampling``, which is only for the log-prob, in training.)
+         and ``type='states'``/``'observed_states'`` for nonlinear models. (Separate from the model's
+         ``mc_sampling``, which is only for the log-prob, in training.)
+        :param generator: An optional :class:`torch.Generator` for those samples. By default, their seed comes from
+         ``torch.initial_seed()`` -- the seed last set by ``torch.manual_seed()``, which makes them reproducible, or
+         else a random one fixed for the process -- so repeated calls agree. With a ``generator``, this call draws its
+         seed from the ``generator`` instead (leaving the predictions' own seed as it was).
         """
+        if generator is not None:
+            with self._output_seed_from(generator):
+                return self.to_dataframe(
+                    dataset=dataset,
+                    type=type,
+                    group_colname=group_colname,
+                    time_colname=time_colname,
+                    conf=conf,
+                    use_map=use_map,
+                    transform=transform,
+                    derived=derived,
+                    num_samples=num_samples,
+                )
         dataset = self._resolve_dataset(dataset)
         group_colname = group_colname or self.dataset_metadata.group_colname
         time_colname = time_colname or self.dataset_metadata.time_colname
@@ -831,10 +863,10 @@ class Predictions:
         """
         Applies ``fun`` to chunks of groups (``self[start:end]``), each small enough that its sample-based outputs'
         samples have at most about ``_MAX_OUTPUT_SAMPLE_ELEMENTS`` elements, and concatenates the results along the
-        groups. Sample-based outputs share their noise across rows (with a fixed seed), so the results are the same as
-        for all groups at once -- just with bounded memory. (The exception: ``BinomialPredictions`` draws binary
-        observations independently per row, so ``derived`` quantities of binary measures depend on the chunking --
-        each row's draws are still valid, and reproducible.)
+        groups. Sample-based outputs share their noise across rows (and the chunks share these predictions' seed), so
+        the results are the same as for all groups at once -- just with bounded memory. (The exception:
+        ``BinomialPredictions`` draws binary observations independently per row, so ``derived`` quantities of binary
+        measures depend on the chunking -- each row's draws are still valid, and reproducible.)
 
         :param fun: Takes a ``Predictions`` object, returns a ``(num_groups, ...)`` tensor, or a dict of tuples of them.
         :param num_samples: The number of samples ``fun`` draws (0 if none, in which case there's no chunking).
@@ -843,6 +875,7 @@ class Predictions:
         group_size = max(1, _MAX_OUTPUT_SAMPLE_ELEMENTS // max(1, num_samples * self.num_timesteps * dim))
         if not num_samples or group_size >= self.num_groups:
             return fun(self)
+        self._get_output_seed()  # (set before chunking, so that the chunks inherit it)
         results = [fun(self[start:start + group_size]) for start in range(0, self.num_groups, group_size)]
         if isinstance(results[0], torch.Tensor):
             return torch.cat(results)
@@ -861,8 +894,8 @@ class Predictions:
         - Nonlinear measures: quantiles of the (fixed) samples of the state's measured-mean, ``mmean_samples`` (the
           same as for the means), plus observation-noise -- and, for measures with mixture components, the regime's
           offset and extra variance, with the regime drawn per sample from its probability. Each measure is sampled on
-          its own (its marginal is all an interval needs), with noise shared across rows, drawn with a fixed seed so
-          repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
+          its own (its marginal is all an interval needs), with noise shared across rows, drawn with these predictions'
+          seed so repeated calls agree. For non-gaussian measures (e.g. binary), the interval is for the mean (e.g. the
           probability), so there's no observation-noise.
 
         :param mmean_samples: Only used if there are nonlinear measures: see ``_resolve_mmean_samples``. Pass
@@ -1672,7 +1705,11 @@ class Predictions:
     def __getitem__(self, item) -> 'Predictions':
         kwargs = self._getitem_helper(item)
         cls = type(self)
-        return cls(**kwargs)
+        out = cls(**kwargs)
+        # a subset shares the seed for sample-based outputs, if it's been set (so e.g. chunks of groups agree with all
+        # the groups at once, even if torch was re-seeded since):
+        out._output_seed = self._output_seed
+        return out
 
     def _getitem_helper(self, item: tuple) -> dict:
         if not isinstance(item, tuple):
@@ -1851,15 +1888,41 @@ class Predictions:
             mmean_samples = measurement_model.get_measure_wide_adjustments(mmean_samples)
         return mmean_samples
 
+    def _get_output_seed(self) -> int:
+        """
+        The seed for sample-based outputs: derived from ``torch.initial_seed()`` the first time it's needed (so
+        ``torch.manual_seed()`` controls it, without drawing from torch's global random state), then kept (so repeated
+        calls on these predictions agree, even if torch is re-seeded in between).
+        """
+        if self._output_seed is None:
+            self._output_seed = torch.initial_seed() % (_MAX_OUTPUT_SEED + 1)
+        return self._output_seed
+
+    @contextlib.contextmanager
+    def _output_seed_from(self, generator: torch.Generator) -> Iterator[None]:
+        """
+        Within the context, sample-based outputs use a seed drawn from ``generator``; afterwards, these predictions'
+        own seed is restored.
+        """
+        seed = int(torch.randint(0, _MAX_OUTPUT_SEED + 1, (1,), generator=generator, device=generator.device).item())
+        previous = self._output_seed
+        self._output_seed = seed
+        try:
+            yield
+        finally:
+            self._output_seed = previous
+
     def _output_generator(self, state: bool) -> torch.Generator:
         """
-        A generator with a fixed seed, so that sample-based outputs are the same on repeated calls.
+        A generator with these predictions' seed (see ``_get_output_seed``), so that sample-based outputs are the same
+        on repeated calls.
 
         :param state: True for draws of the state; False for draws given the state (regimes, observation-noise). These
          use different seeds, so they're independent (with one seed, e.g. the observation-noise would be the first of
          the state's noise draws).
         """
-        return torch.Generator(device=self.state_means.device).manual_seed(_OUTPUT_SEED + (0 if state else 1))
+        seed = self._get_output_seed() + (0 if state else 1)
+        return torch.Generator(device=self.state_means.device).manual_seed(seed)
 
     def _log_prob_white_noise(self, measurement_model: 'MeasurementModel') -> torch.Tensor:
         """
@@ -1914,8 +1977,8 @@ class Predictions:
         for users -- :func:`sample`, and sample-based outputs (monte-carlo means and intervals, ``derived``). (The
         log-prob calls ``_get_measured_mean_samples`` directly, with the model's fixed ``mc_white_noise``.)
 
-        :param generator: For the noise: e.g. ``_output_generator(state=True)`` (a fixed seed, so that repeated calls
-         agree), or :func:`sample`'s (None: torch's global random state).
+        :param generator: For the noise: e.g. ``_output_generator(state=True)`` (these predictions' seed, so that
+         repeated calls agree), or :func:`sample`'s (None: torch's global random state).
         :param shared_noise: If True (the default), the same noise for every row; otherwise independent.
         :param deviation_scales: One per measure: scales its (sampled) deviations from its mean, before any
          nonlinearity -- so each measure's samples are from the state with that part of its variance scaled by the

@@ -7,6 +7,14 @@ import torch
 
 
 class FixedWhiteNoise:
+    """
+    Fixed draws of standard-normal noise (e.g. a model's ``mc_sampling``, for its monte-carlo log-prob), so that a
+    monte-carlo loss is a deterministic function of the parameters.
+
+    Without a ``random_state``, the draws are seeded from ``torch.initial_seed()`` -- the seed last set by
+    ``torch.manual_seed()`` (or a random one fixed for the process) -- so ``torch.manual_seed()`` before creating the
+    model makes them (and so a fit) reproducible.
+    """
     _random_state = None
 
     def __init__(self,
@@ -28,7 +36,8 @@ class FixedWhiteNoise:
         self.__call__.cache_clear()
 
     def reset(self, random_state: Optional[np.random.RandomState] = None):
-        random_state = random_state or np.random.RandomState()
+        if random_state is None:
+            random_state = np.random.RandomState(torch.initial_seed() % 2 ** 32)
         self._random_state = random_state.get_state()
         return self
 
