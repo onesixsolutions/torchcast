@@ -144,6 +144,7 @@ class KalmanFilter(StateSpaceModel):
         trades off against the initial variance.
         """
         free = []
+        on_purpose = set(getattr(self.initial_covariance, 'nonstationary_idx', ()))
         start = 0
         for pid, p in self.processes.items():
             for i, se in enumerate(p.state_elements.values()):
@@ -151,6 +152,7 @@ class KalmanFilter(StateSpaceModel):
                         _is_level_like(se)
                         and _has_learned_decay(se)
                         and (start + i) not in self.initial_covariance.empty_idx
+                        and (start + i) not in on_purpose
                         and pid not in free
                 ):
                     free.append(pid)
@@ -164,8 +166,10 @@ class KalmanFilter(StateSpaceModel):
             f"whole series. Consider tying their initial covariance to their stationary covariance (computed from "
             f"the process-covariance and the decays), e.g.:\n"
             f"  initial_covariance=Covariance.from_processes(processes, cov_type='initial', stationary={free})\n"
-            f"(To keep the free initial variance, ignore this warning, e.g. with "
-            f"``warnings.filterwarnings('ignore', message='These decaying processes')``.)"
+            f"That assumes series start in their usual, steady-state behavior. If instead a decaying process captures "
+            f"how far series start from their long-run level after a common start event (e.g. sign-up), keep its "
+            f"free initial variance on purpose, which silences this warning, with e.g. "
+            f"``stationary={{{free[0]!r}: False}}``."
         )
 
     def _default_initial_cov(self) -> torch.Tensor:

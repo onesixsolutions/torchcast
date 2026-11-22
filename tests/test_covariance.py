@@ -1,7 +1,7 @@
 import math
 import pickle
 import warnings
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import pytest
@@ -403,7 +403,7 @@ def test_warn_correlated_levels():
 
 
 
-def _make_decaying_kf(stationary: Optional[Sequence[str]] = (), decay=(.5, .95), **kwargs) -> KalmanFilter:
+def _make_decaying_kf(stationary: Union[Sequence[str], dict] = (), decay=(.5, .95), **kwargs) -> KalmanFilter:
     # a random walk on each of two measures, and a decaying level on each (correlated with each other, not the walks)
     processes = [
         LocalLevel(id='level_a', measure='a'),
@@ -475,6 +475,10 @@ def test_stationary_initial_covariance_errors():
         Covariance.from_processes(processes, stationary=['transient'])
     with pytest.raises(TypeError, match="list of process ids"):
         Covariance.from_processes(processes, cov_type='initial', stationary='transient')
+    with pytest.raises(TypeError, match="True.*False"):
+        Covariance.from_processes(processes, cov_type='initial', stationary={'transient': 1})
+    with pytest.raises(ValueError, match="unknown process ids"):
+        Covariance.from_processes(processes, cov_type='initial', stationary={'nope': False})
 
     def make(stationary: Sequence[str]) -> KalmanFilter:
         icov = Covariance.from_processes(processes, cov_type='initial', stationary=stationary)
@@ -504,11 +508,15 @@ def test_warn_free_decay_initial_variance():
         _make_decaying_kf(decay=(.9, 1.0))  # can reach 1: no stationary covariance to suggest
         KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])  # no decay
         KalmanFilter(processes=[LocalTrend(id='trend', measure='y')], measures=['y'])  # velocity isn't level-like
-    # silencing it, as the warning suggests:
+    # keeping a free initial variance on purpose, as the warning suggests:
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        warnings.filterwarnings('ignore', message='These decaying processes')
-        _make_decaying_kf()
+        kf = _make_decaying_kf(stationary={'transient_a': True, 'transient_b': False})
+    assert kf.initial_covariance.stationary_idx == [2]
+    assert kf.initial_covariance.nonstationary_idx == [3]
+    assert kf.initial_covariance.param_rank == 3  # (transient_b keeps its parameters)
+    with pytest.warns(UserWarning, match=r"free initial variance: \['transient_a'\]"):
+        _make_decaying_kf(stationary={'transient_b': False})
 
 
 def test_stationary_initial_covariance_default_unchanged():

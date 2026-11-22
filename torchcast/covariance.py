@@ -63,7 +63,7 @@ class Covariance(nn.Module):
                        cov_type: str = 'process',
                        predict_variance: Union[bool, nn.Module] = None,
                        corr_groups: Optional[Sequence[Sequence[str]]] = None,
-                       stationary: Optional[Sequence[str]] = None,
+                       stationary: Union[Sequence[str], Dict[str, bool], None] = None,
                        **kwargs) -> 'Covariance':
         """
         :param processes: The ``processes`` used in your :class:`.StateSpaceModel`.
@@ -92,14 +92,21 @@ class Covariance(nn.Module):
          of a series about as well as a slower decay with a smaller one), so the decay is pinned down by the first few
          timesteps rather than the whole series; the :class:`.KalmanFilter` warns about this. Each element of these
          processes needs process-noise, a decay that's less than 1, and no transitions into it from other elements.
+         Either a list of process ids (all stationary) or a dict of process ids to ``True``/``False``, where ``False``
+         keeps free parameters on purpose (silencing the warning): e.g. for a decaying level that captures how far
+         series start from their long-run level after a common start event (sign-up, launch), whose initial spread
+         is larger than its stationary one.
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
 
         assert cov_type in {'process', 'initial'}
         if isinstance(stationary, str) or any(not isinstance(pid, str) for pid in (stationary or ())):
-            raise TypeError("``stationary`` should be a list of process ids.")
-        stationary = list(stationary or ())
+            raise TypeError("``stationary`` should be a list of process ids, or a dict of process ids to booleans.")
+        if not isinstance(stationary, dict):
+            stationary = {pid: True for pid in (stationary or ())}
+        if any(not isinstance(v, bool) for v in stationary.values()):
+            raise TypeError("``stationary``'s values should be ``True`` or ``False``.")
         if stationary and cov_type != 'initial':
             raise ValueError("``stationary`` is only for ``cov_type='initial'``.")
         unknown = set(stationary) - {p.id for p in processes}
@@ -117,13 +124,16 @@ class Covariance(nn.Module):
         no_cov_idx = []
         level_like_idx = []
         stationary_idx = []
+        nonstationary_idx = []
         for p in processes:
             no_cov_elements = [nm for nm, se in p.state_elements.items() if not getattr(se, f'has_{cov_type}_variance')]
             for i, (nm, se) in enumerate(p.state_elements.items()):
                 if nm in no_cov_elements:
                     no_cov_idx.append(state_rank + i)
-                elif p.id in stationary:
+                elif stationary.get(p.id) is True:
                     stationary_idx.append(state_rank + i)
+                elif stationary.get(p.id) is False:
+                    nonstationary_idx.append(state_rank + i)
                 elif _is_level_like(se):
                     level_like_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
@@ -143,6 +153,8 @@ class Covariance(nn.Module):
 
         if stationary_idx:
             kwargs['stationary_idx'] = stationary_idx
+        if nonstationary_idx:
+            kwargs['nonstationary_idx'] = nonstationary_idx
         return cls(
             rank=state_rank,
             empty_idx=no_cov_idx,
@@ -203,7 +215,8 @@ class Covariance(nn.Module):
                  id: Optional[str] = None,
                  corr_mask: Optional[Tensor] = None,
                  lr_lead: Optional[Sequence[int]] = None,
-                 stationary_idx: Sequence[int] = ()):
+                 stationary_idx: Sequence[int] = (),
+                 nonstationary_idx: Sequence[int] = ()):
         """
         You should rarely call this directly. Instead, call :func:`Covariance.from_measures` and
         :func:`Covariance.from_processes`.
@@ -261,6 +274,9 @@ class Covariance(nn.Module):
         :param stationary_idx: For an initial covariance: elements (of ``0..rank-1``) whose covariance is computed by
          the :class:`.KalmanFilter` (the stationary covariance), so they get no parameters here (like ``empty_idx``).
          Typically set with ``stationary`` in :func:`Covariance.from_processes`. ``corr_mask`` doesn't apply to them.
+        :param nonstationary_idx: For an initial covariance: elements (of ``0..rank-1``) that keep free parameters on
+         purpose, though they could be stationary (``False`` in ``stationary``); this only silences the
+         :class:`.KalmanFilter`'s warning.
         """
 
         super().__init__()
@@ -271,6 +287,9 @@ class Covariance(nn.Module):
         self.stationary_idx = sorted(int(i) for i in stationary_idx)
         if not all(0 <= i < rank for i in self.stationary_idx):
             raise ValueError(f"``stationary_idx`` out of range for rank {rank}: {self.stationary_idx}.")
+        self.nonstationary_idx = sorted(int(i) for i in nonstationary_idx)
+        if set(self.nonstationary_idx) & set(self.stationary_idx):
+            raise ValueError("``stationary_idx`` and ``nonstationary_idx`` overlap.")
         self.empty_idx = set(empty_idx) | set(self.stationary_idx)
         assert all(isinstance(x, int) for x in self.empty_idx)
         self.param_rank = self.rank - len(self.empty_idx)
@@ -469,6 +488,7 @@ class Covariance(nn.Module):
         super().__setstate__(state)
         self.__dict__.setdefault('lr_lead', [])  # (pickled before these existed)
         self.__dict__.setdefault('stationary_idx', [])
+        self.__dict__.setdefault('nonstationary_idx', [])
         # pickled before a binary ``corr_mask`` applied to the cholesky factor: see ``_pack_saved_off_diag()``
         keep = self._get_off_diag_keep()
         if keep is None or bool(keep.all()):
