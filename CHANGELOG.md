@@ -193,6 +193,15 @@ The post-hoc correction's sharpness was always `exp(w * log(num_obs) + b)`. When
 
 Back-compatibility: with `'auto'` (the default, or the deprecated `True`), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
 
+### Removed: long-deprecated arguments
+
+These have warned with a `FutureWarning` since v1.1.0 or earlier, and now raise:
+
+- `fit(tol=, patience=, max_iter=)`: pass them via `stopping`, e.g. `stopping={'abstol': .001, 'patience': 2, 'max_iter': 300}`. `Stopping.from_dict()` is removed (use `Stopping(**kwargs)`), so `stopping={'tol': ...}` now raises: use `abstol`.
+- `Predictions.to_dataframe(type='components')`: use `type='observed_states'`.
+- `complete_times(group_colname=)`: use `group_colnames` (now required). `complete_times(global_max=)` is removed; it had no effect (use `max_dt_colname`). `complete_times` no longer appends `max_dt_colname` to the caller's `group_colnames` list.
+- `Predictions.with_new_start_times()` and `get_state_at_times()` no longer take `start_offsets`/`dt_unit` (call `set_metadata()` first). Passing them already failed with a `TypeError`.
+
 ### Overridable design models
 
 `StateSpaceModel.forward()` now builds its transition and measurement models through two methods,

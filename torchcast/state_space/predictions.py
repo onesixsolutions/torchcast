@@ -582,6 +582,8 @@ class Predictions:
             assert conf >= .50
 
         type = type.casefold()
+        if type == 'components':
+            raise ValueError("`type='components'` is no longer accepted, use `type='observed_states'`.")
         if conf is False and not type.startswith('pred'):
             raise ValueError("`conf=False` is only supported for ``type='predictions'``.")
         if (transform is not None or derived) and not type.startswith('pred'):
@@ -608,17 +610,15 @@ class Predictions:
             if return_std:
                 df['std'] = df.pop('upper') - df.pop('lower')
             return df
-        elif type in ('components', 'states', 'observed_states'):
+        elif type in ('states', 'observed_states'):
             if use_map:
                 raise NotImplementedError("``use_map=True`` not yet implemented for type!='predictions'")
-            if type == 'components':
-                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", FutureWarning)
             return self._to_components_dataframe(
                 dataset=dataset,
                 group_colname=group_colname,
                 time_colname=time_colname,
                 conf=conf,
-                measured=type in ('observed_states', 'components'),
+                measured=type == 'observed_states',
                 num_samples=num_samples,
             )
         else:
@@ -1606,8 +1606,7 @@ class Predictions:
 
     def get_state_at_times(self,
                            times: Union[np.ndarray, np.datetime64],
-                           type_: str = 'update',
-                           **kwargs) -> 'StateTuple':
+                           type_: str = 'update') -> 'StateTuple':
         """
         For each group, get the state (tuple of (mean, cov)) for a timepoint. This is often useful since predictions
         are right-aligned and padded, so that the final prediction for each group is arbitrarily padded and does not
@@ -1625,7 +1624,7 @@ class Predictions:
         """
         from .state import StateTuple
 
-        preds = self.with_new_start_times(start_times=times, n_timesteps=1, **kwargs)
+        preds = self.with_new_start_times(start_times=times, n_timesteps=1)
         single_time = (slice(None), 0)  # (like `.squeeze(1)`)
 
         if type_.startswith('pred'):
@@ -1649,8 +1648,7 @@ class Predictions:
 
     def with_new_start_times(self,
                              start_times: Union[np.ndarray, np.datetime64],
-                             n_timesteps: int,
-                             **kwargs) -> 'Predictions':
+                             n_timesteps: int) -> 'Predictions':
         """
         :param start_times: An array/sequence containing the start time for each group; or a single datetime to apply
           to all groups. If the model/predictions are dateless (no dt_unit) then simply an array of indices.
@@ -1658,28 +1656,13 @@ class Predictions:
           is end.
         :return: A new ``Predictions`` object, with the state and measurement tensors sliced to the given times.
         """
-        start_indices = self._standardize_times(times=start_times, *kwargs)
+        start_indices = self._standardize_times(times=start_times)
         time_indices = np.arange(n_timesteps)[None, ...] + start_indices[:, None, ...]
         return self[np.arange(self.num_groups)[:, None, ...], time_indices]
 
-    def _standardize_times(self,
-                           times: Union[np.ndarray, np.datetime64],
-                           start_offsets: Optional[np.ndarray] = None,
-                           dt_unit: Optional[str] = None) -> np.ndarray:
-        if start_offsets is not None:
-            warn(
-                "Passing `start_offsets` as an argument is deprecated, first call ``set_metadata()``",
-                FutureWarning
-            )
-        if dt_unit is not None:
-            warn(
-                "Passing `dt_unit` as an argument is deprecated, first call ``set_metadata()``",
-                FutureWarning
-            )
-        if self.dataset_metadata.start_offsets is not None:
-            start_offsets = self.dataset_metadata.start_offsets
-        if self.dataset_metadata.dt_unit is not None:
-            dt_unit = self.dataset_metadata.dt_unit
+    def _standardize_times(self, times: Union[np.ndarray, np.datetime64]) -> np.ndarray:
+        start_offsets = self.dataset_metadata.start_offsets
+        dt_unit = self.dataset_metadata.dt_unit
 
         if not isinstance(times, (list, tuple, np.ndarray)):
             times = [times] * self.num_groups

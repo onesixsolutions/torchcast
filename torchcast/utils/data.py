@@ -729,12 +729,10 @@ class _DataFrameGroupByDataset(Dataset):
 
 
 def complete_times(data: 'DataFrame',
-                   group_colnames: Sequence[str] = None,
+                   group_colnames: Union[str, Sequence[str]],
                    time_colname: Optional[str] = None,
                    dt_unit: Optional[str] = None,
-                   max_dt_colname: Optional[str] = None,
-                   global_max: Union[bool, datetime.datetime] = False,
-                   group_colname: Optional[str] = None):
+                   max_dt_colname: Optional[str] = None):
     """
     Given a dataframe time-serieses, convert implicit missings within each time-series to explicit missings.
 
@@ -752,11 +750,8 @@ def complete_times(data: 'DataFrame',
 
     if isinstance(group_colnames, str):
         group_colnames = [group_colnames]
-    elif group_colnames is None:
-        if group_colname is None:
-            raise TypeError("Missing required argument `group_colnames`")
-        warn("Please pass `group_colnames` instead of `group_colname`", FutureWarning)
-        group_colnames = [group_colname]
+    else:
+        group_colnames = list(group_colnames)
     if max_dt_colname and max_dt_colname not in group_colnames:
         assert (data.groupby(group_colnames)[max_dt_colname].nunique() == 1).all()
         group_colnames.append(max_dt_colname)
@@ -777,9 +772,6 @@ def complete_times(data: 'DataFrame',
         # pd.date_range behaves oddly with freq='W'
         # (e.g. does not match behavior of `my_dates.to_period('W').dt.to_timestamp()`)
         dt_unit = pd.Timedelta('7 days 00:00:00')
-
-    if global_max:
-        warn("`global_max=True` is deprecated, use `max_dt_colname` instead.", FutureWarning)
 
     df_group_summary = (data
                         .groupby(group_colnames)

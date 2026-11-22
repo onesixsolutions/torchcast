@@ -544,18 +544,17 @@ class StateSpaceModel(torch.nn.Module):
             if self.adaptive_scaling:
                 self.adaptive_scaling.initialize(y.shape[1])
 
-        _deprecated = {k: kwargs.pop(k) for k in ['tol', 'patience', 'max_iter'] if k in kwargs}
-        _dmsg = f"The following are deprecated, use `stopping` arg instead:\n{set(_deprecated)}"
+        _removed = [k for k in ['tol', 'patience', 'max_iter'] if k in kwargs]
+        if _removed:
+            raise TypeError(
+                f"`fit()` no longer takes {_removed}; pass them via `stopping` instead, e.g. "
+                f"``stopping={{'abstol': .001, 'patience': 2, 'max_iter': 300}}``."
+            )
         if stopping is None:
             stopping = {}
-            if _deprecated:
-                warn(_dmsg, FutureWarning)
-                stopping.update(_deprecated)
-        elif _deprecated:
-            raise ValueError(_dmsg)
         from torchcast.utils.stopping import Stopping
         if not isinstance(stopping, Stopping):
-            stopping = Stopping.from_dict(**stopping)
+            stopping = Stopping(**stopping)
         stopping.module = self
 
         prog = tqdm(disable=True)
