@@ -1,6 +1,7 @@
 """
-Compare the sampling methods behind torchcast's sample-based prediction outputs: randomized quasi-monte-carlo
-(scrambled Sobol, ``sampling='qmc'``, the default) vs. plain monte-carlo (``sampling='mc'``).
+Compare the sampling behind torchcast's sample-based prediction outputs, randomized quasi-monte-carlo (scrambled
+Sobol), with plain monte-carlo (the draws before quasi-monte-carlo was added, via the private debugging flag
+``torchcast.state_space.predictions._QMC_OUTPUTS``).
 
 On synthetic data, for a few realistic outputs, at equal sample counts: the error vs. a high-sample reference, for each
 group and timestep (``row``), and for the sum over groups at each timestep (``aggregate``) -- which matters because the
@@ -66,6 +67,7 @@ from torchcast.kalman_filter import BinomialFilter, KalmanFilter
 from torchcast.mixture import MixtureModel, MixtureComponent, LatentClass
 from torchcast.process import LocalLevel
 from torchcast.state_space import Predictions
+from torchcast.state_space import predictions as predictions_module
 from torchcast.state_space.transforms import LogTransform
 
 NUM_GROUPS = 200
@@ -179,8 +181,10 @@ def get_outputs_for(binomial: Predictions,
     """``get_outputs`` with ``method`` ('qmc', 'mc', or 'qmc-mc-regime') and output-seed ``seed``."""
     for pred in (binomial, sigmoid):
         pred._output_seed = seed
-        pred.output_sampling = 'mc' if method == 'mc' else 'qmc'
-    with monte_carlo_regimes() if method == 'qmc-mc-regime' else contextlib.nullcontext():
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(predictions_module, '_QMC_OUTPUTS', method != 'mc'))
+        if method == 'qmc-mc-regime':
+            stack.enter_context(monte_carlo_regimes())
         return get_outputs(binomial, sigmoid, num_samples)
 
 

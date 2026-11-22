@@ -1,9 +1,9 @@
 """
-Tests for how sample-based outputs draw their noise: randomized quasi-monte-carlo (``output_sampling='qmc'``, scrambled
-Sobol) or monte-carlo (``'mc'``). (Accuracy vs. ground-truth is tested in test_nonlinear.py; see
-``benchmarks/output_sampling.py`` for a comparison of the two methods' errors.)
+Tests for how sample-based outputs draw their noise: randomized quasi-monte-carlo (scrambled Sobol). (Accuracy vs.
+ground-truth is tested in test_nonlinear.py; see ``benchmarks/output_sampling.py`` for a comparison with monte-carlo.)
 """
 import math
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -37,25 +37,21 @@ def _gen(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
-@torch.no_grad()
-def test_qmc_is_the_default():
-    pred = _sigmoid_predictions()
-    assert Predictions.output_sampling == 'qmc'
-    assert pred._uses_qmc()
-    assert pred._num_output_draws(1000) == 1024
+def _monte_carlo():
+    """The private debugging flag: plain monte-carlo draws, as before quasi-monte-carlo was added."""
+    return mock.patch.object(predictions_module, '_QMC_OUTPUTS', False)
 
 
 @torch.no_grad()
-@pytest.mark.parametrize('sampling', ['qmc', 'mc'])
-def test_reproducible_with_seed_or_generator(sampling: str):
-    """The same seed (or generator) gives the same outputs; a different one, a different scramble (or draws)."""
+def test_reproducible_with_seed_or_generator():
+    """The same seed (or generator) gives the same outputs; a different one, a different scramble."""
     pred = _sigmoid_predictions(mixture=True)
-    kwargs = dict(use_map=False, sampling=sampling, num_samples=256)
+    kwargs = dict(use_map=False, num_samples=256)
     assert torch.equal(pred.get_means(**kwargs), pred.get_means(**kwargs))
     assert torch.equal(pred.get_means(**kwargs, generator=_gen(1)), pred.get_means(**kwargs, generator=_gen(1)))
     assert not torch.equal(pred.get_means(**kwargs, generator=_gen(1)), pred.get_means(**kwargs, generator=_gen(2)))
 
-    df_kwargs = dict(conf=.9, use_map=False, sampling=sampling, num_samples=256, derived={'y2': lambda s: s['y'] ** 2})
+    df_kwargs = dict(conf=.9, use_map=False, num_samples=256, derived={'y2': lambda s: s['y'] ** 2})
     cols = ['mean', 'lower', 'upper']
     df1 = pred.to_dataframe(**df_kwargs, generator=_gen(1))[cols].values
     assert np.array_equal(df1, pred.to_dataframe(**df_kwargs, generator=_gen(1))[cols].values)
@@ -69,22 +65,6 @@ def test_reproducible_with_seed_or_generator(sampling: str):
 
     assert torch.equal(fresh_means(3), fresh_means(3))
     assert not torch.equal(fresh_means(3), fresh_means(4))
-
-
-@torch.no_grad()
-def test_mc_matches_plain_monte_carlo():
-    """``sampling='mc'``: independent standard-normals from the predictions' seed, as before QMC was added."""
-    pred = _sigmoid_predictions()
-    em_dim = pred.measurement_model_flat.extended_measure_mat.shape[1]
-    white_noise = torch.randn((300, em_dim), generator=_gen(pred._get_output_seed()))
-    samples = pred._get_measured_mean_samples(
-        measurement_model=pred.measurement_model_flat,
-        state_means=pred.state_means_flat,
-        state_covs=pred.state_covs_flat,
-        white_noise=white_noise,
-    )
-    expected = samples.mean(0).view(pred.num_groups, pred.num_timesteps, 1)
-    assert torch.allclose(pred.get_means(use_map=False, num_samples=300, sampling='mc'), expected)
 
 
 @torch.no_grad()
@@ -110,28 +90,6 @@ def test_qmc_draws_are_balanced_sobol():
 
 
 @torch.no_grad()
-def test_sampling_setting_scopes():
-    """``sampling=`` applies to one call; ``pred.output_sampling`` to one object (and its subsets); bad values raise."""
-    pred = _sigmoid_predictions()
-    kwargs = dict(use_map=False, num_samples=128)
-    qmc, mc = pred.get_means(**kwargs, sampling='qmc'), pred.get_means(**kwargs, sampling='mc')
-    assert not torch.equal(qmc, mc)
-    assert torch.equal(pred.get_means(**kwargs), qmc)  # (the call's setting didn't stick)
-    assert 'output_sampling' not in pred.__dict__
-
-    pred.output_sampling = 'mc'
-    assert torch.equal(pred.get_means(**kwargs), mc)
-    assert torch.equal(pred.get_means(**kwargs, sampling='qmc'), qmc)
-    assert pred.output_sampling == 'mc'
-    assert pred[:2].output_sampling == 'mc'
-    assert torch.allclose(pred[:2].get_means(**kwargs), mc[:2])
-    assert Predictions.output_sampling == 'qmc'
-
-    with pytest.raises(ValueError, match="output_sampling"):
-        pred.get_means(**kwargs, sampling='sobol')
-
-
-@torch.no_grad()
 def test_qmc_chunks_agree(monkeypatch):
     """Outputs computed in chunks of groups (for memory) are the same as all at once: the draws are shared."""
     pred = _sigmoid_predictions(mixture=True, num_groups=6)
@@ -145,12 +103,29 @@ def test_qmc_chunks_agree(monkeypatch):
 
 
 @torch.no_grad()
+def test_monte_carlo_flag_matches_plain_monte_carlo():
+    """The debugging flag: independent standard-normals from the predictions' seed (without rounding to 2 ** m)."""
+    pred = _sigmoid_predictions()
+    em_dim = pred.measurement_model_flat.extended_measure_mat.shape[1]
+    white_noise = torch.randn((300, em_dim), generator=_gen(pred._get_output_seed()))
+    samples = pred._get_measured_mean_samples(
+        measurement_model=pred.measurement_model_flat,
+        state_means=pred.state_means_flat,
+        state_covs=pred.state_covs_flat,
+        white_noise=white_noise,
+    )
+    expected = samples.mean(0).view(pred.num_groups, pred.num_timesteps, 1)
+    with _monte_carlo():
+        assert torch.allclose(pred.get_means(use_map=False, num_samples=300), expected)
+
+
+@torch.no_grad()
 def test_sample_is_unaffected():
-    """``sample()`` is always monte-carlo, whatever ``output_sampling`` is."""
+    """``sample()`` is plain monte-carlo, unaffected by quasi-monte-carlo outputs."""
     pred = _sigmoid_predictions(mixture=True)
     s_qmc = pred.sample(64, shared_noise=False, generator=_gen(0))
-    pred.output_sampling = 'mc'
-    s_mc = pred.sample(64, shared_noise=False, generator=_gen(0))
+    with _monte_carlo():
+        s_mc = pred.sample(64, shared_noise=False, generator=_gen(0))
     assert torch.equal(s_qmc.observations, s_mc.observations)
 
 
@@ -163,9 +138,11 @@ def test_qmc_more_accurate_than_mc():
     pred = _sigmoid_predictions()
     truth = pred.get_means(use_map=False, num_samples=2 ** 16)
 
-    def rmse(sampling: str) -> float:
-        errors = [pred.get_means(use_map=False, num_samples=256, sampling=sampling, generator=_gen(i)) - truth
-                  for i in range(10)]
+    def rmse() -> float:
+        errors = [pred.get_means(use_map=False, num_samples=256, generator=_gen(i)) - truth for i in range(10)]
         return torch.stack(errors).pow(2).mean().sqrt().item()
 
-    assert rmse('mc') > 5 * rmse('qmc')
+    qmc_rmse = rmse()
+    with _monte_carlo():
+        mc_rmse = rmse()
+    assert mc_rmse > 5 * qmc_rmse

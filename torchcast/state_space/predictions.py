@@ -35,11 +35,12 @@ if TYPE_CHECKING:
 # ``Predictions._output_generator``). The largest seed used for the draws of the state (one more is used for the draws
 # given the state):
 _MAX_OUTPUT_SEED = 2 ** 31 - 3
-# the default number of samples for sample-based outputs (with ``sampling='qmc'``, rounded up to 1024):
+# the default number of samples for sample-based outputs (rounded up to 1024, a power of 2, for quasi-monte-carlo):
 _DEFAULT_NUM_SAMPLES = 1000
-# how sample-based outputs draw their standard-normal (and uniform) noise -- see ``Predictions.output_sampling``:
-# randomized quasi-monte-carlo (scrambled Sobol), or plain monte-carlo:
-_OUTPUT_SAMPLING_METHODS = ('qmc', 'mc')
+# sample-based outputs draw their noise by randomized quasi-monte-carlo (scrambled Sobol; see
+# ``Predictions._output_uniforms``). Not part of the API: only for debugging, e.g. to reproduce outputs from before
+# quasi-monte-carlo was added, setting this to False restores those plain monte-carlo draws.
+_QMC_OUTPUTS = True
 # sobol uniforms are clamped this far from 0 and 1 before the inverse normal cdf (torch's sobol points are on a grid
 # of 2 ** -30, and a scrambled point can be exactly 0):
 _SOBOL_EPS = 2. ** -32
@@ -61,32 +62,25 @@ class Predictions:
     measures with a nonlinear measured-mean, ``to_dataframe(derived=...)``, and the states dataframe of nonlinear
     models -- average over draws of the state (and, given it, of the regime and the observation noise). Since they're
     per-row summaries, these draws are shared across groups and timesteps: so each row's estimate is valid, but their
-    errors are correlated -- e.g. a sum over groups doesn't average them out. ``output_sampling`` sets how the draws are
-    made:
+    errors are correlated -- e.g. a sum over groups doesn't average them out.
 
-    - ``'qmc'`` (the default): randomized quasi-monte-carlo. The draws for one row are low-dimensional (one per
-      dimension of the sampled measured-mean, plus one uniform for the regime and two per measure for the observation
-      noise), so they're one scrambled Sobol sequence over those dimensions, mapped to standard-normals by the inverse
-      cdf. Sobol points fill the space more evenly than random ones, so the error shrinks faster with the number of
-      samples: for smooth functions of the draws (e.g. the mean of a sigmoid, or of an exponential) it can be 100x
-      smaller at the same number; less for quantiles (the intervals) and for outputs with discrete draws (the regime,
-      whose effect is discontinuous) -- see ``benchmarks/output_sampling.py``. Binomial draws (for ``derived``
-      quantities of binary measures) are always monte-carlo, independent across rows. Sobol points are balanced in
-      sets of powers of 2, so ``num_samples`` is rounded up to one (e.g. the default 1000 to 1024).
-    - ``'mc'``: plain monte-carlo, independent standard-normal (and uniform) draws.
+    The draws are randomized quasi-monte-carlo. The draws for one row are low-dimensional (one per dimension of the
+    sampled measured-mean, plus one uniform for the regime and two per measure for the observation noise), so they're
+    one scrambled Sobol sequence over those dimensions, mapped to standard-normals by the inverse cdf, and scrambled
+    with these predictions' seed (see ``to_dataframe(generator=...)``), so they're reproducible. Sobol points fill the
+    space more evenly than random ones, so the error shrinks faster with the number of samples: for smooth functions
+    of the draws (e.g. the mean of a sigmoid, or of an exponential) it can be 100x smaller than plain monte-carlo's at
+    the same number; less for quantiles (the intervals) and for outputs with discrete draws (the regime, whose effect
+    is discontinuous) -- see ``benchmarks/output_sampling.py``. Binomial draws (for ``derived`` quantities of binary
+    measures) are monte-carlo, independent across rows. Sobol points are balanced in sets of powers of 2, so
+    ``num_samples`` is rounded up to one (e.g. the default 1000 to 1024).
 
-    Either way, the draws come from these predictions' seed (see ``to_dataframe(generator=...)``), so they're
-    reproducible. Set it for all predictions with ``Predictions.output_sampling = 'mc'``, for one object with
-    ``pred.output_sampling = 'mc'``, or for one call with ``to_dataframe(sampling='mc')`` / ``get_means(sampling=...)``.
-
-    This doesn't apply to :func:`sample`, which is always monte-carlo: its draws can be independent across rows (for
+    This doesn't apply to :func:`sample`, which is plain monte-carlo: its draws can be independent across rows (for
     aggregating), and they're used for quantities across many measures, or (with :func:`StateSpaceModel.simulate`)
     timesteps -- too many dimensions for quasi-monte-carlo to help.
     """
     _means = None
     _covs = None
-    #: How sample-based outputs draw their noise: ``'qmc'`` (scrambled Sobol) or ``'mc'``. See the class docstring.
-    output_sampling: str = 'qmc'
 
     # Construction & metadata ------------------------------------------------------------------------------------------
 
@@ -248,21 +242,19 @@ class Predictions:
                   transform: Union['Transform', dict[str, 'Transform'], None] = None,
                   use_map: Optional[bool] = None,
                   num_samples: int = _DEFAULT_NUM_SAMPLES,
-                  generator: Optional[torch.Generator] = None,
-                  sampling: Optional[str] = None) -> torch.Tensor:
+                  generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """
         The predicted means, as in the ``mean`` column of :func:`to_dataframe` with the same ``transform``,
-        ``use_map``, ``num_samples``, ``generator`` and ``sampling`` -- without computing any intervals.
+        ``use_map``, ``num_samples`` and ``generator`` -- without computing any intervals.
 
         :param transform: See :func:`to_dataframe`.
         :param use_map: See :func:`to_dataframe`.
         :param num_samples: See :func:`to_dataframe`.
         :param generator: See :func:`to_dataframe`.
-        :param sampling: See :func:`to_dataframe`.
         :return: A ``(num_groups, num_timesteps, num_measures)`` tensor.
         """
-        if generator is not None or sampling is not None:
-            with self._output_seed_from(generator), self._output_sampling_as(sampling):
+        if generator is not None:
+            with self._output_seed_from(generator):
                 return self.get_means(transform=transform, use_map=use_map, num_samples=num_samples)
         use_map = self._resolve_use_map(use_map)
         transforms = self._standardize_transforms(transform)
@@ -553,8 +545,7 @@ class Predictions:
                      transform: Union['Transform', dict[str, 'Transform'], None] = None,
                      derived: Optional[dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]]] = None,
                      num_samples: int = _DEFAULT_NUM_SAMPLES,
-                     generator: Optional[torch.Generator] = None,
-                     sampling: Optional[str] = None) -> pd.DataFrame:
+                     generator: Optional[torch.Generator] = None) -> pd.DataFrame:
         """
         :param dataset: If not provided, will use the metadata set by ``set_metadata()``.
         :param type: What type of dataframe to return, either 'predictions',  'states', or 'observed_states'.
@@ -592,18 +583,16 @@ class Predictions:
         :param num_samples: The number of monte-carlo samples, for the outputs that need them: the means (with
          ``use_map=False`` or a ``transform``) and intervals of measures with a nonlinear measured-mean, ``derived``,
          and ``type='states'``/``'observed_states'`` for nonlinear models. (Separate from the model's
-         ``mc_sampling``, which is only for the log-prob, in training.) With ``sampling='qmc'`` (the default), it's
-         rounded up to a power of 2 (e.g. 1000 to 1024).
+         ``mc_sampling``, which is only for the log-prob, in training.) The samples are quasi-monte-carlo (see the class
+         docstring), so this is rounded up to a power of 2 (e.g. 1000 to 1024).
         :param generator: An optional :class:`torch.Generator` for those samples. By default, their seed comes from
          ``torch.initial_seed()`` -- the seed last set by ``torch.manual_seed()``, which makes them reproducible, or
          else a random one fixed for the process -- so repeated calls agree. With a ``generator``, this call draws its
-         seed from the ``generator`` instead (leaving the predictions' own seed as it was). (With ``sampling='qmc'``,
-         the seed sets the Sobol sequence's scrambling.)
-        :param sampling: How those samples are drawn: ``'qmc'`` (randomized quasi-monte-carlo: scrambled Sobol) or
-         ``'mc'`` (monte-carlo). Defaults to ``output_sampling`` (``'qmc'`` unless changed): see the class docstring.
+         seed from the ``generator`` instead (leaving the predictions' own seed as it was). The seed sets the
+         scrambling of the samples' Sobol sequence.
         """
-        if generator is not None or sampling is not None:
-            with self._output_seed_from(generator), self._output_sampling_as(sampling):
+        if generator is not None:
+            with self._output_seed_from(generator):
                 return self.to_dataframe(
                     dataset=dataset,
                     type=type,
@@ -1155,7 +1144,7 @@ class Predictions:
             # sample from the state distribution:
             chol = torch.linalg.cholesky(self.state_covs_flat)
             num_samples = self._num_output_draws(num_samples)
-            if self._uses_qmc():
+            if _QMC_OUTPUTS:
                 # (shared across rows, like the other sample-based outputs; the dimension is the state's)
                 white_noise = _uniform_to_normal(
                     _scrambled_sobol(num_samples, self.state_means_flat.shape[-1], seed=self._get_output_seed())
@@ -1785,8 +1774,6 @@ class Predictions:
         # a subset shares the seed for sample-based outputs, if it's been set (so e.g. chunks of groups agree with all
         # the groups at once, even if torch was re-seeded since):
         out._output_seed = self._output_seed
-        if 'output_sampling' in self.__dict__:
-            out.output_sampling = self.output_sampling
         return out
 
     def _getitem_helper(self, item: tuple) -> dict:
@@ -1977,14 +1964,11 @@ class Predictions:
         return self._output_seed
 
     @contextlib.contextmanager
-    def _output_seed_from(self, generator: Optional[torch.Generator]) -> Iterator[None]:
+    def _output_seed_from(self, generator: torch.Generator) -> Iterator[None]:
         """
         Within the context, sample-based outputs use a seed drawn from ``generator``; afterwards, these predictions'
-        own seed is restored. (If ``generator`` is None, does nothing.)
+        own seed is restored.
         """
-        if generator is None:
-            yield
-            return
         seed = int(torch.randint(0, _MAX_OUTPUT_SEED + 1, (1,), generator=generator, device=generator.device).item())
         previous = self._output_seed
         self._output_seed = seed
@@ -1993,37 +1977,12 @@ class Predictions:
         finally:
             self._output_seed = previous
 
-    @contextlib.contextmanager
-    def _output_sampling_as(self, sampling: Optional[str]) -> Iterator[None]:
-        """
-        Within the context, sample-based outputs use ``sampling`` (see ``output_sampling``); afterwards, these
-        predictions' own setting is restored. (If ``sampling`` is None, does nothing.)
-        """
-        if sampling is None:
-            yield
-            return
-        _validate_output_sampling(sampling)
-        had_own = 'output_sampling' in self.__dict__
-        previous = self.__dict__.get('output_sampling')
-        self.output_sampling = sampling
-        try:
-            yield
-        finally:
-            if had_own:
-                self.output_sampling = previous
-            else:
-                del self.output_sampling
-
-    def _uses_qmc(self) -> bool:
-        """Whether sample-based outputs use quasi-monte-carlo (see ``output_sampling``)."""
-        return _validate_output_sampling(self.output_sampling) == 'qmc'
-
     def _num_output_draws(self, num_samples: int) -> int:
         """The number of draws for ``num_samples`` samples: with quasi-monte-carlo, rounded up to a power of 2."""
         num_samples = int(num_samples)
         if num_samples < 1:
             raise ValueError(f"`num_samples` must be positive, got {num_samples}.")
-        return _next_power_of_2(num_samples) if self._uses_qmc() else num_samples
+        return _next_power_of_2(num_samples) if _QMC_OUTPUTS else num_samples
 
     def _output_uniforms(self, num_samples: int) -> torch.Tensor:
         """
@@ -2050,26 +2009,26 @@ class Predictions:
         """
         The standard-normal noise for the sample-based outputs' draws of the state: ``(num_draws, dim)``, shared across
         rows, with ``num_draws`` from ``_num_output_draws`` and ``dim`` the extended dimensions of
-        ``_get_measured_mean_samples``. From these predictions' seed, by quasi-monte-carlo or monte-carlo (see
-        ``output_sampling``).
+        ``_get_measured_mean_samples``. From these predictions' seed, by quasi-monte-carlo (or, for debugging,
+        monte-carlo: see ``_QMC_OUTPUTS``).
         """
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         to = {'dtype': self.state_means.dtype, 'device': self.state_means.device}
         num_draws = self._num_output_draws(num_samples)
-        if self._uses_qmc():
+        if _QMC_OUTPUTS:
             return _uniform_to_normal(self._output_uniforms(num_draws)[:, :em_dim]).to(**to)
         return torch.randn((num_draws, em_dim), generator=self._output_generator(state=True), **to)
 
     def _output_draws_given_state(self, num_samples: int) -> Optional[dict[str, torch.Tensor]]:
         """
-        For quasi-monte-carlo, the (shared) draws given the state, the continuation of ``_output_state_noise``'s Sobol
+        The (shared) draws given the state, the continuation of ``_output_state_noise``'s Sobol
         points: ``{'regime': (num_samples,) uniforms, 'noise': (num_samples, num_measures) standard-normals, 'noise2':
-        another (num_samples, num_measures)}``. For monte-carlo, None: callers then draw from
-        ``_output_generator(state=False)``.
+        another (num_samples, num_measures)}``. Or None with ``_QMC_OUTPUTS=False`` (for debugging): callers then draw
+        monte-carlo noise from ``_output_generator(state=False)``.
 
         :param num_samples: The number of draws of the state (a power of 2, for quasi-monte-carlo).
         """
-        if not self._uses_qmc():
+        if not _QMC_OUTPUTS:
             return None
         em_dim = self.measurement_model_flat.extended_measure_mat.shape[1]
         num_measures = len(self.measurement_model.measures)
@@ -2154,7 +2113,7 @@ class Predictions:
          square, from the same draws.
         :param white_noise: Optionally, the standard-normal noise, instead of drawing it from ``generator``: e.g.
          ``_output_state_noise()``, for sample-based outputs (with these predictions' seed, so that repeated calls
-         agree; and quasi-monte-carlo, unless ``output_sampling='mc'``). Its number of samples is used.
+         agree; and quasi-monte-carlo). Its number of samples is used.
         :return: A ``(num_samples, num_rows, num_measures)`` tensor.
         """
         if white_noise is None:
@@ -2380,14 +2339,6 @@ def _mc_mvnorm_log_prob(resid: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
     z = torch.linalg.solve_triangular(L, resid.permute(1, 2, 0), upper=False)  # (batch, d, num_samples)
     logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
     return -0.5 * (d * math.log(2 * math.pi) + logdet.unsqueeze(0) + (z ** 2).sum(1).T)
-
-
-def _validate_output_sampling(sampling: str) -> str:
-    if sampling not in _OUTPUT_SAMPLING_METHODS:
-        raise ValueError(
-            f"Expected `sampling`/`output_sampling` to be one of {_OUTPUT_SAMPLING_METHODS}, got {sampling!r}."
-        )
-    return sampling
 
 
 def _next_power_of_2(n: int) -> int:
