@@ -17,6 +17,8 @@ from torchcast.process.process import Process
 DEFAULT_MCOV_MULTI = 1.0
 DEFAULT_PCOV_MULTI = 0.1  # less than measure-cov by default
 DEFAULT_ICOV_MULTI = 0.5  # somewhere in between
+# ``Covariance.from_processes(cov_type='initial')`` uses method='low_rank' by default from this many elements on:
+LOW_RANK_MIN_INITIAL = 15
 
 # the parameters for each ``method``, in the order ``set_matrix_()`` computes them:
 _METHOD_PARAMS = {
@@ -67,7 +69,10 @@ class Covariance(nn.Module):
                        **kwargs) -> 'Covariance':
         """
         :param processes: The ``processes`` used in your :class:`.StateSpaceModel`.
-        :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process').
+        :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process'). Unless you pass
+         ``method``, an initial covariance with 15 or more elements with parameters (and no ``corr_groups``/
+         ``corr_mask``) uses ``method='low_rank'``: it's weakly informed (mainly by the start of each series) and grows
+         quadratically with the state. Otherwise the default is "log_cholesky".
         :param predict_variance: Will the variance be predicted upon calling ``forward()``? This is implemented as a
          multiplier on the base variance given from the 'method'. You can either pass ``True`` in which case it is
          expected you will pass multipliers as 'process_var_multi' when ``forward()`` is called; *or* you can pass a
@@ -132,11 +137,20 @@ class Covariance(nn.Module):
                     no_cov_idx.append(state_rank + i)
                 elif stationary.get(p.id) is True:
                     stationary_idx.append(state_rank + i)
-                elif stationary.get(p.id) is False:
-                    nonstationary_idx.append(state_rank + i)
-                elif _is_level_like(se):
-                    level_like_idx.append(state_rank + i)
+                else:
+                    if stationary.get(p.id) is False:
+                        nonstationary_idx.append(state_rank + i)
+                    if _is_level_like(se):
+                        level_like_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
+
+        default_method = 'method' not in kwargs
+        if default_method and cov_type == 'initial' and 'corr_mask' not in kwargs:
+            # a large initial covariance is weakly informed (mainly by the start of each series) and grows quadratically
+            # with the state, so by default it's a factor model:
+            param_rank = state_rank - len(no_cov_idx) - len(stationary_idx)
+            if param_rank >= LOW_RANK_MIN_INITIAL:
+                kwargs['method'] = 'low_rank'
         if kwargs.get('method', '').startswith('low_rank') and 'lr_lead' not in kwargs:
             kwargs['lr_lead'] = level_like_idx
 
@@ -155,13 +169,15 @@ class Covariance(nn.Module):
             kwargs['stationary_idx'] = stationary_idx
         if nonstationary_idx:
             kwargs['nonstationary_idx'] = nonstationary_idx
-        return cls(
+        out = cls(
             rank=state_rank,
             empty_idx=no_cov_idx,
             id=f'{cov_type}_covariance',
             predict_variance=predict_variance,
             **kwargs
         )
+        out._default_method = default_method
+        return out
 
     @classmethod
     def from_measures(cls,
@@ -193,8 +209,7 @@ class Covariance(nn.Module):
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
             kwargs['corr_mask'] = _corr_groups_to_mask(element_ids=list(measures), corr_groups=corr_groups,
                                                        kind='measure')
-        if 'method' not in kwargs and len(measures) > 5:
-            kwargs['method'] = 'low_rank'
+        default_method = 'method' not in kwargs
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
 
@@ -203,7 +218,9 @@ class Covariance(nn.Module):
             if 'expected_kwargs' not in kwargs:
                 kwargs['expected_kwargs'] = [f'measure_var_multi']
 
-        return cls(rank=len(measures), id='measure_covariance', predict_variance=predict_variance, **kwargs)
+        out = cls(rank=len(measures), id='measure_covariance', predict_variance=predict_variance, **kwargs)
+        out._default_method = default_method
+        return out
 
     def __init__(self,
                  rank: int,
@@ -230,7 +247,8 @@ class Covariance(nn.Module):
          model: the covariance is ``V @ V.t() + D``, with ``V`` (``lr_mat``) a G*K matrix of factor-loadings (G the
          number of elements with variance, K the number of factors) and ``D`` a diagonal matrix of
          ``exp(log_std_devs) ** 2``. This suits a large covariance that's weakly informed by the data, e.g. one
-         dominated by a few common factors. K defaults to ``int(sqrt(G))`` (an arbitrary rule of thumb: pass e.g.
+         dominated by a few common factors; it's the default for a large initial covariance (see
+         :func:`Covariance.from_processes`). K defaults to ``int(sqrt(G))`` (an arbitrary rule of thumb: pass e.g.
          "low_rank3" for 3 factors). The factor-loadings start at a scale comparable to ``D`` (half the initial
          variance each), not near zero, which is a saddle-point the factors are slow to leave. Rotations of ``V``
          leave ``V @ V.t()`` unchanged; that's harmless for fitting (and constraining ``V`` to remove them slows it
@@ -301,6 +319,9 @@ class Covariance(nn.Module):
 
         self.lr_lead = self._validate_lr_lead(lr_lead)
         self._set_params(method, init_diag_multi)
+        # whether ``method`` was chosen by default (by ``from_processes()``/``from_measures()``); if so, a state-dict
+        # saved with another method (e.g. under an older default) is loaded by switching to that method:
+        self._default_method = False
 
         self.var_predict_module = predict_variance
 
@@ -428,7 +449,6 @@ class Covariance(nn.Module):
             self.log_std_devs = nn.Parameter(.1 * torch.randn(self.param_rank, **fkw) + math.log(init_diag_multi))
             self.corr_unconstrained = nn.Parameter(.1 * torch.randn(self._get_num_off_diag_params(), **fkw))
         elif method.startswith('low_rank'):
-            warn("``method='low_rank'`` is experimental")
             self.method = 'low_rank'
             low_rank = method.replace('low_rank', '')
             if low_rank:
@@ -456,7 +476,13 @@ class Covariance(nn.Module):
         expected = set(_METHOD_PARAMS.get(self.method, ()))
         if not expected <= present:
             saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
-            if saved_with:
+            if saved_with and getattr(self, '_default_method', False):
+                # the method was a default, which may have changed since the state-dict was saved: use the saved one
+                method = saved_with[0]
+                if method == 'low_rank':
+                    method = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
+                self._set_params(method, init_diag_multi=1.)
+            elif saved_with:
                 error_msgs.append(
                     f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
                     f"with method='{saved_with[0]}'. Load it into a module with method='{saved_with[0]}', then "
@@ -489,6 +515,7 @@ class Covariance(nn.Module):
         self.__dict__.setdefault('lr_lead', [])  # (pickled before these existed)
         self.__dict__.setdefault('stationary_idx', [])
         self.__dict__.setdefault('nonstationary_idx', [])
+        self.__dict__.setdefault('_default_method', False)
         # pickled before a binary ``corr_mask`` applied to the cholesky factor: see ``_pack_saved_off_diag()``
         keep = self._get_off_diag_keep()
         if keep is None or bool(keep.all()):
@@ -658,6 +685,7 @@ class Covariance(nn.Module):
         """
         out = copy.deepcopy(self)
         out._set_params(method, init_diag_multi=1.0)
+        out._default_method = False
         return out.set_matrix_(self._get_mini_cov().detach())
 
     def get_param_idx(self, i: int) -> int:
