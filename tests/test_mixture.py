@@ -1045,6 +1045,32 @@ def test_latent_classes_transition():
     assert torch.allclose(nxt, expected, atol=1e-6)
 
 
+def test_latent_classes_hessian_when_class_certain():
+    """
+    A group can be (numerically) certain of its class, so the other classes' masses underflow. The combo-prior should
+    still have finite second derivatives (e.g. for ``newton_refine()``), not just first derivatives.
+    """
+    torch.manual_seed(0)
+    mixture = MixtureModel(
+        [MixtureComponent(measure='y', offset_init=-4., prob_init=.1, id='low')],
+        classes=[LatentClass('a'), LatentClass('b', relative_rate_init={'y.low': 3.})],
+    )
+    base_probs = mixture.get_base_probs().detach()
+    # class-major combos: (a, standard), (a, low), (b, standard), (b, low); class 'b' has mass ~1e-20: representable
+    # in float32, but its cube isn't
+    logits = torch.tensor([[0., -1., -46., -47.]], requires_grad=True)
+    posterior = torch.softmax(logits, -1)
+    assert 1e-30 < posterior[0, 2:].sum() < 1e-13
+
+    prior = mixture.get_next_prior(posterior, base_probs)
+    assert torch.allclose(prior.sum(-1), torch.ones(1))
+    weights = torch.randn(prior.shape)
+    grad, = torch.autograd.grad((prior * weights).sum(), logits, create_graph=True)
+    assert torch.isfinite(grad).all()
+    hvp, = torch.autograd.grad((grad * torch.randn(grad.shape)).sum(), logits)
+    assert torch.isfinite(hvp).all()
+
+
 @torch.no_grad()
 def test_latent_classes_base_probs():
     """Combos are class-major; each class has its own base-rates (the component's logit + the class's offset)."""

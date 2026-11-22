@@ -79,7 +79,7 @@ inflate the variance.
   `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
   `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
   `transform={'log_spend': LogTransform()}`. The derived means use the measures with exact means as control variates, which reduces their monte-carlo error (e.g. a sum of measures is exact). The functions should compute each group and timestep from its own values (not e.g. a total across groups).
-- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000), with a seed drawn at import so repeated calls agree. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
+- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000). Their seed comes from `torch.initial_seed()`: the seed last set by `torch.manual_seed()`, which makes them reproducible across processes, or else a random one fixed for the process. Either way, repeated calls within a process agree, and torch's global random state isn't drawn from. Or pass `generator=` (a `torch.Generator`) to `to_dataframe()` or `get_means()` for one call. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
 
 ### Behavior change: `simulate()`
 
@@ -103,6 +103,14 @@ inflate the variance.
 - The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
 - `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
 - Deprecation warnings are now `FutureWarning` instead of `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code). This covers the old `torchcast.covariance.base` import path, `fit(tol=, patience=, max_iter=)`, `Stopping.from_dict(tol=)` (previously a plain `UserWarning`), `Predictions` arguments `start_offsets`/`dt_unit` and `type='components'`, `complete_times()` arguments `group_colname` and `global_max=True`, and `BinomialFilter(do_post_hoc_correction=True/False)`.
+- A model's default monte-carlo noise for the log-prob (`mc_sampling`, a `FixedWhiteNoise`) is seeded from
+  `torch.initial_seed()` instead of numpy's unseeded random state, so `torch.manual_seed()` before creating the model
+  makes a fit with a monte-carlo loss (e.g. a `BinomialFilter`'s) reproducible. Before, each model got different
+  noise, so refits of the same model on the same data landed at different parameters.
+- `load_state_dict()` warns when an `EWMAdaptiveScaler`'s state-dict has no `adaptive_scaling._extra_state`. It still
+  loads it with the pre-1.2.0 behavior (a running mean starting at 0), which is right for state-dicts saved by older
+  versions -- but a newer state-dict that lost that entry (e.g. filtered to tensors) silently got the old behavior too,
+  and different predictions.
 - `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of
   computing intervals; `Predictions.get_means(transform=..., use_map=...)` returns them as a
   `(num_groups, num_timesteps, num_measures)` tensor.

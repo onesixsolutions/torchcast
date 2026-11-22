@@ -1,7 +1,9 @@
 import copy
 import io
 import math
+import warnings
 
+import pytest
 import torch
 
 from torchcast.kalman_filter import KalmanFilter
@@ -102,9 +104,13 @@ def test_legacy_state_dict():
     sd = _make_kf().state_dict()
     assert sd.pop('adaptive_scaling._extra_state') == {'running_init': 1.}
     kf = _make_kf()
-    kf.load_state_dict(sd)  # strict
+    # (strict; it can't tell an old state-dict from a new one that lost its extra-state, so it warns:)
+    with pytest.warns(UserWarning, match="adaptive_scaling._extra_state"):
+        kf.load_state_dict(sd)
     assert kf.adaptive_scaling._running_init == 0.
 
-    # round-trip of a new state-dict:
-    kf.load_state_dict(_make_kf().state_dict())
+    # round-trip of a new state-dict, without a warning:
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        kf.load_state_dict(_make_kf().state_dict())
     assert kf.adaptive_scaling._running_init == 1.
