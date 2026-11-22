@@ -4,6 +4,7 @@ and (2) with a log_prob that use binomial likelihood (using monte-carlo approxim
 """
 
 from math import log
+from warnings import warn
 
 import pandas as pd
 import torch
@@ -42,7 +43,7 @@ class BinomialFilter(KalmanFilter):
        an error asking you to choose; loading a state-dict also chooses, to match the saved parameters.
      - ``'none'``: no correction.
 
-     ``True`` and ``False`` are accepted for backwards-compatibility, meaning ``'auto'`` and ``'none'``.
+     ``True`` and ``False`` are deprecated (with a warning), meaning ``'auto'`` and ``'none'``.
     :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
     :param process_covariance: A module created with ``Covariance.from_processes(processes, type='process')``.
     :param initial_covariance: A module created with ``Covariance.from_processes(measures, type='initial')``.
@@ -90,7 +91,13 @@ class BinomialFilter(KalmanFilter):
         )
 
         if isinstance(do_post_hoc_correction, bool):
-            do_post_hoc_correction = 'auto' if do_post_hoc_correction else 'none'
+            mode = 'auto' if do_post_hoc_correction else 'none'
+            warn(
+                f"``do_post_hoc_correction={do_post_hoc_correction}`` is deprecated; use ``'{mode}'`` (the same), or "
+                f"choose ``'static'`` or ``'num_obs'`` (see the ``BinomialFilter`` docs).",
+                DeprecationWarning
+            )
+            do_post_hoc_correction = mode
         if do_post_hoc_correction not in _POST_HOC_CORRECTIONS:
             raise ValueError(
                 f"``do_post_hoc_correction`` should be one of {_POST_HOC_CORRECTIONS}, got {do_post_hoc_correction!r}."
@@ -696,7 +703,7 @@ def main(num_groups: int = 50, num_timesteps: int = 100, bias: float = -2, prop_
         measures=measures,
         binary_measures=binary_measures,
         observed_counts=False,
-        do_post_hoc_correction=False
+        do_post_hoc_correction='none'
     )
 
     y = dataset.tensors[0]

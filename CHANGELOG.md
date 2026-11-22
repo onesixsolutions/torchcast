@@ -181,9 +181,9 @@ The post-hoc correction's sharpness was always `exp(w * log(num_obs) + b)`. When
 - `'num_obs'`: the previous form, with a slope on `log(num_obs)`; for data whose `num_obs` varies.
 - `'auto'` (the default): `'static'` or `'num_obs'`, chosen by `BinomialFilter.fit()` from whether the `num_obs` passed to it varies (before it creates the optimizer). Calling the model while it's still `'auto'` (e.g. training with your own loop, or `StateSpaceTrainer`) raises an error asking you to choose.
 - `'none'`: no correction.
-- `True` and `False` still work, meaning `'auto'` and `'none'` (to be deprecated eventually).
+- `True` (the previous default) and `False` are deprecated, with a `DeprecationWarning`; they mean `'auto'` and `'none'`.
 
-Back-compatibility: with `'auto'` (so also with `True`, or the default), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
+Back-compatibility: with `'auto'` (the default, or the deprecated `True`), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
 
 ### Overridable design models
 

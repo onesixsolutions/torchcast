@@ -6,6 +6,7 @@ test_kalman_filter.py.) Where possible, results are compared to an independent g
 `FixedWhiteNoise`, so these tests are deterministic.
 """
 import math
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -102,7 +103,7 @@ def test_binomial_mc_log_prob_matches_quadrature(observed_counts: bool):
     num_obs = 5
     bf = BinomialFilter(
         processes=[LocalLevel(id='level')], measures=['y'], observed_counts=observed_counts,
-        do_post_hoc_correction=False
+        do_post_hoc_correction='none'
     )
     bf.mc_sampling = _white_noise(20_000)
     counts = torch.randint(0, num_obs + 1, (3, 8, 1)).float()
@@ -160,7 +161,7 @@ def test_binomial_update_adds_binomial_variance():
         measures=['visit', 'spend'],
         binary_measures=['visit'],
         observed_counts=False,
-        do_post_hoc_correction=False,
+        do_post_hoc_correction='none',
     )
     measured_mean = torch.tensor([[.2, 1.], [.7, 2.]])
     measure_cov = torch.diag_embed(torch.tensor([[0., .5], [0., .5]]))
@@ -545,9 +546,11 @@ def _make_binomial(**kwargs):
 
 
 def test_post_hoc_correction_modes():
-    # booleans are backwards-compatible aliases:
-    assert _make_binomial(do_post_hoc_correction=True).post_hoc_correction == 'auto'
-    assert _make_binomial(do_post_hoc_correction=False).post_hoc_correction == 'none'
+    # booleans are deprecated aliases:
+    with pytest.warns(DeprecationWarning, match="``do_post_hoc_correction=True`` is deprecated; use ``'auto'``"):
+        assert _make_binomial(do_post_hoc_correction=True).post_hoc_correction == 'auto'
+    with pytest.warns(DeprecationWarning, match="``do_post_hoc_correction=False`` is deprecated; use ``'none'``"):
+        assert _make_binomial(do_post_hoc_correction=False).post_hoc_correction == 'none'
     assert _make_binomial().post_hoc_correction == 'auto'
     with pytest.raises(ValueError, match="should be one of"):
         _make_binomial(do_post_hoc_correction='sometimes')
@@ -603,9 +606,11 @@ def test_post_hoc_correction_loading():
         saved = _make_binomial(do_post_hoc_correction=mode)
         with torch.no_grad():
             expected = saved(y).means
-        # a model created with the default ('auto', or ``True``) matches the saved parameters:
+        # a model created with the default ('auto', or the deprecated ``True``) matches the saved parameters:
         for default in ('auto', True):
-            loaded = _make_binomial(do_post_hoc_correction=default)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', DeprecationWarning)
+                loaded = _make_binomial(do_post_hoc_correction=default)
             loaded.load_state_dict(saved.state_dict())
             assert loaded.post_hoc_correction == mode
             with torch.no_grad():
