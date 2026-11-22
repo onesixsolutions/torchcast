@@ -1,7 +1,7 @@
 import math
 import pickle
 import warnings
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pytest
@@ -382,9 +382,12 @@ def test_warn_correlated_levels():
     def make(**kwargs):
         processes = [
             LocalLevel(id='level', measure='y'),
-            # (``stationary_initial_variance``: so that the free-initial-variance warning doesn't fire here)
-            LocalLevel(id='transient', measure='y', decay=(.5, .95), stationary_initial_variance=True)
+            LocalLevel(id='transient', measure='y', decay=(.5, .95))
         ]
+        # (``stationary``: so that the free-initial-variance warning doesn't fire here)
+        kwargs['initial_covariance'] = Covariance.from_processes(
+            processes, cov_type='initial', stationary=['transient']
+        )
         if kwargs.pop('uncorrelated', False):
             kwargs['process_covariance'] = Covariance.from_processes(processes, corr_groups=[['transient']])
         return KalmanFilter(processes=processes, measures=['y'], **kwargs)
@@ -399,94 +402,128 @@ def test_warn_correlated_levels():
         KalmanFilter(processes=[LocalLevel(id='a', measure='x'), LocalLevel(id='b', measure='y')], measures=['x', 'y'])
 
 
-def _make_decaying_kf(stationary: Optional[bool], decay=(.5, .95), **kwargs) -> KalmanFilter:
+
+def _make_decaying_kf(stationary: Optional[Sequence[str]] = (), decay=(.5, .95), **kwargs) -> KalmanFilter:
+    # a random walk on each of two measures, and a decaying level on each (correlated with each other, not the walks)
     processes = [
-        LocalLevel(id='level', measure='y'),
-        LocalLevel(id='transient', measure='y', decay=decay, stationary_initial_variance=stationary)
+        LocalLevel(id='level_a', measure='a'),
+        LocalLevel(id='level_b', measure='b'),
+        LocalLevel(id='transient_a', measure='a', decay=decay),
+        LocalLevel(id='transient_b', measure='b', decay=decay)
     ]
     return KalmanFilter(
         processes=processes,
-        measures=['y'],
-        process_covariance=Covariance.from_processes(processes, corr_groups=[['transient']]),
+        measures=['a', 'b'],
+        process_covariance=Covariance.from_processes(processes, corr_groups=[['transient_a', 'transient_b']]),
+        initial_covariance=Covariance.from_processes(processes, cov_type='initial', stationary=stationary),
         **kwargs
     )
 
 
-def test_stationary_initial_variance():
+def _get_decay(kf: KalmanFilter, pid: str) -> torch.Tensor:
+    return kf.processes[pid].state_elements['level'].transitions_to['level']().squeeze()
+
+
+def test_stationary_initial_covariance():
     torch.manual_seed(0)
-    kf = _make_decaying_kf(stationary=True)
-    # no free parameter for the transient's initial variance (or its correlations):
-    assert kf.initial_covariance.empty_idx == {1}
-    assert kf.initial_covariance.param_rank == 1
-    assert kf.initial_covariance.cholesky_off_diag.numel() == 0
+    kf = _make_decaying_kf(stationary=['transient_a', 'transient_b'])
+    # no parameters for the stationary elements (their variances or any correlations):
+    assert kf.initial_covariance.stationary_idx == [2, 3]
+    assert kf.initial_covariance.empty_idx == {2, 3}
+    assert kf.initial_covariance.param_rank == 2
+    assert kf.initial_covariance.cholesky_off_diag.numel() == 1  # (just the two random walks)
 
     with torch.no_grad():
-        kf.processes['transient'].state_elements['level'].transitions_to['level'].raw.fill_(.3)
-    decay = kf.processes['transient'].state_elements['level'].transitions_to['level']()
+        kf.processes['transient_a'].state_elements['level'].transitions_to['level'].raw.fill_(.3)
+        kf.processes['transient_b'].state_elements['level'].transitions_to['level'].raw.fill_(-.5)
+        kf.process_covariance.cholesky_off_diag.fill_(.3)  # (correlated transients)
+    decays = torch.stack([_get_decay(kf, 'transient_a'), _get_decay(kf, 'transient_b')])
     pcov = kf.process_covariance({}, num_groups=1, num_times=1).squeeze()
-    scale2 = kf._get_measure_scaling()[0] ** 2
-    init_cov = kf._default_initial_cov().squeeze(0)
-    torch.testing.assert_close(init_cov[1, 1], (pcov[1, 1] / (1 - decay ** 2)).squeeze() * scale2)
-    assert init_cov[0, 1] == 0 and init_cov[1, 0] == 0
-    # the non-stationary element's initial variance is unchanged:
+    scale = kf._get_measure_scaling().repeat(2)  # (measures a, b, a, b)
+    init_cov = kf._default_initial_cov().squeeze(0) / (scale.unsqueeze(-1) * scale.unsqueeze(-2))
+    # the stationary covariance, including the cross-covariance between the transients:
+    expected = pcov[2:, 2:] / (1 - decays.unsqueeze(-1) * decays.unsqueeze(-2))
+    assert expected[0, 1] != 0
+    torch.testing.assert_close(init_cov[2:, 2:], expected)
+    # zero with the random walks; the random walks' block is the free parameters:
+    assert (init_cov[:2, 2:] == 0).all() and (init_cov[2:, :2] == 0).all()
     icov = kf.initial_covariance({}, num_groups=1, num_times=1).squeeze()
-    torch.testing.assert_close(init_cov[0, 0], icov[0, 0] * scale2)
+    torch.testing.assert_close(init_cov[:2, :2], icov[:2, :2])
+    # it's what the filter would converge to, starting from it: ``F P F' + Q = P``
+    torch.testing.assert_close(decays.unsqueeze(-1) * expected * decays.unsqueeze(-2) + pcov[2:, 2:], expected)
 
-    # the decay and process-variance get gradients through the initial variance:
-    init_cov[1, 1].backward()
-    assert kf.processes['transient'].state_elements['level'].transitions_to['level'].raw.grad.abs() > 0
+    # the decays and process-covariance get gradients through the initial covariance:
+    init_cov[2:, 2:].sum().backward()
+    assert kf.processes['transient_a'].state_elements['level'].transitions_to['level'].raw.grad.abs() > 0
     assert kf.process_covariance.cholesky_log_diag.grad.abs().sum() > 0
 
     # and in a forward pass:
-    y = torch.randn(2, 10, 1)
+    y = torch.randn(2, 10, 2)
     kf(y).log_prob(y).sum().backward()
 
 
-def test_stationary_initial_variance_errors():
-    with pytest.raises(ValueError, match="needs a decay"):
-        LocalLevel(id='x', stationary_initial_variance=True)
-    with pytest.raises(ValueError, match="needs a decay"):
-        LocalLevel(id='x', decay=(.5, 1.0), stationary_initial_variance=True)
-    # an initial covariance created before the flag (with a free parameter for the element):
-    plain = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
-    flagged = [
+def test_stationary_initial_covariance_errors():
+    processes = [
         LocalLevel(id='level', measure='y'),
-        LocalLevel(id='transient', measure='y', decay=(.5, .95), stationary_initial_variance=True)
+        LocalLevel(id='transient', measure='y', decay=(.5, .95)),
+        LocalLevel(id='near_walk', measure='y', decay=(.5, 1.0)),
+        LocalTrend(id='trend', measure='y', decay_position=(.5, .95))
     ]
-    with pytest.raises(ValueError, match="free parameter"):
-        KalmanFilter(
-            processes=flagged,
-            measures=['y'],
-            initial_covariance=Covariance.from_processes(plain, cov_type='initial')
-        )
+    with pytest.raises(ValueError, match="unknown process ids"):
+        Covariance.from_processes(processes, cov_type='initial', stationary=['nope'])
+    with pytest.raises(ValueError, match="only for ``cov_type='initial'``"):
+        Covariance.from_processes(processes, stationary=['transient'])
+    with pytest.raises(TypeError, match="list of process ids"):
+        Covariance.from_processes(processes, cov_type='initial', stationary='transient')
+
+    def make(stationary: Sequence[str]) -> KalmanFilter:
+        icov = Covariance.from_processes(processes, cov_type='initial', stationary=stationary)
+        return KalmanFilter(processes=processes, measures=['y'], initial_covariance=icov)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # (correlated levels)
+        make(['transient'])
+        with pytest.raises(ValueError, match="decay can be 1"):
+            make(['level'])
+        with pytest.raises(ValueError, match="decay can be 1"):
+            make(['near_walk'])
+        with pytest.raises(ValueError, match="also transition into it"):
+            make(['trend'])  # (velocity transitions into position)
 
 
 def test_warn_free_decay_initial_variance():
-    match = r"learned decay and a free initial variance: \['transient'\]"
+    match = r"learned decay and a free initial variance: \['transient_a', 'transient_b'\]"
     with pytest.warns(UserWarning, match=match):
-        _make_decaying_kf(stationary=None)
+        _make_decaying_kf()
+    with pytest.warns(UserWarning, match=r"stationary=\['transient_b'\]"):
+        _make_decaying_kf(stationary=['transient_a'])
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        _make_decaying_kf(stationary=True)  # tied to the stationary variance
-        _make_decaying_kf(stationary=False)  # explicitly free
-        _make_decaying_kf(stationary=None, decay=.9)  # fixed decay: nothing to trade off
-        _make_decaying_kf(stationary=None, decay=(.9, 1.0))  # can reach 1: no stationary variance to suggest
+        _make_decaying_kf(stationary=['transient_a', 'transient_b'])
+        _make_decaying_kf(decay=.9)  # fixed decay: nothing to trade off
+        _make_decaying_kf(decay=(.9, 1.0))  # can reach 1: no stationary covariance to suggest
         KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])  # no decay
         KalmanFilter(processes=[LocalTrend(id='trend', measure='y')], measures=['y'])  # velocity isn't level-like
+    # silencing it, as the warning suggests:
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        warnings.filterwarnings('ignore', message='These decaying processes')
+        _make_decaying_kf()
 
 
-def test_stationary_initial_variance_default_unchanged():
-    # by default (and with ``False``) the initial covariance keeps a free parameter for a decaying level:
-    for stationary in (None, False):
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            kf = _make_decaying_kf(stationary=stationary)
-        assert kf.initial_covariance.empty_idx == set()
-        assert kf.initial_covariance.param_rank == 2
-        icov = kf.initial_covariance({}, num_groups=1, num_times=1).squeeze()
-        scale2 = kf._get_measure_scaling()[0] ** 2
-        torch.testing.assert_close(kf._default_initial_cov().squeeze(0), icov * scale2)
-
+def test_stationary_initial_covariance_default_unchanged():
+    # by default the initial covariance keeps free parameters for the decaying levels:
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        kf = _make_decaying_kf()
+    assert kf.initial_covariance.stationary_idx == []
+    assert kf.initial_covariance.empty_idx == set()
+    assert kf.initial_covariance.param_rank == 4
+    icov = kf.initial_covariance({}, num_groups=1, num_times=1).squeeze()
+    scale = kf._get_measure_scaling().repeat(2)
+    torch.testing.assert_close(
+        kf._default_initial_cov().squeeze(0), icov * scale.unsqueeze(-1) * scale.unsqueeze(-2)
+    )
 
 
 def _make_masked_cov(method: str, corr_mask: bool = True) -> Covariance:
@@ -585,13 +622,16 @@ def test_corr_mask_old_model_same_predictions(monkeypatch):
     def make() -> KalmanFilter:
         processes = [
             LocalLevel(id='level', measure='y'),
-            LocalLevel(id='transient', measure='y', decay=(.5, .95), stationary_initial_variance=True),
-            LocalLevel(id='transient2', measure='y', decay=(.5, .95), stationary_initial_variance=True)
+            LocalLevel(id='transient', measure='y', decay=(.5, .95)),
+            LocalLevel(id='transient2', measure='y', decay=(.5, .95))
         ]
         return KalmanFilter(
             processes=processes,
             measures=['y'],
-            process_covariance=Covariance.from_processes(processes, corr_groups=[['transient', 'transient2']])
+            process_covariance=Covariance.from_processes(processes, corr_groups=[['transient', 'transient2']]),
+            initial_covariance=Covariance.from_processes(
+                processes, cov_type='initial', stationary=['transient', 'transient2']
+            )
         )
 
     torch.manual_seed(3)

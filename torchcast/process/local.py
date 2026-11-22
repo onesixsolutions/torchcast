@@ -17,38 +17,20 @@ class LocalLevel(Process):
      assign a parameter representing the decay as a learned parameter somewhere between these bounds. The default value
      means a half-life that can't go lower than ~13 timesteps; overriding this based on your domain-knowledge is
      encouraged.
-    :param stationary_initial_variance: Only for a decaying level (whose decay is less than 1, e.g. bounds like
-     ``(.5, .95)``). If ``True``, the level's initial variance is its stationary variance,
-     ``sigma^2 / (1 - decay^2)`` (``sigma^2`` its process-variance), rather than a free parameter of the
-     ``initial_covariance``; its initial correlations with other state elements are zero. With a learned decay this
-     is recommended: otherwise the decay trades off against the initial variance (a faster decay with a larger initial
-     variance fits the start of a series about as well as a slower decay with a smaller one), so the decay is
-     identified by the first few timesteps rather than the whole series; the :class:`.KalmanFilter` warns about this.
-     ``False`` keeps the free initial variance and silences that warning. Note: the initial covariance must be
-     created *after* this process (as it is by default), since this removes a parameter from it.
     """
 
     def __init__(self,
                  id: str,
                  measure: Optional[str] = None,
-                 decay: Optional[Union[torch.nn.Module, tuple[float, float], float]] = None,
-                 stationary_initial_variance: Optional[bool] = None):
+                 decay: Optional[Union[torch.nn.Module, tuple[float, float], float]] = None):
+        super().__init__(
+            id=id,
+            state_elements=[StateElement(name='level', measure_multi=1.0, has_process_variance=True)],
+            measure=measure
+        )
+
         decay = standardize_decay(decay)
         self._has_decay = not isinstance(decay, float) or decay < 1.0
-        if stationary_initial_variance:
-            upper = getattr(decay, 'upper', decay)  # (``Bounded`` or float; other modules are checked at forward)
-            if not self._has_decay or (isinstance(upper, (float, int)) and upper >= 1.0):
-                raise ValueError(
-                    f"`{id}`: ``stationary_initial_variance=True`` needs a decay that's less than 1 (e.g. bounds like "
-                    f"``decay=(.5, .95)``); without decay there's no stationary variance."
-                )
-        level = StateElement(
-            name='level',
-            measure_multi=1.0,
-            has_process_variance=True,
-            stationary_initial_variance=stationary_initial_variance
-        )
-        super().__init__(id=id, state_elements=[level], measure=measure)
         self.state_elements['level'].set_transition_to(self.state_elements['level'], multi=decay)
 
     @property
