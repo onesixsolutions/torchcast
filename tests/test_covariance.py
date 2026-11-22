@@ -905,3 +905,32 @@ def test_default_method_loads_older_state_dicts():
     # but an explicitly chosen method still raises:
     with pytest.raises(RuntimeError, match="saved with method='low_rank'"):
         Covariance.from_measures(many, method='log_cholesky').load_state_dict(old_mcov.state_dict())
+
+
+def test_prepare_for_hessian_hook(monkeypatch):
+    # ``get_laplace_mvnorm()`` calls ``prepare_for_hessian_()`` on any submodule that has it, and leaves out what it
+    # returns -- nothing covariance-specific:
+    torch.manual_seed(6)
+    kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])
+    calls = []
+
+    def prepare_for_hessian_() -> dict:
+        calls.append(True)
+        return {'initial_mean': torch.ones(1, dtype=torch.bool)}
+
+    monkeypatch.setattr(kf.processes['level'], 'prepare_for_hessian_', prepare_for_hessian_, raising=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        _, names = kf.get_laplace_mvnorm(torch.randn(2, 10, 1))
+    assert calls == [True]
+    assert 'processes.level.initial_mean[0]' not in names
+    assert len(names) == sum(p.numel() for p in kf.parameters()) - 1
+
+    # other covariance methods leave everything in:
+    assert Covariance(rank=3, init_diag_multi=1.).prepare_for_hessian_() == {}
+    # "low_rank" with groups: only one of the groups' rotations can be pinned
+    groups = torch.tensor([0, 0, 0, 1, 1, 1])
+    corr_mask = (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
+    masked = Covariance(rank=6, init_diag_multi=1., method='low_rank2', corr_mask=corr_mask)
+    with pytest.warns(UserWarning, match="each group's factor-loadings can be rotated separately"):
+        masked.prepare_for_hessian_()

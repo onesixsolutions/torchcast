@@ -252,8 +252,9 @@ class Covariance(nn.Module):
          "low_rank3" for 3 factors). The factor-loadings start at a scale comparable to ``D`` (half the initial
          variance each), not near zero, which is a saddle-point the factors are slow to leave. Rotations of ``V``
          leave ``V @ V.t()`` unchanged; that's harmless for fitting (and constraining ``V`` to remove them slows it
-         down), but makes the hessian singular, so :func:`StateSpaceModel.get_laplace_mvnorm` first rotates ``V``
-         (see :func:`Covariance.rotate_low_rank_`) and leaves out the entries that pinned the rotation.
+         down), but makes the hessian singular, so for :func:`StateSpaceModel.get_laplace_mvnorm`,
+         :func:`Covariance.prepare_for_hessian_` rotates ``V`` to a canonical form and leaves out the entries that pin
+         the rotation.
          Finally, "sd_corr" separates scale from correlation: ``diag(std) @ R @ diag(std)``, with parameters
          ``log_std_devs`` and ``corr_unconstrained``. ``R`` is a correlation matrix built from canonical partial
          correlations ``tanh(corr_unconstrained)`` (as in Stan's ``cholesky_factor_corr``), one per off-diagonal
@@ -412,8 +413,8 @@ class Covariance(nn.Module):
         For "low_rank": rotate the factor-loadings ``V`` (in-place) to the lower-trapezoidal form (``V[i, j] = 0``
         for ``j > i``, with elements in the order of ``lr_lead``), by an LQ decomposition. This leaves the covariance
         unchanged (exactly, up to floating-point error) and pins down the rotation, which is otherwise arbitrary:
-        e.g. for a hessian (as in :func:`StateSpaceModel.get_laplace_mvnorm`), where the entries above the diagonal
-        are then left out.
+        e.g. for a hessian (see :func:`Covariance.prepare_for_hessian_`), where the entries above the diagonal are
+        then left out.
         """
         if self.method != 'low_rank':
             raise TypeError(f"``rotate_low_rank_()`` is for method='low_rank', not '{self.method}'.")
@@ -424,14 +425,31 @@ class Covariance(nn.Module):
         self.lr_mat.copy_(rotated.masked_fill(self._get_lr_redundant().cpu(), 0.))
         return self
 
-    def _get_redundant_params(self) -> Dict[str, Tensor]:
+    def prepare_for_hessian_(self) -> Dict[str, Tensor]:
         """
-        Boolean masks of parameter-entries that leave the covariance unchanged, by name: for "low_rank" (after
-        :func:`Covariance.rotate_low_rank_`), ``lr_mat``'s entries that pin the rotation.
+        Called by :func:`StateSpaceModel.get_laplace_mvnorm` (on any submodule that has this method) before computing
+        the hessian: put the parameters (in-place, without changing the model) into a canonical form, and return, by
+        parameter name, boolean masks of the entries to leave out of the hessian, because the model only defines
+        them up to a symmetry along which the likelihood is flat (so the hessian is singular there).
+
+        For "low_rank", rotations of the factor-loadings ``V`` leave the covariance unchanged: this rotates ``V`` to
+        lower-trapezoidal form (see :func:`Covariance.rotate_low_rank_`) and leaves out the entries above the
+        diagonal. (With a binary ``corr_mask``, each group of elements can be rotated separately; only one rotation
+        is pinned, so the hessian stays singular, with a warning.) Other methods have no such symmetry.
         """
-        if self.method == 'low_rank':
-            return {'lr_mat': self._get_lr_redundant()}
-        return {}
+        if self.method != 'low_rank':
+            return {}
+        corr_mask = getattr(self, 'corr_mask', None)
+        if corr_mask is not None:
+            idx = self.non_empty_idx
+            corr_mask = corr_mask[idx][:, idx]
+        if corr_mask is not None and ((corr_mask == 0) | (corr_mask == 1)).all() and (corr_mask == 0).any():
+            warn(
+                f"`{self.id}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
+                f"rotated separately; only one rotation is pinned for the hessian, which stays singular."
+            )
+        self.rotate_low_rank_()
+        return {'lr_mat': self._get_lr_redundant()}
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None

@@ -956,20 +956,21 @@ class StateSpaceModel(torch.nn.Module):
          with :class:`.LossFun`
         :param kwargs: Keyword-arguments to the forward pass.
         :return: The multivariate normal distribution for the Laplace approximation, and the corresponding names of the
-         parameters. Parameter-entries that leave the model unchanged are left out: for a ``Covariance`` with
-         ``method='low_rank'``, whose factor-loadings are first rotated in-place (see
-         :func:`Covariance.rotate_low_rank_`, which doesn't change the model), the entries that pin the rotation.
+         parameters. Submodules whose parameters are only defined up to a symmetry (along which the likelihood is
+         flat, so the hessian is singular) can define ``prepare_for_hessian_()``: it's called first, puts their
+         parameters into a canonical form in-place (without changing the model), and returns masks of entries to
+         leave out, which are then missing from the result. E.g. :func:`Covariance.prepare_for_hessian_` does this for
+         ``method='low_rank'``.
         """
         if not get_loss:
             get_loss = LossFun(reduce='sum')
 
-        redundant = {}
+        leave_out = {}
         for module_nm, module in self.named_modules():
-            if isinstance(module, Covariance) and module.method == 'low_rank':
-                module.rotate_low_rank_()
-            if isinstance(module, Covariance):
-                for nm, is_redundant in module._get_redundant_params().items():
-                    redundant[f'{module_nm}.{nm}' if module_nm else nm] = is_redundant.reshape(-1).cpu()
+            prepare = getattr(module, 'prepare_for_hessian_', None)
+            if callable(prepare):
+                for nm, mask in prepare().items():
+                    leave_out[f'{module_nm}.{nm}' if module_nm else nm] = mask.reshape(-1).cpu()
 
         pred = self(y, **kwargs)
         loss = get_loss(pred, y)
@@ -982,7 +983,7 @@ class StateSpaceModel(torch.nn.Module):
                 continue
             all_param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
             all_params.append(par)
-            keep.append(~redundant[nm] if nm in redundant else torch.ones(par.numel(), dtype=torch.bool))
+            keep.append(~leave_out[nm] if nm in leave_out else torch.ones(par.numel(), dtype=torch.bool))
         # TODO: any way to verify reshape(-1) matches internals of hessian?
         means = torch.cat([p.reshape(-1) for p in all_params])
 
