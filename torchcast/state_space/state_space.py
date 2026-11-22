@@ -968,7 +968,12 @@ class StateSpaceModel(torch.nn.Module):
         leave_out = {}
         for module_nm, module in self.named_modules():
             prepare = getattr(module, 'prepare_for_hessian_', None)
-            if callable(prepare):
+            if prepare is not None:
+                if not callable(prepare):
+                    raise TypeError(
+                        f"`{module_nm or type(module).__name__}.prepare_for_hessian_` should be a method (returning "
+                        f"masks of entries to leave out), got {type(prepare).__name__}."
+                    )
                 for nm, mask in prepare().items():
                     leave_out[f'{module_nm}.{nm}' if module_nm else nm] = mask.reshape(-1).cpu()
 

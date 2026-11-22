@@ -187,6 +187,7 @@ class Covariance(nn.Module):
                       measures: Sequence[str],
                       predict_variance: Union[bool, nn.Module] = None,
                       corr_groups: Optional[Sequence[Sequence[str]]] = None,
+                      method: Optional[str] = None,
                       **kwargs) -> 'Covariance':
         """
         :param measures: The ``measures`` used in your :class:`.StateSpaceModel`.
@@ -198,6 +199,9 @@ class Covariance(nn.Module):
          ``(num_groups, num_times, len(measures))``.
         :param corr_groups: Optionally, groups of measures that are uncorrelated with those in other groups; measures
          not in any group form one more group together. See :func:`Covariance.from_processes`.
+        :param method: The parameterization, see :func:`Covariance.__init__`. If not given, "log_cholesky". (When the
+         method is chosen this way, loading a state-dict saved with another method switches to that method, e.g. for
+         models saved under older defaults.)
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`.
         :return: A :class:`.Covariance` object that can be used in your :class:`.StateSpaceModel`.
         """
@@ -212,7 +216,9 @@ class Covariance(nn.Module):
                 raise TypeError("Pass ``corr_groups`` or ``corr_mask``, not both.")
             kwargs['corr_mask'] = _corr_groups_to_mask(element_ids=list(measures), corr_groups=corr_groups,
                                                        kind='measure')
-        default_method = 'method' not in kwargs
+        default_method = method is None
+        if default_method:
+            method = 'log_cholesky'
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
 
@@ -221,7 +227,9 @@ class Covariance(nn.Module):
             if 'expected_kwargs' not in kwargs:
                 kwargs['expected_kwargs'] = [f'measure_var_multi']
 
-        out = cls(rank=len(measures), id='measure_covariance', predict_variance=predict_variance, **kwargs)
+        out = cls(
+            rank=len(measures), id='measure_covariance', predict_variance=predict_variance, method=method, **kwargs
+        )
         out._default_method = default_method
         return out
 

@@ -936,6 +936,11 @@ def test_prepare_for_hessian_hook(monkeypatch):
     assert 'processes.level.initial_mean[0]' not in names
     assert len(names) == sum(p.numel() for p in kf.parameters()) - 1
 
+    # a non-callable ``prepare_for_hessian_`` is a mistake, not something to skip:
+    monkeypatch.setattr(kf.processes['level'], 'prepare_for_hessian_', {'initial_mean': True}, raising=False)
+    with pytest.raises(TypeError, match="should be a method"):
+        kf.get_laplace_mvnorm(torch.randn(2, 10, 1))
+
     # other covariance methods leave everything in:
     assert Covariance(rank=3, init_diag_multi=1.).prepare_for_hessian_() == {}
     # "low_rank" with groups: only one of the groups' rotations can be pinned
