@@ -137,7 +137,13 @@ class BinomialFilter(KalmanFilter):
         self.post_correction_module = self._resolve_post_hoc_correction(num_obs)
         return super().fit(y, **kwargs)
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+    def _load_from_state_dict(self,
+                              state_dict,
+                              prefix,
+                              local_metadata,
+                              strict,
+                              missing_keys,
+                              unexpected_keys,
                               error_msgs):
         # with 'auto' (e.g. a model created with the default, or ``True``, to load a fitted one): match the saved
         # correction's parameters ('num_obs' has a slope, ``post_correction_module.weight``; 'static' doesn't)
