@@ -30,7 +30,36 @@ class AdaptiveScaler(nn.Module):
         """
         raise NotImplementedError
 
-    def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
+    def get_state(self, num_groups: int, like: torch.Tensor) -> Optional[dict[str, torch.Tensor]]:
+        """
+        The internal state (e.g. running statistics), so a later forward-pass can continue from it (see
+        :class:`.StateTuple`). Returns None if the scaler doesn't support this -- forward-passes continued from an
+        ``initial_state`` then start from a fresh state.
+
+        :param num_groups: The number of groups (for the state before any residuals have been seen).
+        :param like: A tensor whose dtype/device to use.
+        :return: A dict of ``(num_groups, ...)`` tensors (which aren't modified in place afterwards), or None.
+        """
+        return None
+
+    def set_state(self, state: dict[str, torch.Tensor]):
+        """
+        Restore a state returned by :func:`get_state` (after :func:`reset`).
+        """
+        raise NotImplementedError
+
+    def forward(self,
+                residuals: torch.Tensor,
+                skip_mask: torch.Tensor,
+                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        :param residuals: A ``(num_groups, num_measures)`` tensor of residuals.
+        :param skip_mask: A boolean tensor, same shape as ``residuals``, indicating residuals to skip (e.g. nans).
+        :param weights: Optional tensor, same shape as ``residuals``, with values in [0, 1] indicating how much each
+         residual should count. Only passed for models with mixture components, where it's the probability that the
+         observation came from the standard regime (as opposed to e.g. an outlier-regime that already explains it).
+        :return: A ``(num_groups, num_measures)`` tensor of multipliers for the standard-deviations.
+        """
         raise NotImplementedError
 
 
@@ -82,9 +111,19 @@ class EWMAdaptiveScaler(AdaptiveScaler):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
-        # state-dicts saved by older versions have no extra-state; those params were fit with a running-init of 0:
+        # state-dicts saved by older versions have no extra-state; those params were fit with a running-init of 0. But
+        # so does a newer state-dict that lost its extra-state (e.g. filtered to tensors), and loading it with the old
+        # behavior silently changes the model's predictions -- so say so:
         extra_state_key = prefix + '_extra_state'
         if extra_state_key not in state_dict:
+            warnings.warn(
+                f"The state-dict has no '{extra_state_key}', so this `EWMAdaptiveScaler` is loaded with the behavior "
+                f"of torchcast < 1.2.0: its running mean of squared residuals starts at 0 instead of 1. That's right "
+                f"for a state-dict saved by an older version. If it was saved by torchcast >= 1.2.0 and lost its "
+                f"extra-state (e.g. it was filtered to tensors), include '{extra_state_key}' (from "
+                f"`state_dict()`) -- otherwise the loaded model's predictions will differ from the saved one's.",
+                stacklevel=2,
+            )
             state_dict = {**state_dict, extra_state_key: {'running_init': 0.0}}
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -113,15 +152,41 @@ class EWMAdaptiveScaler(AdaptiveScaler):
             warnings.warn("Consider calling adaptive scaler's `initialize()` method before use.")
             self._called_initialize = False  # only warn once
 
-    def forward(self, residuals: torch.Tensor, skip_mask: torch.Tensor) -> torch.Tensor:
+    def get_state(self, num_groups: int, like: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self._running is None:
+            shape = (num_groups, self._taus.shape[0])
+            return {
+                'running': torch.full(shape, self._running_init, dtype=like.dtype, device=like.device),
+                'time': torch.zeros(shape, dtype=like.dtype, device=like.device),
+            }
+        return {'running': self._running, 'time': self._time}
+
+    def set_state(self, state: dict[str, torch.Tensor]):
+        self._running = state['running']
+        self._time = state['time']
+
+    def forward(self,
+                residuals: torch.Tensor,
+                skip_mask: torch.Tensor,
+                weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self._running is None:
             self._running = torch.full_like(residuals, self._running_init)
             self._time = torch.zeros_like(residuals)
-        self._time += (~skip_mask).int()
+        # (not in-place: states returned by `get_state()` must stay as they were)
+        if weights is None:
+            self._time = self._time + (~skip_mask).int()
+        else:
+            # a partially-weighted observation only partially counts towards the elapsed time:
+            self._time = self._time + weights * (~skip_mask)
 
         sq_resids = residuals ** 2
         alpha = torch.zeros_like(sq_resids)
         alpha[~skip_mask] = self.alpha[~skip_mask]
+        if weights is not None:
+            # an observation with weight w moves the running average w-as-much. (note this is different from
+            # down-weighting the residual itself, which would imply the observation is small, rather than that it
+            # (partially) doesn't count.)
+            alpha = alpha * weights
         ewma = (1 - alpha) * self._running + alpha * sq_resids
         self._running = ewma.clamp(self.eps)
         log_running_std = torch.log(self._running ** .5)

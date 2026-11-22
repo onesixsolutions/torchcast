@@ -1,5 +1,211 @@
 # CHANGELOG
 
+## v2.0.0
+
+### New feature: mixture components (experimental)
+
+A measure can now have one or more alternative *regimes* -- e.g. for outliers that shouldn't update the state or
+inflate the variance.
+
+- The new `torchcast.mixture` module: `MixtureModel`, `MixtureComponent`, `RegimeTransition`, `StickyTransition`.
+- `KalmanFilter(mixture=MixtureModel([MixtureComponent(...), ...]))` (or just `mixture=[MixtureComponent(...), ...]`):
+  each `MixtureComponent` is an *offset* from the standard regime: a learned offset to the (state-dependent)
+  measured-mean, extra variance (added to the measurement-noise), and base-rate. E.g. a 'quick visit' component means
+  'spend well below *this* customer's usual level'. An observation in a component's regime updates the state as
+  usual, but accounting for the offset and the extra noise -- so it doesn't drag the state towards it. Components are supported on any measure with a gaussian likelihood, including the non-binary measures of a
+  `BinomialFilter`, and measures with a nonlinear measurement (a nonlinear process such as `SaturatedLinearModel`, or
+  a measure-function): for these, the update-step uses the linearized (EKF) measurement, while `log_prob()`, `means`,
+  and `to_dataframe()` use monte-carlo.
+- Regime-probabilities are tracked jointly across measures and carried through time. How they persist is controlled by
+  a `RegimeTransition`; the default `StickyTransition` learns a "stickiness" for each regime (and reduces to a static
+  mixture when that's zero). A custom transition can be passed via `MixtureModel(..., transition=)`; `StaticTransition`
+  is a static mixture.
+- Latent classes: `MixtureModel(..., classes=[LatentClass('reference'), LatentClass('volatile',
+  relative_rate_init={'y.low': 3.}), ...])` gives groups (e.g. customers) their own base-rates for the components -- a
+  discrete random effect, learned per class (each class after the first, relative to the first). A group's class is
+  fixed but unknown: its posterior (`Predictions.latent_class_probs`) accumulates evidence over all of its timesteps
+  and carries into forecasts. The transition is shared by the classes, applied within each one.
+- Binary measures never influence the regime-probabilities (their gaussian approximation in the update-step is
+  crude).
+- `Predictions.log_prob()` is the exact marginal likelihood of the mixture.
+- Outputs: `Predictions.get_mixture(measure)` returns a `MixtureOfNormals` (probability, mean, and variance of each
+  regime, with `mean()`, `var()`, `cdf()`, `quantile()`), e.g. for back-transforming each regime before mixing. (For
+  a measure with a nonlinear measurement, the standard regime's mean and variance are the linearized approximation,
+  with a warning.)
+  `means`/`covs` are the mixture's exact moments (accessing `covs` warns, since it's easy to misuse), and
+  `to_dataframe()`/`plot()` intervals use the mixture's exact quantiles.
+- With `adaptive_scaling`, residuals explained by a mixture component don't inflate the scaling.
+- `MixtureModel(..., joseph_form=False)` uses the simpler covariance update (`P - K @ H @ P`) instead of the Joseph
+  form for the non-standard regime-combos (the update-step runs once per combo; the standard regime follows the
+  model's own covariance-update): less memory during training, and faster, but less numerically robust -- though the
+  non-standard combos are the better-conditioned ones. The default is the Joseph form.
+- A component's base-rate can depend on predictors: `MixtureComponent(..., predictors=['treated'])` learns a
+  coefficient for each (added to its logit), e.g. for a treatment that makes the regime more common. Pass them to
+  `forward()` as `X` (or `{component_id}__X`), as a `(num_groups, num_timesteps, num_predictors)` tensor covering the
+  forecast horizon. Custom `RegimeTransition`s then receive `base_probs` with shape `(num_groups, num_combos)`.
+
+### New feature: back-transforming predictions
+
+- `Predictions.to_dataframe(transform=...)` maps predictions of transformed measures back to the original scale,
+  e.g. `transform=LogTransform()` (for all measures) or `transform={'sales': LogTransform(base=10)}`. Intervals are
+  back-transformed exactly (quantiles pass through monotone transforms), and so is the mean: `E[inverse(Y)]` rather
+  than `inverse(E[Y])`, via closed form where available and gauss-hermite quadrature otherwise. For models with
+  mixture components, each regime is back-transformed and then mixed. Actuals are back-transformed too.
+- `Transform` is the base class: subclasses only need to implement `transform()` and `inverse()`. `LogTransform` and
+  `BoxCoxTransform` (with `lmbda >= 0`) are provided, as well as `SmearingTransform`.
+- `bias_adjust` (0-1) controls how much bias-adjustment is applied to the back-transformed mean (0 = the
+  back-transformed median; default = the full mean); it doesn't affect intervals.
+- `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
+  `to_dataframe()`.
+- `SmearingTransform(base, residuals)` wraps a transform so that back-transformed means use the empirical
+  distribution of standardized residuals instead of assuming gaussian noise (Duan's smearing estimator); intervals
+  are unaffected. `SmearingTransform.from_predictions(base, predictions, y, measure)` builds one from a model's
+  residuals. For a measure with mixture components, it smears each regime with its own residuals, weighted by the
+  probability that each observation came from that regime -- so a component's back-transformed mean uses the
+  residuals attributed to it, rather than e.g. a lognormal mean that's very sensitive to a large component
+  variance. Custom transforms can override `Transform._expected_inverse()` (a closed form) or
+  `Transform._noise_nodes()` (a different noise distribution).
+- For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.get_regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
+- `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
+  `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`.
+
+### New feature: sampling predictions, and derived quantities
+
+- `Predictions.sample(num_samples, shared_noise, observation_noise=True, generator=None)` draws from the predictive distribution, jointly across measures (independently per group/timestep; for trajectories, see `simulate()`). Each draw samples the state (and regime, for mixture models), giving the conditional `means`/`covs` of the measures; with `observation_noise=True`, observations are sampled too (binomial draws for binary measures). `shared_noise` (required) says whether the underlying random draws are shared across groups and timesteps (cheaper, fine for per-row summaries) or independent (needed to aggregate across groups). Returns a `PredictionSamples`, whose `combos` gives each draw's regime-combo, for mixture models.
+- `sample(regime_noise_scale={'quick': 0.})` scales the randomness of draws in a component's regime: `0` pins them at the regime's center (the measured-mean of the state's mean, plus the offset), while the standard regime is sampled as usual -- e.g. to see how much a component's variance contributes to back-transformed outputs.
+- `Predictions.to_dataframe(derived={'total': lambda s: s['a'] + s['b']})` adds quantities computed from several
+  measures, from joint samples (so correlations between measures are accounted for), on the scale given by
+  `transform`. E.g. expected weekly spend from a binary 'visited' measure and a log-spend measure:
+  `derived={'weekly_spend': lambda s: s['visited'] * s['log_spend'].nan_to_num()}` with
+  `transform={'log_spend': LogTransform()}`. The derived means use the measures with exact means as control variates, which reduces their monte-carlo error (e.g. a sum of measures is exact). The functions should compute each group and timestep from its own values (not e.g. a total across groups).
+- Sample-based outputs (`to_dataframe()`'s monte-carlo means/intervals and `derived`, `get_means()`) take `num_samples` (default 1000). Their seed comes from `torch.initial_seed()`: the seed last set by `torch.manual_seed()`, which makes them reproducible across processes, or else a random one fixed for the process. Either way, repeated calls within a process agree, and torch's global random state isn't drawn from. Or pass `generator=` (a `torch.Generator`) to `to_dataframe()` or `get_means()` for one call. They're computed in chunks of groups, so their memory is bounded; since their noise is shared across rows, the results don't depend on the chunking.
+
+### Behavior change: `simulate()`
+
+- **`simulate()` now outputs the simulated states**, so its `means`, `sample()` and `to_dataframe()` describe observations around the simulated trajectories. Before, each timestep's output was the one-step *prior* given the previous simulated state -- so e.g. `sample()` drew fresh process-noise for each timestep, ignoring the process-noise the trajectory actually carried forward, and the variance of quantities summed over time (e.g. a lifetime total) was too small. **Code that uses `simulate()` will get different (correct) values.** With `include_updates_in_output=True`, the `update_*` attributes are the same states. `forward(simulate=...)` now requires `n_step=1`.
+- For models with mixture components, the regimes are simulated too: one regime-combo per timestep, drawn given the previous one (so e.g. a sticky regime persists), with one-hot `combo_probs` -- so `sample()` draws observations in the simulated regime. Before, the regime-probabilities were just rolled forward.
+- `simulate(generator=...)` for reproducible simulations.
+- Bug fix: `simulate()` failed for float64 (or non-cpu) models.
+
+### Bug fix that changes predictions: adaptive scaling when forecasting from `initial_state`
+
+- With `adaptive_scaling`, a forward-pass started from `initial_state=pred.get_state_at_times(...)` used to start the
+  scaler from scratch, and applied no multiplier at the first step -- so a continued forecast silently differed from
+  the same forecast made in one pass. The `StateTuple` now also carries the scaler's state (`scaling`: the running
+  statistics, and the pending multiplier for the next step), and `forward()` continues from it. Prediction-type states
+  carry the state of the update they were rolled forward from. Plain `(mean, cov)` tuples still start fresh.
+- Custom `AdaptiveScaler`s can take part by implementing `get_state()` / `set_state()`; otherwise they start fresh, as
+  before.
+
+### Bug fix that changes predictions: `to_dataframe(conf=None)`
+
+- The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
+  uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
+  larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+
+### New option: `joseph_form`
+
+`KalmanFilter(joseph_form=False)` (and `BinomialFilter`) uses the simpler covariance update `P - K H P` (symmetrized) instead of the Joseph form `(I - K H) P (I - K H)' + K R K'`. It uses less memory during training (in a test with a state-size of 44: ~20-25% less peak memory for forward + backward) and is faster, but it's less numerically robust: errors in the kalman gain have a first-order (rather than second-order) effect on the covariance, which can lose positive-definiteness. The default is unchanged (`joseph_form=True`), as are models saved by older versions.
+
+### New option: `Covariance(method='sd_corr')`
+
+A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.get_param_idx()`, `Covariance.get_off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
+
+- `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
+- `Covariance.get_corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
+- Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
+- Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
+
+### New option: uncorrelated groups of processes or measures (`corr_groups`)
+
+`Covariance.from_processes(processes, corr_groups=[['transient_a', 'transient_b']])` (and `Covariance.from_measures(measures, corr_groups=...)`, keyed on measure names) makes the listed processes correlated with each other but uncorrelated with all the others; processes not in any group form one more group together, and a process's own state-elements always stay correlated. E.g. a random-walk level and a decaying level on the same measure are poorly identified with correlated process-noise (only their sum is observed, and correlated shocks let many combinations of their variances fit equally well); grouping the decaying levels separates them, while keeping the correlations between measures within each group. Groups (rather than arbitrary pairs) are exactly the zero-patterns that masking can guarantee to keep a covariance positive semi-definite.
+
+- Implemented as `Covariance(..., corr_mask=)`: a `(rank, rank)` tensor, validated to be symmetric, with ones on the diagonal, and positive semi-definite. A binary mask (as `corr_groups` builds; a positive semi-definite 0/1 mask is always a grouping) masks the cholesky factor (for "sd_corr", the correlation's cholesky factor), so masked-out pairs have no parameters: `cholesky_off_diag`/`corr_unconstrained` hold one entry per pair that isn't masked out (`get_off_diag_idx()` accounts for this, and raises for a masked-out pair). Masking the covariance after `L @ L.t()` instead would leave parameters for the masked-out pairs that still feed the in-group entries, and so exact ridges in the likelihood (a singular Hessian, slow L-BFGS convergence, poor Laplace approximations); the representable covariances are the same either way. Other masks (e.g. entries of 0.5) multiply the covariance elementwise, which by the Schur product theorem keeps it positive semi-definite. Modules without a mask (incl. those pickled or saved by older versions) are unchanged.
+- `KalmanFilter` now warns when two level-like processes on the same measure (state-elements with process-noise, a fixed measurement-weight, that transition only to themselves -- e.g. `LocalLevel`, `LocalTrend`'s position) have correlated process-noise, with a ready-made `corr_groups` that puts the decaying ones in their own group.
+- `LocalLevel`'s docs note that `decay=True` can't give a half-life below ~13 timesteps, and encourage setting the bounds from domain-knowledge.
+
+### New option: decaying processes' initial covariance from their stationary covariance (`stationary`)
+
+`Covariance.from_processes(processes, cov_type='initial', stationary=['transient_a', 'transient_b'])` ties the listed decaying processes' initial covariance to their stationary covariance instead of free parameters: `Q[i, j] / (1 - decay_i * decay_j)` between their elements (`Q` the base process-covariance, before any `predict_variance`; the `KalmanFilter` computes it), so e.g. decaying levels whose process-noise is correlated across measures start correlated too. With a learned decay, a free initial variance is poorly identified: a faster decay with a larger initial variance fits the start of a series about as well as a slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the whole series (in a fitted model, the Hessian's weakest directions loaded mainly on a decay rate together with the initial-covariance parameters). The listed processes' elements get no parameters in the initial covariance (the new `Covariance(stationary_idx=...)`), and their initial covariance with other elements is zero: there's no stationary covariance with a non-stationary element such as a random walk, and keeping free correlations alongside a computed variance would bring back parameters that trade off against the decay. Each listed element needs process-noise, a decay that's less than 1, and no transitions into it from other elements. A learned decay may be bounded at 1 (e.g. `decay=(.5, 1.0)`): the stationary variance grows without bound as the decay nears 1, so the likelihood keeps it below, and an error is raised if it reaches 1. A decay fixed at 1 (or no decay) is rejected.
+
+- `stationary` is a list of process ids, or a dict of process ids to `True`/`False`: `False` keeps free parameters on purpose, e.g. for a decaying level that captures how far series start from their long-run level after a common start event (sign-up, launch), whose initial spread is larger than its stationary one.
+- Listing processes in `stationary` changes the initial covariance's parameters and its `mask` buffer (both shrink), so a state-dict saved without it won't load into a model with it. To warm-start, drop all of the saved `initial_covariance.*` entries (not just the cholesky parameters), and set the free block with `set_matrix_()` if needed.
+- `KalmanFilter` now warns when a level-like process has a learned decay (including one bounded at 1) and a free initial variance (unless it's `False` in `stationary`), with a ready-made `stationary=[...]` line. Nothing changes by default.
+
+### Removed: `Covariance(method='low_rank')` for new models
+
+`low_rank` (a factor model, `V @ V.t() + D`) is no longer available when creating a `Covariance`; use "log_cholesky" (the default) or "sd_corr". Its free diagonal `D` can collapse toward zero, leaving a near-singular covariance that's nearly certain about most directions and very loose about the rest. Tried as the default for large initial covariances, it fit about as well as "log_cholesky" but forecast worse: in the air-quality example's multivariate model (a 28-element initial covariance, with 12 stations to learn it from), the 30-day-ahead backtest error rose from 147.3 to 150.6, losing the multivariate model's advantage over the univariate one (150.3). There, the initial covariance is a weakly identified prior over static states, and within the low-rank family maximum likelihood preferred an inflated prior. A low-rank option with a better-behaved residual (e.g. probabilistic PCA) may come later.
+
+- Pickled models with a "low_rank" covariance still load and work, with a `FutureWarning`; `.to_method('log_cholesky')` converts one exactly.
+- Loading a state-dict saved with "low_rank" (e.g. a measure-covariance with more than 5 measures, which used to default to it) raises an error that says how to keep the fitted covariance: unpickle the saved model, or load the state-dict with an older torchcast and convert it with `.to_method('log_cholesky')`.
+
+### Behavior change: default covariance methods
+
+- `Covariance.from_measures()` no longer switches to "low_rank" for more than 5 measures: every covariance now defaults to "log_cholesky".
+- `Covariance.from_processes()` and `Covariance.from_measures()` take `method` as an explicit argument.
+
+### Behavior change: `BinomialFilter(do_post_hoc_correction=...)` modes
+
+The post-hoc correction's sharpness was always `exp(w * log(num_obs) + b)`. When `num_obs` doesn't vary in the data, the slope `w` can't be identified (an exactly flat direction in the likelihood, with a singular Hessian); with binary data (`num_obs=1`) it has no effect at all, and is never trained. `do_post_hoc_correction` now takes:
+
+- `'static'`: one learned sharpness, with no slope.
+- `'num_obs'`: the previous form, with a slope on `log(num_obs)`; for data whose `num_obs` varies.
+- `'auto'` (the default): `'static'` or `'num_obs'`, chosen by `BinomialFilter.fit()` from whether the `num_obs` passed to it varies (before it creates the optimizer). Calling the model while it's still `'auto'` (e.g. training with your own loop, or `StateSpaceTrainer`) raises an error asking you to choose.
+- `'none'`: no correction.
+- `True` (the previous default) and `False` are deprecated, with a `FutureWarning`; they mean `'num_obs'` and `'none'`, so code that passes them explicitly keeps its previous behavior.
+
+Back-compatibility: with `'auto'` (the default), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
+
+### Removed: long-deprecated arguments
+
+These were deprecated in v1.1.0 or earlier, and now raise. Their warnings were `DeprecationWarning`s (a `UserWarning` for `Stopping`'s `tol`), which Python hides unless they're triggered directly from `__main__`, so you may not have seen them:
+
+- `fit(tol=, patience=, max_iter=)`: pass them via `stopping`, e.g. `stopping={'abstol': .001, 'patience': 2, 'max_iter': 300}`. `Stopping.from_dict()` is removed (use `Stopping(**kwargs)`), so `stopping={'tol': ...}` now raises: use `abstol`.
+- `Predictions.to_dataframe(type='components')`: use `type='observed_states'`.
+- `complete_times(group_colname=)`: use `group_colnames` (now required). `complete_times(global_max=)` is removed; it had no effect (use `max_dt_colname`). `complete_times` no longer appends `max_dt_colname` to the caller's `group_colnames` list.
+- `Predictions.with_new_start_times()` and `get_state_at_times()` no longer take `start_offsets`/`dt_unit` (call `set_metadata()` first). Passing them already failed with a `TypeError`.
+
+### Overridable design models
+
+`StateSpaceModel.forward()` now builds its transition and measurement models through two methods,
+`_make_transition_model(num_groups, num_timesteps)` and `_make_measurement_model(num_groups, num_timesteps, **kwargs)`,
+instead of constructing `TransitionModel` and `MeasurementModel` inline. The defaults are unchanged. A subclass can
+override them to change the design matrices without copying `forward()`: e.g. a transition from one process's state
+to another's, which the default block-diagonal (by process) transition matrix can't express.
+
+### Other changes
+
+- Passing a `Covariance` created for one role as another now raises a `ValueError` that says how to create the right one: e.g. `initial_covariance=Covariance.from_processes(processes)` (which makes a process-covariance, whose elements without process-noise get no parameters, so a fixed season would get zero initial variance) used to warn only `Id already set to process_covariance, overwriting`.
+- The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
+- `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
+- The deprecation warning for the old `torchcast.covariance.base` import path is now a `FutureWarning` instead of a `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code).
+- A model's default monte-carlo noise for the log-prob (`mc_sampling`, a `FixedWhiteNoise`) is seeded from
+  `torch.initial_seed()` instead of numpy's unseeded random state, so `torch.manual_seed()` before creating the model
+  makes a fit with a monte-carlo loss (e.g. a `BinomialFilter`'s) reproducible. Before, each model got different
+  noise, so refits of the same model on the same data landed at different parameters.
+- `load_state_dict()` warns when an `EWMAdaptiveScaler`'s state-dict has no `adaptive_scaling._extra_state`. It still
+  loads it with the pre-1.2.0 behavior (a running mean starting at 0), which is right for state-dicts saved by older
+  versions -- but a newer state-dict that lost that entry (e.g. filtered to tensors) silently got the old behavior too,
+  and different predictions.
+- `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of
+  computing intervals; `Predictions.get_means(transform=..., use_map=...)` returns them as a
+  `(num_groups, num_timesteps, num_measures)` tensor.
+- Monte-Carlo intervals (for measures with a nonlinear measured-mean) reuse the state-samples already drawn for the
+  means, adding each measure's observation-noise (and, for mixture components, a regime drawn per sample) on its
+  own, rather than a second, joint sampling pass. Much faster (e.g. ~11x for `to_dataframe()` of a `BinomialFilter`
+  with mixture components); the intervals change only by monte-carlo error.
+- `Predictions.get_state_at_times()` returns a `StateTuple` rather than a tuple. It behaves like the `(mean, cov)`
+  tuple it replaces (unpacking, `len()`, indexing), and also carries the combo-probabilities (`combo_probs`) of models with mixture
+  components, so that passing it as `initial_state` continues a forecast where it left off. (Code that checks
+  `isinstance(..., tuple)` will need updating.)
+- `AdaptiveScaler.forward()` takes an optional `weights` argument. It's only passed for models with mixture
+  components, so custom subclasses only need to accept it to be used with mixtures.
+- For subclasses of `KalmanFilter`: the update-step is now split into `_prepare_update()` (a hook to adjust
+  inputs, called once per step), `_kalman_update()`, and `_mixture_update()`. Subclasses that previously overrode
+  `_update_step()` to adjust its inputs (as `BinomialFilter` did) should override `_prepare_update()` instead.
+- Adds `benchmarks/profile_simple_model.py`, for checking performance against other git refs.
+- `load_air_quality_data(dt_unit, outage_prob=...)` can simulate sensor outages for the PM2.5 and PM10 sensors (persistent, and rarely both at once; see `outage_persistence`, `outage_corr`, `outage_seed`), as used by the air-quality example.
+
 ## v1.2.0
 
 ### Behavior change: adaptive scaling starts at "no adjustment"

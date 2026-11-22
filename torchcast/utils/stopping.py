@@ -49,17 +49,6 @@ class Stopping:
     def convergence(self) -> str:
         return '{:.4}/{}'.format(self.last_change, self.abstol)
 
-    @classmethod
-    def from_dict(cls, **kwargs) -> 'Stopping':
-        # handle deprecated
-        if 'tol' in kwargs:
-            _msg = "Please specify `abstol` not `tol`"
-            if 'abstol' in kwargs:
-                raise TypeError(_msg)
-            warnings.warn(_msg)
-            kwargs['abstol'] = kwargs.pop('tol')
-        return cls(**kwargs)
-
     @torch.inference_mode()
     def _get_new_values(self, loss: Optional[float]) -> torch.Tensor:
         flat = []

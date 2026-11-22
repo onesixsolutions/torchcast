@@ -92,6 +92,7 @@ class ExpSmoother(StateSpaceModel):
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
                      K: torch.Tensor,
+                     val_idx: Optional[torch.Tensor] = None,
                      **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         if kwargs:
             raise TypeError(f"`{type(self).__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")
