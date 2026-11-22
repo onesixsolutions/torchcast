@@ -549,7 +549,7 @@ class StateSpaceModel(torch.nn.Module):
         if stopping is None:
             stopping = {}
             if _deprecated:
-                warn(_dmsg, DeprecationWarning)
+                warn(_dmsg, FutureWarning)
                 stopping.update(_deprecated)
         elif _deprecated:
             raise ValueError(_dmsg)

@@ -37,6 +37,20 @@ def _has_decay(se: StateElement) -> bool:
     return not (isinstance(multi, FixedValue) and bool(multi.value == 1))
 
 
+def _has_learned_decay(se: StateElement) -> bool:
+    """
+    Whether a state element's transition to itself is learned (e.g. ``Bounded``, including with an upper bound of 1:
+    as long as the fitted value is less than 1, there's a stationary variance).
+    """
+    multi = se.transitions_to[se.name]
+    return any(p.requires_grad for p in multi.parameters())
+
+
+def _get_elements_by_idx(processes: dict[str, Process]) -> list[tuple[str, str]]:
+    """``(process id, state element name)`` for each index of the state."""
+    return [(pid, nm) for pid, p in processes.items() for nm in p.state_elements]
+
+
 class KalmanFilter(StateSpaceModel):
     """
     :param processes: A list of :class:`.Process` modules.
@@ -85,7 +99,102 @@ class KalmanFilter(StateSpaceModel):
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
         self.joseph_form = joseph_form
+        self._validate_stationary_initial_variance()
         self._warn_correlated_levels()
+        self._warn_free_decay_initial_variance()
+
+    def _get_stationary_idx(self) -> list[int]:
+        # (``getattr``: modules pickled before ``stationary_idx`` existed don't have it)
+        return list(getattr(self.initial_covariance, 'stationary_idx', ()))
+
+    def _validate_stationary_initial_variance(self):
+        elements = _get_elements_by_idx(self.processes)
+        for idx in self._get_stationary_idx():
+            pid, nm = elements[idx]
+            process = self.processes[pid]
+            se = process.state_elements[nm]
+            label = f"`{pid}.{nm}` is ``stationary`` in the ``initial_covariance``"
+            if not process.linear_transition:
+                raise ValueError(f"{label}, which isn't supported for processes with a nonlinear transition.")
+            feeders = [
+                other for other, other_se in process.state_elements.items()
+                if other != nm and nm in other_se.transitions_to
+            ]
+            if feeders:
+                raise ValueError(
+                    f"{label}, but {feeders} also transition into it, so its stationary covariance isn't "
+                    f"``Q / (1 - decay * decay)``."
+                )
+            if idx in self.process_covariance.empty_idx:
+                raise ValueError(f"{label}, but it has no process-variance in ``process_covariance``.")
+            # a learned decay may be bounded at 1 (e.g. ``(.5, 1.0)``): the stationary variance grows without bound as
+            # it nears 1, so the likelihood keeps it below, and ``_default_initial_cov()`` checks the value at forward
+            decay = se.transitions_to[nm]
+            if isinstance(decay, FixedValue) and bool(torch.as_tensor(decay.value).abs() >= 1):
+                raise ValueError(
+                    f"{label}, but its decay is fixed at {float(decay.value)} (e.g. no decay), and there's no "
+                    f"stationary covariance without decay."
+                )
+
+    def _warn_free_decay_initial_variance(self):
+        """
+        A decaying level whose decay is learned, and whose initial variance is free, is poorly identified: the decay
+        trades off against the initial variance.
+        """
+        free = []
+        on_purpose = set(getattr(self.initial_covariance, 'nonstationary_idx', ()))
+        start = 0
+        for pid, p in self.processes.items():
+            for i, se in enumerate(p.state_elements.values()):
+                if (
+                        _is_level_like(se)
+                        and _has_learned_decay(se)
+                        and (start + i) not in self.initial_covariance.empty_idx
+                        and (start + i) not in on_purpose
+                        and pid not in free
+                ):
+                    free.append(pid)
+            start += p.rank
+        if not free:
+            return
+        warn(
+            f"These decaying processes have a learned decay and a free initial variance: {free}. That's poorly "
+            f"identified: a faster decay with a larger initial variance fits the start of a series about as well as a "
+            f"slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the "
+            f"whole series. Consider tying their initial covariance to their stationary covariance (computed from "
+            f"the process-covariance and the decays), e.g.:\n"
+            f"  initial_covariance=Covariance.from_processes(processes, cov_type='initial', stationary={free})\n"
+            f"That assumes series start in their usual, steady-state behavior. If instead a decaying process captures "
+            f"how far series start from their long-run level after a common start event (e.g. sign-up), keep its "
+            f"free initial variance on purpose, which silences this warning, with e.g. "
+            f"``stationary={{{free[0]!r}: False}}``."
+        )
+
+    def _default_initial_cov(self) -> torch.Tensor:
+        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        stationary_idx = self._get_stationary_idx()
+        if stationary_idx:
+            # the stationary covariance of the decaying elements, ``Q[i, j] / (1 - decay_i * decay_j)``, from the base
+            # process-covariance (ignoring any ``predict_variance``, as the initial covariance does):
+            pcov = self.process_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+            elements = _get_elements_by_idx(self.processes)
+            decays = []
+            for idx in stationary_idx:
+                pid, nm = elements[idx]
+                decay = self.processes[pid].state_elements[nm].transitions_to[nm]().reshape(())
+                if not bool(decay.abs() < 1):
+                    raise RuntimeError(
+                        f"`{pid}.{nm}` is ``stationary`` in the ``initial_covariance``, but its decay is "
+                        f"{decay.item():.4f}; there's no stationary covariance unless it's less than 1."
+                    )
+                decays.append(decay.to(pcov))
+            decays = torch.stack(decays)
+            idx = torch.tensor(stationary_idx, device=pcov.device)
+            block = pcov[idx][:, idx] / (1 - decays.unsqueeze(-1) * decays.unsqueeze(-2))
+            rows, cols = torch.meshgrid(idx, idx, indexing='ij')
+            init_cov = init_cov + pcov.new_zeros(pcov.shape).index_put((rows, cols), block)
+        # both are on the same (measure-relative) scale, so the scaling applies to the sum:
+        return self._apply_cov_scaling(init_cov, scaling=self._get_measure_scaling(), is_process_cov=True)
 
     def _warn_correlated_levels(self):
         """

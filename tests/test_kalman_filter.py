@@ -437,6 +437,7 @@ def test_adaptive_scaling_with_empty_measure_cov():
     def make(measures):
         torch.manual_seed(0)
         return BinomialFilter(
+            do_post_hoc_correction='num_obs',
             processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
             measures=measures,
             binary_measures=['visit'],
@@ -476,7 +477,7 @@ def test_nonlinear_covs_warns_once():
     from torchcast.state_space import predictions
 
     torch.manual_seed(0)
-    bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['visit'])
+    bf = BinomialFilter(do_post_hoc_correction='num_obs', processes=[LocalLevel(id='level')], measures=['visit'])
     bf.mc_sampling = 10
     pred = bf((torch.rand(2, 5, 1) > .5).float())
     predictions._warn_once.pop('cov', None)
@@ -610,7 +611,7 @@ def test_unpickling_model_from_before_mixtures():
     y = torch.randn(3, 10, 2)
     y[..., 0] = (y[..., 0] > 0).float()
     kf = BinomialFilter(processes=[LocalLevel(id='lv', measure='v'), LocalLevel(id='ls', measure='s')],
-                        measures=['v', 's'], binary_measures=['v'])
+                        measures=['v', 's'], binary_measures=['v'], do_post_hoc_correction='num_obs')
     expected = kf(y).means
     del kf.mixture  # simulate an older pickle
     loaded = pickle.loads(pickle.dumps(kf))
@@ -654,7 +655,12 @@ def test_joseph_form_option():
     bf_preds = []
     for joseph_form in (True, False):
         torch.manual_seed(1)
-        bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['visit'], joseph_form=joseph_form)
+        bf = BinomialFilter(
+            processes=[LocalLevel(id='level')],
+            measures=['visit'],
+            joseph_form=joseph_form,
+            do_post_hoc_correction='num_obs'
+        )
         assert bf.joseph_form is joseph_form
         bf_preds.append(bf(visit))
     assert torch.allclose(bf_preds[0].state_covs, bf_preds[1].state_covs, atol=1e-5)
