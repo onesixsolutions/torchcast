@@ -623,7 +623,9 @@ def test_corr_mask_with_predict_corr():
     # predicted correlations are masked too: masked-out pairs stay uncorrelated whatever the adjustment. with a binary
     # mask, the prediction has one column per entry of ``corr_unconstrained`` (pairs that aren't masked out)
     corr_mask = torch.tensor([[1., 1., 0.], [1., 1., 0.], [0., 0., 1.]])
-    module = Covariance(rank=3, init_diag_multi=1., predict_corr=Identity(), predictor_kwargs=['d'], corr_mask=corr_mask)
+    module = Covariance(
+        rank=3, init_diag_multi=1., predict_corr=Identity(), predictor_kwargs=['d'], corr_mask=corr_mask
+    )
     assert module.corr_unconstrained.numel() == 1
     module.corr_unconstrained.normal_()
     with pytest.raises(ValueError, match="should output 1 columns"):
@@ -1255,7 +1257,10 @@ def test_deprecated_id():
 
 
 def test_covariance_from_dict_spec():
-    processes = [LocalLevel(id='level', measure='y'), Season(id='season', measure='y', period=7, dt_unit=None, K=1, fixed=True)]
+    processes = [
+        LocalLevel(id='level', measure='y'),
+        Season(id='season', measure='y', period=7, dt_unit=None, K=1, fixed=True)
+    ]
     kf = KalmanFilter(
         processes=processes,
         measures=['y'],
@@ -1268,7 +1273,7 @@ def test_covariance_from_dict_spec():
     assert kf.initial_covariance.empty_idx == set()
     assert kf.process_covariance.empty_idx == {1, 2}
     assert kf.measure_covariance.method == 'sd_corr'
-    with pytest.raises(TypeError, match=r"can't include \['cov_type'\]"):
+    with pytest.raises(TypeError, match="can't include ``cov_type``"):
         KalmanFilter(processes=processes, measures=['y'], initial_covariance={'cov_type': 'process'})
     with pytest.raises(TypeError, match="should be a ``Covariance``, a dict"):
         KalmanFilter(processes=processes, measures=['y'], initial_covariance='sd_corr')
@@ -1316,3 +1321,36 @@ def test_smoothing_matrix_names():
     old = SmoothingMatrix.__new__(SmoothingMatrix)
     old.__setstate__(state)
     assert (old.id, old.measures) == ('smoothing_matrix', None)
+
+
+def test_covariance_dict_options_are_validated():
+    processes = [LocalLevel(id='level', measure='y')]
+
+    def make(**kwargs):
+        return KalmanFilter(processes=processes, measures=['y'], **kwargs)
+
+    with pytest.raises(TypeError, match=r"``initial_covariance`` got an unknown option 'methd'. Did you mean 'method'"):
+        make(initial_covariance={'methd': 'sd_corr'})
+    with pytest.raises(TypeError, match=r"Options: corr_groups, stationary, method, init_diag_multi, corr_mask\.$"):
+        make(initial_covariance={'nonsense': 1})
+    with pytest.raises(TypeError, match="can't include ``cov_type``: the model sets it"):
+        make(initial_covariance={'cov_type': 'process'})
+    with pytest.raises(TypeError, match="can't include ``stationary``: it's only for the ``initial_covariance``"):
+        make(process_covariance={'stationary': ['level']})
+    with pytest.raises(TypeError, match="can't include ``empty_idx``"):
+        make(process_covariance={'empty_idx': [0]})
+    with pytest.raises(TypeError, match="initial covariance applies before any data"):
+        make(initial_covariance={'predict_std': Identity(), 'predictor_kwargs': ['x']})
+    # (also for a Covariance object, whose prediction would have no effect:)
+    with pytest.raises(ValueError, match="applies before any data"):
+        make(initial_covariance=Covariance(rank=1, init_diag_multi=1., predict_std=Identity(), predictor_kwargs=['x']))
+
+    # deprecated options still work, and aren't suggested:
+    with pytest.warns(FutureWarning, match="predict_variance"):
+        make(measure_covariance={'predict_variance': True})
+    with pytest.raises(TypeError) as e:
+        make(measure_covariance={'nonsense': 1})
+    assert 'predict_variance' not in str(e.value) and 'predict_corr' in str(e.value)
+    # BinomialFilter sets ``empty_idx`` itself:
+    with pytest.raises(TypeError, match=r"'nonsense'.*Options: corr_groups, method, init_diag_multi, predict_std"):
+        BinomialFilter(processes=processes, measures=['y'], measure_covariance={'nonsense': 1})

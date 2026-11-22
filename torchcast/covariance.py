@@ -1,4 +1,6 @@
 import copy
+import difflib
+import inspect
 import math
 import sys
 import types
@@ -505,6 +507,11 @@ class Covariance(nn.Module):
             raise ValueError(
                 f"This covariance was created as a ``{self.role}`` covariance, but it's being used as the ``{role}`` "
                 f"covariance. Create it with ``{how}``."
+            )
+        if role == 'initial' and self.is_predicted:
+            raise ValueError(
+                "The ``initial`` covariance has ``predict_std`` / ``predict_corr``, but it applies before any data, so "
+                "it isn't predicted (those would have no effect)."
             )
         element_names = list(element_names)
         kind, source = ('measures', 'measures') if role == 'measure' else ('state-elements', 'processes')
@@ -1055,12 +1062,59 @@ def _make_covariance(spec: Union[Covariance, dict, None],
         spec = {}
     if not isinstance(spec, dict):
         raise TypeError(f"``{role}_covariance`` should be a ``Covariance``, a dict of options, or None; got {spec!r}.")
-    reserved = {'processes', 'measures', 'cov_type', 'role', 'element_names', 'rank', 'id', *kwargs} & set(spec)
-    if reserved:
-        raise TypeError(f"``{role}_covariance`` options can't include {sorted(reserved)}: the model sets these.")
+    _validate_options(spec, role=role, model_sets=set(kwargs))
     if role == 'measure':
         return Covariance.from_measures(list(measures), **spec, **kwargs)
     return Covariance.from_processes(list(processes), cov_type=role, **spec, **kwargs)
+
+
+# options a model's covariance-dict can't include: the model sets them, or they're internal to ``from_processes()``
+_MODEL_SETS = {'processes', 'measures', 'cov_type', 'rank', 'role', 'element_names', 'id'}
+_INTERNAL = {'self', 'stationary_idx', 'nonstationary_idx'}
+# the initial covariance is used before any data, as ``base_cov()``, so predicting it has no effect:
+_NOT_FOR_INITIAL = {'predict_std', 'predict_corr', 'predictor_kwargs', 'predict_variance', 'expected_kwargs'}
+# accepted (with a deprecation warning), but not suggested:
+_DEPRECATED_OPTIONS = {'predict_variance', 'expected_kwargs'}
+
+
+def _get_options(role: str) -> List[str]:
+    """The options a model's ``{role}_covariance`` dict can include, in the order of the factory's signature."""
+    factory = Covariance.from_measures if role == 'measure' else Covariance.from_processes
+    names = []
+    for fun in (factory, Covariance.__init__):
+        for nm, param in inspect.signature(fun).parameters.items():
+            if param.kind not in (param.VAR_KEYWORD, param.VAR_POSITIONAL) and nm not in names:
+                names.append(nm)
+    exclude = _MODEL_SETS | _INTERNAL
+    if role != 'measure':
+        exclude = exclude | {'empty_idx'}  # (from the processes' state-elements)
+    if role != 'initial':
+        exclude = exclude | {'stationary'}
+    if role == 'initial':
+        exclude = exclude | _NOT_FOR_INITIAL
+    return [nm for nm in names if nm not in exclude]
+
+
+def _validate_options(spec: dict, role: str, model_sets: Set[str] = frozenset()):
+    """Raise for keys in a model's ``{role}_covariance`` dict that aren't options, with what they could be."""
+    arg = f"``{role}_covariance``"
+    options = [nm for nm in _get_options(role) if nm not in model_sets]
+    unknown = [k for k in spec if k not in options]
+    options = [nm for nm in options if nm not in _DEPRECATED_OPTIONS]
+    if not unknown:
+        return
+    key = unknown[0]
+    if key in _MODEL_SETS or key in model_sets or (key == 'empty_idx' and role != 'measure'):
+        raise TypeError(f"{arg} can't include ``{key}``: the model sets it.")
+    if role == 'initial' and key in _NOT_FOR_INITIAL:
+        raise TypeError(
+            f"{arg} can't include ``{key}``: the initial covariance applies before any data, so it isn't predicted."
+        )
+    if key == 'stationary':
+        raise TypeError(f"{arg} can't include ``stationary``: it's only for the ``initial_covariance``.")
+    close = difflib.get_close_matches(str(key), options, n=1)
+    hint = f" Did you mean '{close[0]}'?" if close else ""
+    raise TypeError(f"{arg} got an unknown option '{key}'.{hint} Options: {', '.join(options)}.")
 
 
 def get_state_element_names(processes: Sequence[Process]) -> List[str]:
