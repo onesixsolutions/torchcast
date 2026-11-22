@@ -237,20 +237,8 @@ class StateSpaceModel(torch.nn.Module):
         )
         used_keys.update(mcov_keys)
 
-        transition_model = TransitionModel(
-            processes=self.processes,
-            measures=self.measures,
-            num_groups=num_groups,
-            num_timesteps=out_timesteps,
-        )
-        measurement_model = MeasurementModel(
-            processes=self.processes,
-            measures=self.measures,
-            num_groups=num_groups,
-            num_timesteps=out_timesteps,
-            measure_funs=self.measure_funs,
-            **kwargs
-        )
+        transition_model = self._make_transition_model(num_groups=num_groups, num_timesteps=out_timesteps)
+        measurement_model = self._make_measurement_model(num_groups=num_groups, num_timesteps=out_timesteps, **kwargs)
         used_keys = used_keys.union(measurement_model.used_keys)
         # (None without mixture components)
         combo_prior, base_probs, mixture_keys = self._prepare_combos(
@@ -400,6 +388,35 @@ class StateSpaceModel(torch.nn.Module):
             dt_unit=self.dt_unit
         )
 
+    def _make_transition_model(self, num_groups: int, num_timesteps: int) -> TransitionModel:
+        """
+        The transition model for a forward pass. By default it's block-diagonal by process (each process's states
+        transition only among themselves); subclasses can override this, e.g. to add transitions from one process's
+        states to another's.
+        """
+        return TransitionModel(
+            processes=self.processes,
+            measures=self.measures,
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+        )
+
+    def _make_measurement_model(self, num_groups: int, num_timesteps: int, **kwargs) -> MeasurementModel:
+        """
+        The measurement model for a forward pass: each process's states measured by its own measure. Subclasses can
+        override this, e.g. to have a measure load on another measure's states.
+
+        :param kwargs: ``forward()``'s keyword-arguments (e.g. the processes' predictors).
+        """
+        return MeasurementModel(
+            processes=self.processes,
+            measures=self.measures,
+            num_groups=num_groups,
+            num_timesteps=num_timesteps,
+            measure_funs=self.measure_funs,
+            **kwargs
+        )
+
     def _apply_cov_scaling(self,
                            cov: torch.Tensor,
                            scaling: Optional[torch.Tensor],
@@ -529,7 +546,7 @@ class StateSpaceModel(torch.nn.Module):
         if stopping is None:
             stopping = {}
             if _deprecated:
-                warn(_dmsg, DeprecationWarning)
+                warn(_dmsg, FutureWarning)
                 stopping.update(_deprecated)
         elif _deprecated:
             raise ValueError(_dmsg)
@@ -936,25 +953,50 @@ class StateSpaceModel(torch.nn.Module):
          with :class:`.LossFun`
         :param kwargs: Keyword-arguments to the forward pass.
         :return: The multivariate normal distribution for the Laplace approximation, and the corresponding names of the
-         parameters.
+         parameters. Submodules whose parameters are only defined up to a symmetry (along which the likelihood is
+         flat, so the hessian is singular) can define ``prepare_for_hessian_()``: it's called first, puts their
+         parameters into a canonical form in-place (without changing the model), and returns masks of entries to
+         leave out, which are then missing from the result. E.g. :func:`Covariance.prepare_for_hessian_` does this for
+         ``method='low_rank'``.
         """
         if not get_loss:
             get_loss = LossFun(reduce='sum')
+
+        leave_out = {}
+        for module_nm, module in self.named_modules():
+            prepare = getattr(module, 'prepare_for_hessian_', None)
+            if prepare is not None:
+                if not callable(prepare):
+                    raise TypeError(
+                        f"`{module_nm or type(module).__name__}.prepare_for_hessian_` should be a method (returning "
+                        f"masks of entries to leave out), got {type(prepare).__name__}."
+                    )
+                for nm, mask in prepare().items():
+                    leave_out[f'{module_nm}.{nm}' if module_nm else nm] = mask.reshape(-1).cpu()
 
         pred = self(y, **kwargs)
         loss = get_loss(pred, y)
 
         all_params = []
         all_param_names = []
+        keep = []
         for nm, par in self.named_parameters():
             if not par.requires_grad:
                 continue
             all_param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
             all_params.append(par)
+            keep.append(~leave_out[nm] if nm in leave_out else torch.ones(par.numel(), dtype=torch.bool))
         # TODO: any way to verify reshape(-1) matches internals of hessian?
         means = torch.cat([p.reshape(-1) for p in all_params])
 
         hess = hessian(output=loss.squeeze(), inputs=all_params, allow_unused=True, progress=False)
+
+        keep = torch.cat(keep)
+        if not keep.all():
+            all_param_names = [nm for nm, k in zip(all_param_names, keep.tolist()) if k]
+            keep = keep.to(hess.device)
+            means = means[keep]
+            hess = hess[keep][:, keep]
 
         # create mvnorm for laplace approx:
         with torch.no_grad():

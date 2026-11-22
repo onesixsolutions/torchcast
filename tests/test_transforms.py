@@ -118,6 +118,7 @@ def test_to_dataframe_transform_binomial():
     spend[visit == 0] = float('nan')
     y = torch.stack([visit, spend], -1)
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -212,6 +213,7 @@ def test_bias_adjust_monte_carlo():
     torch.manual_seed(1)
     y = torch.stack([(torch.rand(2, 8) > .4).float(), torch.randn(2, 8) * .3 + 2], -1)
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -451,6 +453,7 @@ def test_means_only(use_map: bool):
     spend[visit == 0] = float('nan')
     y = torch.stack([visit, spend, spend * .5], -1)
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend', 'other']],
         measures=['visit', 'spend', 'other'],
         binary_measures=['visit'],

@@ -1,7 +1,7 @@
 Mixture Components
 ==================
 
-*Experimental.* See the :doc:`../examples/mixture_components` example.
+*Experimental.*
 
 .. automodule:: torchcast.mixture
    :members: MixtureModel, MixtureComponent, StandardRegime, LatentClass, RegimeTransition, StaticTransition,

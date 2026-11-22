@@ -56,7 +56,7 @@ class Stopping:
             _msg = "Please specify `abstol` not `tol`"
             if 'abstol' in kwargs:
                 raise TypeError(_msg)
-            warnings.warn(_msg)
+            warnings.warn(_msg, FutureWarning)
             kwargs['abstol'] = kwargs.pop('tol')
         return cls(**kwargs)
 

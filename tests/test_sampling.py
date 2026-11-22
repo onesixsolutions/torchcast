@@ -99,6 +99,7 @@ def test_sample_binomial(shared_noise: bool):
     spend = torch.randn(3, 12).cumsum(1) * .2 + 3.
     spend[visit == 0] = float('nan')
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -233,6 +234,7 @@ def test_sample_binomial_saturated_probability():
     """
     torch.manual_seed(0)
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -260,6 +262,7 @@ def test_derived_binomial_spend():
     log_spend = torch.randn(3, 12).cumsum(1) * .2 + 3.
     log_spend[visit == 0] = float('nan')
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'log_spend']],
         measures=['visit', 'log_spend'],
         binary_measures=['visit'],
@@ -330,6 +333,7 @@ def test_nonlinear_model_linear_measures_exact():
     spend[visit == 0] = float('nan')
     y = torch.stack([visit, spend], -1)
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -414,6 +418,7 @@ def test_sample_binomial_measure_order():
     num_obs = torch.tensor([3., 50.])  # (in the order of `binary_measures`: 'b', then 'a')
     counts = torch.stack([torch.randint(0, 51, (2, 6)), torch.randint(0, 4, (2, 6))], -1).float()  # ('a', 'b')
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in 'ab'],
         measures=['a', 'b'],
         binary_measures=['b', 'a'],
@@ -455,6 +460,7 @@ def test_simulate_repeats_num_obs():
     # simulate(num_sims > 1) lays sims out in blocks of groups; each row's num_obs must be its own group's
     torch.manual_seed(0)
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         measures=['y'], processes=[LocalLevel(id='lvl', measure='y')], binary_measures=['y'], observed_counts=True
     )
     num_groups, num_times, num_sims = 3, 10, 4
@@ -480,7 +486,13 @@ def test_sample_outputs_chunked(nonlinear: bool, monkeypatch):
     mixture = [MixtureComponent('y', offset_init=-2., prob_init=.2, id='low')]
     processes = [LocalLevel(id=f'lvl_{m}', measure=m) for m in ('b', 'y')]
     if nonlinear:
-        model = BinomialFilter(measures=['b', 'y'], processes=processes, binary_measures=['b'], mixture=mixture)
+        model = BinomialFilter(
+            measures=['b', 'y'],
+            processes=processes,
+            binary_measures=['b'],
+            mixture=mixture,
+            do_post_hoc_correction='num_obs'
+        )
         y = torch.cat([torch.randint(0, 2, (num_groups, num_times, 1)), torch.randn(num_groups, num_times, 1)], -1)
     else:
         model = KalmanFilter(measures=['b', 'y'], processes=processes, mixture=mixture)
