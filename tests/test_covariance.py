@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag
+from torchcast.covariance import Covariance, corr_cholesky_from_unconstrained, num_off_diag, cov2corr
 from torchcast.kalman_filter import BinomialFilter, KalmanFilter
 from torchcast.process import LocalLevel, LocalTrend, Season
 from torchcast.process.utils import Identity
@@ -657,6 +657,15 @@ def test_low_rank_init_and_rotation():
     torch.testing.assert_close(cov._get_mini_cov().detach(), before)
     assert cov._get_lr_order() == order
 
+    # the canonical form is unique: equivalent loadings (differing by a rotation) give the same result, with a
+    # non-negative diagonal
+    other = _make_low_rank()
+    with torch.no_grad():
+        other.lr_mat.copy_(cov.lr_mat @ torch.linalg.qr(torch.randn(3, 3))[0])
+    other._rotate_low_rank_(other._get_lr_order())
+    torch.testing.assert_close(other.lr_mat, cov.lr_mat)
+    assert (cov.lr_mat[order[:3], [0, 1, 2]] >= 0).all()
+
     with pytest.raises(ValueError, match="number of factors"):
         Covariance(rank=3, init_diag_multi=1., method='low_rank4')
     with pytest.raises(TypeError, match="low_rank"):
@@ -901,3 +910,13 @@ def test_prepare_for_hessian_hook(monkeypatch):
     masked = Covariance(rank=6, init_diag_multi=1., method='low_rank2', corr_mask=corr_mask)
     with pytest.warns(UserWarning, match="each group's factor-loadings can be rotated separately"):
         masked.prepare_for_hessian_()
+
+
+def test_cov2corr():
+    cov = _random_cov(4, torch.tensor([1., .1, 3., 2.], dtype=torch.float64))
+    corr = cov2corr(cov)
+    std = cov.diagonal().sqrt()
+    torch.testing.assert_close(corr, cov / std.outer(std))
+    torch.testing.assert_close(corr.diagonal(), torch.ones(4, dtype=torch.float64))
+    # batched:
+    torch.testing.assert_close(cov2corr(torch.stack([cov, 2 * cov])), torch.stack([corr, corr]))

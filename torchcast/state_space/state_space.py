@@ -960,7 +960,10 @@ class StateSpaceModel(torch.nn.Module):
          flat, so the hessian is singular) can define ``prepare_for_hessian_()``: it's called first, puts their
          parameters into a canonical form in-place (without changing the model), and returns masks of entries to
          leave out, which are then missing from the result. E.g. :func:`Covariance.prepare_for_hessian_` does this for
-         ``method='low_rank'``.
+         ``method='low_rank'``. Note that this modifies those parameters in-place: the model is the same (up to
+         floating-point rounding), and the result's means and names match the module afterwards (so samples can be
+         written back into it by name), but the parameters' values change, so reset any optimizer state before
+         resuming training.
         """
         if not get_loss:
             get_loss = LossFun(reduce='sum')

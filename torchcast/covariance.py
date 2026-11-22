@@ -683,16 +683,14 @@ class Covariance(nn.Module):
     def _rotate_low_rank_(self, order: Sequence[int]) -> 'Covariance':
         """
         For "low_rank": rotate the factor-loadings ``V`` (in-place) to lower-trapezoidal form (``V[i, j] = 0`` for
-        ``j > i``, with the elements in ``order``, e.g. from ``_get_lr_order()``), by an LQ decomposition. This leaves
-        the covariance unchanged (exactly, up to floating-point error) and pins down the rotation, which is otherwise
-        arbitrary; see :func:`Covariance.prepare_for_hessian_`.
+        ``j > i``, with the elements in ``order``, e.g. from ``_get_lr_order()``), by an LQ decomposition, with a
+        non-negative diagonal. This leaves the covariance unchanged (exactly, up to floating-point error) and pins down
+        the rotation, which is otherwise arbitrary: equivalent loadings give the same result. See
+        :func:`Covariance.prepare_for_hessian_`.
         """
         if self.method != 'low_rank':
             raise TypeError(f"``_rotate_low_rank_()`` is for method='low_rank', not '{self.method}'.")
-        order = list(order)
-        _, R = torch.linalg.qr(self.lr_mat[order].t().cpu().to(torch.float64))
-        rotated = torch.zeros_like(R.t())
-        rotated[order] = R.t()
+        rotated = _to_lower_trapezoidal(self.lr_mat.detach().cpu().to(torch.float64), order)
         self.lr_mat.copy_(rotated.masked_fill(self._get_lr_redundant(order).cpu(), 0.))
         return self
 
@@ -811,8 +809,7 @@ def _cholesky(cov: Tensor) -> Tensor:
 
 def cov2corr(cov: Tensor) -> Tensor:
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
-    # TODO: cov / std_.unsqueeze(-1) / std_.unsqueeze(-2)
-    return cov / (std_.unsqueeze(-1) @ std_.unsqueeze(-2))
+    return cov / (std_.unsqueeze(-1) * std_.unsqueeze(-2))
 
 
 def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
@@ -860,6 +857,20 @@ def _get_pivot_order(V: Tensor) -> List[int]:
     return lead + [i for i in range(V.shape[0]) if i not in lead]
 
 
+def _to_lower_trapezoidal(V: Tensor, order: Sequence[int]) -> Tensor:
+    """
+    Rotate ``V`` (``(rank, K)``) to the lower-trapezoidal form with the rows in ``order`` (``V[order[i], j] = 0`` for
+    ``j > i``), by an LQ decomposition, which leaves ``V @ V.t()`` unchanged. The diagonal (``V[order[j], j]``) is made
+    non-negative, which makes this form unique: equivalent ``V``s (differing by a rotation) give the same result.
+    """
+    order = list(order)
+    _, R = torch.linalg.qr(V[order].t())
+    signs = torch.where(R.diagonal() < 0, -1., 1.).to(R)
+    out = torch.zeros_like(V)
+    out[order] = R.t() * signs
+    return out
+
+
 def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) -> tuple[Tensor, Tensor]:
     """
     Fit ``cov ~= V @ V.t() + diag(std ** 2)``, with ``V`` lower-trapezoidal (see ``_get_pivot_order``): principal-axis
@@ -899,13 +910,7 @@ def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) 
             opt.step(closure)
         V, uniq = V.detach(), log_uniq.detach().exp()
 
-    # rotate to lower-trapezoidal (leading with the most independent rows) with an LQ decomposition, which leaves
-    # ``V @ V.t()`` unchanged:
-    order = _get_pivot_order(V)
-    _, R = torch.linalg.qr(V[order].t())
-    V_lower = torch.empty_like(V)
-    V_lower[order] = R.t()
-    return V_lower, uniq.sqrt()
+    return _to_lower_trapezoidal(V, _get_pivot_order(V)), uniq.sqrt()
 
 
 def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
