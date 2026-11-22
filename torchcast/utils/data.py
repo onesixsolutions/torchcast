@@ -755,7 +755,7 @@ def complete_times(data: 'DataFrame',
     elif group_colnames is None:
         if group_colname is None:
             raise TypeError("Missing required argument `group_colnames`")
-        warn("Please pass `group_colnames` instead of `group_colname`", DeprecationWarning)
+        warn("Please pass `group_colnames` instead of `group_colname`", FutureWarning)
         group_colnames = [group_colname]
     if max_dt_colname and max_dt_colname not in group_colnames:
         assert (data.groupby(group_colnames)[max_dt_colname].nunique() == 1).all()
@@ -779,7 +779,7 @@ def complete_times(data: 'DataFrame',
         dt_unit = pd.Timedelta('7 days 00:00:00')
 
     if global_max:
-        warn("`global_max=True` is deprecated, use `max_dt_colname` instead.", DeprecationWarning)
+        warn("`global_max=True` is deprecated, use `max_dt_colname` instead.", FutureWarning)
 
     df_group_summary = (data
                         .groupby(group_colnames)

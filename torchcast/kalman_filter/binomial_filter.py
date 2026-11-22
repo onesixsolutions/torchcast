@@ -95,7 +95,7 @@ class BinomialFilter(KalmanFilter):
             warn(
                 f"``do_post_hoc_correction={do_post_hoc_correction}`` is deprecated; use ``'{mode}'`` (the same), or "
                 f"choose ``'static'`` or ``'num_obs'`` (see the ``BinomialFilter`` docs).",
-                DeprecationWarning
+                FutureWarning
             )
             do_post_hoc_correction = mode
         if do_post_hoc_correction not in _POST_HOC_CORRECTIONS:

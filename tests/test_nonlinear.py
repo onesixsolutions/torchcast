@@ -547,9 +547,9 @@ def _make_binomial(**kwargs):
 
 def test_post_hoc_correction_modes():
     # booleans are deprecated aliases:
-    with pytest.warns(DeprecationWarning, match="``do_post_hoc_correction=True`` is deprecated; use ``'auto'``"):
+    with pytest.warns(FutureWarning, match="``do_post_hoc_correction=True`` is deprecated; use ``'auto'``"):
         assert _make_binomial(do_post_hoc_correction=True).post_hoc_correction == 'auto'
-    with pytest.warns(DeprecationWarning, match="``do_post_hoc_correction=False`` is deprecated; use ``'none'``"):
+    with pytest.warns(FutureWarning, match="``do_post_hoc_correction=False`` is deprecated; use ``'none'``"):
         assert _make_binomial(do_post_hoc_correction=False).post_hoc_correction == 'none'
     assert _make_binomial().post_hoc_correction == 'auto'
     with pytest.raises(ValueError, match="should be one of"):
@@ -609,7 +609,7 @@ def test_post_hoc_correction_loading():
         # a model created with the default ('auto', or the deprecated ``True``) matches the saved parameters:
         for default in ('auto', True):
             with warnings.catch_warnings():
-                warnings.simplefilter('ignore', DeprecationWarning)
+                warnings.simplefilter('ignore', FutureWarning)
                 loaded = _make_binomial(do_post_hoc_correction=default)
             loaded.load_state_dict(saved.state_dict())
             assert loaded.post_hoc_correction == mode

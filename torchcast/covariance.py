@@ -938,7 +938,7 @@ class _DeprecatedBase(types.ModuleType):
             warn(
                 f"`torchcast.covariance.base.{name}` is deprecated, instead just import from "
                 f"`torchcast.covariance.{name}`.",
-                DeprecationWarning,
+                FutureWarning,
                 stacklevel=2
             )
         return globals()[name]

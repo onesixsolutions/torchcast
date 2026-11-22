@@ -580,7 +580,7 @@ class Predictions:
             if use_map:
                 raise NotImplementedError("``use_map=True`` not yet implemented for type!='predictions'")
             if type == 'components':
-                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", DeprecationWarning)
+                warn("`type='components'` is deprecated, use `type='observed_states'` instead.", FutureWarning)
             return self._to_components_dataframe(
                 dataset=dataset,
                 group_colname=group_colname,
@@ -1636,12 +1636,12 @@ class Predictions:
         if start_offsets is not None:
             warn(
                 "Passing `start_offsets` as an argument is deprecated, first call ``set_metadata()``",
-                DeprecationWarning
+                FutureWarning
             )
         if dt_unit is not None:
             warn(
                 "Passing `dt_unit` as an argument is deprecated, first call ``set_metadata()``",
-                DeprecationWarning
+                FutureWarning
             )
         if self.dataset_metadata.start_offsets is not None:
             start_offsets = self.dataset_metadata.start_offsets
