@@ -96,7 +96,9 @@ class Covariance(nn.Module):
          decay trades off against the initial variance (a faster decay with a larger initial variance fits the start
          of a series about as well as a slower decay with a smaller one), so the decay is pinned down by the first few
          timesteps rather than the whole series; the :class:`.KalmanFilter` warns about this. Each element of these
-         processes needs process-noise, a decay that's less than 1, and no transitions into it from other elements.
+         processes needs process-noise, a decay that's less than 1 (a learned decay may be bounded at 1, e.g.
+         ``decay=(.5, 1.0)``: the stationary variance grows without bound as it nears 1, so the likelihood keeps it
+         below, and an error is raised if it reaches 1), and no transitions into it from other elements.
          Either a list of process ids (all stationary) or a dict of process ids to ``True``/``False``, where ``False``
          keeps free parameters on purpose (silencing the warning): e.g. for a decaying level that captures how far
          series start from their long-run level after a common start event (sign-up, launch), whose initial spread

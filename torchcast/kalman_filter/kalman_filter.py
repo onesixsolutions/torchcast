@@ -39,14 +39,11 @@ def _has_decay(se: StateElement) -> bool:
 
 def _has_learned_decay(se: StateElement) -> bool:
     """
-    Whether a state element's transition to itself is learned, and can be (but isn't fixed at) less than 1; e.g. not
-    ``Bounded`` with an upper bound of 1 or more (which has no stationary variance).
+    Whether a state element's transition to itself is learned (e.g. ``Bounded``, including with an upper bound of 1:
+    as long as the fitted value is less than 1, there's a stationary variance).
     """
     multi = se.transitions_to[se.name]
-    if not any(p.requires_grad for p in multi.parameters()):
-        return False
-    upper = getattr(multi, 'upper', None)
-    return not (isinstance(upper, (float, int)) and upper >= 1)
+    return any(p.requires_grad for p in multi.parameters())
 
 
 def _get_elements_by_idx(processes: dict[str, Process]) -> list[tuple[str, str]]:
@@ -130,11 +127,12 @@ class KalmanFilter(StateSpaceModel):
                 )
             if idx in self.process_covariance.empty_idx:
                 raise ValueError(f"{label}, but it has no process-variance in ``process_covariance``.")
+            # a learned decay may be bounded at 1 (e.g. ``(.5, 1.0)``): the stationary variance grows without bound as
+            # it nears 1, so the likelihood keeps it below, and ``_default_initial_cov()`` checks the value at forward
             decay = se.transitions_to[nm]
-            upper = decay.value if isinstance(decay, FixedValue) else getattr(decay, 'upper', None)
-            if upper is not None and bool(torch.as_tensor(upper) >= 1):  # (other modules are checked at forward)
+            if isinstance(decay, FixedValue) and bool(torch.as_tensor(decay.value).abs() >= 1):
                 raise ValueError(
-                    f"{label}, but its decay can be 1 (e.g. no decay, or bounds like ``(.9, 1.0)``), and there's no "
+                    f"{label}, but its decay is fixed at {float(decay.value)} (e.g. no decay), and there's no "
                     f"stationary covariance without decay."
                 )
 

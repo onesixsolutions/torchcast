@@ -487,12 +487,18 @@ def test_stationary_initial_covariance_errors():
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')  # (correlated levels)
         make(['transient'])
-        with pytest.raises(ValueError, match="decay can be 1"):
-            make(['level'])
-        with pytest.raises(ValueError, match="decay can be 1"):
-            make(['near_walk'])
+        with pytest.raises(ValueError, match="fixed at 1.0"):
+            make(['level'])  # (no decay)
         with pytest.raises(ValueError, match="also transition into it"):
             make(['trend'])  # (velocity transitions into position)
+        # a learned decay bounded at 1 is allowed (the likelihood keeps it below 1), but checked at forward:
+        kf = make(['near_walk'])
+        y = torch.randn(2, 5, 1)
+        kf(y)
+        with torch.no_grad():
+            kf.processes['near_walk'].state_elements['level'].transitions_to['level'].raw.fill_(50.)
+        with pytest.raises(RuntimeError, match="no stationary covariance unless it's less than 1"):
+            kf(y)
 
 
 def test_warn_free_decay_initial_variance():
@@ -501,11 +507,13 @@ def test_warn_free_decay_initial_variance():
         _make_decaying_kf()
     with pytest.warns(UserWarning, match=r"stationary=\['transient_b'\]"):
         _make_decaying_kf(stationary=['transient_a'])
+    with pytest.warns(UserWarning, match=match):
+        _make_decaying_kf(decay=(.9, 1.0))  # a learned decay bounded at 1 counts too
     with warnings.catch_warnings():
         warnings.simplefilter('error')
         _make_decaying_kf(stationary=['transient_a', 'transient_b'])
         _make_decaying_kf(decay=.9)  # fixed decay: nothing to trade off
-        _make_decaying_kf(decay=(.9, 1.0))  # can reach 1: no stationary covariance to suggest
+        _make_decaying_kf(decay=(.9, 1.0), stationary=['transient_a', 'transient_b'])
         KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])  # no decay
         KalmanFilter(processes=[LocalTrend(id='trend', measure='y')], measures=['y'])  # velocity isn't level-like
     # keeping a free initial variance on purpose, as the warning suggests:
