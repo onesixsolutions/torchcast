@@ -466,19 +466,26 @@ class Covariance(nn.Module):
         keep = self._get_off_diag_keep()
         return off_diag if keep is None else _unpack_off_diag(off_diag, keep)
 
+    def _get_binary_mini_mask(self) -> Optional[Tensor]:
+        """
+        A binary (0/1) ``corr_mask`` restricted to the elements with parameters (``(param_rank, param_rank)``), or
+        ``None`` if there's no ``corr_mask`` or it isn't binary.
+        """
+        # (``getattr``: modules pickled before ``corr_mask`` existed don't have the buffer)
+        corr_mask = getattr(self, 'corr_mask', None)
+        if corr_mask is None or not ((corr_mask == 0) | (corr_mask == 1)).all():
+            return None
+        return corr_mask[self.non_empty_idx][:, self.non_empty_idx]
+
     def _get_off_diag_keep(self) -> Optional[Tensor]:
         """
         For a binary ``corr_mask`` and a cholesky-based ``method``: the mask for the off-diagonal parameters
         (``cholesky_off_diag`` or ``corr_unconstrained``), in their ``tril_indices`` order. ``None`` otherwise.
         """
-        corr_mask = getattr(self, 'corr_mask', None)
-        if corr_mask is None or self.method not in ('log_cholesky', 'sd_corr'):
+        mini_mask = self._get_binary_mini_mask()
+        if mini_mask is None or self.method not in ('log_cholesky', 'sd_corr'):
             return None
-        if not ((corr_mask == 0) | (corr_mask == 1)).all():
-            return None
-        num_non_empty = len(self.non_empty_idx)
-        mini_mask = corr_mask[self.non_empty_idx][:, self.non_empty_idx]
-        rows, cols = torch.tril_indices(num_non_empty, num_non_empty, offset=-1).to(mini_mask.device)
+        rows, cols = torch.tril_indices(self.param_rank, self.param_rank, offset=-1).to(mini_mask.device)
         return mini_mask[rows, cols]
 
     def _get_num_off_diag_params(self) -> int:
@@ -528,17 +535,23 @@ class Covariance(nn.Module):
                 f"Expected ``cov`` to have shape {(self.rank, self.rank)} or {(self.param_rank, self.param_rank)}, "
                 f"got {tuple(cov.shape)}."
             )
-        corr_mask = getattr(self, 'corr_mask', None)
-        if corr_mask is not None and ((corr_mask == 0) | (corr_mask == 1)).all():
-            # (it can't represent these entries; for a cholesky-based method, they'd also change the others, since the
-            # factor's entries behind them are dropped)
-            mini_mask = corr_mask[self.non_empty_idx][:, self.non_empty_idx].to(mini_cov)
-            tol = 1e-8 * mini_cov.diagonal().abs().max()
-            if ((mini_cov * (1 - mini_mask)).abs() > tol).any():
-                raise ValueError("``cov`` has non-zero entries for pairs of elements masked out by ``corr_mask``.")
+        self._validate_masked_entries(mini_cov)
         for name, value in self._get_params_for_matrix(mini_cov).items():
             getattr(self, name).copy_(value)
         return self
+
+    def _validate_masked_entries(self, mini_cov: Tensor):
+        """
+        Raise if a ``(param_rank, param_rank)`` covariance has non-zero entries for pairs masked out by a binary
+        ``corr_mask``: they can't be represented (and for a cholesky-based method, dropping the factor's entries
+        behind them would also change the entries within groups).
+        """
+        mini_mask = self._get_binary_mini_mask()
+        if mini_mask is None:
+            return
+        tol = 1e-8 * mini_cov.diagonal().abs().max()
+        if ((mini_cov * (1 - mini_mask.to(mini_cov))).abs() > tol).any():
+            raise ValueError("``cov`` has non-zero entries for pairs of elements masked out by ``corr_mask``.")
 
     def _get_params_for_matrix(self, mini_cov: Tensor) -> Dict[str, Tensor]:
         """The parameters' values (by name, as float64 on cpu) for a ``(param_rank, param_rank)`` covariance."""
@@ -656,11 +669,8 @@ class Covariance(nn.Module):
         """
         if self.method != 'low_rank':
             return {}
-        corr_mask = getattr(self, 'corr_mask', None)
-        if corr_mask is not None:
-            idx = self.non_empty_idx
-            corr_mask = corr_mask[idx][:, idx]
-        if corr_mask is not None and ((corr_mask == 0) | (corr_mask == 1)).all() and (corr_mask == 0).any():
+        mini_mask = self._get_binary_mini_mask()
+        if mini_mask is not None and (mini_mask == 0).any():
             warn(
                 f"`{self.id}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
                 f"rotated separately; only one rotation is pinned for the hessian, which stays singular."
@@ -708,7 +718,7 @@ class Covariance(nn.Module):
         position[order] = torch.arange(self.param_rank)
         return (position.unsqueeze(-1) < torch.arange(self.lr_mat.shape[-1])).to(self.lr_mat.device)
 
-    # Loading state-dicts and unpickling -------------------------------------------------------------------------------
+    # Loading state-dicts ----------------------------------------------------------------------------------------------
 
     def _load_from_state_dict(self,
                               state_dict,
@@ -738,54 +748,9 @@ class Covariance(nn.Module):
                     f"measure-covariance.)"
                 )
                 return
-        self._pack_saved_off_diag(state_dict, prefix)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
-
-    def _pack_saved_off_diag(self, state_dict: dict, prefix: str):
-        """
-        A state-dict saved before a binary ``corr_mask`` applied to the cholesky factor has an entry in
-        ``cholesky_off_diag``/``corr_unconstrained`` for every pair, whose masked-out ones fed the other entries.
-        Replace its parameters (in-place) with ones for the same covariance in the current format.
-        """
-        keep = self._get_off_diag_keep()
-        if keep is None or bool(keep.all()):
-            return
-        diag_key, off_diag_key = (prefix + nm for nm in _METHOD_PARAMS[self.method])
-        diag, off_diag = state_dict.get(diag_key), state_dict.get(off_diag_key)
-        if diag is None or off_diag is None or off_diag.numel() != keep.numel():
-            return
-        params = self._get_params_for_matrix(self._get_unpacked_mini_cov(diag, off_diag))
-        for name, value in params.items():
-            state_dict[prefix + name] = value.to(off_diag)
-
-    def __setstate__(self, state: dict):
-        super().__setstate__(state)
-        # (pickled before these existed)
-        self.__dict__.setdefault('stationary_idx', [])
-        self.__dict__.setdefault('nonstationary_idx', [])
-        # pickled before a binary ``corr_mask`` applied to the cholesky factor: see ``_pack_saved_off_diag()``
-        keep = self._get_off_diag_keep()
-        if keep is None or bool(keep.all()):
-            return
-        diag_name, off_diag_name = _METHOD_PARAMS[self.method]
-        diag, off_diag = getattr(self, diag_name), getattr(self, off_diag_name)
-        if off_diag.numel() == keep.numel():
-            with torch.no_grad():
-                params = self._get_params_for_matrix(self._get_unpacked_mini_cov(diag, off_diag))
-            for name, value in params.items():
-                setattr(self, name, nn.Parameter(value.to(off_diag)))
-
-    def _get_unpacked_mini_cov(self, diag: Tensor, off_diag: Tensor) -> Tensor:
-        """The covariance from parameters with an entry for every pair (the format before ``_pack_saved_off_diag``)."""
-        diag, off_diag = diag.detach(), off_diag.detach()
-        if self.method == 'log_cholesky':
-            L = self.log_chol_to_chol(diag, off_diag)
-        else:
-            L = diag.exp().unsqueeze(-1) * corr_cholesky_from_unconstrained(off_diag, rank=self.param_rank)
-        idx = self.non_empty_idx
-        return L @ L.t() * self.corr_mask[idx][:, idx].to(L)
 
 
 def num_off_diag(rank: int) -> int:
