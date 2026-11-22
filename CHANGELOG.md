@@ -173,6 +173,18 @@ Previously the mask was applied to the covariance after `L @ L.t()`, so the fact
 - The process-covariance's default is unchanged ("log_cholesky").
 - Back-compatibility: when the method was chosen by default (not passed), a state-dict saved with another method -- e.g. under the old defaults -- is loaded by switching the module to the saved method, so older models load with the same predictions. Pickled models keep their own method. An explicitly passed `method` still raises on a mismatch.
 
+### Behavior change: `BinomialFilter(do_post_hoc_correction=...)` modes
+
+The post-hoc correction's sharpness was always `exp(w * log(num_obs) + b)`. When `num_obs` doesn't vary in the data, the slope `w` can't be identified (an exactly flat direction in the likelihood, with a singular Hessian); with binary data (`num_obs=1`) it has no effect at all, and is never trained. `do_post_hoc_correction` now takes:
+
+- `'static'`: one learned sharpness, with no slope.
+- `'num_obs'`: the previous form, with a slope on `log(num_obs)`; for data whose `num_obs` varies.
+- `'auto'` (the default): `'static'` or `'num_obs'`, chosen by `BinomialFilter.fit()` from whether the `num_obs` passed to it varies (before it creates the optimizer). Calling the model while it's still `'auto'` (e.g. training with your own loop, or `StateSpaceTrainer`) raises an error asking you to choose.
+- `'none'`: no correction.
+- `True` and `False` still work, meaning `'auto'` and `'none'` (to be deprecated eventually).
+
+Back-compatibility: with `'auto'` (so also with `True`, or the default), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
+
 ### Overridable design models
 
 `StateSpaceModel.forward()` now builds its transition and measurement models through two methods,

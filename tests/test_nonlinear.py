@@ -134,7 +134,12 @@ def test_binomial_counts_vs_proportions():
     preds = {}
     for observed_counts in (True, False):
         torch.manual_seed(1)
-        bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['y'], observed_counts=observed_counts)
+        bf = BinomialFilter(
+            processes=[LocalLevel(id='level')],
+            measures=['y'],
+            observed_counts=observed_counts,
+            do_post_hoc_correction='num_obs'
+        )
         bf.mc_sampling = _white_noise(500)
         y = counts if observed_counts else counts / num_obs
         preds[observed_counts] = (bf(y, num_obs=num_obs), y)
@@ -209,6 +214,7 @@ def test_binomial_log_prob_with_missing_binary():
     spend = torch.randn(3, 10).cumsum(1) * .3 + 2
     visit[:, 5] = float('nan')
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -230,7 +236,7 @@ def test_binomial_fit_recovers_probability():
     torch.manual_seed(0)
     true_prob = .25
     y = (torch.rand(30, 40, 1) < true_prob).float()
-    bf = BinomialFilter(processes=[LocalLevel(id='level')], measures=['y'])
+    bf = BinomialFilter(do_post_hoc_correction='num_obs', processes=[LocalLevel(id='level')], measures=['y'])
     bf.mc_sampling = _white_noise(100)
     bf.fit(y, stopping={'max_iter': 15}, verbose=0)
     with torch.no_grad():
@@ -430,6 +436,7 @@ def test_binomial_mixture_with_nonlinear_process():
     y = torch.stack([visit, spend], -1)
 
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[
             LocalLevel(id='level_visit', measure='visit'),
             LocalLevel(id='level_spend', measure='spend'),
@@ -530,3 +537,86 @@ def test_output_samples_separate_from_mc_sampling():
 
     df_means = pred.to_dataframe(conf=False, use_map=False, derived=derived)
     assert np.array_equal(df_means['mean'].values, dfs[50]['mean'].values)
+
+
+def _make_binomial(**kwargs):
+    from torchcast.kalman_filter import BinomialFilter
+    return BinomialFilter(processes=[LocalLevel(id='level')], measures=['y'], **kwargs)
+
+
+def test_post_hoc_correction_modes():
+    # booleans are backwards-compatible aliases:
+    assert _make_binomial(do_post_hoc_correction=True).post_hoc_correction == 'auto'
+    assert _make_binomial(do_post_hoc_correction=False).post_hoc_correction == 'none'
+    assert _make_binomial().post_hoc_correction == 'auto'
+    with pytest.raises(ValueError, match="should be one of"):
+        _make_binomial(do_post_hoc_correction='sometimes')
+    # 'static' has no slope (nothing to identify it when ``num_obs`` doesn't vary); 'num_obs' does:
+    names = lambda bf: sorted(nm for nm, _ in bf.named_parameters() if 'post_correction' in nm)
+    assert names(_make_binomial(do_post_hoc_correction='static')) == ['post_correction_module.bias']
+    assert names(_make_binomial(do_post_hoc_correction='num_obs')) == [
+        'post_correction_module.bias', 'post_correction_module.weight'
+    ]
+    assert names(_make_binomial(do_post_hoc_correction='none')) == []
+    assert names(_make_binomial()) == []  # ('auto': not created until resolved)
+
+    # 'auto' can't be used before it's resolved:
+    y = (torch.rand(3, 10, 1) > .5).float()
+    with pytest.raises(RuntimeError, match="only resolved by ``BinomialFilter.fit"):
+        _make_binomial()(y)
+    _make_binomial(do_post_hoc_correction='static')(y)
+
+
+@pytest.mark.parametrize(
+    argnames=['num_obs', 'expected'],
+    argvalues=[(None, 'static'), ('constant', 'static'), ('varying', 'num_obs')]
+)
+def test_post_hoc_correction_auto_in_fit(num_obs, expected):
+    torch.manual_seed(0)
+    kwargs = {}
+    if num_obs is None:  # binary data
+        y = (torch.rand(3, 10, 1) > .5).float()
+    else:
+        n = torch.full((3, 10, 1), 5.) if num_obs == 'constant' else torch.randint(1, 10, (3, 10, 1)).float()
+        y = torch.distributions.Binomial(n, probs=.3).sample()
+        kwargs.update(num_obs=n, observed_counts=True)
+    bf = _make_binomial(observed_counts=kwargs.pop('observed_counts', None))
+    optimized = []
+
+    def make_optimizer(params: list) -> torch.optim.Optimizer:
+        optimized.extend(params)
+        return torch.optim.Adam(params, lr=.01)
+
+    bf.fit(y, optimizer=make_optimizer, stopping={'max_iter': 2}, verbose=0, **kwargs)
+    assert bf.post_hoc_correction == expected
+    # its parameters were created before the optimizer, so they're fitted:
+    correction_params = [p for nm, p in bf.named_parameters() if 'post_correction' in nm]
+    assert correction_params and all(any(p is q for q in optimized) for p in correction_params)
+    bf(y, **kwargs)
+
+
+def test_post_hoc_correction_loading():
+    import pickle
+    torch.manual_seed(0)
+    y = (torch.rand(3, 10, 1) > .5).float()
+    for mode in ('none', 'static', 'num_obs'):
+        saved = _make_binomial(do_post_hoc_correction=mode)
+        with torch.no_grad():
+            expected = saved(y).means
+        # a model created with the default ('auto', or ``True``) matches the saved parameters:
+        for default in ('auto', True):
+            loaded = _make_binomial(do_post_hoc_correction=default)
+            loaded.load_state_dict(saved.state_dict())
+            assert loaded.post_hoc_correction == mode
+            with torch.no_grad():
+                torch.testing.assert_close(loaded(y).means, expected)
+    # an explicit mismatch raises:
+    with pytest.raises(RuntimeError, match="saved with 'num_obs'"):
+        _make_binomial(do_post_hoc_correction='static').load_state_dict(
+            _make_binomial(do_post_hoc_correction='num_obs').state_dict()
+        )
+    # pickled before the modes existed (the correction was a ``Linear``, i.e. 'num_obs', or absent):
+    for mode in ('num_obs', 'none'):
+        old = _make_binomial(do_post_hoc_correction=mode)
+        del old.post_hoc_correction
+        assert pickle.loads(pickle.dumps(old)).post_hoc_correction == mode

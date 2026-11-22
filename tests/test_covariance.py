@@ -277,6 +277,7 @@ def test_sd_corr_fit():
 def test_binomial_filter_accepts_covariance():
     processes = [LocalLevel(id='level_a', measure='a'), LocalLevel(id='level_b', measure='b')]
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=processes,
         measures=['a', 'b'],
         binary_measures=['a'],

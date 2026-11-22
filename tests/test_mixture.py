@@ -100,6 +100,7 @@ def test_mixture_model_validation():
         )
     with pytest.raises(ValueError, match="not yet supported .* non-gaussian"):
         BinomialFilter(
+            do_post_hoc_correction='num_obs',
             processes=[LocalLevel(id='lvl', measure='visit')],
             measures=['visit'],
             mixture=[MixtureComponent(measure='visit', offset_init=0., prob_init=.1, id='v1')]
@@ -291,6 +292,7 @@ def test_binomial_filter_with_mixture():
 
     measures = ['visit', 'spend']
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         binary_measures=['visit'],
@@ -317,6 +319,7 @@ def test_binary_measures_excluded_from_responsibilities():
     measure, changing the binary observation changes the updated state, but not the combo-posterior.
     """
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in ['visit', 'spend']],
         measures=['visit', 'spend'],
         binary_measures=['visit'],
@@ -794,6 +797,7 @@ def test_binomial_prediction_outputs():
     y = torch.stack([visit, spend], -1)
     measures = ['visit', 'spend']
     bf = BinomialFilter(
+        do_post_hoc_correction='num_obs',
         processes=[LocalLevel(id=f'level_{m}', measure=m) for m in measures],
         measures=measures,
         binary_measures=['visit'],
