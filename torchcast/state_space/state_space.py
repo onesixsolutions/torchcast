@@ -10,7 +10,7 @@ from torchcast.internals.batch_design import TransitionModel, MeasurementModel, 
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, as_timestep_list
-from torchcast.covariance import Covariance
+from torchcast.covariance import Covariance, _make_covariance
 from torchcast.process.regression import Process
 from torchcast.mixture import MixtureModel, MixtureComponent
 
@@ -28,7 +28,9 @@ class StateSpaceModel(torch.nn.Module):
 
     :param processes: A list of :class:`.Process` modules.
     :param measures: A list of strings specifying the names of the dimensions of the time-series being measured.
-    :param measure_covariance: A module created with ``Covariance.from_measures(measures)``.
+    :param measure_covariance: A dict of options for :func:`Covariance.from_measures` (e.g.
+     ``{'method': 'sd_corr'}``), or a :class:`.Covariance` created with it. Default: ``Covariance.from_measures()``'s
+     defaults.
     :param measure_funs: A dictionary mapping measure-names to measurement-functions. Currently only supports 'sigmoid'.
     :param adaptive_scaling: Experimental feature to adaptively scale the covariance as a function of residuals. This
      is useful if different groups have very different magnitudes.
@@ -40,7 +42,7 @@ class StateSpaceModel(torch.nn.Module):
     def __init__(self,
                  processes: Sequence['Process'],
                  measures: Sequence[str],
-                 measure_covariance: Optional[Covariance] = None,
+                 measure_covariance: Union[Covariance, dict, None] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: Union[bool, AdaptiveScaler] = False,
                  mixture: Union[MixtureModel, Sequence[MixtureComponent], None] = None):
@@ -50,8 +52,7 @@ class StateSpaceModel(torch.nn.Module):
         assert isinstance(measures, (tuple, list)), "`measures` must be a list/tuple"
         self.measures = measures
 
-        if measure_covariance is None:
-            measure_covariance = Covariance.from_measures(measures)
+        measure_covariance = _make_covariance(measure_covariance, role='measure', measures=measures)
         self.measure_covariance = measure_covariance._bind('measure', measures)
 
         self.measure_funs = {}

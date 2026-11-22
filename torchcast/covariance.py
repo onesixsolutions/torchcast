@@ -1032,6 +1032,37 @@ class Covariance(nn.Module):
         return log_chol_to_chol(log_diag, off_diag)
 
 
+def _make_covariance(spec: Union[Covariance, dict, None],
+                    role: str,
+                    processes: Optional[Sequence[Process]] = None,
+                    measures: Optional[Sequence[str]] = None,
+                    **kwargs) -> Covariance:
+    """
+    How models create a covariance from their ``{role}_covariance`` argument: a :class:`.Covariance` is returned
+    as-is (the model then checks its ``role`` and ``element_names``); a dict of options (or ``None``, for the
+    defaults) is passed to :func:`Covariance.from_measures` (for ``role='measure'``) or
+    :func:`Covariance.from_processes` (with ``cov_type=role``), with the model's ``measures`` / ``processes``.
+
+    :param spec: A :class:`.Covariance`, a dict of options, or ``None``.
+    :param role: "process", "initial" or "measure".
+    :param processes: The model's processes (for "process" and "initial").
+    :param measures: The model's measures (for "measure").
+    :param kwargs: Options the model sets (e.g. ``BinomialFilter``'s ``empty_idx`` for its binary measures).
+    """
+    if isinstance(spec, Covariance):
+        return spec
+    if spec is None:
+        spec = {}
+    if not isinstance(spec, dict):
+        raise TypeError(f"``{role}_covariance`` should be a ``Covariance``, a dict of options, or None; got {spec!r}.")
+    reserved = {'processes', 'measures', 'cov_type', 'role', 'element_names', 'rank', 'id', *kwargs} & set(spec)
+    if reserved:
+        raise TypeError(f"``{role}_covariance`` options can't include {sorted(reserved)}: the model sets these.")
+    if role == 'measure':
+        return Covariance.from_measures(list(measures), **spec, **kwargs)
+    return Covariance.from_processes(list(processes), cov_type=role, **spec, **kwargs)
+
+
 def get_state_element_names(processes: Sequence[Process]) -> List[str]:
     """
     The names of the state-elements, in the order of the state vector: ``'{process_id}.{state_element}'``. These are

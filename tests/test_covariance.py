@@ -608,7 +608,7 @@ def test_warn_correlated_levels():
             kwargs['process_covariance'] = Covariance.from_processes(processes, corr_groups=[['transient']])
         return KalmanFilter(processes=processes, measures=['y'], **kwargs)
 
-    with pytest.warns(UserWarning, match=r"corr_groups=\[\['transient'\]\]"):
+    with pytest.warns(UserWarning, match=r"'corr_groups': \[\['transient'\]\]"):
         make()
     with pytest.warns(UserWarning, match="both decaying or both not"):
         KalmanFilter(processes=[LocalLevel(id='a'), LocalLevel(id='b')], measures=['y'])
@@ -738,7 +738,7 @@ def test_warn_free_decay_initial_variance():
     match = r"learned decay and a free initial variance: \['transient_a', 'transient_b'\]"
     with pytest.warns(UserWarning, match=match):
         _make_decaying_kf()
-    with pytest.warns(UserWarning, match=r"stationary=\['transient_b'\]"):
+    with pytest.warns(UserWarning, match=r"initial_covariance={'stationary': \['transient_b'\]}"):
         _make_decaying_kf(stationary=['transient_a'])
     with pytest.warns(UserWarning, match=match):
         _make_decaying_kf(decay=(.9, 1.0))  # a learned decay bounded at 1 counts too
@@ -1252,3 +1252,67 @@ def test_deprecated_id():
     assert (old.role, old.element_names, old.id) == ('measure', None, 'measure_covariance')
     kf = KalmanFilter(processes=[LocalLevel(id='a', measure='y')], measures=['y'], measure_covariance=old)
     assert old.element_names == ['y']
+
+
+def test_covariance_from_dict_spec():
+    processes = [LocalLevel(id='level', measure='y'), Season(id='season', measure='y', period=7, dt_unit=None, K=1, fixed=True)]
+    kf = KalmanFilter(
+        processes=processes,
+        measures=['y'],
+        initial_covariance={'method': 'sd_corr'},
+        process_covariance={'init_diag_multi': .2},
+        measure_covariance={'method': 'sd_corr'},
+    )
+    # created with the right ``cov_type``: the fixed season has initial variance, but no process variance
+    assert kf.initial_covariance.role == 'initial' and kf.initial_covariance.method == 'sd_corr'
+    assert kf.initial_covariance.empty_idx == set()
+    assert kf.process_covariance.empty_idx == {1, 2}
+    assert kf.measure_covariance.method == 'sd_corr'
+    with pytest.raises(TypeError, match=r"can't include \['cov_type'\]"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance={'cov_type': 'process'})
+    with pytest.raises(TypeError, match="should be a ``Covariance``, a dict"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance='sd_corr')
+
+    # BinomialFilter sets the binary measures' ``empty_idx``; old-style dicts (``Covariance.__init__``'s kwargs) work
+    bf = BinomialFilter(
+        processes=[LocalLevel(id='a', measure='a'), LocalLevel(id='b', measure='b')],
+        measures=['a', 'b'],
+        binary_measures=['a'],
+        measure_covariance={'rank': 2, 'method': 'sd_corr'},
+    )
+    assert bf.measure_covariance.empty_idx == {0}
+    assert bf.measure_covariance.method == 'sd_corr'
+    assert bf.measure_covariance.element_names == ['a', 'b']
+
+
+def test_smoothing_matrix_names():
+    from torchcast.exp_smooth import ExpSmoother, SmoothingMatrix
+    processes = [LocalLevel(id='a', measure='y'), LocalTrend(id='b', measure='y')]
+    es = ExpSmoother(processes=processes, measures=['y'], smoothing_matrix={'method': 'low_rank1'})
+    assert es.smoothing_matrix.method == 'low_rank'
+    assert es.smoothing_matrix.state_element_names == ['a.level', 'b.position', 'b.velocity']
+    assert es.smoothing_matrix.measures == ['y']
+    assert es.smoothing_matrix.id == 'smoothing_matrix'
+
+    other = [LocalTrend(id='b', measure='y'), LocalLevel(id='a', measure='y')]
+    with pytest.raises(ValueError, match="created for the state-elements"):
+        ExpSmoother(
+            processes=processes,
+            measures=['y'],
+            smoothing_matrix=SmoothingMatrix.from_measures_and_processes(['y'], other)
+        )
+    direct = SmoothingMatrix(measure_rank=1, state_rank=3)
+    ExpSmoother(processes=processes, measures=['y'], smoothing_matrix=direct)
+    assert direct.measures == ['y']
+    with pytest.raises(ValueError, match="has 2 state-elements, but the model has 3"):
+        ExpSmoother(processes=processes, measures=['y'], smoothing_matrix=SmoothingMatrix(measure_rank=1, state_rank=2))
+
+    with pytest.warns(FutureWarning, match="set_id"):
+        direct.set_id('x')
+    # pickled before ``id`` became a property:
+    state = direct.__dict__.copy()
+    del state['state_element_names'], state['measures']
+    state['id'] = 'smoothing_matrix'
+    old = SmoothingMatrix.__new__(SmoothingMatrix)
+    old.__setstate__(state)
+    assert (old.id, old.measures) == ('smoothing_matrix', None)

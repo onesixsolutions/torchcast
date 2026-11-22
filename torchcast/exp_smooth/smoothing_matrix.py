@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Sequence, Dict
+from typing import List, Optional, Sequence, Dict
 import torch.nn.functional as F
 from warnings import warn
 
@@ -24,6 +24,7 @@ class SmoothingMatrix(torch.nn.Module):
         :param kwargs: Other kwargs to pass to ``__init__``
         :return: A :class:`.SmoothingMatrix` object that can be used in your :class:`.ExpSmoother`.
         """
+        from torchcast.covariance import get_state_element_names
         measures = list(measures)
         state_rank = 0
         fixed_states = []
@@ -39,6 +40,8 @@ class SmoothingMatrix(torch.nn.Module):
             state_rank=state_rank,
             fixed_states=fixed_states,
             method=method,
+            state_element_names=get_state_element_names(processes),
+            measures=measures,
             **kwargs
         )
 
@@ -48,11 +51,41 @@ class SmoothingMatrix(torch.nn.Module):
                  method: str = 'full',
                  fixed_states: Sequence[int] = (),
                  init_bias: int = -10,
+                 state_element_names: Optional[Sequence[str]] = None,
+                 measures: Optional[Sequence[str]] = None,
                  id: Optional[str] = None):
+        """
+        You should rarely call this directly: use :func:`SmoothingMatrix.from_measures_and_processes`, or pass a dict
+        of its options as the :class:`.ExpSmoother`'s ``smoothing_matrix``.
+
+        :param measure_rank: The number of measures (columns).
+        :param state_rank: The number of state-elements (rows).
+        :param method: Parameterization, currently supports 'full' and 'low_rank'.
+        :param fixed_states: State-elements with no smoothing (no process-variance).
+        :param init_bias: Added to the unconstrained parameters, so the gains start near zero.
+        :param state_element_names: The names of the rows (see :func:`torchcast.covariance.get_state_element_names`),
+         and ``measures`` those of the columns. Set by :func:`SmoothingMatrix.from_measures_and_processes`; if
+         ``None``, the :class:`.ExpSmoother` sets them. The model raises if they don't match its own.
+        :param measures: See ``state_element_names``.
+        :param id: Deprecated, has no effect.
+        """
 
         super().__init__()
 
-        self.id = id
+        if id is not None:
+            warn("``SmoothingMatrix(id=...)`` is deprecated, and has no effect.", FutureWarning, stacklevel=2)
+        self.state_element_names: Optional[List[str]] = None
+        self.measures: Optional[List[str]] = None
+        if state_element_names is not None:
+            if len(state_element_names) != state_rank:
+                raise ValueError(
+                    f"``state_element_names`` has {len(state_element_names)} names, expected {state_rank}."
+                )
+            self.state_element_names = list(state_element_names)
+        if measures is not None:
+            if len(measures) != measure_rank:
+                raise ValueError(f"``measures`` has {len(measures)} names, expected {measure_rank}.")
+            self.measures = list(measures)
 
         self.state_rank = state_rank
         self.measure_rank = measure_rank
@@ -121,9 +154,45 @@ class SmoothingMatrix(torch.nn.Module):
         K = K.unsqueeze(1).expand(-1, num_times, -1, -1)
         return K
 
+    @property
+    def id(self) -> str:
+        return 'smoothing_matrix'
+
+    def _bind(self, state_element_names: Sequence[str], measures: Sequence[str]) -> 'SmoothingMatrix':
+        """
+        Called by the :class:`.ExpSmoother` with the names of its state-elements and measures: raises if they don't
+        match this module's, and sets them if they weren't set.
+        """
+        how = "SmoothingMatrix.from_measures_and_processes(measures, processes, ...)"
+        for attr, expected, kind, source in [
+            ('state_element_names', list(state_element_names), 'state-elements', 'processes'),
+            ('measures', list(measures), 'measures', 'measures')
+        ]:
+            current = getattr(self, attr)
+            rank = self.state_rank if attr == 'state_element_names' else self.measure_rank
+            if current is None:
+                if rank != len(expected):
+                    raise ValueError(
+                        f"The ``smoothing_matrix`` has {rank} {kind}, but the model has {len(expected)}: {expected}. "
+                        f"Create it with ``{how}``."
+                    )
+            elif current != expected:
+                raise ValueError(
+                    f"The ``smoothing_matrix`` was created for the {kind} {current}, but the model's are {expected}. "
+                    f"Create it with ``{how}``, with the model's {source}, in the same order."
+                )
+            setattr(self, attr, expected)
+        return self
+
     @jit.ignore
     def set_id(self, id: str) -> 'SmoothingMatrix':
-        if self.id and id != self.id:
-            warn(f"Id already set to {self.id}, overwriting")
-        self.id = id
+        """Deprecated, has no effect."""
+        warn("``SmoothingMatrix.set_id()`` is deprecated, and has no effect.", FutureWarning, stacklevel=2)
         return self
+
+    def __setstate__(self, state: dict):
+        # pickled before ``id`` became a property, and before the element names existed:
+        state.pop('id', None)
+        state.setdefault('state_element_names', None)
+        state.setdefault('measures', None)
+        super().__setstate__(state)

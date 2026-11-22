@@ -3,13 +3,13 @@ The :class:`.ExpSmoother` is a :class:`torch.nn.Module` which generates forecast
 
 This class inherits most of its methods from :class:`torchcast.state_space.StateSpaceModel`.
 """
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Union
 
 import torch
 from torch import Tensor
 
 from torchcast.exp_smooth.smoothing_matrix import SmoothingMatrix
-from torchcast.covariance import Covariance
+from torchcast.covariance import Covariance, get_state_element_names
 from torchcast.internals.utils import update_tensor, transpose_last_dims
 from torchcast.process import Process
 from torchcast.state_space import StateSpaceModel
@@ -19,8 +19,8 @@ class ExpSmoother(StateSpaceModel):
     def __init__(self,
                  processes: Sequence[Process],
                  measures: Sequence[str],
-                 measure_covariance: Optional[Covariance] = None,
-                 smoothing_matrix: Optional[SmoothingMatrix] = None,
+                 measure_covariance: Union[Covariance, dict, None] = None,
+                 smoothing_matrix: Union[SmoothingMatrix, dict, None] = None,
                  measure_funs: Optional[dict[str, str]] = None,
                  adaptive_scaling: bool = False):
 
@@ -32,8 +32,12 @@ class ExpSmoother(StateSpaceModel):
             adaptive_scaling=adaptive_scaling,
         )
         if smoothing_matrix is None:
-            smoothing_matrix = SmoothingMatrix.from_measures_and_processes(measures=measures, processes=processes)
-        self.smoothing_matrix = smoothing_matrix.set_id('smoothing_matrix')
+            smoothing_matrix = {}
+        if isinstance(smoothing_matrix, dict):
+            smoothing_matrix = SmoothingMatrix.from_measures_and_processes(
+                measures=measures, processes=processes, **smoothing_matrix
+            )
+        self.smoothing_matrix = smoothing_matrix._bind(get_state_element_names(self.processes.values()), measures)
 
     def _default_initial_cov(self) -> Tensor:
         # initial covariance is always zero. this will be replaced by the 1-step covariance in the first call to predict
