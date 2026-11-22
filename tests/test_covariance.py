@@ -591,6 +591,17 @@ def test_corr_mask_packed_params(method: str):
 
 
 @pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
+def test_corr_mask_set_matrix_rejects_masked_entries(method: str):
+    # a non-zero entry for a masked-out pair can't be represented (and dropping its cholesky entry would also change
+    # the entries within groups), so it raises
+    cov = _make_masked_cov(method)
+    idx = cov.non_empty_idx
+    target = torch.eye(4, dtype=torch.float64) + .3 * (1 - cov.corr_mask[idx][:, idx].to(torch.float64))
+    with pytest.raises(ValueError, match="masked out by ``corr_mask``"):
+        cov.set_matrix_(target)
+
+
+@pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
 def test_corr_mask_representable_covs_unchanged(method: str):
     torch.manual_seed(1)
     cov = _make_masked_cov(method)
@@ -706,7 +717,7 @@ def test_low_rank_init_and_rotation():
     redundant = cov._get_lr_redundant(order)
     assert redundant.sum() == 3 and redundant[5, 1] and redundant[5, 2] and redundant[3, 2]
     assert (cov.lr_mat[redundant] != 0).any()
-    cov.rotate_low_rank_()
+    cov._rotate_low_rank_(order)
     assert (cov.lr_mat[redundant] == 0).all()
     torch.testing.assert_close(cov._get_mini_cov().detach(), before)
     assert cov._get_lr_order() == order
@@ -714,7 +725,7 @@ def test_low_rank_init_and_rotation():
     with pytest.raises(ValueError, match="number of factors"):
         Covariance(rank=3, init_diag_multi=1., method='low_rank4')
     with pytest.raises(TypeError, match="low_rank"):
-        Covariance(rank=3, init_diag_multi=1.).rotate_low_rank_()
+        Covariance(rank=3, init_diag_multi=1.)._rotate_low_rank_([0, 1, 2])
 
 
 def test_low_rank_set_matrix_round_trip():
@@ -796,7 +807,7 @@ def test_low_rank_identified_after_rotation():
     target = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) + .2)
     cov.set_matrix_(target)
     order = cov._get_lr_order()
-    cov.rotate_low_rank_(order)
+    cov._rotate_low_rank_(order)
     lr0, std0 = cov.lr_mat.detach().clone(), cov.log_std_devs.detach().clone()
 
     def nll(flat: torch.Tensor) -> torch.Tensor:
@@ -944,7 +955,7 @@ def test_prepare_for_hessian_hook(monkeypatch):
 
     # a non-callable ``prepare_for_hessian_`` is a mistake, not something to skip:
     monkeypatch.setattr(kf.processes['level'], 'prepare_for_hessian_', {'initial_mean': True}, raising=False)
-    with pytest.raises(TypeError, match="should be a method"):
+    with pytest.raises(TypeError, match="not callable"):
         kf.get_laplace_mvnorm(torch.randn(2, 10, 1))
 
     # other covariance methods leave everything in:
