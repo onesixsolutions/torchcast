@@ -100,6 +100,7 @@ inflate the variance.
 
 ### Other changes
 
+- The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
 - `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
 - Deprecation warnings are now `FutureWarning` instead of `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code). This covers the old `torchcast.covariance.base` import path, `fit(tol=, patience=, max_iter=)`, `Stopping.from_dict(tol=)` (previously a plain `UserWarning`), `Predictions` arguments `start_offsets`/`dt_unit` and `type='components'`, `complete_times()` arguments `group_colname` and `global_max=True`, and `BinomialFilter(do_post_hoc_correction=True/False)`.
 - `to_dataframe(conf=False)` returns just the means (the same as the default call's), skipping all of the work of

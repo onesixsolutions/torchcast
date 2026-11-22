@@ -333,7 +333,7 @@ class Covariance(nn.Module):
         self.empty_idx = set(empty_idx) | set(self.stationary_idx)
         assert all(isinstance(x, int) for x in self.empty_idx)
         self.param_rank = self.rank - len(self.empty_idx)
-        mask = mini_cov_mask(rank=self.rank, empty_idx=self.empty_idx)
+        mask = self._get_mini_cov_mask(rank=self.rank, empty_idx=self.empty_idx)
         self.register_buffer('mask', mask)
 
         if corr_mask is not None:
@@ -364,6 +364,21 @@ class Covariance(nn.Module):
                 "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
             )
         return corr_mask
+
+    @staticmethod
+    def _get_mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
+        """
+        A ``(rank, param_rank)`` matrix that embeds the covariance of the elements with parameters (the "mini-cov")
+        into the full ``(rank, rank)`` covariance, with zero rows/columns for ``empty_idx``.
+        """
+        param_rank = rank - len(empty_idx)
+        mask = torch.zeros((rank, param_rank), **kwargs)
+        c = 0
+        for r in range(rank):
+            if r not in empty_idx:
+                mask[r, c] = 1.
+                c += 1
+        return mask
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -918,17 +933,6 @@ def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) 
         V, uniq = V.detach(), log_uniq.detach().exp()
 
     return _to_lower_trapezoidal(V, _get_pivot_order(V)), uniq.sqrt()
-
-
-def mini_cov_mask(rank: int, empty_idx: Collection[int], **kwargs) -> Tensor:
-    param_rank = rank - len(empty_idx)
-    mask = torch.zeros((rank, param_rank), **kwargs)
-    c = 0
-    for r in range(rank):
-        if r not in empty_idx:
-            mask[r, c] = 1.
-            c += 1
-    return mask
 
 
 # backwards compat shim
