@@ -956,25 +956,44 @@ class StateSpaceModel(torch.nn.Module):
          with :class:`.LossFun`
         :param kwargs: Keyword-arguments to the forward pass.
         :return: The multivariate normal distribution for the Laplace approximation, and the corresponding names of the
-         parameters.
+         parameters. Parameter-entries that leave the model unchanged are left out: for a ``Covariance`` with
+         ``method='low_rank'``, whose factor-loadings are first rotated in-place (see
+         :func:`Covariance.rotate_low_rank_`, which doesn't change the model), the entries that pin the rotation.
         """
         if not get_loss:
             get_loss = LossFun(reduce='sum')
+
+        redundant = {}
+        for module_nm, module in self.named_modules():
+            if isinstance(module, Covariance) and module.method == 'low_rank':
+                module.rotate_low_rank_()
+            if isinstance(module, Covariance):
+                for nm, is_redundant in module._get_redundant_params().items():
+                    redundant[f'{module_nm}.{nm}' if module_nm else nm] = is_redundant.reshape(-1).cpu()
 
         pred = self(y, **kwargs)
         loss = get_loss(pred, y)
 
         all_params = []
         all_param_names = []
+        keep = []
         for nm, par in self.named_parameters():
             if not par.requires_grad:
                 continue
             all_param_names.extend(f'{nm}[{i}]' for i in range(par.numel()))
             all_params.append(par)
+            keep.append(~redundant[nm] if nm in redundant else torch.ones(par.numel(), dtype=torch.bool))
         # TODO: any way to verify reshape(-1) matches internals of hessian?
         means = torch.cat([p.reshape(-1) for p in all_params])
 
         hess = hessian(output=loss.squeeze(), inputs=all_params, allow_unused=True, progress=False)
+
+        keep = torch.cat(keep)
+        if not keep.all():
+            all_param_names = [nm for nm, k in zip(all_param_names, keep.tolist()) if k]
+            keep = keep.to(hess.device)
+            means = means[keep]
+            hess = hess[keep][:, keep]
 
         # create mvnorm for laplace approx:
         with torch.no_grad():

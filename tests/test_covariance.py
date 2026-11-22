@@ -327,7 +327,13 @@ def test_corr_mask(method: str, empty_idx: tuple):
                               [1., 0., 1., 0., 1.]])
     module = Covariance(rank=rank, init_diag_multi=1., method=method, empty_idx=list(empty_idx), corr_mask=corr_mask)
     unmasked = Covariance(rank=rank, init_diag_multi=1., method=method, empty_idx=list(empty_idx))
-    unmasked.load_state_dict({k: v for k, v in module.state_dict().items() if k != 'corr_mask'})
+    # (the masked module has parameters only for pairs that aren't masked out; unpacked, they're the same factor:)
+    diag_name, off_diag_name = ('cholesky_log_diag', 'cholesky_off_diag') if method == 'log_cholesky' \
+        else ('log_std_devs', 'corr_unconstrained')
+    assert getattr(module, off_diag_name).numel() < getattr(unmasked, off_diag_name).numel()
+    with torch.no_grad():
+        getattr(unmasked, diag_name).copy_(getattr(module, diag_name))
+        getattr(unmasked, off_diag_name).copy_(module._get_off_diag())
     with torch.no_grad():
         cov = module({}, num_groups=1, num_times=1).squeeze()
         cov_unmasked = unmasked({}, num_groups=1, num_times=1).squeeze()
@@ -482,46 +488,52 @@ def test_stationary_initial_variance_default_unchanged():
         torch.testing.assert_close(kf._default_initial_cov().squeeze(0), icov * scale2)
 
 
-def _make_masked_cov(method: str) -> Covariance:
+
+def _make_masked_cov(method: str, corr_mask: bool = True) -> Covariance:
     # elements 0, 3 in one group, 1, 4 in another; 2 has no variance:
     groups = torch.tensor([0, 1, 0, 0, 1])
-    corr_mask = (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
-    return Covariance(rank=5, init_diag_multi=.5, method=method, empty_idx=[2], corr_mask=corr_mask)
+    mask = (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
+    return Covariance(
+        rank=5, init_diag_multi=.5, method=method, empty_idx=[2], corr_mask=mask if corr_mask else None
+    )
 
 
-def _get_masked_pairs(cov: Covariance) -> torch.Tensor:
-    return (cov._get_off_diag_keep() == 0).nonzero().squeeze(-1)
+def _get_param_names(method: str) -> tuple[str, str]:
+    if method == 'log_cholesky':
+        return 'cholesky_log_diag', 'cholesky_off_diag'
+    return 'log_std_devs', 'corr_unconstrained'
 
 
 @pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
-def test_corr_mask_masks_factor(method: str):
+def test_corr_mask_packed_params(method: str):
     torch.manual_seed(0)
     cov = _make_masked_cov(method)
-    off_diag_name = 'cholesky_off_diag' if method == 'log_cholesky' else 'corr_unconstrained'
-    off_diag = getattr(cov, off_diag_name)
-    masked = _get_masked_pairs(cov)
-    assert len(masked) == 4  # (0 or 3) x (1 or 4), among the non-empty elements
-    assert (off_diag[masked] == 0).all()
+    off_diag = getattr(cov, _get_param_names(method)[1])
+    # 4 non-empty elements -> 6 pairs, of which 4 are masked out ((0 or 3) x (1 or 4)), leaving (0, 3) and (1, 4):
+    assert off_diag.numel() == 2
+    unpacked = cov._get_off_diag()
+    assert unpacked.numel() == 6 and (unpacked != 0).sum() == 2
 
-    # masked factor entries get exactly zero gradient, from the whole covariance:
+    # every parameter gets a gradient (none are redundant):
     mini_cov = cov._get_mini_cov()
     (mini_cov * torch.randn_like(mini_cov)).sum().backward()
-    assert (off_diag.grad[masked] == 0).all()
-    keep = torch.ones_like(off_diag, dtype=torch.bool)
-    keep[masked] = False
-    assert (off_diag.grad[keep] != 0).all()
+    assert (off_diag.grad != 0).all()
 
-    # and changing them doesn't change the covariance (no redundant directions):
+    # indexing: masked-out pairs have no parameter; others index into the packed parameter
+    with pytest.raises(ValueError, match="masked out"):
+        cov.get_off_diag_idx(0, 1)
+    assert sorted([cov.get_off_diag_idx(0, 3), cov.get_off_diag_idx(4, 1)]) == [0, 1]
     with torch.no_grad():
-        off_diag[masked] = 1.
-    torch.testing.assert_close(cov._get_mini_cov(), mini_cov.detach(), rtol=0, atol=0)
+        before = cov._get_mini_cov()
+        off_diag[cov.get_off_diag_idx(0, 3)] += 1.
+        changed = (cov._get_mini_cov() - before).abs() > 0
+    # (in the mini-cov, elements 0, 3 are rows 0, 2)
+    assert changed[0, 2] and not changed[0, 1] and not changed[1, 3]
 
-    # e.g. with ``corr_groups`` in a model:
+    # e.g. with ``corr_groups`` in a model: no off-diagonal parameters at all for two uncorrelated processes
     processes = [LocalLevel(id='level', measure='y'), LocalLevel(id='transient', measure='y', decay=(.5, .95))]
     pcov = Covariance.from_processes(processes, corr_groups=[['transient']], method=method)
-    assert (getattr(pcov, off_diag_name) == 0).all()
-    pcov({}, num_groups=1, num_times=1).sum().backward()
-    assert (getattr(pcov, off_diag_name).grad == 0).all()
+    assert getattr(pcov, _get_param_names(method)[1]).numel() == 0
 
 
 @pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
@@ -534,74 +546,234 @@ def test_corr_mask_representable_covs_unchanged(method: str):
     target = (A @ A.t() + torch.eye(4, dtype=torch.float64)) * mini_mask.to(torch.float64)
     cov.set_matrix_(target)
     torch.testing.assert_close(cov._get_mini_cov().detach().to(torch.float64), target, rtol=1e-5, atol=1e-6)
-    off_diag = cov._get_off_diag(masked=False)
-    assert (off_diag[_get_masked_pairs(cov)] == 0).all()
-
-
-def _make_old_style(cov: Covariance) -> torch.Tensor:
-    """Give ``cov`` non-zero masked factor entries, as fitted before the factor was masked; return its old cov."""
-    off_diag = cov._get_off_diag(masked=False)
-    with torch.no_grad():
-        off_diag[_get_masked_pairs(cov)] = torch.tensor([.3, -.2, .5, .1])
-    return cov._get_mini_cov(_mask_factor=False).detach()
+    # and conversions keep the mask and the packing:
+    other = 'sd_corr' if method == 'log_cholesky' else 'log_cholesky'
+    converted = cov.to_method(other)
+    assert getattr(converted, _get_param_names(other)[1]).numel() == 2
+    torch.testing.assert_close(converted._get_mini_cov(), cov._get_mini_cov(), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize('method', ['log_cholesky', 'sd_corr'])
-def test_corr_mask_loads_old_state_dict(method: str):
+def test_corr_mask_loads_old_format(method: str):
     torch.manual_seed(2)
-    old = _make_masked_cov(method)
-    old_cov = _make_old_style(old)
-    # (the old covariance differs from what the new code would compute from the same parameters:)
-    assert not torch.allclose(old._get_mini_cov().detach(), old_cov)
-
-    state_dict = old.state_dict()
-    state_dict._metadata[''] = {'version': 1}
+    diag_name, off_diag_name = _get_param_names(method)
+    # the old format: a parameter for every pair, with the mask applied to the covariance afterwards
+    unmasked = _make_masked_cov(method, corr_mask=False)
     new = _make_masked_cov(method)
+    idx = new.non_empty_idx
+    old_cov = unmasked._get_mini_cov().detach() * new.corr_mask[idx][:, idx]
+    state_dict = {**unmasked.state_dict(), 'corr_mask': new.corr_mask}
     new.load_state_dict(state_dict)
+    assert getattr(new, off_diag_name).numel() == 2
     torch.testing.assert_close(new._get_mini_cov().detach(), old_cov)
-    assert (new._get_off_diag(masked=False)[_get_masked_pairs(new)] == 0).all()
-
     # a current state-dict loads as is:
     new2 = _make_masked_cov(method)
     new2.load_state_dict(new.state_dict())
     torch.testing.assert_close(new2._get_mini_cov(), new._get_mini_cov(), rtol=0, atol=0)
 
-    # pickled before the change (no ``_factor_masked``):
-    old2 = _make_masked_cov(method)
-    old_cov2 = _make_old_style(old2)
-    del old2._factor_masked
-    unpickled = pickle.loads(pickle.dumps(old2))
-    torch.testing.assert_close(unpickled._get_mini_cov().detach(), old_cov2)
-    assert unpickled._factor_masked
+    # pickled in the old format:
+    old = _make_masked_cov(method)
+    setattr(old, off_diag_name, torch.nn.Parameter(getattr(unmasked, off_diag_name).detach().clone()))
+    with torch.no_grad():
+        getattr(old, diag_name).copy_(getattr(unmasked, diag_name))
+    unpickled = pickle.loads(pickle.dumps(old))
+    assert getattr(unpickled, off_diag_name).numel() == 2
+    torch.testing.assert_close(unpickled._get_mini_cov().detach(), old_cov)
 
 
 def test_corr_mask_old_model_same_predictions(monkeypatch):
+    def make() -> KalmanFilter:
+        processes = [
+            LocalLevel(id='level', measure='y'),
+            LocalLevel(id='transient', measure='y', decay=(.5, .95), stationary_initial_variance=True),
+            LocalLevel(id='transient2', measure='y', decay=(.5, .95), stationary_initial_variance=True)
+        ]
+        return KalmanFilter(
+            processes=processes,
+            measures=['y'],
+            process_covariance=Covariance.from_processes(processes, corr_groups=[['transient', 'transient2']])
+        )
+
     torch.manual_seed(3)
-    processes = [
-        LocalLevel(id='level', measure='y'),
-        LocalLevel(id='transient', measure='y', decay=(.5, .95), stationary_initial_variance=True)
-    ]
-    kf = KalmanFilter(
-        processes=processes,
-        measures=['y'],
-        process_covariance=Covariance.from_processes(processes, corr_groups=[['transient']])
-    )
     y = torch.randn(2, 15, 1)
-    # emulate the old behavior (mask only applied to the covariance), with non-zero masked factor entries:
+    # emulate the old format (a parameter for every pair, the mask applied to the covariance afterwards):
     with monkeypatch.context() as m:
         m.setattr(Covariance, '_get_off_diag_keep', lambda self: None)
+        old = make()
         with torch.no_grad():
-            kf.process_covariance.cholesky_off_diag.fill_(.4)
-        with torch.no_grad():
-            old_pred = kf(y)
-        state_dict = kf.state_dict()
-    state_dict._metadata['process_covariance']['version'] = 1
-    # (without converting, the new code gives different predictions from the same parameters:)
-    with torch.no_grad():
-        assert not torch.allclose(kf(y).covs, old_pred.covs)
+            old.process_covariance.cholesky_off_diag.fill_(.4)
+            old_pred = old(y)
+        state_dict = old.state_dict()
+    assert state_dict['process_covariance.cholesky_off_diag'].numel() == 3
 
-    kf.load_state_dict(state_dict)
+    new = make()
+    assert new.process_covariance.cholesky_off_diag.numel() == 1
+    new.load_state_dict(state_dict)
     with torch.no_grad():
-        new_pred = kf(y)
+        new_pred = new(y)
     torch.testing.assert_close(new_pred.means, old_pred.means)
     torch.testing.assert_close(new_pred.covs, old_pred.covs)
+
+
+def _make_low_rank(**kwargs) -> Covariance:
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # (experimental)
+        return Covariance(rank=8, init_diag_multi=.5, method='low_rank3', empty_idx=[3], lr_lead=[5, 7], **kwargs)
+
+
+def test_low_rank_init_and_rotation():
+    # init: about half the variance (``init_diag_multi ** 2``) from the factors, half from the diagonal
+    torch.manual_seed(1)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        big = Covariance(rank=200, init_diag_multi=.5, method='low_rank4')
+    lr_var = (big.lr_mat ** 2).sum(-1).mean()
+    diag_var = (big.log_std_devs.exp() ** 2).mean()
+    assert .4 < lr_var / .25 < .6 and .4 < diag_var / .25 < .6
+
+    # rotating to lower-trapezoidal (in ``lr_lead`` order: param indices 4, 6, then 0, 1, ...) is exact:
+    cov = _make_low_rank()
+    before = cov._get_mini_cov().detach()
+    redundant = cov._get_lr_redundant()
+    assert redundant.sum() == 3 and redundant[4, 1] and redundant[4, 2] and redundant[6, 2]
+    assert (cov.lr_mat[redundant] != 0).all()
+    cov.rotate_low_rank_()
+    assert (cov.lr_mat[redundant] == 0).all()
+    torch.testing.assert_close(cov._get_mini_cov().detach(), before)
+
+    with pytest.raises(ValueError, match="number of factors"):
+        Covariance(rank=3, init_diag_multi=1., method='low_rank4')
+    with pytest.raises(ValueError, match="lr_lead"):
+        Covariance(rank=8, init_diag_multi=.5, method='low_rank3', empty_idx=[3], lr_lead=[3])
+    with pytest.raises(TypeError, match="low_rank"):
+        Covariance(rank=3, init_diag_multi=1.).rotate_low_rank_()
+
+
+def test_low_rank_from_processes_lead():
+    processes = [
+        LocalLevel(id='a', measure='y'),
+        LocalTrend(id='b', measure='y'),  # position is level-like, velocity isn't
+        LocalLevel(id='c', measure='y')
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        cov = Covariance.from_processes(processes, cov_type='initial', method='low_rank2')
+    assert cov.lr_lead == [0, 1, 3]
+
+
+def test_low_rank_set_matrix_round_trip():
+    torch.manual_seed(2)
+    cov = _make_low_rank()
+    W = torch.randn(7, 3, dtype=torch.float64)
+    target = W @ W.t() + torch.diag(torch.rand(7, dtype=torch.float64) + .1)
+    cov.set_matrix_(target)
+    torch.testing.assert_close(cov._get_mini_cov().detach().to(torch.float64), target, rtol=1e-4, atol=1e-5)
+    # and converting from another method:
+    sd_corr = Covariance.from_matrix(target, method='sd_corr')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        low_rank = sd_corr.to_method('low_rank3')
+    torch.testing.assert_close(low_rank._get_mini_cov(), sd_corr._get_mini_cov(), rtol=1e-4, atol=1e-5)
+
+
+def _fit_low_rank_excess_loss(seed: int, old_init: bool) -> float:
+    """Fit a 2-factor covariance to simulated data (20 L-BFGS iterations); return its excess loss over the truth."""
+    torch.manual_seed(seed)
+    p, k, n = 12, 2, 400
+    W = torch.randn(p, k, dtype=torch.float64) * torch.tensor([2., 1.], dtype=torch.float64)
+    true_cov = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) * .3 + .05)
+    y = torch.distributions.MultivariateNormal(torch.zeros(p, dtype=torch.float64), true_cov).sample((n,))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        cov = Covariance(rank=p, init_diag_multi=1., method=f'low_rank{k}').double()
+    if old_init:
+        with torch.no_grad():
+            cov.lr_mat.copy_(.01 * torch.randn(p, k))
+            cov.log_std_devs.copy_(.1 * torch.randn(p))
+
+    def get_loss(c: torch.Tensor) -> torch.Tensor:
+        return -torch.distributions.MultivariateNormal(torch.zeros(p, dtype=c.dtype), c).log_prob(y).mean()
+
+    opt = torch.optim.LBFGS(cov.parameters(), max_iter=20, line_search_fn='strong_wolfe')
+
+    def closure() -> torch.Tensor:
+        opt.zero_grad()
+        loss = get_loss(cov._get_mini_cov())
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return (get_loss(cov._get_mini_cov()) - get_loss(true_cov)).item()
+
+
+def test_low_rank_init_recovers_factors():
+    new = sorted(_fit_low_rank_excess_loss(seed, old_init=False) for seed in range(12))
+    old = sorted(_fit_low_rank_excess_loss(seed, old_init=True) for seed in range(12))
+    # the new init gets about as close as the true covariance (it can do better: it's fit to the sample)
+    assert new[6] < .05
+    # factor-loadings near zero start at a saddle-point, so with the same budget they do worse:
+    assert old[6] > .3
+
+
+def test_low_rank_old_state_dict_loads():
+    # the parameterization is unchanged (only the init is new), so old state-dicts load as is:
+    torch.manual_seed(3)
+    old = _make_low_rank()
+    with torch.no_grad():
+        old.lr_mat.copy_(.01 * torch.randn_like(old.lr_mat))
+    state_dict = old.state_dict()
+    state_dict._metadata[''] = {'version': 1}
+    new = _make_low_rank()
+    new.load_state_dict(state_dict)
+    torch.testing.assert_close(new._get_mini_cov(), old._get_mini_cov(), rtol=0, atol=0)
+
+
+def test_low_rank_identified_after_rotation():
+    # at the optimum of a gaussian likelihood, the hessian is singular along the rotations, and non-singular once
+    # the rotated factor's redundant entries are left out
+    torch.manual_seed(4)
+    p, k = 6, 2
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        cov = Covariance(rank=p, init_diag_multi=1., method=f'low_rank{k}').double()
+    W = torch.randn(p, k, dtype=torch.float64)
+    target = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) + .2)
+    cov.set_matrix_(target)
+    cov.rotate_low_rank_()
+    lr0, std0 = cov.lr_mat.detach().clone(), cov.log_std_devs.detach().clone()
+
+    def nll(flat: torch.Tensor) -> torch.Tensor:
+        lr, log_std = flat[:p * k].reshape(p, k), flat[p * k:]
+        c = lr @ lr.t() + torch.diag(log_std.exp() ** 2)
+        return torch.logdet(c) + torch.trace(torch.linalg.solve(c, target))
+
+    hess = torch.autograd.functional.hessian(nll, torch.cat([lr0.reshape(-1), std0]))
+    assert torch.linalg.eigvalsh(hess).abs().min() < 1e-8
+    keep = torch.cat([~cov._get_lr_redundant().reshape(-1), torch.ones(p, dtype=torch.bool)])
+    assert torch.linalg.eigvalsh(hess[keep][:, keep]).min() > 1e-4
+
+
+def test_laplace_leaves_out_low_rank_rotation():
+    torch.manual_seed(5)
+    processes = [LocalLevel(id=f'level_{m}', measure=m) for m in 'abc']
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        kf = KalmanFilter(
+            processes=processes,
+            measures=list('abc'),
+            initial_covariance=Covariance.from_processes(processes, cov_type='initial', method='low_rank2')
+        )
+    y = torch.randn(2, 10, 3)
+    with torch.no_grad():
+        before = kf(y)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # (an unfitted model's hessian needn't be positive-definite)
+        mvnorm, names = kf.get_laplace_mvnorm(y)
+    num_params = sum(p.numel() for p in kf.parameters())
+    assert len(names) == mvnorm.loc.numel() == num_params - 1  # k * (k - 1) / 2 for k = 2
+    assert 'initial_covariance.lr_mat[1]' not in names  # (row 0, column 1)
+    assert kf.initial_covariance.lr_mat[0, 1] == 0
+    with torch.no_grad():
+        after = kf(y)
+    torch.testing.assert_close(after.means, before.means)
+    torch.testing.assert_close(after.covs, before.covs)
