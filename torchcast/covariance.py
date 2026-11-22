@@ -17,11 +17,11 @@ from torchcast.process.process import Process
 DEFAULT_MCOV_MULTI = 1.0
 DEFAULT_PCOV_MULTI = 0.1  # less than measure-cov by default
 DEFAULT_ICOV_MULTI = 0.5  # somewhere in between
-# the ids that ``Covariance.from_processes()``/``from_measures()`` give, and how to create each (see ``set_id()``):
+# a covariance's possible ``role`` in a model, and how to create one for it:
 _HOW_TO_CREATE = {
-    'process_covariance': "Covariance.from_processes(processes, cov_type='process', ...)",
-    'initial_covariance': "Covariance.from_processes(processes, cov_type='initial', ...)",
-    'measure_covariance': "Covariance.from_measures(measures, ...)",
+    'process': "Covariance.from_processes(processes, cov_type='process', ...)",
+    'initial': "Covariance.from_processes(processes, cov_type='initial', ...)",
+    'measure': "Covariance.from_measures(measures, ...)",
 }
 # ``Covariance.from_processes(cov_type='initial')`` uses method='low_rank' by default from this many elements on:
 LOW_RANK_MIN_INITIAL = 15
@@ -69,8 +69,14 @@ class Covariance(nn.Module):
         kf.fit(y, group_ids=group_ids, season_X=season_X)
 
     Here both modules receive both kwargs (``module(group_ids, season_X)``): wrap a module to ignore what it doesn't
-    need. A kwarg named ``{id}__{name}`` (e.g. ``measure_covariance__season_X``) overrides ``name`` for this
-    covariance.
+    need. A kwarg named ``{role}_covariance__{name}`` (e.g. ``measure_covariance__season_X``) overrides ``name`` for
+    this covariance.
+
+    A covariance knows its ``role`` in a model ("process", "initial" or "measure") and the names of its elements
+    (``element_names``: ``'{process_id}.{state_element}'`` for the state, or the measures), which
+    :func:`Covariance.from_processes` and :func:`Covariance.from_measures` set. The model checks both, so e.g. a
+    process-covariance passed as the ``initial_covariance``, or a covariance created from other processes (or in
+    another order), raises an error rather than fitting the wrong model.
     """
 
     # Construction -----------------------------------------------------------------------------------------------------
@@ -179,7 +185,14 @@ class Covariance(nn.Module):
             kwargs['stationary_idx'] = stationary_idx
         if nonstationary_idx:
             kwargs['nonstationary_idx'] = nonstationary_idx
-        return cls(rank=state_rank, empty_idx=no_cov_idx, id=f'{cov_type}_covariance', method=method, **kwargs)
+        return cls(
+            rank=state_rank,
+            empty_idx=no_cov_idx,
+            role=cov_type,
+            element_names=get_state_element_names(processes),
+            method=method,
+            **kwargs
+        )
 
     @classmethod
     def from_measures(cls,
@@ -217,7 +230,7 @@ class Covariance(nn.Module):
             kwargs['init_diag_multi'] = DEFAULT_MCOV_MULTI
         _deprecated_predict_variance(predict_variance, kwargs, default_kwarg='measure_var_multi')
 
-        return cls(rank=len(measures), id='measure_covariance', method=method, **kwargs)
+        return cls(rank=len(measures), role='measure', element_names=list(measures), method=method, **kwargs)
 
     @staticmethod
     def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:
@@ -252,6 +265,8 @@ class Covariance(nn.Module):
                  predict_std: Optional[nn.Module] = None,
                  predict_corr: Optional[nn.Module] = None,
                  predictor_kwargs: Sequence[Union[str, ProcessKwarg]] = (),
+                 role: Optional[str] = None,
+                 element_names: Optional[Sequence[str]] = None,
                  id: Optional[str] = None,
                  predict_variance: Optional[nn.Module] = None,
                  expected_kwargs: Optional[Sequence[str]] = None,
@@ -297,8 +312,14 @@ class Covariance(nn.Module):
          inputs to ``predict_std``/``predict_corr``. A string is a tensor whose first dimension is the group (e.g.
          ``group_ids``, or a ``(num_groups, num_times, ...)`` tensor); for inputs that aren't group-indexed, pass
          ``ProcessKwarg(name, is_group_time_tensor=False)``.
-        :param id: Identifier for this covariance. Typically left ``None`` and set when passed to the
-         :class:`.StateSpaceModel`.
+        :param role: The covariance's role in a model: "process", "initial" or "measure". Set by
+         :func:`Covariance.from_processes` / :func:`Covariance.from_measures`; if ``None``, the model sets it. A model
+         raises if a covariance with a different role is passed.
+        :param element_names: The names of the ``rank`` elements: ``'{process_id}.{state_element}'`` for a process or
+         initial covariance (see :func:`get_state_element_names`), the measures for a measure covariance. Set by
+         :func:`Covariance.from_processes` / :func:`Covariance.from_measures`; if ``None``, the model sets it. A model
+         raises if they don't match its own (e.g. a covariance created from other processes, or in another order).
+        :param id: Deprecated: the id is now derived from ``role`` (e.g. "process_covariance").
         :param predict_variance: Deprecated, use ``predict_std``.
         :param expected_kwargs: Deprecated, use ``predictor_kwargs``.
         :param corr_mask: Optionally, a ``(rank, rank)`` tensor that the covariance is multiplied by elementwise, e.g.
@@ -341,8 +362,27 @@ class Covariance(nn.Module):
         if predict_corr is not None and method != 'sd_corr':
             raise ValueError(f"``predict_corr`` requires ``method='sd_corr'`` (got '{method}').")
 
-        self.id = id
+        if id is not None:
+            warn(
+                "``Covariance(id=...)`` is deprecated: a covariance's ``role`` is set by ``from_processes()`` / "
+                "``from_measures()``, or by the model it's passed to.",
+                FutureWarning,
+                stacklevel=2
+            )
+            if role is None and id.endswith('_covariance') and id[:-len('_covariance')] in _HOW_TO_CREATE:
+                role = id[:-len('_covariance')]
+        if role is not None and role not in _HOW_TO_CREATE:
+            raise ValueError(f"``role`` should be one of {list(_HOW_TO_CREATE)}, got '{role}'.")
+        self.role = role
         self.rank = rank
+        self.element_names: Optional[List[str]] = None
+        if element_names is not None:
+            element_names = list(element_names)
+            if len(element_names) != rank:
+                raise ValueError(f"``element_names`` has {len(element_names)} names, expected {rank} (``rank``).")
+            if len(set(element_names)) != rank:
+                raise ValueError(f"``element_names`` aren't unique: {element_names}.")
+            self.element_names = element_names
 
         self.stationary_idx = sorted(int(i) for i in stationary_idx)
         if not all(0 <= i < rank for i in self.stationary_idx):
@@ -440,17 +480,59 @@ class Covariance(nn.Module):
         else:
             raise NotImplementedError(method)
 
+    @property
+    def id(self) -> Optional[str]:
+        """
+        ``'{role}_covariance'`` (e.g. "measure_covariance"), or ``None`` if the role isn't set yet. Used in messages,
+        and as the prefix of keyword-arguments that override ``predictor_kwargs`` for this covariance.
+        """
+        return None if self.role is None else f'{self.role}_covariance'
+
+    @property
+    def _label(self) -> str:
+        return self.id or type(self).__name__
+
+    def _bind(self, role: str, element_names: Sequence[str]) -> 'Covariance':
+        """
+        Called by a model on the covariance it's given for ``role``, with the names of the elements the model expects
+        (see ``element_names`` in :func:`Covariance.__init__`): raises if they don't match the covariance's, and sets
+        them if they weren't set.
+        """
+        assert role in _HOW_TO_CREATE
+        how = _HOW_TO_CREATE[role]
+        if self.role is not None and self.role != role:
+            # e.g. ``Covariance.from_processes(processes)`` (a process-covariance) passed as an initial covariance:
+            raise ValueError(
+                f"This covariance was created as a ``{self.role}`` covariance, but it's being used as the ``{role}`` "
+                f"covariance. Create it with ``{how}``."
+            )
+        element_names = list(element_names)
+        kind, source = ('measures', 'measures') if role == 'measure' else ('state-elements', 'processes')
+        if self.element_names is None:
+            if self.rank != len(element_names):
+                raise ValueError(
+                    f"The ``{role}`` covariance has rank {self.rank}, but the model has {len(element_names)} {kind}: "
+                    f"{element_names}. Create it with ``{how}``."
+                )
+        elif self.element_names != element_names:
+            raise ValueError(
+                f"The ``{role}`` covariance was created for the {kind} {self.element_names}, but the model's are "
+                f"{element_names}. Create it with ``{how}``, with the model's {source}, in the same order."
+            )
+        self.role = role
+        self.element_names = element_names
+        return self
+
     @jit.ignore
     def set_id(self, id: str) -> 'Covariance':
-        if self.id and id != self.id:
-            if self.id in _HOW_TO_CREATE:
-                # e.g. ``Covariance.from_processes(processes)`` (a process-covariance) passed as an initial covariance:
-                raise ValueError(
-                    f"This covariance was created as ``{self.id}``, but it's being used as ``{id}``. "
-                    f"Create the ``{id}`` with ``{_HOW_TO_CREATE.get(id, 'Covariance.from_processes()')}``."
-                )
-            warn(f"Id already set to {self.id}, overwriting")
-        self.id = id
+        """Deprecated: a covariance's ``role`` is set by ``from_processes()`` / ``from_measures()``, or by the model."""
+        warn("``Covariance.set_id()`` is deprecated (the id is derived from ``role``).", FutureWarning, stacklevel=2)
+        role = id[:-len('_covariance')] if id.endswith('_covariance') else None
+        if role not in _HOW_TO_CREATE:
+            raise ValueError(f"Expected one of {[f'{r}_covariance' for r in _HOW_TO_CREATE]}, got '{id}'.")
+        if self.role is not None and self.role != role:
+            raise ValueError(f"This covariance was created as a ``{self.role}`` covariance, not ``{role}``.")
+        self.role = role
         return self
 
     @property
@@ -517,11 +599,11 @@ class Covariance(nn.Module):
         inputs, used = [], set()
         for pkwarg in self.predictor_kwargs:
             key = f'{self.id}__{pkwarg.name}'
-            if key not in kwargs:
+            if self.id is None or key not in kwargs:
                 key = pkwarg.name
             if key not in kwargs:
                 raise TypeError(
-                    f"`{self.id}` expected a `{pkwarg.name}` (or `{self.id}__{pkwarg.name}`) keyword-argument."
+                    f"`{self._label}` expected a `{pkwarg.name}` (or `{self.id}__{pkwarg.name}`) keyword-argument."
                 )
             inputs.append(kwargs[key])
             used.add(key)
@@ -534,7 +616,7 @@ class Covariance(nn.Module):
                 self.predict_std(*inputs), 'predict_std', self.param_rank, num_groups, num_times
             )
             if (std_multi < 0).any():
-                raise RuntimeError(f"{self.id}'s `predict_std` produced values <0; needs exp/softplus layer.")
+                raise RuntimeError(f"`{self._label}`'s `predict_std` produced values <0; needs exp/softplus layer.")
         if self.predict_corr is not None:
             corr_delta = self._validate_prediction(
                 self.predict_corr(*inputs), 'predict_corr', self._get_num_off_diag_params(), num_groups, num_times
@@ -563,18 +645,20 @@ class Covariance(nn.Module):
             if pred.shape[-1] == 1:
                 pred = pred.expand(*pred.shape[:-1], num_cols)
             else:
-                raise ValueError(f"`{self.id}`'s `{name}` should output {num_cols} columns, got shape {pred.shape}.")
+                raise ValueError(
+                    f"`{self._label}`'s `{name}` should output {num_cols} columns, got shape {pred.shape}."
+                )
         if pred.ndim == 1:
             pred = pred[None, None]
         elif pred.ndim == 2:
             pred = pred.unsqueeze(1)
         if pred.ndim != 3 or pred.shape[0] not in (1, num_groups) or pred.shape[1] not in (1, num_times):
             raise ValueError(
-                f"`{self.id}`'s `{name}` output should have shape (num_groups, num_times, {num_cols}) or "
+                f"`{self._label}`'s `{name}` output should have shape (num_groups, num_times, {num_cols}) or "
                 f"(num_groups, {num_cols}), i.e. ({num_groups}, {num_times}, {num_cols}); got {tuple(pred.shape)}."
             )
         if torch.isnan(pred).any() or torch.isinf(pred).any():
-            raise RuntimeError(f"`{self.id}`'s `{name}` produced nans/infs")
+            raise RuntimeError(f"`{self._label}`'s `{name}` produced nans/infs")
         return pred
 
     def _embed(self, mini_cov: Tensor) -> Tensor:
@@ -605,7 +689,7 @@ class Covariance(nn.Module):
 
         if is_near_zero(mini_cov.diagonal(dim1=-2, dim2=-1), atol=1e-12).any():
             warn(
-                f"`{self.id}` has near-zero along the diagonal. Will add 1e-12 to the diagonal. "
+                f"`{self._label}` has near-zero along the diagonal. Will add 1e-12 to the diagonal. "
                 f"Values:\n{mini_cov.diag()}"
             )
             mini_cov = mini_cov + torch.eye(mini_cov.shape[-1], device=mini_cov.device, dtype=mini_cov.dtype) * 1e-12
@@ -764,9 +848,9 @@ class Covariance(nn.Module):
         """
         A copy of this module with a different parameterization (``method``) but the same covariance (exactly, up to
         floating-point error), e.g. to convert a fitted model:
-        ``model.initial_covariance = model.initial_covariance.to_method('sd_corr')``. Other attributes (``id``,
-        ``empty_idx``, ``predict_std``, ``predict_corr``) are carried over. Note that a model's state-dict saved after
-        converting can only be loaded into a model created with the new ``method``.
+        ``model.initial_covariance = model.initial_covariance.to_method('sd_corr')``. Other attributes (``role``,
+        ``element_names``, ``empty_idx``, ``predict_std``, ``predict_corr``) are carried over. Note that a model's
+        state-dict saved after converting can only be loaded into a model created with the new ``method``.
         """
         if self.predict_corr is not None and method != 'sd_corr':
             raise ValueError(f"``predict_corr`` requires ``method='sd_corr'`` (got '{method}').")
@@ -796,7 +880,7 @@ class Covariance(nn.Module):
                 if saved == 'low_rank':
                     saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
                 error_msgs.append(
-                    f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
+                    f"`{self._label}` uses method='{self.method}', but the state-dict was saved "
                     f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
                     f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
                     f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
@@ -820,6 +904,12 @@ class Covariance(nn.Module):
             state['predictor_kwargs'] = [
                 ProcessKwarg(name=k, is_group_time_tensor=True) for k in (state.pop('expected_kwargs', None) or [])
             ]
+        # (``id`` is now derived from ``role``)
+        if 'role' not in state:
+            old_id = state.pop('id', None) or ''
+            role = old_id[:-len('_covariance')] if old_id.endswith('_covariance') else None
+            state['role'] = role if role in _HOW_TO_CREATE else None
+        state.setdefault('element_names', None)
         super().__setstate__(state)
 
     # Indexing the parameters ------------------------------------------------------------------------------------------
@@ -886,7 +976,7 @@ class Covariance(nn.Module):
         mini_mask = self._get_binary_mini_mask()
         if mini_mask is not None and (mini_mask == 0).any():
             warn(
-                f"`{self.id}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
+                f"`{self._label}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
                 f"rotated separately; only one rotation is pinned for the hessian, which stays singular."
             )
         order = self._get_lr_order()
@@ -940,6 +1030,14 @@ class Covariance(nn.Module):
             FutureWarning
         )
         return log_chol_to_chol(log_diag, off_diag)
+
+
+def get_state_element_names(processes: Sequence[Process]) -> List[str]:
+    """
+    The names of the state-elements, in the order of the state vector: ``'{process_id}.{state_element}'``. These are
+    the ``element_names`` of a process or initial :class:`.Covariance`.
+    """
+    return [f'{p.id}.{nm}' for p in processes for nm in p.state_elements]
 
 
 def num_off_diag(rank: int) -> int:

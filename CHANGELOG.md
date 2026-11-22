@@ -100,7 +100,6 @@ inflate the variance.
 
 ### Other changes
 
-- Passing a `Covariance` created for one role as another now raises a `ValueError` that says how to create the right one: e.g. `initial_covariance=Covariance.from_processes(processes)` (which makes a process-covariance, whose elements without process-noise get no parameters, so a fixed season would get zero initial variance) used to warn only `Id already set to process_covariance, overwriting`.
 - The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
 - `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
 - Deprecation warnings are now `FutureWarning` instead of `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code). This covers the old `torchcast.covariance.base` import path, `fit(tol=, patience=, max_iter=)`, `Stopping.from_dict(tol=)` (previously a plain `UserWarning`), `Predictions` arguments `start_offsets`/`dt_unit` and `type='components'`, `complete_times()` arguments `group_colname` and `global_max=True`, and `BinomialFilter(do_post_hoc_correction=True/False)`.
@@ -165,6 +164,7 @@ A `Covariance` can now predict how *correlations* vary by group/time, not just v
 - Predictions that only vary by group (shape `(num_groups, ...)`) are no longer expanded over time inside the models, which is cheaper on the backward pass. The same goes for covariances without predictions.
 - `Covariance.base_cov()` returns the covariance before predictions; `Covariance.batch_cov(kwargs, num_groups, num_times)` is what the models use (it doesn't expand dimensions that don't vary). `forward()` is unchanged.
 - For `ExpSmoother` subclasses: the zero initial covariance is now provided by overriding `_default_initial_cov()`, rather than an `initial_covariance()` method.
+- A covariance now knows its `role` in a model ("process", "initial" or "measure") and its `element_names` (`'{process_id}.{state_element}'` for the state, or the measures), which `from_processes()` / `from_measures()` set; the model checks both, so a covariance passed in the wrong role, or created from other processes (or in another order), raises a `ValueError` that says how to create the right one. E.g. `initial_covariance=Covariance.from_processes(processes)` (which makes a process-covariance, whose elements without process-noise get no parameters, so a fixed season would get zero initial variance) used to warn only `Id already set to process_covariance, overwriting`, then fit poorly. A covariance created directly (`Covariance(rank=...)`) gets both from the model it's passed to, if its rank matches. `Covariance.id` is now read-only, derived from the role (e.g. `measure_covariance`, still the prefix for `{id}__{name}` kwargs); `Covariance(id=...)` and `set_id()` are deprecated. Pickled models load, with their role taken from their old id.
 
 ### New option: decaying processes' initial covariance from their stationary covariance (`stationary`)
 

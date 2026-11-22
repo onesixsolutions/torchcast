@@ -18,7 +18,7 @@ from torchcast.process.utils import Identity
 
 @torch.no_grad()
 def test_from_log_cholesky():
-    module = Covariance(id='test', rank=3, init_diag_multi=0.1)
+    module = Covariance(rank=3, init_diag_multi=0.1)
 
     module.state_dict()['cholesky_log_diag'][:] = torch.arange(1., 3.1)
     module.state_dict()['cholesky_off_diag'][:] = torch.arange(1., 3.1)
@@ -32,7 +32,7 @@ def test_from_log_cholesky():
 
 @torch.no_grad()
 def test_empty_idx():
-    module = Covariance(id='test', rank=3, empty_idx=[0], init_diag_multi=0.1)
+    module = Covariance(rank=3, empty_idx=[0], init_diag_multi=0.1)
     cov = module({}, num_groups=1, num_times=1)
     cov = cov.squeeze()
     assert (cov[0, :] == 0).all()
@@ -196,7 +196,7 @@ def test_sd_corr_freezing_hooks():
 
 
 def test_state_dict_across_methods():
-    lc = Covariance(rank=3, init_diag_multi=1., id='initial_covariance')
+    lc = Covariance(rank=3, init_diag_multi=1., role='initial')
     lc2 = Covariance(rank=3, init_diag_multi=1.)
     lc2.load_state_dict(lc.state_dict())  # same method: unchanged
     assert torch.equal(lc2.cholesky_off_diag, lc.cholesky_off_diag)
@@ -1177,21 +1177,78 @@ def test_covariance_base_shim():
 def test_covariance_in_the_wrong_slot_raises():
     processes = [LocalLevel(id='level', measure='y')]
     # e.g. forgetting ``cov_type='initial'``, which makes a process-covariance (different elements get parameters):
-    with pytest.raises(ValueError, match=r"created as ``process_covariance``.*cov_type='initial'"):
+    with pytest.raises(ValueError, match=r"created as a ``process`` covariance.*cov_type='initial'"):
         KalmanFilter(
             processes=processes, measures=['y'], initial_covariance=Covariance.from_processes(processes)
         )
-    with pytest.raises(ValueError, match=r"created as ``initial_covariance``.*cov_type='process'"):
+    with pytest.raises(ValueError, match=r"created as a ``initial`` covariance.*cov_type='process'"):
         KalmanFilter(
             processes=processes,
             measures=['y'],
             process_covariance=Covariance.from_processes(processes, cov_type='initial')
         )
-    with pytest.raises(ValueError, match=r"used as ``measure_covariance``.*from_measures"):
+    with pytest.raises(ValueError, match=r"used as the ``measure`` covariance.*from_measures"):
         KalmanFilter(
             processes=processes, measures=['y'], measure_covariance=Covariance.from_processes(processes)
         )
-    # a covariance with a custom id is renamed, with a warning, as before:
-    custom = Covariance(rank=1, init_diag_multi=1., id='my_covariance')
-    with pytest.warns(UserWarning, match="Id already set to my_covariance"):
-        KalmanFilter(processes=processes, measures=['y'], initial_covariance=custom)
+
+
+def test_covariance_elements_must_match_the_model():
+    processes = [LocalLevel(id='a', measure='y'), LocalTrend(id='b', measure='y')]
+    kf = KalmanFilter(processes=processes, measures=['y'])
+    names = ['a.level', 'b.position', 'b.velocity']
+    assert kf.process_covariance.element_names == names
+    assert kf.initial_covariance.element_names == names
+    assert kf.measure_covariance.element_names == ['y']
+    assert (kf.process_covariance.role, kf.process_covariance.id) == ('process', 'process_covariance')
+
+    # created from other processes, or in another order (same rank):
+    other = [LocalTrend(id='b', measure='y'), LocalLevel(id='a', measure='y')]
+    with pytest.raises(ValueError, match=r"created for the state-elements \['b.position'.*in the same order"):
+        KalmanFilter(processes=processes, measures=['y'], process_covariance=Covariance.from_processes(other))
+    with pytest.raises(ValueError, match="created for the measures"):
+        KalmanFilter(processes=processes, measures=['y'], measure_covariance=Covariance.from_measures(['z']))
+
+    # a covariance created directly gets its role and names from the model, if its rank matches:
+    direct = Covariance(rank=3, init_diag_multi=1.)
+    assert direct.role is None and direct.id is None
+    kf = KalmanFilter(processes=processes, measures=['y'], initial_covariance=direct)
+    assert kf.initial_covariance is direct
+    assert (direct.role, direct.element_names) == ('initial', names)
+    with pytest.raises(ValueError, match="has rank 2, but the model has 3 state-elements"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance=Covariance(rank=2, init_diag_multi=1.))
+    # now that it's bound, it can't be used in another role:
+    with pytest.raises(ValueError, match="created as a ``initial`` covariance"):
+        KalmanFilter(processes=processes, measures=['y'], process_covariance=direct)
+
+    # copies keep them:
+    assert direct.to_method('sd_corr').element_names == names
+    assert copy.deepcopy(direct).role == 'initial'
+
+    with pytest.raises(ValueError, match="``role`` should be one of"):
+        Covariance(rank=3, init_diag_multi=1., role='measures')
+    with pytest.raises(ValueError, match="expected 3"):
+        Covariance(rank=3, init_diag_multi=1., element_names=['a', 'b'])
+
+
+def test_deprecated_id():
+    with pytest.warns(FutureWarning, match=r"Covariance\(id=...\)"):
+        cov = Covariance(rank=1, init_diag_multi=1., id='initial_covariance')
+    assert cov.role == 'initial'
+    with pytest.warns(FutureWarning, match=r"Covariance\(id=...\)"):
+        cov = Covariance(rank=1, init_diag_multi=1., id='my_covariance')
+    assert cov.role is None
+    with pytest.warns(FutureWarning, match="set_id"):
+        cov.set_id('measure_covariance')
+    assert cov.id == 'measure_covariance'
+
+    # a module pickled before ``role`` existed (it had an ``id`` attribute instead):
+    cov = Covariance.from_measures(['y'])
+    state = cov.__dict__.copy()
+    del state['role'], state['element_names']
+    state['id'] = 'measure_covariance'
+    old = Covariance.__new__(Covariance)
+    old.__setstate__(state)
+    assert (old.role, old.element_names, old.id) == ('measure', None, 'measure_covariance')
+    kf = KalmanFilter(processes=[LocalLevel(id='a', measure='y')], measures=['y'], measure_covariance=old)
+    assert old.element_names == ['y']

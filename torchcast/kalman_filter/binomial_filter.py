@@ -190,7 +190,8 @@ class BinomialFilter(KalmanFilter):
         if measure_covariance is None:
             measure_covariance = {}
         if isinstance(measure_covariance, dict):
-            measure_covariance['id'] = 'measure_covariance'
+            measure_covariance['role'] = 'measure'
+            measure_covariance['element_names'] = list(measures)
             measure_covariance['rank'] = len(measures)
             measure_covariance['empty_idx'] = mcov_empty_idx
             measure_covariance['init_diag_multi'] = measure_covariance.get('init_diag_multi', DEFAULT_MCOV_MULTI)

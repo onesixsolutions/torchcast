@@ -17,3 +17,5 @@ Helpers
 .. autofunction:: torchcast.covariance.corr_cholesky_to_unconstrained
 
 .. autofunction:: torchcast.covariance.cov2corr
+
+.. autofunction:: torchcast.covariance.get_state_element_names

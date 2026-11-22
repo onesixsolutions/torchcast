@@ -52,9 +52,7 @@ class StateSpaceModel(torch.nn.Module):
 
         if measure_covariance is None:
             measure_covariance = Covariance.from_measures(measures)
-        else:
-            assert measure_covariance.rank == 1 or measure_covariance.rank == len(measures)
-        self.measure_covariance = measure_covariance.set_id('measure_covariance')
+        self.measure_covariance = measure_covariance._bind('measure', measures)
 
         self.measure_funs = {}
         for m, alias in (measure_funs or {}).items():

@@ -7,7 +7,7 @@ This class inherits most of its methods from :class:`torchcast.state_space.State
 from typing import Sequence
 from warnings import warn
 
-from torchcast.covariance import Covariance
+from torchcast.covariance import Covariance, get_state_element_names
 from torchcast.internals.utils import update_tensor, mvnorm_log_prob, as_timestep_list
 from torchcast.process import Process
 from torchcast.process.utils import StateElement, FixedValue
@@ -96,8 +96,9 @@ class KalmanFilter(StateSpaceModel):
             adaptive_scaling=adaptive_scaling,
             mixture=mixture,
         )
-        self.process_covariance = process_covariance.set_id('process_covariance')
-        self.initial_covariance = initial_covariance.set_id('initial_covariance')
+        state_element_names = get_state_element_names(self.processes.values())
+        self.process_covariance = process_covariance._bind('process', state_element_names)
+        self.initial_covariance = initial_covariance._bind('initial', state_element_names)
         self.joseph_form = joseph_form
         self._validate_stationary_initial_variance()
         self._warn_correlated_levels()
