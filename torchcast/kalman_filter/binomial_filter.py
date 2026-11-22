@@ -51,7 +51,7 @@ class BinomialFilter(KalmanFilter):
                  measures: Optional[Sequence[str]],
                  binary_measures: Optional[Sequence[str]] = None,
                  observed_counts: Optional[bool] = None,
-                 do_post_hoc_correction: Union[Literal['none', 'static', 'num_obs', 'auto'], bool] = 'auto',
+                 do_post_hoc_correction: Literal['none', 'static', 'num_obs', 'auto'] = 'auto',
                  measure_covariance: Optional[Union[Covariance, dict]] = None,
                  process_covariance: Optional[Covariance] = None,
                  initial_covariance: Optional[Covariance] = None,

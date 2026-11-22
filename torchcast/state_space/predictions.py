@@ -480,30 +480,6 @@ class Predictions:
             return False
         return any(m in measurement_model.measures for m in self.mixture.mixture_measures)
 
-    def _effective_combo_terms(self,
-                               measures: Sequence[str],
-                               like: torch.Tensor,
-                               log_prior: torch.Tensor) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """
-        For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
-        are distinguishable given ``measures`` (see ``MixtureModel.get_effective_combos``).
-
-        :param like: A ``(batch, ...)`` tensor, for the number of rows, dtype and device.
-        :param log_prior: A ``(batch, num_combos)`` tensor of log prior combo-probabilities.
-        :return: For each effective combo, two ``(len(measures),)`` tensors -- the offset to each measure's
-         measured-mean and the variance to add to its measurement-noise -- and the ``(batch,)`` log prior probability
-         (pooled over the combos that are indistinguishable given ``measures``).
-        """
-        effective_combos, mapping = self.mixture.get_effective_combos(measures)
-        for idx, combo in enumerate(effective_combos):
-            shift, extra_var = self.mixture.get_combo_offsets(combo, measures, like=like)
-            # `mapping` gives each combo's effective combo, so `mapping == idx` selects the combos that the effective
-            # combo at `idx` stands for. given the observed measures, these combos are mutually exclusive, so the prior
-            # for this effective combo is the sum of these combos' priors. for example, if only measure1 is observed,
-            # the effective combo (measure1='weird') pools p(measure1='weird', measure2='standard')
-            # + p(measure1='weird', measure2='weird').
-            yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == idx).to(log_prior.device)], dim=-1)
-
     # Dataframes & plotting --------------------------------------------------------------------------------------------
 
     @torch.inference_mode()
@@ -1601,6 +1577,30 @@ class Predictions:
             )
             probs.append(core_probs[..., in_regime].sum(-1))
         return torch.stack(probs, -1)
+
+    def _effective_combo_terms(self,
+                               measures: Sequence[str],
+                               like: torch.Tensor,
+                               log_prior: torch.Tensor) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        For the mixture's marginal log-likelihood, ``logsumexp_c(log_prior_c + log_lik_c)``: the regime-combos that
+        are distinguishable given ``measures`` (see ``MixtureModel.get_effective_combos``).
+
+        :param like: A ``(batch, ...)`` tensor, for the number of rows, dtype and device.
+        :param log_prior: A ``(batch, num_combos)`` tensor of log prior combo-probabilities.
+        :return: For each effective combo, two ``(len(measures),)`` tensors -- the offset to each measure's
+         measured-mean and the variance to add to its measurement-noise -- and the ``(batch,)`` log prior probability
+         (pooled over the combos that are indistinguishable given ``measures``).
+        """
+        effective_combos, mapping = self.mixture.get_effective_combos(measures)
+        for idx, combo in enumerate(effective_combos):
+            shift, extra_var = self.mixture.get_combo_offsets(combo, measures, like=like)
+            # `mapping` gives each combo's effective combo, so `mapping == idx` selects the combos that the effective
+            # combo at `idx` stands for. given the observed measures, these combos are mutually exclusive, so the prior
+            # for this effective combo is the sum of these combos' priors. for example, if only measure1 is observed,
+            # the effective combo (measure1='weird') pools p(measure1='weird', measure2='standard')
+            # + p(measure1='weird', measure2='weird').
+            yield shift, extra_var, torch.logsumexp(log_prior[:, (mapping == idx).to(log_prior.device)], dim=-1)
 
     # States at specific times, and indexing ---------------------------------------------------------------------------
 
