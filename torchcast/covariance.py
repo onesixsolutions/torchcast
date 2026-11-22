@@ -10,7 +10,7 @@ import torch
 from torch import Tensor, nn, jit
 from torch.nn import functional as F
 
-from torchcast.process.utils import Identity, FixedValue
+from torchcast.process.utils import Identity
 from torchcast.internals.utils import is_near_zero, validate_gt_shape
 from torchcast.process.process import Process
 
@@ -132,21 +132,17 @@ class Covariance(nn.Module):
             )
         state_rank = 0
         no_cov_idx = []
-        level_like_idx = []
         stationary_idx = []
         nonstationary_idx = []
         for p in processes:
             no_cov_elements = [nm for nm, se in p.state_elements.items() if not getattr(se, f'has_{cov_type}_variance')]
-            for i, (nm, se) in enumerate(p.state_elements.items()):
+            for i, nm in enumerate(p.state_elements):
                 if nm in no_cov_elements:
                     no_cov_idx.append(state_rank + i)
                 elif stationary.get(p.id) is True:
                     stationary_idx.append(state_rank + i)
-                else:
-                    if stationary.get(p.id) is False:
-                        nonstationary_idx.append(state_rank + i)
-                    if _is_level_like(se):
-                        level_like_idx.append(state_rank + i)
+                elif stationary.get(p.id) is False:
+                    nonstationary_idx.append(state_rank + i)
             state_rank += len(p.state_elements)
 
         default_method = 'method' not in kwargs
@@ -156,8 +152,6 @@ class Covariance(nn.Module):
             param_rank = state_rank - len(no_cov_idx) - len(stationary_idx)
             if param_rank >= LOW_RANK_MIN_INITIAL:
                 kwargs['method'] = 'low_rank'
-        if kwargs.get('method', '').startswith('low_rank') and 'lr_lead' not in kwargs:
-            kwargs['lr_lead'] = level_like_idx
 
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
@@ -236,7 +230,6 @@ class Covariance(nn.Module):
                  expected_kwargs: Optional[Sequence[str]] = None,
                  id: Optional[str] = None,
                  corr_mask: Optional[Tensor] = None,
-                 lr_lead: Optional[Sequence[int]] = None,
                  stationary_idx: Sequence[int] = (),
                  nonstationary_idx: Sequence[int] = ()):
         """
@@ -289,12 +282,6 @@ class Covariance(nn.Module):
          cholesky factor that's zero there too. With other masks (e.g. entries of 0.5), and with "low_rank", the mask
          only applies to the covariance, so the parameters behind masked-out entries are redundant (they don't change
          the masked covariance's zeros, but do change its other entries).
-        :param lr_lead: For "low_rank": elements (of ``0..rank-1``) to put first in the order used by
-         :func:`Covariance.rotate_low_rank_` (and ``set_matrix_()``); the others follow in their usual order. The
-         rotation is pinned down by the first K elements in this order, which is better conditioned when they carry
-         substantial factor-variance (not, e.g., seasonal elements with tiny variance).
-         :func:`Covariance.from_processes` defaults to the processes' level-like elements (e.g. ``LocalLevel``'s
-         level, ``LocalTrend``'s position).
         :param stationary_idx: For an initial covariance: elements (of ``0..rank-1``) whose covariance is computed by
          the :class:`.KalmanFilter` (the stationary covariance), so they get no parameters here (like ``empty_idx``).
          Typically set with ``stationary`` in :func:`Covariance.from_processes`. ``corr_mask`` doesn't apply to them.
@@ -323,7 +310,6 @@ class Covariance(nn.Module):
         if corr_mask is not None:
             self.register_buffer('corr_mask', self._validate_corr_mask(corr_mask, rank=self.rank))
 
-        self.lr_lead = self._validate_lr_lead(lr_lead)
         self._set_params(method, init_diag_multi)
         # whether ``method`` was chosen by default (by ``from_processes()``/``from_measures()``); if so, a state-dict
         # saved with another method (e.g. under an older default) is loaded by switching to that method:
@@ -387,47 +373,44 @@ class Covariance(nn.Module):
         keep = self._get_off_diag_keep()
         return off_diag if keep is None else _unpack_off_diag(off_diag, keep)
 
-    def _validate_lr_lead(self, lr_lead: Optional[Sequence[int]]) -> List[int]:
-        lr_lead = [int(i) for i in (lr_lead or ())]
-        if len(set(lr_lead)) != len(lr_lead):
-            raise ValueError(f"``lr_lead`` has duplicates: {lr_lead}.")
-        bad = [i for i in lr_lead if i in self.empty_idx or not 0 <= i < self.rank]
-        if bad:
-            raise ValueError(f"``lr_lead`` has elements that are out of range or in ``empty_idx``: {bad}.")
-        return lr_lead
-
     def _get_lr_order(self) -> List[int]:
-        """For "low_rank": the (``param_rank``) indices of the elements, in ``lr_lead`` order."""
-        non_empty = self.non_empty_idx
-        lead = [non_empty.index(i) for i in getattr(self, 'lr_lead', ())]
-        return lead + [i for i in range(self.param_rank) if i not in lead]
-
-    def _get_lr_redundant(self) -> Tensor:
         """
-        For "low_rank": a ``(param_rank, K)`` boolean mask of the entries of ``lr_mat`` above the diagonal (in the
-        order of ``lr_lead``): after :func:`Covariance.rotate_low_rank_` they're zero, and they span the rotations.
+        For "low_rank": an order of the (``param_rank``) elements that leads with the K whose factor-loadings are the
+        most linearly independent (greedily, as in a pivoted QR decomposition), followed by the rest in their usual
+        order. Rotating ``V`` to lower-trapezoidal form in this order pins the rotation on rows that are well away from
+        singular. (It depends only on ``V @ V.t()``, so a rotation doesn't change it.)
         """
         assert self.lr_mat is not None
+        return _get_pivot_order(self.lr_mat.detach())
+
+    def _get_lr_redundant(self, order: Optional[Sequence[int]] = None) -> Tensor:
+        """
+        For "low_rank": a ``(param_rank, K)`` boolean mask of the entries of ``lr_mat`` above the diagonal, in
+        ``order`` (default: :func:`Covariance._get_lr_order`). After :func:`Covariance.rotate_low_rank_` they're zero,
+        and they span the rotations.
+        """
+        assert self.lr_mat is not None
+        order = self._get_lr_order() if order is None else list(order)
         position = torch.empty(self.param_rank, dtype=torch.long)
-        position[self._get_lr_order()] = torch.arange(self.param_rank)
+        position[order] = torch.arange(self.param_rank)
         return (position.unsqueeze(-1) < torch.arange(self.lr_mat.shape[-1])).to(self.lr_mat.device)
 
     @torch.no_grad()
-    def rotate_low_rank_(self) -> 'Covariance':
+    def rotate_low_rank_(self, order: Optional[Sequence[int]] = None) -> 'Covariance':
         """
-        For "low_rank": rotate the factor-loadings ``V`` (in-place) to the lower-trapezoidal form (``V[i, j] = 0``
-        for ``j > i``, with elements in the order of ``lr_lead``), by an LQ decomposition. This leaves the covariance
-        unchanged (exactly, up to floating-point error) and pins down the rotation, which is otherwise arbitrary:
-        e.g. for a hessian (see :func:`Covariance.prepare_for_hessian_`), where the entries above the diagonal are
-        then left out.
+        For "low_rank": rotate the factor-loadings ``V`` (in-place) to lower-trapezoidal form (``V[i, j] = 0`` for
+        ``j > i``, with the elements in ``order``; by default leading with those whose loadings are the most linearly
+        independent), by an LQ decomposition. This leaves the covariance unchanged (exactly, up to floating-point
+        error) and pins down the rotation, which is otherwise arbitrary: e.g. for a hessian (see
+        :func:`Covariance.prepare_for_hessian_`), where the entries above the diagonal are then left out.
         """
         if self.method != 'low_rank':
             raise TypeError(f"``rotate_low_rank_()`` is for method='low_rank', not '{self.method}'.")
-        order = self._get_lr_order()
+        order = self._get_lr_order() if order is None else list(order)
         _, R = torch.linalg.qr(self.lr_mat[order].t().cpu().to(torch.float64))
         rotated = torch.zeros_like(R.t())
         rotated[order] = R.t()
-        self.lr_mat.copy_(rotated.masked_fill(self._get_lr_redundant().cpu(), 0.))
+        self.lr_mat.copy_(rotated.masked_fill(self._get_lr_redundant(order).cpu(), 0.))
         return self
 
     def prepare_for_hessian_(self) -> Dict[str, Tensor]:
@@ -453,8 +436,9 @@ class Covariance(nn.Module):
                 f"`{self.id}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
                 f"rotated separately; only one rotation is pinned for the hessian, which stays singular."
             )
-        self.rotate_low_rank_()
-        return {'lr_mat': self._get_lr_redundant()}
+        order = self._get_lr_order()
+        self.rotate_low_rank_(order)
+        return {'lr_mat': self._get_lr_redundant(order)}
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -535,7 +519,7 @@ class Covariance(nn.Module):
 
     def __setstate__(self, state: dict):
         super().__setstate__(state)
-        self.__dict__.setdefault('lr_lead', [])  # (pickled before these existed)
+        # (pickled before these existed)
         self.__dict__.setdefault('stationary_idx', [])
         self.__dict__.setdefault('nonstationary_idx', [])
         self.__dict__.setdefault('_default_method', False)
@@ -670,7 +654,7 @@ class Covariance(nn.Module):
             L_corr = _cholesky(mini_cov / (std.unsqueeze(-1) * std.unsqueeze(-2)))
             values = std.log(), corr_cholesky_to_unconstrained(L_corr)
         elif self.method == 'low_rank':
-            lr_mat, std = _fit_factor_model(mini_cov, num_factors=self.lr_mat.shape[-1], order=self._get_lr_order())
+            lr_mat, std = _fit_factor_model(mini_cov, num_factors=self.lr_mat.shape[-1])
             values = lr_mat, std.log()
         else:
             raise NotImplementedError(f"``set_matrix_()`` isn't supported for method='{self.method}'.")
@@ -865,20 +849,33 @@ def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Seque
     return (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
 
 
-def _is_level_like(se) -> bool:
-    """A state element with a fixed non-zero measurement-weight, that transitions only to itself (e.g. a level)."""
-    multi = se._measure_multi
-    return isinstance(multi, FixedValue) and bool(multi.value != 0) and set(se.transitions_to) == {se.name}
+def _get_pivot_order(V: Tensor) -> List[int]:
+    """
+    An order of ``V``'s rows: first, greedily, the ``V.shape[-1]`` rows that are the most linearly independent (each
+    the one with the largest norm after projecting out those already chosen, as in a pivoted QR decomposition of
+    ``V.t()``), then the rest in their usual order. Depends only on ``V @ V.t()``.
+    """
+    residual = V.cpu().to(torch.float64).clone()
+    lead = []
+    for _ in range(min(V.shape)):
+        norms = (residual ** 2).sum(-1)
+        norms[lead] = -1.
+        i = int(norms.argmax())
+        lead.append(i)
+        if norms[i] <= 0:
+            continue
+        q = residual[i] / norms[i].sqrt()
+        residual = residual - (residual @ q).unsqueeze(-1) * q
+    return lead + [i for i in range(V.shape[0]) if i not in lead]
 
 
 def _fit_factor_model(cov: Tensor,
                       num_factors: int,
-                      order: Sequence[int],
                       num_paf_iter: int = 2_000) -> tuple[Tensor, Tensor]:
     """
-    Fit ``cov ~= V @ V.t() + diag(std ** 2)``, with ``V`` lower-trapezoidal in ``order``: principal-axis factoring
-    (alternating the top eigenvectors of ``cov - D`` with the residual diagonal ``D``) for a start, then polished
-    with L-BFGS on the squared error (principal-axis factoring alone can converge very slowly).
+    Fit ``cov ~= V @ V.t() + diag(std ** 2)``, with ``V`` lower-trapezoidal (see ``_get_pivot_order``): principal-axis
+    factoring (alternating the top eigenvectors of ``cov - D`` with the residual diagonal ``D``) for a start, then
+    polished with L-BFGS on the squared error (principal-axis factoring alone can converge very slowly).
 
     :return: ``V`` (``(rank, num_factors)``) and ``std`` (``(rank,)``).
     """
@@ -913,10 +910,12 @@ def _fit_factor_model(cov: Tensor,
             opt.step(closure)
         V, uniq = V.detach(), log_uniq.detach().exp()
 
-    # rotate to lower-trapezoidal (in ``order``) with an LQ decomposition, which leaves ``V @ V.t()`` unchanged:
-    _, R = torch.linalg.qr(V[list(order)].t())
+    # rotate to lower-trapezoidal (leading with the most independent rows) with an LQ decomposition, which leaves
+    # ``V @ V.t()`` unchanged:
+    order = _get_pivot_order(V)
+    _, R = torch.linalg.qr(V[order].t())
     V_lower = torch.empty_like(V)
-    V_lower[list(order)] = R.t()
+    V_lower[order] = R.t()
     return V_lower, uniq.sqrt()
 
 

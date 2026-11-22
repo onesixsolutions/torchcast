@@ -675,7 +675,7 @@ def test_corr_mask_old_model_same_predictions(monkeypatch):
 def _make_low_rank(**kwargs) -> Covariance:
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')  # (experimental)
-        return Covariance(rank=8, init_diag_multi=.5, method='low_rank3', empty_idx=[3], lr_lead=[5, 7], **kwargs)
+        return Covariance(rank=8, init_diag_multi=.5, method='low_rank3', empty_idx=[3], **kwargs)
 
 
 def test_low_rank_init_and_rotation():
@@ -688,34 +688,33 @@ def test_low_rank_init_and_rotation():
     diag_var = (big.log_std_devs.exp() ** 2).mean()
     assert .4 < lr_var / .25 < .6 and .4 < diag_var / .25 < .6
 
-    # rotating to lower-trapezoidal (in ``lr_lead`` order: param indices 4, 6, then 0, 1, ...) is exact:
+    # the rotation leads with the rows whose loadings are the most independent, not ones that are nearly zero (like
+    # seasonal elements with tiny variance) or redundant with one already chosen:
     cov = _make_low_rank()
+    with torch.no_grad():
+        cov.lr_mat.mul_(.001)
+        cov.lr_mat[5] = torch.tensor([2., 0., 0.])
+        cov.lr_mat[1] = torch.tensor([1.9, .1, 0.])  # (large, but nearly parallel to row 5)
+        cov.lr_mat[3] = torch.tensor([0., 1., 0.])
+        cov.lr_mat[6] = torch.tensor([.1, .1, .8])
+        cov.lr_mat.copy_(cov.lr_mat @ torch.linalg.qr(torch.randn(3, 3))[0])  # (an arbitrary rotation)
+    order = cov._get_lr_order()
+    assert order[:3] == [5, 3, 6] and sorted(order) == list(range(7))
+
+    # rotating to lower-trapezoidal in that order is exact, and doesn't change the order:
     before = cov._get_mini_cov().detach()
-    redundant = cov._get_lr_redundant()
-    assert redundant.sum() == 3 and redundant[4, 1] and redundant[4, 2] and redundant[6, 2]
-    assert (cov.lr_mat[redundant] != 0).all()
+    redundant = cov._get_lr_redundant(order)
+    assert redundant.sum() == 3 and redundant[5, 1] and redundant[5, 2] and redundant[3, 2]
+    assert (cov.lr_mat[redundant] != 0).any()
     cov.rotate_low_rank_()
     assert (cov.lr_mat[redundant] == 0).all()
     torch.testing.assert_close(cov._get_mini_cov().detach(), before)
+    assert cov._get_lr_order() == order
 
     with pytest.raises(ValueError, match="number of factors"):
         Covariance(rank=3, init_diag_multi=1., method='low_rank4')
-    with pytest.raises(ValueError, match="lr_lead"):
-        Covariance(rank=8, init_diag_multi=.5, method='low_rank3', empty_idx=[3], lr_lead=[3])
     with pytest.raises(TypeError, match="low_rank"):
         Covariance(rank=3, init_diag_multi=1.).rotate_low_rank_()
-
-
-def test_low_rank_from_processes_lead():
-    processes = [
-        LocalLevel(id='a', measure='y'),
-        LocalTrend(id='b', measure='y'),  # position is level-like, velocity isn't
-        LocalLevel(id='c', measure='y')
-    ]
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        cov = Covariance.from_processes(processes, cov_type='initial', method='low_rank2')
-    assert cov.lr_lead == [0, 1, 3]
 
 
 def test_low_rank_set_matrix_round_trip():
@@ -796,7 +795,8 @@ def test_low_rank_identified_after_rotation():
     W = torch.randn(p, k, dtype=torch.float64)
     target = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) + .2)
     cov.set_matrix_(target)
-    cov.rotate_low_rank_()
+    order = cov._get_lr_order()
+    cov.rotate_low_rank_(order)
     lr0, std0 = cov.lr_mat.detach().clone(), cov.log_std_devs.detach().clone()
 
     def nll(flat: torch.Tensor) -> torch.Tensor:
@@ -806,7 +806,7 @@ def test_low_rank_identified_after_rotation():
 
     hess = torch.autograd.functional.hessian(nll, torch.cat([lr0.reshape(-1), std0]))
     assert torch.linalg.eigvalsh(hess).abs().min() < 1e-8
-    keep = torch.cat([~cov._get_lr_redundant().reshape(-1), torch.ones(p, dtype=torch.bool)])
+    keep = torch.cat([~cov._get_lr_redundant(order).reshape(-1), torch.ones(p, dtype=torch.bool)])
     assert torch.linalg.eigvalsh(hess[keep][:, keep]).min() > 1e-4
 
 
@@ -828,8 +828,9 @@ def test_laplace_leaves_out_low_rank_rotation():
         mvnorm, names = kf.get_laplace_mvnorm(y)
     num_params = sum(p.numel() for p in kf.parameters())
     assert len(names) == mvnorm.loc.numel() == num_params - 1  # k * (k - 1) / 2 for k = 2
-    assert 'initial_covariance.lr_mat[1]' not in names  # (row 0, column 1)
-    assert kf.initial_covariance.lr_mat[0, 1] == 0
+    lr_mat = kf.initial_covariance.lr_mat
+    left_out = [i for i in range(lr_mat.numel()) if f'initial_covariance.lr_mat[{i}]' not in names]
+    assert len(left_out) == 1 and lr_mat.reshape(-1)[left_out[0]] == 0  # (the entry the rotation set to zero)
     with torch.no_grad():
         after = kf(y)
     torch.testing.assert_close(after.means, before.means)
@@ -852,7 +853,7 @@ def test_default_methods():
     big, small = _make_seasonal_processes(3), _make_seasonal_processes(2)
     cov = Covariance.from_processes(big, cov_type='initial')
     assert cov.method == 'low_rank' and cov.param_rank == 15 and cov.lr_mat.shape == (15, 3)
-    assert cov.lr_lead == [0, 5, 10] and cov._default_method
+    assert cov._default_method
     assert Covariance.from_processes(small, cov_type='initial').method == 'log_cholesky'
     # not with ``corr_groups``, nor for the process-covariance, nor when ``method`` is passed:
     assert Covariance.from_processes(big, cov_type='initial', corr_groups=[['level0']]).method == 'log_cholesky'
