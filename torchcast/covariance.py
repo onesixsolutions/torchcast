@@ -6,6 +6,7 @@ import sys
 import types
 
 from typing import Any, List, Mapping, Optional, Sequence, Set, Dict, Tuple, Union, Collection
+import warnings
 from warnings import warn
 
 import torch
@@ -25,8 +26,6 @@ _HOW_TO_CREATE = {
     'initial': "Covariance.from_processes(processes, cov_type='initial', ...)",
     'measure': "Covariance.from_measures(measures, ...)",
 }
-# ``Covariance.from_processes(cov_type='initial')`` uses method='low_rank' by default from this many elements on:
-LOW_RANK_MIN_INITIAL = 15
 
 # the parameters for each ``method``, in the order ``set_matrix_()`` computes them:
 _METHOD_PARAMS = {
@@ -123,10 +122,8 @@ class Covariance(nn.Module):
          its ``mask`` buffer (both shrink), so a state-dict saved without it won't load into one with it: to warm-start,
          drop all of the saved ``initial_covariance.*`` entries, and set the free block with
          :func:`Covariance.set_matrix_` if needed.
-        :param method: The parameterization, see :func:`Covariance.__init__`. If not given: "low_rank" for an initial
-         covariance with 15 or more elements with parameters (not counting ``stationary`` ones) and no
-         ``corr_groups``/``corr_mask``, since it's weakly informed (mainly by the start of each series) and grows
-         quadratically with the state; "sd_corr" if ``predict_corr`` is passed; otherwise "log_cholesky".
+        :param method: The parameterization, see :func:`Covariance.__init__`. If not given, "sd_corr" if
+         ``predict_corr`` is passed, otherwise "log_cholesky".
         :param kwargs: Other arguments passed to :func:`Covariance.__init__`, e.g. ``predict_std``,
          ``predict_corr``, ``predictor_kwargs``. Note that the outputs of a ``predict_std`` module have
          ``param_rank`` columns, i.e. one for each state-element with parameters (not ``empty_idx`` or
@@ -173,11 +170,7 @@ class Covariance(nn.Module):
         if method is None and kwargs.get('predict_corr') is not None:
             method = 'sd_corr'
         if method is None:
-            # a large initial covariance is weakly informed (mainly by the start of each series) and grows quadratically
-            # with the state, so by default it's a factor model:
-            param_rank = state_rank - len(no_cov_idx) - len(stationary_idx)
-            use_low_rank = cov_type == 'initial' and 'corr_mask' not in kwargs and param_rank >= LOW_RANK_MIN_INITIAL
-            method = 'low_rank' if use_low_rank else 'log_cholesky'
+            method = 'log_cholesky'
 
         if 'init_diag_multi' not in kwargs:
             kwargs['init_diag_multi'] = DEFAULT_PCOV_MULTI if cov_type == 'process' else DEFAULT_ICOV_MULTI
@@ -284,17 +277,8 @@ class Covariance(nn.Module):
          This can be useful to provide intelligent starting-values to speed up optimization.
         :param method: The parameterization for the covariance. The default, "log_cholesky" (or "sd_corr" if
          ``predict_corr`` is passed), parameterizes the covariance using the cholesky factorization (which is itself
-         split into two tensors: the log-transformed diagonal elements and the off-diagonal). The other currently
-         supported option is "low_rank", a factor model: the covariance is ``V @ V.t() + D``, with ``V`` (``lr_mat``) a
-         G*K matrix of factor-loadings (G the number of elements with variance, K the number of factors) and ``D`` a
-         diagonal matrix of ``exp(log_std_devs) ** 2``. This suits a large covariance that's weakly informed by the
-         data, e.g. one dominated by a few common factors; it's the default for a large initial covariance (see
-         :func:`Covariance.from_processes`). K defaults to ``int(sqrt(G))`` (an arbitrary rule of thumb: pass e.g.
-         "low_rank3" for 3 factors). Rotations of ``V`` leave ``V @ V.t()`` unchanged; that's harmless for fitting, but
-         makes the hessian singular, so for :func:`StateSpaceModel.get_laplace_mvnorm`,
-         :func:`Covariance.prepare_for_hessian_` rotates ``V`` to a canonical form and leaves out the entries that pin
-         the rotation.
-         Finally, "sd_corr" separates scale from correlation: ``diag(std) @ R @ diag(std)``, with parameters
+         split into two tensors: the log-transformed diagonal elements and the off-diagonal). The other option is
+         "sd_corr", which separates scale from correlation: ``diag(std) @ R @ diag(std)``, with parameters
          ``log_std_devs`` and ``corr_unconstrained``. ``R`` is a correlation matrix built from canonical partial
          correlations ``tanh(corr_unconstrained)`` (as in Stan's ``cholesky_factor_corr``), one per off-diagonal
          element. Unlike "log_cholesky" (where off-diagonal entries are in absolute units, and also change the
@@ -303,7 +287,9 @@ class Covariance(nn.Module):
          and correlations separately (see :func:`Covariance.get_param_idx` and
          :func:`Covariance.get_off_diag_idx`). Note that a zero ``corr_unconstrained`` is a zero *partial* correlation
          (given the earlier elements): element ``i`` is uncorrelated with all others when every entry in its row *and*
-         column is zero. Existing modules can be converted with :func:`Covariance.to_method`.
+         column is zero. Existing modules can be converted with :func:`Covariance.to_method`. ("low_rank" is no
+         longer available for new modules; a pickled "low_rank" covariance still loads, with a warning, and converts
+         exactly with :func:`Covariance.to_method`.)
         :param empty_idx: In some cases (e.g. process-covariance) we will have some elements with no variance.
         :param predict_std: A module predicting (strictly positive) multipliers on the std-devs, with ``param_rank``
          columns. See the class docstring.
@@ -334,9 +320,9 @@ class Covariance(nn.Module):
          cholesky factor for "sd_corr"): the factor's entries for masked-out pairs are zero, and aren't parameters
          (``cholesky_off_diag``/``corr_unconstrained`` have one entry per pair that isn't masked out; see
          :func:`Covariance.get_off_diag_idx`). This loses nothing: a covariance that's zero across groups has a
-         cholesky factor that's zero there too. With other masks (e.g. entries of 0.5), and with "low_rank", the mask
-         only applies to the covariance, so the parameters behind masked-out entries are redundant (they don't change
-         the masked covariance's zeros, but do change its other entries). It also applies to ``predict_corr``'s
+         cholesky factor that's zero there too. With other masks (e.g. entries of 0.5), the mask only applies to the
+         covariance, so the parameters behind masked-out entries are redundant (they don't change the masked
+         covariance's zeros, but do change its other entries). It also applies to ``predict_corr``'s
          adjusted covariances.
         :param stationary_idx: For an initial covariance: elements (of ``0..rank-1``) whose covariance is computed by
          the :class:`.KalmanFilter` (the stationary covariance), so they get no parameters here (like ``empty_idx``).
@@ -463,21 +449,11 @@ class Covariance(nn.Module):
             self.log_std_devs = nn.Parameter(.1 * torch.randn(self.param_rank, **fkw) + math.log(init_diag_multi))
             self.corr_unconstrained = nn.Parameter(.1 * torch.randn(self._get_num_off_diag_params(), **fkw))
         elif method.startswith('low_rank'):
-            self.method = 'low_rank'
-            low_rank = method.replace('low_rank', '')
-            if low_rank:
-                low_rank = int(low_rank)
-            else:
-                low_rank = max(int(math.sqrt(self.param_rank)), 1)
-            if not 1 <= low_rank <= self.param_rank:
-                raise ValueError(f"``method='{method}'``: the number of factors must be in 1..{self.param_rank}.")
-            # half of each element's initial variance (``init_diag_multi ** 2``, as for the other methods) from the
-            # factors, half from the diagonal (factor-loadings near zero would start at a saddle-point):
-            self.lr_mat = nn.Parameter(
-                torch.randn(self.param_rank, low_rank, **fkw) * init_diag_multi * math.sqrt(.5 / low_rank)
-            )
-            self.log_std_devs = nn.Parameter(
-                data=.1 * torch.randn(self.param_rank, **fkw) + math.log(init_diag_multi * math.sqrt(.5))
+            raise ValueError(
+                "``method='low_rank'`` is no longer available for new models: as a default for large covariances it "
+                "could fit as well as \"log_cholesky\" but forecast worse (its free diagonal can collapse, leaving a "
+                "near-singular prior). Use \"log_cholesky\" or \"sd_corr\". (A pickled \"low_rank\" covariance still "
+                "loads, and converts exactly with ``.to_method('log_cholesky')``.)"
             )
         else:
             raise NotImplementedError(method)
@@ -766,9 +742,7 @@ class Covariance(nn.Module):
     def set_matrix_(self, cov: Tensor) -> 'Covariance':
         """
         Set this module's parameters (in-place) so that its covariance (before any ``predict_std``/``predict_corr``)
-        equals ``cov``. For "low_rank", which can't represent an arbitrary matrix, this fits the factor model to ``cov``
-        (by principal-axis factoring: alternating the top-K eigendecomposition of ``cov - D`` with the residual
-        diagonal ``D``, kept positive), which is exact if ``cov`` has that structure, and an approximation otherwise.
+        equals ``cov``.
 
         :param cov: A ``(rank, rank)`` covariance matrix, whose rows/columns in ``empty_idx`` are zero (as are its
          entries masked out by a binary ``corr_mask``); or just the ``(param_rank, param_rank)`` block for the
@@ -821,9 +795,6 @@ class Covariance(nn.Module):
             std = mini_cov.diagonal().sqrt()
             L_corr = _cholesky(mini_cov / (std.unsqueeze(-1) * std.unsqueeze(-2)))
             values = std.log(), corr_cholesky_to_unconstrained(L_corr)
-        elif self.method == 'low_rank':
-            lr_mat, std = _fit_factor_model(mini_cov, num_factors=self.lr_mat.shape[-1])
-            values = lr_mat, std.log()
         else:
             raise NotImplementedError(f"``set_matrix_()`` isn't supported for method='{self.method}'.")
         keep = self._get_off_diag_keep()
@@ -861,7 +832,10 @@ class Covariance(nn.Module):
         """
         if self.predict_corr is not None and method != 'sd_corr':
             raise ValueError(f"``predict_corr`` requires ``method='sd_corr'`` (got '{method}').")
-        out = copy.deepcopy(self)
+        with warnings.catch_warnings():
+            # (deep-copying unpickles, which warns for a 'low_rank' covariance -- the one you'd be converting away from)
+            warnings.filterwarnings('ignore', message=".*method='low_rank'", category=FutureWarning)
+            out = copy.deepcopy(self)
         out._set_params(method, init_diag_multi=1.0)
         return out.set_matrix_(self._get_mini_cov().detach())
 
@@ -884,17 +858,23 @@ class Covariance(nn.Module):
             saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
             if saved_with:
                 saved = saved_with[0]
+                label = self._label
                 if saved == 'low_rank':
-                    saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
-                error_msgs.append(
-                    f"`{self._label}` uses method='{self.method}', but the state-dict was saved "
-                    f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
-                    f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
-                    f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
-                    f"(torchcast 2.0 changed the default methods: \"low_rank\" for an initial covariance with "
-                    f"{LOW_RANK_MIN_INITIAL} or more elements with parameters, and \"log_cholesky\" for every "
-                    f"measure-covariance.)"
-                )
+                    msg = (
+                        f"`{label}`: the state-dict was saved with method='low_rank', which torchcast 2.0 no longer "
+                        f"offers for new models (it was the default for a measure-covariance with more than 5 "
+                        f"measures). To keep the fitted covariance, unpickle the saved model if you have it (pickled "
+                        f"'low_rank' covariances still load), or load the state-dict with an older torchcast and "
+                        f"convert it with ``.to_method('{self.method}')``."
+                    )
+                else:
+                    msg = (
+                        f"`{label}` uses method='{self.method}', but the state-dict was saved with method='{saved}'. "
+                        f"To load it, create this covariance with ``method='{saved}'`` (e.g. "
+                        f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
+                        f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``."
+                    )
+                error_msgs.append(msg)
                 return
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -918,13 +898,19 @@ class Covariance(nn.Module):
             state['role'] = role if role in _HOW_TO_CREATE else None
         state.setdefault('element_names', None)
         super().__setstate__(state)
+        if self.method == 'low_rank':
+            warn(
+                f"`{self._label}` uses method='low_rank', which is deprecated and no longer available for new models; "
+                f"convert it (exactly) with ``.to_method('log_cholesky')``.",
+                FutureWarning
+            )
 
     # Indexing the parameters ------------------------------------------------------------------------------------------
 
     def get_param_idx(self, i: int) -> int:
         """
         The index of element ``i`` (of ``0..rank-1``) in the per-element parameters (``log_std_devs`` for
-        "sd_corr"/"low_rank", ``cholesky_log_diag`` for "log_cholesky"), accounting for ``empty_idx``. E.g., to
+        "sd_corr", ``cholesky_log_diag`` for "log_cholesky"), accounting for ``empty_idx``. E.g., to
         freeze some elements' std-devs and correlations (the frozen entries get exactly zero gradients):
 
         .. code-block:: python3
@@ -963,69 +949,6 @@ class Covariance(nn.Module):
         if not keep[idx]:
             raise ValueError(f"Elements {i} and {j} are masked out by ``corr_mask``, so they have no parameter.")
         return int(keep[:idx].sum())
-
-    # Low-rank rotation, for the hessian -------------------------------------------------------------------------------
-
-    def prepare_for_hessian_(self) -> Dict[str, Tensor]:
-        """
-        Called by :func:`StateSpaceModel.get_laplace_mvnorm` (on any submodule that has this method) before computing
-        the hessian: put the parameters (in-place, without changing the model) into a canonical form, and return, by
-        parameter name, boolean masks of the entries to leave out of the hessian, because the model only defines
-        them up to a symmetry along which the likelihood is flat (so the hessian is singular there).
-
-        For "low_rank", rotations of the factor-loadings ``V`` leave the covariance unchanged: this rotates ``V`` to
-        lower-trapezoidal form (see ``Covariance._rotate_low_rank_()``) and leaves out the entries above the
-        diagonal. (With a binary ``corr_mask``, each group of elements can be rotated separately; only one rotation
-        is pinned, so the hessian stays singular, with a warning.) Other methods have no such symmetry.
-        """
-        if self.method != 'low_rank':
-            return {}
-        mini_mask = self._get_binary_mini_mask()
-        if mini_mask is not None and (mini_mask == 0).any():
-            warn(
-                f"`{self._label}` has method='low_rank' and a ``corr_mask``, so each group's factor-loadings can be "
-                f"rotated separately; only one rotation is pinned for the hessian, which stays singular."
-            )
-        order = self._get_lr_order()
-        self._rotate_low_rank_(order)
-        return {'lr_mat': self._get_lr_redundant(order)}
-
-    @torch.no_grad()
-    def _rotate_low_rank_(self, order: Sequence[int]) -> 'Covariance':
-        """
-        For "low_rank": rotate the factor-loadings ``V`` (in-place) to lower-trapezoidal form (``V[i, j] = 0`` for
-        ``j > i``, with the elements in ``order``, e.g. from ``_get_lr_order()``), by an LQ decomposition, with a
-        non-negative diagonal. This leaves the covariance unchanged (exactly, up to floating-point error) and pins down
-        the rotation, which is otherwise arbitrary: equivalent loadings give the same result. See
-        :func:`Covariance.prepare_for_hessian_`.
-        """
-        if self.method != 'low_rank':
-            raise TypeError(f"``_rotate_low_rank_()`` is for method='low_rank', not '{self.method}'.")
-        rotated = _to_lower_trapezoidal(self.lr_mat.detach().cpu().to(torch.float64), order)
-        self.lr_mat.copy_(rotated.masked_fill(self._get_lr_redundant(order).cpu(), 0.))
-        return self
-
-    def _get_lr_order(self) -> List[int]:
-        """
-        For "low_rank": an order of the (``param_rank``) elements that leads with the K whose factor-loadings are the
-        most linearly independent (greedily, as in a pivoted QR decomposition), followed by the rest in their usual
-        order. Rotating ``V`` to lower-trapezoidal form in this order pins the rotation on rows that are well away from
-        singular. (It depends only on ``V @ V.t()``, so a rotation doesn't change it.)
-        """
-        assert self.lr_mat is not None
-        return _get_pivot_order(self.lr_mat.detach())
-
-    def _get_lr_redundant(self, order: Optional[Sequence[int]] = None) -> Tensor:
-        """
-        For "low_rank": a ``(param_rank, K)`` boolean mask of the entries of ``lr_mat`` above the diagonal, in
-        ``order`` (default: :func:`Covariance._get_lr_order`). After ``Covariance._rotate_low_rank_()`` they're zero,
-        and they span the rotations.
-        """
-        assert self.lr_mat is not None
-        order = self._get_lr_order() if order is None else list(order)
-        position = torch.empty(self.param_rank, dtype=torch.long)
-        position[order] = torch.arange(self.param_rank)
-        return (position.unsqueeze(-1) < torch.arange(self.lr_mat.shape[-1])).to(self.lr_mat.device)
 
     # Deprecated -------------------------------------------------------------------------------------------------------
 
@@ -1206,82 +1129,6 @@ def cov2corr(cov: Tensor) -> Tensor:
     """The correlation matrix (or matrices, over leading dims) of a covariance matrix."""
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
     return cov / (std_.unsqueeze(-1) * std_.unsqueeze(-2))
-
-
-def _get_pivot_order(V: Tensor) -> List[int]:
-    """
-    An order of ``V``'s rows: first, greedily, the ``V.shape[-1]`` rows that are the most linearly independent (each
-    the one with the largest norm after projecting out those already chosen, as in a pivoted QR decomposition of
-    ``V.t()``), then the rest in their usual order. Depends only on ``V @ V.t()``.
-    """
-    residual = V.cpu().to(torch.float64).clone()
-    lead = []
-    for _ in range(min(V.shape)):
-        norms = (residual ** 2).sum(-1)
-        norms[lead] = -1.
-        i = int(norms.argmax())
-        lead.append(i)
-        if norms[i] <= 0:
-            continue
-        q = residual[i] / norms[i].sqrt()
-        residual = residual - (residual @ q).unsqueeze(-1) * q
-    return lead + [i for i in range(V.shape[0]) if i not in lead]
-
-
-def _to_lower_trapezoidal(V: Tensor, order: Sequence[int]) -> Tensor:
-    """
-    Rotate ``V`` (``(rank, K)``) to the lower-trapezoidal form with the rows in ``order`` (``V[order[i], j] = 0`` for
-    ``j > i``), by an LQ decomposition, which leaves ``V @ V.t()`` unchanged. The diagonal (``V[order[j], j]``) is made
-    non-negative, which makes this form unique: equivalent ``V``s (differing by a rotation) give the same result.
-    """
-    order = list(order)
-    _, R = torch.linalg.qr(V[order].t())
-    signs = torch.where(R.diagonal() < 0, -1., 1.).to(R)
-    out = torch.zeros_like(V)
-    out[order] = R.t() * signs
-    return out
-
-
-def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) -> tuple[Tensor, Tensor]:
-    """
-    Fit ``cov ~= V @ V.t() + diag(std ** 2)``, with ``V`` lower-trapezoidal (see ``_get_pivot_order``): principal-axis
-    factoring (alternating the top eigenvectors of ``cov - D`` with the residual diagonal ``D``) for a start, then
-    polished with L-BFGS on the squared error (principal-axis factoring alone can converge very slowly).
-
-    :return: ``V`` (``(rank, num_factors)``) and ``std`` (``(rank,)``).
-    """
-    diag = cov.diagonal()
-    min_var = diag * 1e-8
-    # start the uniqueness at the residual variance given all other elements (a standard start):
-    uniq = (1 / torch.linalg.inv(cov).diagonal()).clamp(min=min_var)
-    for _ in range(num_paf_iter):
-        evals, evecs = torch.linalg.eigh(cov - torch.diag(uniq))
-        V = evecs[:, -num_factors:] * evals[-num_factors:].clamp(min=0).sqrt()
-        new_uniq = (diag - (V ** 2).sum(-1)).clamp(min=min_var)
-        converged = (new_uniq - uniq).abs().max() <= 1e-12 * diag.max()
-        uniq = new_uniq
-        if converged:
-            break
-
-    if not converged:
-        V = V.clone(memory_format=torch.contiguous_format).requires_grad_()
-        log_uniq = uniq.log().requires_grad_()
-        opt = torch.optim.LBFGS(
-            [V, log_uniq], max_iter=1_000, tolerance_grad=1e-15, tolerance_change=1e-20, line_search_fn='strong_wolfe'
-        )
-        scale = diag.max()
-
-        def closure() -> Tensor:
-            opt.zero_grad()
-            loss = ((V @ V.t() + torch.diag(log_uniq.exp()) - cov) / scale).pow(2).sum()
-            loss.backward()
-            return loss
-
-        with torch.enable_grad():
-            opt.step(closure)
-        V, uniq = V.detach(), log_uniq.detach().exp()
-
-    return _to_lower_trapezoidal(V, _get_pivot_order(V)), uniq.sqrt()
 
 
 def _deprecated_predict_variance(predict_variance: Union[bool, nn.Module, None], kwargs: dict, default_kwarg: str):

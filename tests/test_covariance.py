@@ -205,9 +205,10 @@ def test_state_dict_across_methods():
         Covariance(rank=3, init_diag_multi=1., method='sd_corr').load_state_dict(lc.state_dict())
     with pytest.raises(RuntimeError, match=r"saved with method='sd_corr'"):
         lc2.load_state_dict(sc.state_dict())
-    lr = Covariance(rank=3, init_diag_multi=1., method='low_rank')
-    with pytest.raises(RuntimeError, match=r"saved with method='low_rank1'"):  # (with the number of factors)
-        Covariance(rank=3, init_diag_multi=1., method='sd_corr').load_state_dict(lr.state_dict())
+    # a state-dict saved with 'low_rank' (no longer available for new models):
+    low_rank_state = {'lr_mat': torch.randn(3, 1), 'log_std_devs': torch.randn(3)}
+    with pytest.raises(RuntimeError, match=r"saved with method='low_rank'.*unpickle the saved model"):
+        Covariance(rank=3, init_diag_multi=1., method='sd_corr').load_state_dict(low_rank_state)
 
 
 def test_sd_corr_conditioning():
@@ -378,7 +379,7 @@ def test_predict_std_and_corr():
 def test_predict_corr_requires_sd_corr():
     with pytest.raises(ValueError, match="requires ``method='sd_corr'``"):
         Covariance(rank=3, init_diag_multi=1., method='log_cholesky', predict_corr=Identity(), predictor_kwargs=['d'])
-    # from_measures picks sd_corr, even with >5 measures (which would otherwise default to low_rank):
+    # from_measures picks sd_corr when predict_corr is passed:
     measures = list('abcdefg')
     assert Covariance.from_measures(measures, predict_corr=Identity(), predictor_kwargs=['d']).method == 'sd_corr'
     module = Covariance.from_measures(['a', 'b'], predict_corr=Identity(), predictor_kwargs=['d'])
@@ -852,180 +853,6 @@ def test_corr_mask_representable_covs_unchanged(method: str):
     torch.testing.assert_close(converted._get_mini_cov(), cov._get_mini_cov(), rtol=1e-5, atol=1e-6)
 
 
-def _make_low_rank(**kwargs) -> Covariance:
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')  # (experimental)
-        return Covariance(rank=8, init_diag_multi=.5, method='low_rank3', empty_idx=[3], **kwargs)
-
-
-def test_low_rank_init_and_rotation():
-    # init: about half the variance (``init_diag_multi ** 2``) from the factors, half from the diagonal
-    torch.manual_seed(1)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        big = Covariance(rank=200, init_diag_multi=.5, method='low_rank4')
-    lr_var = (big.lr_mat ** 2).sum(-1).mean()
-    diag_var = (big.log_std_devs.exp() ** 2).mean()
-    assert .4 < lr_var / .25 < .6 and .4 < diag_var / .25 < .6
-
-    # the rotation leads with the rows whose loadings are the most independent, not ones that are nearly zero (like
-    # seasonal elements with tiny variance) or redundant with one already chosen:
-    cov = _make_low_rank()
-    with torch.no_grad():
-        cov.lr_mat.mul_(.001)
-        cov.lr_mat[5] = torch.tensor([2., 0., 0.])
-        cov.lr_mat[1] = torch.tensor([1.9, .1, 0.])  # (large, but nearly parallel to row 5)
-        cov.lr_mat[3] = torch.tensor([0., 1., 0.])
-        cov.lr_mat[6] = torch.tensor([.1, .1, .8])
-        cov.lr_mat.copy_(cov.lr_mat @ torch.linalg.qr(torch.randn(3, 3))[0])  # (an arbitrary rotation)
-    order = cov._get_lr_order()
-    assert order[:3] == [5, 3, 6] and sorted(order) == list(range(7))
-
-    # rotating to lower-trapezoidal in that order is exact, and doesn't change the order:
-    before = cov._get_mini_cov().detach()
-    redundant = cov._get_lr_redundant(order)
-    assert redundant.sum() == 3 and redundant[5, 1] and redundant[5, 2] and redundant[3, 2]
-    assert (cov.lr_mat[redundant] != 0).any()
-    cov._rotate_low_rank_(order)
-    assert (cov.lr_mat[redundant] == 0).all()
-    torch.testing.assert_close(cov._get_mini_cov().detach(), before)
-    assert cov._get_lr_order() == order
-
-    # the canonical form is unique: equivalent loadings (differing by a rotation) give the same result, with a
-    # non-negative diagonal
-    other = _make_low_rank()
-    with torch.no_grad():
-        other.lr_mat.copy_(cov.lr_mat @ torch.linalg.qr(torch.randn(3, 3))[0])
-    other._rotate_low_rank_(other._get_lr_order())
-    torch.testing.assert_close(other.lr_mat, cov.lr_mat)
-    assert (cov.lr_mat[order[:3], [0, 1, 2]] >= 0).all()
-
-    with pytest.raises(ValueError, match="number of factors"):
-        Covariance(rank=3, init_diag_multi=1., method='low_rank4')
-    with pytest.raises(TypeError, match="low_rank"):
-        Covariance(rank=3, init_diag_multi=1.)._rotate_low_rank_([0, 1, 2])
-
-
-def test_low_rank_set_matrix_round_trip():
-    torch.manual_seed(2)
-    cov = _make_low_rank()
-    W = torch.randn(7, 3, dtype=torch.float64)
-    target = W @ W.t() + torch.diag(torch.rand(7, dtype=torch.float64) + .1)
-    cov.set_matrix_(target)
-    torch.testing.assert_close(cov._get_mini_cov().detach().to(torch.float64), target, rtol=1e-4, atol=1e-5)
-    # and converting from another method:
-    sd_corr = Covariance.from_matrix(target, method='sd_corr')
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        low_rank = sd_corr.to_method('low_rank3')
-    torch.testing.assert_close(low_rank._get_mini_cov(), sd_corr._get_mini_cov(), rtol=1e-4, atol=1e-5)
-
-
-def _fit_low_rank_excess_loss(seed: int, old_init: bool) -> float:
-    """Fit a 2-factor covariance to simulated data (20 L-BFGS iterations); return its excess loss over the truth."""
-    torch.manual_seed(seed)
-    p, k, n = 12, 2, 400
-    W = torch.randn(p, k, dtype=torch.float64) * torch.tensor([2., 1.], dtype=torch.float64)
-    true_cov = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) * .3 + .05)
-    y = torch.distributions.MultivariateNormal(torch.zeros(p, dtype=torch.float64), true_cov).sample((n,))
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        cov = Covariance(rank=p, init_diag_multi=1., method=f'low_rank{k}').double()
-    if old_init:
-        with torch.no_grad():
-            cov.lr_mat.copy_(.01 * torch.randn(p, k))
-            cov.log_std_devs.copy_(.1 * torch.randn(p))
-
-    def get_loss(c: torch.Tensor) -> torch.Tensor:
-        return -torch.distributions.MultivariateNormal(torch.zeros(p, dtype=c.dtype), c).log_prob(y).mean()
-
-    opt = torch.optim.LBFGS(cov.parameters(), max_iter=20, line_search_fn='strong_wolfe')
-
-    def closure() -> torch.Tensor:
-        opt.zero_grad()
-        loss = get_loss(cov._get_mini_cov())
-        loss.backward()
-        return loss
-
-    opt.step(closure)
-    return (get_loss(cov._get_mini_cov()) - get_loss(true_cov)).item()
-
-
-def test_low_rank_init_recovers_factors():
-    new = sorted(_fit_low_rank_excess_loss(seed, old_init=False) for seed in range(12))
-    old = sorted(_fit_low_rank_excess_loss(seed, old_init=True) for seed in range(12))
-    # the new init gets about as close as the true covariance (it can do better: it's fit to the sample)
-    assert new[6] < .05
-    # factor-loadings near zero start at a saddle-point, so with the same budget they do worse:
-    assert old[6] > .3
-
-
-def test_low_rank_old_state_dict_loads():
-    # the parameterization is unchanged (only the init is new), so old state-dicts load as is:
-    torch.manual_seed(3)
-    old = _make_low_rank()
-    with torch.no_grad():
-        old.lr_mat.copy_(.01 * torch.randn_like(old.lr_mat))
-    state_dict = old.state_dict()
-    state_dict._metadata[''] = {'version': 1}
-    new = _make_low_rank()
-    new.load_state_dict(state_dict)
-    torch.testing.assert_close(new._get_mini_cov(), old._get_mini_cov(), rtol=0, atol=0)
-
-
-def test_low_rank_identified_after_rotation():
-    # at the optimum of a gaussian likelihood, the hessian is singular along the rotations, and non-singular once
-    # the rotated factor's redundant entries are left out
-    torch.manual_seed(4)
-    p, k = 6, 2
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        cov = Covariance(rank=p, init_diag_multi=1., method=f'low_rank{k}').double()
-    W = torch.randn(p, k, dtype=torch.float64)
-    target = W @ W.t() + torch.diag(torch.rand(p, dtype=torch.float64) + .2)
-    cov.set_matrix_(target)
-    order = cov._get_lr_order()
-    cov._rotate_low_rank_(order)
-    lr0, std0 = cov.lr_mat.detach().clone(), cov.log_std_devs.detach().clone()
-
-    def nll(flat: torch.Tensor) -> torch.Tensor:
-        lr, log_std = flat[:p * k].reshape(p, k), flat[p * k:]
-        c = lr @ lr.t() + torch.diag(log_std.exp() ** 2)
-        return torch.logdet(c) + torch.trace(torch.linalg.solve(c, target))
-
-    hess = torch.autograd.functional.hessian(nll, torch.cat([lr0.reshape(-1), std0]))
-    assert torch.linalg.eigvalsh(hess).abs().min() < 1e-8
-    keep = torch.cat([~cov._get_lr_redundant(order).reshape(-1), torch.ones(p, dtype=torch.bool)])
-    assert torch.linalg.eigvalsh(hess[keep][:, keep]).min() > 1e-4
-
-
-def test_laplace_leaves_out_low_rank_rotation():
-    torch.manual_seed(5)
-    processes = [LocalLevel(id=f'level_{m}', measure=m) for m in 'abc']
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        kf = KalmanFilter(
-            processes=processes,
-            measures=list('abc'),
-            initial_covariance=Covariance.from_processes(processes, cov_type='initial', method='low_rank2')
-        )
-    y = torch.randn(2, 10, 3)
-    with torch.no_grad():
-        before = kf(y)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')  # (an unfitted model's hessian needn't be positive-definite)
-        mvnorm, names = kf.get_laplace_mvnorm(y)
-    num_params = sum(p.numel() for p in kf.parameters())
-    assert len(names) == mvnorm.loc.numel() == num_params - 1  # k * (k - 1) / 2 for k = 2
-    lr_mat = kf.initial_covariance.lr_mat
-    left_out = [i for i in range(lr_mat.numel()) if f'initial_covariance.lr_mat[{i}]' not in names]
-    assert len(left_out) == 1 and lr_mat.reshape(-1)[left_out[0]] == 0  # (the entry the rotation set to zero)
-    with torch.no_grad():
-        after = kf(y)
-    torch.testing.assert_close(after.means, before.means)
-    torch.testing.assert_close(after.covs, before.covs)
-
-
 def _make_seasonal_processes(num_measures: int) -> list:
     # 5 elements per measure (a level, and a season with 4)
     return [
@@ -1038,112 +865,51 @@ def _make_seasonal_processes(num_measures: int) -> list:
 
 
 def test_default_methods():
-    # initial covariance: low_rank from 15 elements with parameters
-    big, small = _make_seasonal_processes(3), _make_seasonal_processes(2)
-    cov = Covariance.from_processes(big, cov_type='initial')
-    assert cov.method == 'low_rank' and cov.param_rank == 15 and cov.lr_mat.shape == (15, 3)
-    assert Covariance.from_processes(small, cov_type='initial').method == 'log_cholesky'
-    # not with ``corr_groups``, nor for the process-covariance, nor when ``method`` is passed:
-    assert Covariance.from_processes(big, cov_type='initial', corr_groups=[['level0']]).method == 'log_cholesky'
+    # everything defaults to log_cholesky, however large:
+    big = _make_seasonal_processes(3)
+    assert Covariance.from_processes(big, cov_type='initial').method == 'log_cholesky'
     assert Covariance.from_processes(big).method == 'log_cholesky'
-    explicit = Covariance.from_processes(big, cov_type='initial', method='log_cholesky')
-    assert explicit.method == 'log_cholesky'
-    # stationary elements don't count:
-    decaying = big + [LocalLevel(id='transient', measure='y0', decay=(.5, .95))]
-    assert Covariance.from_processes(decaying, cov_type='initial').method == 'low_rank'
-    transients = [LocalLevel(id=f't{i}', measure=f'y{i}', decay=(.5, .95)) for i in range(3)]
-    mixed = _make_seasonal_processes(3)[:-1] + transients + [LocalLevel(id='t3', measure='y0', decay=(.5, .95))]
-    assert Covariance.from_processes(mixed, cov_type='initial').param_rank == 15
-    assert Covariance.from_processes(mixed, cov_type='initial').method == 'low_rank'
-    stationary = ['t0', 't1', 't2', 't3']
-    assert Covariance.from_processes(mixed, cov_type='initial', stationary=stationary).method == 'log_cholesky'
-
-    # measure covariance: always log_cholesky by default
     assert Covariance.from_measures([f'y{i}' for i in range(8)]).method == 'log_cholesky'
-
-    # a default model:
     kf = KalmanFilter(processes=big, measures=['y0', 'y1', 'y2'])
-    assert kf.initial_covariance.method == 'low_rank'
-    assert kf.process_covariance.method == 'log_cholesky'
+    assert kf.initial_covariance.method == kf.process_covariance.method == 'log_cholesky'
+    assert kf.measure_covariance.method == 'log_cholesky'
+    # 'low_rank' is no longer available for new models:
+    with pytest.raises(ValueError, match="no longer available"):
+        Covariance.from_processes(big, cov_type='initial', method='low_rank')
+    with pytest.raises(ValueError, match="no longer available"):
+        Covariance.from_measures([f'y{i}' for i in range(8)], method='low_rank3')
 
 
-def test_older_default_state_dicts_raise_with_fix():
+def _make_pickled_low_rank(rank: int, num_factors: int) -> Covariance:
+    """A 'low_rank' covariance as an older torchcast would have pickled it (it can't be created any more)."""
+    cov = Covariance(rank=rank, init_diag_multi=1.)
+    cov.cholesky_log_diag = None
+    cov.cholesky_off_diag = None
+    cov.method = 'low_rank'
+    cov.lr_mat = torch.nn.Parameter(torch.randn(rank, num_factors))
+    cov.log_std_devs = torch.nn.Parameter(torch.randn(rank) * .1)
+    return cov
+
+
+def test_pickled_low_rank_still_works():
     torch.manual_seed(0)
-    measures = [f'y{i}' for i in range(3)]
+    old = _make_pickled_low_rank(rank=7, num_factors=2)
+    expected = (old.lr_mat @ old.lr_mat.t() + torch.diag(old.log_std_devs.exp() ** 2)).detach()
+    with pytest.warns(FutureWarning, match=r"method='low_rank'.*to_method\('log_cholesky'\)"):
+        unpickled = pickle.loads(pickle.dumps(old))
+    torch.testing.assert_close(unpickled({}, num_groups=1, num_times=1).squeeze().detach(), expected)
+    # it converts exactly:
+    converted = unpickled.to_method('log_cholesky')
+    assert converted.method == 'log_cholesky'
+    torch.testing.assert_close(converted._get_mini_cov().detach(), expected, rtol=1e-5, atol=1e-6)
 
-    def make(**kwargs) -> KalmanFilter:
-        return KalmanFilter(processes=_make_seasonal_processes(3), measures=measures, **kwargs)
 
-    # saved under the old defaults: a full initial covariance (and, with > 5 measures, a low_rank measure-covariance)
-    old = make(
-        initial_covariance=Covariance.from_processes(
-            _make_seasonal_processes(3), cov_type='initial', method='log_cholesky'
-        )
-    )
-    y = torch.randn(2, 12, 3)
-    start_offsets = np.zeros(2, dtype='int')
-    with torch.no_grad():
-        old_pred = old(y, start_offsets=start_offsets)
-
-    # a model built with the new defaults raises, saying how to load it:
-    new = make()
-    assert new.initial_covariance.method == 'low_rank'
-    with pytest.raises(RuntimeError, match=r"from_processes\(\.\.\., method='log_cholesky'\).*torchcast 2\.0"):
-        new.load_state_dict(old.state_dict())
-    # following that, it loads with the same predictions:
-    fixed = make(
-        initial_covariance=Covariance.from_processes(
-            _make_seasonal_processes(3), cov_type='initial', method='log_cholesky'
-        )
-    )
-    fixed.load_state_dict(old.state_dict())
-    with torch.no_grad():
-        new_pred = fixed(y, start_offsets=start_offsets)
-    torch.testing.assert_close(new_pred.means, old_pred.means)
-    torch.testing.assert_close(new_pred.covs, old_pred.covs)
-
-    # the message names the number of factors for low_rank:
+def test_low_rank_state_dicts_raise_with_guidance():
+    # e.g. a measure-covariance with more than 5 measures, which used to default to 'low_rank':
     many = [f'y{i}' for i in range(7)]
-    old_mcov = Covariance.from_measures(many, method='low_rank')
-    with pytest.raises(RuntimeError, match=r"from_measures\(\.\.\., method='low_rank2'\)"):
-        Covariance.from_measures(many).load_state_dict(old_mcov.state_dict())
-    fixed_mcov = Covariance.from_measures(many, method='low_rank2')
-    fixed_mcov.load_state_dict(old_mcov.state_dict())
-    torch.testing.assert_close(fixed_mcov._get_mini_cov(), old_mcov._get_mini_cov())
-
-
-def test_prepare_for_hessian_hook(monkeypatch):
-    # ``get_laplace_mvnorm()`` calls ``prepare_for_hessian_()`` on any submodule that has it, and leaves out what it
-    # returns -- nothing covariance-specific:
-    torch.manual_seed(6)
-    kf = KalmanFilter(processes=[LocalLevel(id='level', measure='y')], measures=['y'])
-    calls = []
-
-    def prepare_for_hessian_() -> dict:
-        calls.append(True)
-        return {'initial_mean': torch.ones(1, dtype=torch.bool)}
-
-    monkeypatch.setattr(kf.processes['level'], 'prepare_for_hessian_', prepare_for_hessian_, raising=False)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        _, names = kf.get_laplace_mvnorm(torch.randn(2, 10, 1))
-    assert calls == [True]
-    assert 'processes.level.initial_mean[0]' not in names
-    assert len(names) == sum(p.numel() for p in kf.parameters()) - 1
-
-    # a non-callable ``prepare_for_hessian_`` is a mistake, not something to skip:
-    monkeypatch.setattr(kf.processes['level'], 'prepare_for_hessian_', {'initial_mean': True}, raising=False)
-    with pytest.raises(TypeError, match="not callable"):
-        kf.get_laplace_mvnorm(torch.randn(2, 10, 1))
-
-    # other covariance methods leave everything in:
-    assert Covariance(rank=3, init_diag_multi=1.).prepare_for_hessian_() == {}
-    # "low_rank" with groups: only one of the groups' rotations can be pinned
-    groups = torch.tensor([0, 0, 0, 1, 1, 1])
-    corr_mask = (groups.unsqueeze(-1) == groups.unsqueeze(-2)).to(torch.get_default_dtype())
-    masked = Covariance(rank=6, init_diag_multi=1., method='low_rank2', corr_mask=corr_mask)
-    with pytest.warns(UserWarning, match="each group's factor-loadings can be rotated separately"):
-        masked.prepare_for_hessian_()
+    old = _make_pickled_low_rank(rank=7, num_factors=2)
+    with pytest.raises(RuntimeError, match=r"saved with method='low_rank'.*unpickle the saved model.*older torchcast"):
+        Covariance.from_measures(many).load_state_dict(old.state_dict())
 
 
 def test_cov2corr():
