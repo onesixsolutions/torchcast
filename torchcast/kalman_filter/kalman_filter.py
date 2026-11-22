@@ -37,6 +37,31 @@ def _has_decay(se: StateElement) -> bool:
     return not (isinstance(multi, FixedValue) and bool(multi.value == 1))
 
 
+def _has_learned_decay(se: StateElement) -> bool:
+    """
+    Whether a state element's transition to itself is learned, and can be (but isn't fixed at) less than 1; e.g. not
+    ``Bounded`` with an upper bound of 1 or more (which has no stationary variance).
+    """
+    multi = se.transitions_to[se.name]
+    if not any(p.requires_grad for p in multi.parameters()):
+        return False
+    upper = getattr(multi, 'upper', None)
+    return not (isinstance(upper, (float, int)) and upper >= 1)
+
+
+def _get_stationary_init_elements(processes: dict[str, Process]) -> list[tuple[int, str, str]]:
+    """``(index, process id, state element name)`` for the elements with ``stationary_initial_variance=True``."""
+    out = []
+    start = 0
+    for pid, p in processes.items():
+        for i, (nm, se) in enumerate(p.state_elements.items()):
+            # (``getattr``: state elements pickled before this existed don't have the attribute)
+            if getattr(se, 'stationary_initial_variance', None):
+                out.append((start + i, pid, nm))
+        start += p.rank
+    return out
+
+
 class KalmanFilter(StateSpaceModel):
     """
     :param processes: A list of :class:`.Process` modules.
@@ -85,7 +110,83 @@ class KalmanFilter(StateSpaceModel):
         self.process_covariance = process_covariance.set_id('process_covariance')
         self.initial_covariance = initial_covariance.set_id('initial_covariance')
         self.joseph_form = joseph_form
+        self._validate_stationary_initial_variance()
         self._warn_correlated_levels()
+        self._warn_free_decay_initial_variance()
+
+    def _validate_stationary_initial_variance(self):
+        for idx, pid, nm in _get_stationary_init_elements(self.processes):
+            process = self.processes[pid]
+            label = f"`{pid}.{nm}` has ``stationary_initial_variance=True``"
+            if not process.linear_transition:
+                raise ValueError(f"{label}, which isn't supported for processes with a nonlinear transition.")
+            feeders = [
+                other for other, se in process.state_elements.items() if other != nm and nm in se.transitions_to
+            ]
+            if feeders:
+                raise ValueError(
+                    f"{label}, but {feeders} also transition into it, so its stationary variance isn't "
+                    f"``sigma^2 / (1 - decay^2)``."
+                )
+            if idx in self.process_covariance.empty_idx:
+                raise ValueError(f"{label}, but it has no process-variance in ``process_covariance``.")
+            if idx not in self.initial_covariance.empty_idx:
+                raise ValueError(
+                    f"{label}, but ``initial_covariance`` has a free parameter for it (was it created before the "
+                    f"process, or not with ``Covariance.from_processes(processes, cov_type='initial')``?)."
+                )
+
+    def _warn_free_decay_initial_variance(self):
+        """
+        A decaying level whose decay is learned, and whose initial variance is free, is poorly identified: the decay
+        trades off against the initial variance.
+        """
+        free = []
+        start = 0
+        for pid, p in self.processes.items():
+            for i, se in enumerate(p.state_elements.values()):
+                if (
+                        _is_level_like(se)
+                        and _has_learned_decay(se)
+                        and getattr(se, 'stationary_initial_variance', None) is None
+                        and (start + i) not in self.initial_covariance.empty_idx
+                ):
+                    free.append(pid if p.rank == 1 else f'{pid}.{se.name}')
+            start += p.rank
+        if not free:
+            return
+        warn(
+            f"These decaying processes have a learned decay and a free initial variance: {free}. That's poorly "
+            f"identified: a faster decay with a larger initial variance fits the start of a series about as well as a "
+            f"slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the "
+            f"whole series. Consider tying the initial variance to the stationary variance, sigma^2 / (1 - decay^2), "
+            f"with ``LocalLevel(..., stationary_initial_variance=True)`` (``StateElement(..., "
+            f"stationary_initial_variance=True)`` in custom processes); or pass ``stationary_initial_variance=False`` "
+            f"to keep the free initial variance and silence this warning."
+        )
+
+    def _default_initial_cov(self) -> torch.Tensor:
+        init_cov = self.initial_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[:, 0]
+        stationary = _get_stationary_init_elements(self.processes)
+        if stationary:
+            # the base process-variance (ignoring any ``predict_variance``, as the initial covariance does):
+            pcov = self.process_covariance({}, num_groups=1, num_times=1, _ignore_input=True)[0, 0]
+            idx, variances = [], []
+            for i, pid, nm in stationary:
+                decay = self.processes[pid].state_elements[nm].transitions_to[nm]().reshape(())
+                if not bool(decay.abs() < 1):
+                    raise RuntimeError(
+                        f"`{pid}.{nm}` has ``stationary_initial_variance=True`` but its decay is {decay.item():.4f}; "
+                        f"there's no stationary variance unless it's less than 1 (in absolute value)."
+                    )
+                idx.append(i)
+                variances.append(pcov[i, i] / (1 - decay.to(pcov) ** 2))
+            extra = pcov.new_zeros(self.state_rank).index_put(
+                (torch.tensor(idx, device=pcov.device),), torch.stack(variances)
+            )
+            init_cov = init_cov + torch.diag_embed(extra)
+        # both are on the same (measure-relative) scale, so the scaling applies to the sum:
+        return self._apply_cov_scaling(init_cov, scaling=self._get_measure_scaling(), is_process_cov=True)
 
     def _warn_correlated_levels(self):
         """

@@ -145,6 +145,12 @@ A parameterization that separates scale from correlation: `diag(std) @ R @ diag(
 - `KalmanFilter` now warns when two level-like processes on the same measure (state-elements with process-noise, a fixed measurement-weight, that transition only to themselves -- e.g. `LocalLevel`, `LocalTrend`'s position) have correlated process-noise, with a ready-made `corr_groups` that puts the decaying ones in their own group.
 - `LocalLevel`'s docs note that `decay=True` can't give a half-life below ~13 timesteps, and encourage setting the bounds from domain-knowledge.
 
+### New option: a decaying level's initial variance from its stationary variance (`stationary_initial_variance`)
+
+`LocalLevel(..., decay=(.5, .95), stationary_initial_variance=True)` ties the level's initial variance to its stationary variance, `sigma^2 / (1 - decay^2)` (`sigma^2` its process-variance), instead of a free parameter of the `initial_covariance`. With a learned decay, a free initial variance is poorly identified: a faster decay with a larger initial variance fits the start of a series about as well as a slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the whole series (in a fitted model, the Hessian's weakest directions loaded mainly on a decay rate together with the initial-covariance parameters). The element's initial correlations with other elements are zero (it's excluded from the `initial_covariance`, as with `has_initial_variance=False`): the joint stationary covariance with a non-stationary element such as a random walk doesn't exist, and free correlations would bring back parameters that trade off against the decay. The stationary variance uses the base process-variance (before any `predict_variance`). Custom processes can use `StateElement(..., stationary_initial_variance=True)`, for elements with process-noise that transition only from themselves.
+
+- `KalmanFilter` now warns when a level-like process has a learned decay (that can't reach 1) and a free initial variance. Pass `stationary_initial_variance=True` to fix it, or `False` to keep the free initial variance and silence the warning. The default (`None`) behaves as before.
+
 ### Overridable design models
 
 `StateSpaceModel.forward()` now builds its transition and measurement models through two methods,

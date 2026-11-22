@@ -61,14 +61,32 @@ class StateElement(torch.nn.Module):
                  name: str,
                  measure_multi: Union[float, torch.nn.Module, None],
                  has_process_variance: bool,
-                 has_initial_variance: bool = True):
+                 has_initial_variance: bool = True,
+                 stationary_initial_variance: Optional[bool] = None):
+        """
+        :param name: The name of this state element, unique within its process.
+        :param measure_multi: Its weight in the measurement (``None`` if the process builds its own measurement
+         matrix).
+        :param has_process_variance: Whether it has process-noise.
+        :param has_initial_variance: Whether it has a (free) initial variance.
+        :param stationary_initial_variance: If ``True``, its initial variance is its stationary variance,
+         ``sigma^2 / (1 - decay^2)``, where ``sigma^2`` is its process-variance and ``decay`` its transition to itself
+         (which must be less than 1), rather than a free parameter of the initial covariance. Its initial
+         correlations with other elements are zero. This needs process-noise, and a transition only from itself (see
+         :class:`.LocalLevel`). ``False`` keeps a free initial variance and says so explicitly (silencing a
+         :class:`.KalmanFilter` warning about learned decays); ``None`` (the default) does the same without saying so.
+        """
         super().__init__()
         self.name = name
         if not callable(measure_multi) and measure_multi is not None:
             measure_multi = FixedValue(measure_multi)
         self._measure_multi = measure_multi
         self.has_process_variance = has_process_variance
-        self.has_initial_variance = has_initial_variance
+        if stationary_initial_variance and not has_process_variance:
+            raise ValueError(f"`{name}`: ``stationary_initial_variance`` needs ``has_process_variance=True``.")
+        self.stationary_initial_variance = stationary_initial_variance
+        # the initial variance isn't a free parameter if it's derived from the stationary variance:
+        self.has_initial_variance = has_initial_variance and not stationary_initial_variance
         self.transitions_to = torch.nn.ModuleDict()
         # self-transitions by default:
         self.set_transition_to(self, multi=1.0)

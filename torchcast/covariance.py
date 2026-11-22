@@ -66,7 +66,9 @@ class Covariance(nn.Module):
                        **kwargs) -> 'Covariance':
         """
         :param processes: The ``processes`` used in your :class:`.StateSpaceModel`.
-        :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process').
+        :param cov_type: The type of covariance, either 'process' or 'initial' (default: 'process'). For 'initial',
+         state elements with ``stationary_initial_variance=True`` (see :class:`.LocalLevel`) get no parameters: the
+         :class:`.KalmanFilter` derives their initial variance from the process-covariance and their decay.
         :param predict_variance: Will the variance be predicted upon calling ``forward()``? This is implemented as a
          multiplier on the base variance given from the 'method'. You can either pass ``True`` in which case it is
          expected you will pass multipliers as 'process_var_multi' when ``forward()`` is called; *or* you can pass a
