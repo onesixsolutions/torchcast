@@ -802,6 +802,15 @@ def _log_cosh(x: Tensor) -> Tensor:
 
 
 def log_chol_to_chol(log_diag: torch.Tensor, off_diag: torch.Tensor) -> torch.Tensor:
+    """
+    A lower-triangular cholesky factor from its log-diagonal and its off-diagonal entries (filled into the strict lower
+    triangle in the order of ``torch.tril_indices(rank, rank, -1)``), as parameterized by
+    ``Covariance(method='log_cholesky')``.
+
+    :param log_diag: Tensor whose last dim is ``rank``.
+    :param off_diag: Tensor whose last dim is ``rank * (rank - 1) / 2``.
+    :return: Tensor with trailing dims ``(rank, rank)``.
+    """
     assert log_diag.shape[:-1] == off_diag.shape[:-1]
 
     rank = log_diag.shape[-1]
@@ -855,6 +864,7 @@ def _cholesky(cov: Tensor) -> Tensor:
 
 
 def cov2corr(cov: Tensor) -> Tensor:
+    """The correlation matrix (or matrices, over leading dims) of a covariance matrix."""
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
     return cov / (std_.unsqueeze(-1) * std_.unsqueeze(-2))
 
@@ -938,7 +948,11 @@ def _fit_factor_model(cov: Tensor, num_factors: int, num_paf_iter: int = 2_000) 
 # backwards compat shim
 class _DeprecatedBase(types.ModuleType):
     def __getattr__(self, name):
-        if name != '__file__':
+        if name not in globals():
+            # (an ``AttributeError``, as ``getattr(module, name, default)`` and tools probing modules expect)
+            raise AttributeError(f"module 'torchcast.covariance' has no attribute '{name}'")
+        # (no warning for dunders such as ``__file__``, which tools like sphinx look up)
+        if not (name.startswith('__') and name.endswith('__')):
             warn(
                 f"`torchcast.covariance.base.{name}` is deprecated, instead just import from "
                 f"`torchcast.covariance.{name}`.",

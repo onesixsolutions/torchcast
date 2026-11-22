@@ -928,3 +928,15 @@ def test_log_chol_to_chol_deprecated_alias():
     with pytest.warns(FutureWarning, match="use ``torchcast.covariance.log_chol_to_chol"):
         L = Covariance.log_chol_to_chol(log_diag, off_diag)
     torch.testing.assert_close(L, log_chol_to_chol(log_diag, off_diag))
+
+
+def test_covariance_base_shim():
+    import torchcast.covariance.base as base
+    with pytest.warns(FutureWarning, match="covariance.base.Covariance` is deprecated"):
+        assert base.Covariance is Covariance
+    # missing attributes raise AttributeError (so ``getattr(..., default)`` works), and dunders don't warn:
+    assert getattr(base, 'does_not_exist', None) is None
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert getattr(base, '__sphinx_mock__', None) is None
+        base.__file__
