@@ -311,7 +311,7 @@ class Covariance(nn.Module):
         self.register_buffer('mask', mask)
 
         if corr_mask is not None:
-            self.register_buffer('corr_mask', self._validate_corr_mask(corr_mask, rank=self.rank))
+            self.register_buffer('corr_mask', _validate_corr_mask(corr_mask, rank=self.rank))
 
         self._set_params(method, init_diag_multi)
 
@@ -322,22 +322,6 @@ class Covariance(nn.Module):
         if isinstance(expected_kwargs, str):
             expected_kwargs = [expected_kwargs]
         self.expected_kwargs: Optional[List[str]] = None if expected_kwargs is None else list(expected_kwargs)
-
-    @staticmethod
-    def _validate_corr_mask(corr_mask: Tensor, rank: int) -> Tensor:
-        corr_mask = torch.as_tensor(corr_mask, dtype=torch.get_default_dtype()).detach().clone()
-        if corr_mask.shape != (rank, rank):
-            raise ValueError(f"Expected ``corr_mask`` to have shape {(rank, rank)}, got {tuple(corr_mask.shape)}.")
-        if not torch.equal(corr_mask, corr_mask.t()):
-            raise ValueError("``corr_mask`` must be symmetric.")
-        if not (corr_mask.diagonal() == 1).all():
-            raise ValueError("``corr_mask`` must have ones on the diagonal.")
-        if torch.linalg.eigvalsh(corr_mask.to(torch.float64)).min() < -1e-8:
-            raise ValueError(
-                "``corr_mask`` must be positive semi-definite (otherwise the masked covariance may not be), e.g. a "
-                "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
-            )
-        return corr_mask
 
     def _set_params(self, method: str, init_diag_multi: float):
         self.cholesky_log_diag: Optional[nn.Parameter] = None
@@ -413,7 +397,7 @@ class Covariance(nn.Module):
     def _get_mini_cov(self) -> Tensor:
         if self.method == 'log_cholesky':
             assert self.cholesky_log_diag is not None
-            L = self.log_chol_to_chol(self.cholesky_log_diag, self._get_off_diag())
+            L = log_chol_to_chol(self.cholesky_log_diag, self._get_off_diag())
             mini_cov = L @ L.t()
         elif self.method == 'sd_corr':
             assert self.log_std_devs is not None
@@ -442,18 +426,6 @@ class Covariance(nn.Module):
             )
             mini_cov = mini_cov + torch.eye(mini_cov.shape[-1], device=mini_cov.device, dtype=mini_cov.dtype) * 1e-12
         return mini_cov
-
-    @staticmethod
-    def log_chol_to_chol(log_diag: torch.Tensor, off_diag: torch.Tensor) -> torch.Tensor:
-        assert log_diag.shape[:-1] == off_diag.shape[:-1]
-
-        rank = log_diag.shape[-1]
-        L1 = torch.diag_embed(torch.exp(log_diag))
-
-        L2 = torch.zeros_like(L1)
-        mask = torch.tril_indices(rank, rank, offset=-1)
-        L2[mask[0], mask[1]] = off_diag
-        return L1 + L2
 
     def _get_off_diag(self) -> Tensor:
         """
@@ -505,7 +477,7 @@ class Covariance(nn.Module):
         std = mini_cov.diagonal(dim1=-2, dim2=-1).sqrt()
         return torch.linalg.cholesky(mini_cov / (std.unsqueeze(-1) * std.unsqueeze(-2)))
 
-    # Setting from a matrix, and converting ----------------------------------------------------------------------------
+    # Setting parameters, and converting between methods ---------------------------------------------------------------
 
     @torch.no_grad()
     def set_matrix_(self, cov: Tensor) -> 'Covariance':
@@ -607,6 +579,38 @@ class Covariance(nn.Module):
         out = copy.deepcopy(self)
         out._set_params(method, init_diag_multi=1.0)
         return out.set_matrix_(self._get_mini_cov().detach())
+
+    def _load_from_state_dict(self,
+                              state_dict,
+                              prefix,
+                              local_metadata,
+                              strict,
+                              missing_keys,
+                              unexpected_keys,
+                              error_msgs):
+        # a state-dict saved with a different ``method`` would otherwise fail with a generic missing/unexpected-keys
+        # error (or, for ``log_std_devs``, which 'low_rank' and 'sd_corr' share, partially load):
+        present = {k[len(prefix):] for k in state_dict if k.startswith(prefix)}
+        expected = set(_METHOD_PARAMS.get(self.method, ()))
+        if not expected <= present:
+            saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
+            if saved_with:
+                saved = saved_with[0]
+                if saved == 'low_rank':
+                    saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
+                error_msgs.append(
+                    f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
+                    f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
+                    f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
+                    f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
+                    f"(torchcast 2.0 changed the default methods: \"low_rank\" for an initial covariance with "
+                    f"{LOW_RANK_MIN_INITIAL} or more elements with parameters, and \"log_cholesky\" for every "
+                    f"measure-covariance.)"
+                )
+                return
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     # Indexing the parameters ------------------------------------------------------------------------------------------
 
@@ -716,39 +720,16 @@ class Covariance(nn.Module):
         position[order] = torch.arange(self.param_rank)
         return (position.unsqueeze(-1) < torch.arange(self.lr_mat.shape[-1])).to(self.lr_mat.device)
 
-    # Loading state-dicts ----------------------------------------------------------------------------------------------
+    # Deprecated -------------------------------------------------------------------------------------------------------
 
-    def _load_from_state_dict(self,
-                              state_dict,
-                              prefix,
-                              local_metadata,
-                              strict,
-                              missing_keys,
-                              unexpected_keys,
-                              error_msgs):
-        # a state-dict saved with a different ``method`` would otherwise fail with a generic missing/unexpected-keys
-        # error (or, for ``log_std_devs``, which 'low_rank' and 'sd_corr' share, partially load):
-        present = {k[len(prefix):] for k in state_dict if k.startswith(prefix)}
-        expected = set(_METHOD_PARAMS.get(self.method, ()))
-        if not expected <= present:
-            saved_with = [m for m, nms in _METHOD_PARAMS.items() if m != self.method and set(nms) <= present]
-            if saved_with:
-                saved = saved_with[0]
-                if saved == 'low_rank':
-                    saved = f"low_rank{state_dict[prefix + 'lr_mat'].shape[-1]}"
-                error_msgs.append(
-                    f"`{self.id or type(self).__name__}` uses method='{self.method}', but the state-dict was saved "
-                    f"with method='{saved}'. To load it, create this covariance with ``method='{saved}'`` (e.g. "
-                    f"``Covariance.from_processes(..., method='{saved}')`` or ``Covariance.from_measures(..., "
-                    f"method='{saved}')``), then, if you like, convert it with ``.to_method('{self.method}')``. "
-                    f"(torchcast 2.0 changed the default methods: \"low_rank\" for an initial covariance with "
-                    f"{LOW_RANK_MIN_INITIAL} or more elements with parameters, and \"log_cholesky\" for every "
-                    f"measure-covariance.)"
-                )
-                return
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    @staticmethod
+    def log_chol_to_chol(log_diag: Tensor, off_diag: Tensor) -> Tensor:
+        """Deprecated: use :func:`torchcast.covariance.log_chol_to_chol`."""
+        warn(
+            "``Covariance.log_chol_to_chol()`` is deprecated, use ``torchcast.covariance.log_chol_to_chol()``.",
+            FutureWarning
         )
+        return log_chol_to_chol(log_diag, off_diag)
 
 
 def num_off_diag(rank: int) -> int:
@@ -764,6 +745,18 @@ def _unpack_off_diag(packed: Tensor, keep: Tensor) -> Tensor:
 def _log_cosh(x: Tensor) -> Tensor:
     # stable for large |x|, and smooth (exact second derivative at 0, unlike formulas using abs(x))
     return x + F.softplus(-2. * x) - math.log(2.)
+
+
+def log_chol_to_chol(log_diag: torch.Tensor, off_diag: torch.Tensor) -> torch.Tensor:
+    assert log_diag.shape[:-1] == off_diag.shape[:-1]
+
+    rank = log_diag.shape[-1]
+    L1 = torch.diag_embed(torch.exp(log_diag))
+
+    L2 = torch.zeros_like(L1)
+    mask = torch.tril_indices(rank, rank, offset=-1)
+    L2[mask[0], mask[1]] = off_diag
+    return L1 + L2
 
 
 def corr_cholesky_from_unconstrained(u: Tensor, rank: int) -> Tensor:
@@ -810,6 +803,22 @@ def _cholesky(cov: Tensor) -> Tensor:
 def cov2corr(cov: Tensor) -> Tensor:
     std_ = torch.sqrt(torch.diagonal(cov, dim1=-2, dim2=-1))
     return cov / (std_.unsqueeze(-1) * std_.unsqueeze(-2))
+
+
+def _validate_corr_mask(corr_mask: Tensor, rank: int) -> Tensor:
+    corr_mask = torch.as_tensor(corr_mask, dtype=torch.get_default_dtype()).detach().clone()
+    if corr_mask.shape != (rank, rank):
+        raise ValueError(f"Expected ``corr_mask`` to have shape {(rank, rank)}, got {tuple(corr_mask.shape)}.")
+    if not torch.equal(corr_mask, corr_mask.t()):
+        raise ValueError("``corr_mask`` must be symmetric.")
+    if not (corr_mask.diagonal() == 1).all():
+        raise ValueError("``corr_mask`` must have ones on the diagonal.")
+    if torch.linalg.eigvalsh(corr_mask.to(torch.float64)).min() < -1e-8:
+        raise ValueError(
+            "``corr_mask`` must be positive semi-definite (otherwise the masked covariance may not be), e.g. a "
+            "block-diagonal matrix of ones; see ``corr_groups`` in ``Covariance.from_processes()``."
+        )
+    return corr_mask
 
 
 def _corr_groups_to_mask(element_ids: Sequence[str], corr_groups: Sequence[Sequence[str]], kind: str) -> Tensor:

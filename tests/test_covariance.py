@@ -920,3 +920,11 @@ def test_cov2corr():
     torch.testing.assert_close(corr.diagonal(), torch.ones(4, dtype=torch.float64))
     # batched:
     torch.testing.assert_close(cov2corr(torch.stack([cov, 2 * cov])), torch.stack([corr, corr]))
+
+
+def test_log_chol_to_chol_deprecated_alias():
+    from torchcast.covariance import log_chol_to_chol
+    log_diag, off_diag = torch.randn(3), torch.randn(3)
+    with pytest.warns(FutureWarning, match="use ``torchcast.covariance.log_chol_to_chol"):
+        L = Covariance.log_chol_to_chol(log_diag, off_diag)
+    torch.testing.assert_close(L, log_chol_to_chol(log_diag, off_diag))
