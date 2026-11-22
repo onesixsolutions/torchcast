@@ -83,10 +83,12 @@ class BinomialFilter(KalmanFilter):
         )
 
         if isinstance(do_post_hoc_correction, bool):
-            mode = 'auto' if do_post_hoc_correction else 'none'
+            # (``True`` keeps its previous behavior, a slope on ``log(num_obs)``, rather than the new default 'auto')
+            mode = 'num_obs' if do_post_hoc_correction else 'none'
+            alternatives = "``'auto'`` or ``'static'``" if do_post_hoc_correction else "another mode"
             warn(
                 f"``do_post_hoc_correction={do_post_hoc_correction}`` is deprecated; use ``'{mode}'`` (the same), or "
-                f"choose ``'static'`` or ``'num_obs'`` (see the ``BinomialFilter`` docs).",
+                f"choose {alternatives} (see the ``BinomialFilter`` docs).",
                 FutureWarning
             )
             do_post_hoc_correction = mode
@@ -145,7 +147,7 @@ class BinomialFilter(KalmanFilter):
                               missing_keys,
                               unexpected_keys,
                               error_msgs):
-        # with 'auto' (e.g. a model created with the default, or ``True``, to load a fitted one): match the saved
+        # with 'auto' (e.g. a model created with the default, to load a fitted one): match the saved
         # correction's parameters ('num_obs' has a slope, ``post_correction_module.weight``; 'static' doesn't)
         saved = {k[len(prefix):] for k in state_dict if k.startswith(prefix + 'post_correction_module.')}
         saved_mode = 'num_obs' if 'post_correction_module.weight' in saved else \

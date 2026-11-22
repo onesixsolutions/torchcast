@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## v2.0.0 (unreleased)
+## v2.0.0
 
 ### New feature: mixture components (experimental)
 
@@ -51,9 +51,9 @@ inflate the variance.
   back-transformed exactly (quantiles pass through monotone transforms), and so is the mean: `E[inverse(Y)]` rather
   than `inverse(E[Y])`, via closed form where available and gauss-hermite quadrature otherwise. For models with
   mixture components, each regime is back-transformed and then mixed. Actuals are back-transformed too.
-- `Transform` is the base class: subclasses only need to implement `inverse()`. `LogTransform` and
-  `BoxCoxTransform` (with `lmbda >= 0`) are provided.
-  `bias_adjust` (0-1) controls how much bias-adjustment is applied to the back-transformed mean (0 = the
+- `Transform` is the base class: subclasses only need to implement `transform()` and `inverse()`. `LogTransform` and
+  `BoxCoxTransform` (with `lmbda >= 0`) are provided, as well as `SmearingTransform`.
+- `bias_adjust` (0-1) controls how much bias-adjustment is applied to the back-transformed mean (0 = the
   back-transformed median; default = the full mean); it doesn't affect intervals.
 - `Predictions.samples_to_dataframe()` summarizes samples of arbitrary quantities into the same format as
   `to_dataframe()`.
@@ -67,8 +67,7 @@ inflate the variance.
   `Transform._noise_nodes()` (a different noise distribution).
 - For mixture measures, `bias_adjust` can be set per regime: e.g. `LogTransform(bias_adjust={'quick': 0.})` back-transforms the 'quick' regime to its median, and the others (the standard regime's key is `'__standard__'`, its `id`: see `MixtureModel.get_regimes()`; `MixtureOfNormals.labels` and `get_regime_combos()` use the same ids) to their means. For a measure with a nonlinear measured-mean, a regime with `bias_adjust=0` is computed without sampling (the plug-in `inverse(measured-mean + offset)`), while its other regimes' values must be the same (otherwise they're ignored, with a warning).
 - `TimeSeriesDataset.from_dataframe(transform=...)` applies the same `transform` argument going in: a single
-  `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`. `Transform` subclasses
-  now implement `transform()` (the forward transformation) as well as `inverse()`.
+  `Transform` for all the time-series' measures (not predictors), or `{measure: Transform}`.
 
 ### New feature: sampling predictions, and derived quantities
 
@@ -98,12 +97,88 @@ inflate the variance.
 - Custom `AdaptiveScaler`s can take part by implementing `get_state()` / `set_state()`; otherwise they start fresh, as
   before.
 
+### Bug fix that changes predictions: `to_dataframe(conf=None)`
+
+- The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
+  uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
+  larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
+
+### New option: `joseph_form`
+
+`KalmanFilter(joseph_form=False)` (and `BinomialFilter`) uses the simpler covariance update `P - K H P` (symmetrized) instead of the Joseph form `(I - K H) P (I - K H)' + K R K'`. It uses less memory during training (in a test with a state-size of 44: ~20-25% less peak memory for forward + backward) and is faster, but it's less numerically robust: errors in the kalman gain have a first-order (rather than second-order) effect on the covariance, which can lose positive-definiteness. The default is unchanged (`joseph_form=True`), as are models saved by older versions.
+
+### New option: `Covariance(method='sd_corr')`
+
+A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.get_param_idx()`, `Covariance.get_off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
+
+- `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
+- `Covariance.get_corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
+- Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
+- Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
+
+### New option: uncorrelated groups of processes or measures (`corr_groups`)
+
+`Covariance.from_processes(processes, corr_groups=[['transient_a', 'transient_b']])` (and `Covariance.from_measures(measures, corr_groups=...)`, keyed on measure names) makes the listed processes correlated with each other but uncorrelated with all the others; processes not in any group form one more group together, and a process's own state-elements always stay correlated. E.g. a random-walk level and a decaying level on the same measure are poorly identified with correlated process-noise (only their sum is observed, and correlated shocks let many combinations of their variances fit equally well); grouping the decaying levels separates them, while keeping the correlations between measures within each group. Groups (rather than arbitrary pairs) are exactly the zero-patterns that masking can guarantee to keep a covariance positive semi-definite.
+
+- Implemented as `Covariance(..., corr_mask=)`: a `(rank, rank)` tensor, validated to be symmetric, with ones on the diagonal, and positive semi-definite. A binary mask (as `corr_groups` builds; a positive semi-definite 0/1 mask is always a grouping) masks the cholesky factor (for "sd_corr", the correlation's cholesky factor), so masked-out pairs have no parameters: `cholesky_off_diag`/`corr_unconstrained` hold one entry per pair that isn't masked out (`get_off_diag_idx()` accounts for this, and raises for a masked-out pair). Masking the covariance after `L @ L.t()` instead would leave parameters for the masked-out pairs that still feed the in-group entries, and so exact ridges in the likelihood (a singular Hessian, slow L-BFGS convergence, poor Laplace approximations); the representable covariances are the same either way. Other masks (e.g. entries of 0.5) multiply the covariance elementwise, which by the Schur product theorem keeps it positive semi-definite. Modules without a mask (incl. those pickled or saved by older versions) are unchanged.
+- `KalmanFilter` now warns when two level-like processes on the same measure (state-elements with process-noise, a fixed measurement-weight, that transition only to themselves -- e.g. `LocalLevel`, `LocalTrend`'s position) have correlated process-noise, with a ready-made `corr_groups` that puts the decaying ones in their own group.
+- `LocalLevel`'s docs note that `decay=True` can't give a half-life below ~13 timesteps, and encourage setting the bounds from domain-knowledge.
+
+### New option: decaying processes' initial covariance from their stationary covariance (`stationary`)
+
+`Covariance.from_processes(processes, cov_type='initial', stationary=['transient_a', 'transient_b'])` ties the listed decaying processes' initial covariance to their stationary covariance instead of free parameters: `Q[i, j] / (1 - decay_i * decay_j)` between their elements (`Q` the base process-covariance, before any `predict_variance`; the `KalmanFilter` computes it), so e.g. decaying levels whose process-noise is correlated across measures start correlated too. With a learned decay, a free initial variance is poorly identified: a faster decay with a larger initial variance fits the start of a series about as well as a slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the whole series (in a fitted model, the Hessian's weakest directions loaded mainly on a decay rate together with the initial-covariance parameters). The listed processes' elements get no parameters in the initial covariance (the new `Covariance(stationary_idx=...)`), and their initial covariance with other elements is zero: there's no stationary covariance with a non-stationary element such as a random walk, and keeping free correlations alongside a computed variance would bring back parameters that trade off against the decay. Each listed element needs process-noise, a decay that's less than 1, and no transitions into it from other elements. A learned decay may be bounded at 1 (e.g. `decay=(.5, 1.0)`): the stationary variance grows without bound as the decay nears 1, so the likelihood keeps it below, and an error is raised if it reaches 1. A decay fixed at 1 (or no decay) is rejected.
+
+- `stationary` is a list of process ids, or a dict of process ids to `True`/`False`: `False` keeps free parameters on purpose, e.g. for a decaying level that captures how far series start from their long-run level after a common start event (sign-up, launch), whose initial spread is larger than its stationary one.
+- Listing processes in `stationary` changes the initial covariance's parameters and its `mask` buffer (both shrink), so a state-dict saved without it won't load into a model with it. To warm-start, drop all of the saved `initial_covariance.*` entries (not just the cholesky parameters), and set the free block with `set_matrix_()` if needed.
+- `KalmanFilter` now warns when a level-like process has a learned decay (including one bounded at 1) and a free initial variance (unless it's `False` in `stationary`), with a ready-made `stationary=[...]` line. Nothing changes by default.
+
+### Removed: `Covariance(method='low_rank')` for new models
+
+`low_rank` (a factor model, `V @ V.t() + D`) is no longer available when creating a `Covariance`; use "log_cholesky" (the default) or "sd_corr". Its free diagonal `D` can collapse toward zero, leaving a near-singular covariance that's nearly certain about most directions and very loose about the rest. Tried as the default for large initial covariances, it fit about as well as "log_cholesky" but forecast worse: in the air-quality example's multivariate model (a 28-element initial covariance, with 12 stations to learn it from), the 30-day-ahead backtest error rose from 147.3 to 150.6, losing the multivariate model's advantage over the univariate one (150.3). There, the initial covariance is a weakly identified prior over static states, and within the low-rank family maximum likelihood preferred an inflated prior. A low-rank option with a better-behaved residual (e.g. probabilistic PCA) may come later.
+
+- Pickled models with a "low_rank" covariance still load and work, with a `FutureWarning`; `.to_method('log_cholesky')` converts one exactly.
+- Loading a state-dict saved with "low_rank" (e.g. a measure-covariance with more than 5 measures, which used to default to it) raises an error that says how to keep the fitted covariance: unpickle the saved model, or load the state-dict with an older torchcast and convert it with `.to_method('log_cholesky')`.
+
+### Behavior change: default covariance methods
+
+- `Covariance.from_measures()` no longer switches to "low_rank" for more than 5 measures: every covariance now defaults to "log_cholesky".
+- `Covariance.from_processes()` and `Covariance.from_measures()` take `method` as an explicit argument.
+
+### Behavior change: `BinomialFilter(do_post_hoc_correction=...)` modes
+
+The post-hoc correction's sharpness was always `exp(w * log(num_obs) + b)`. When `num_obs` doesn't vary in the data, the slope `w` can't be identified (an exactly flat direction in the likelihood, with a singular Hessian); with binary data (`num_obs=1`) it has no effect at all, and is never trained. `do_post_hoc_correction` now takes:
+
+- `'static'`: one learned sharpness, with no slope.
+- `'num_obs'`: the previous form, with a slope on `log(num_obs)`; for data whose `num_obs` varies.
+- `'auto'` (the default): `'static'` or `'num_obs'`, chosen by `BinomialFilter.fit()` from whether the `num_obs` passed to it varies (before it creates the optimizer). Calling the model while it's still `'auto'` (e.g. training with your own loop, or `StateSpaceTrainer`) raises an error asking you to choose.
+- `'none'`: no correction.
+- `True` (the previous default) and `False` are deprecated, with a `FutureWarning`; they mean `'num_obs'` and `'none'`, so code that passes them explicitly keeps its previous behavior.
+
+Back-compatibility: with `'auto'` (the default), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
+
+### Removed: long-deprecated arguments
+
+These were deprecated in v1.1.0 or earlier, and now raise. Their warnings were `DeprecationWarning`s (a `UserWarning` for `Stopping`'s `tol`), which Python hides unless they're triggered directly from `__main__`, so you may not have seen them:
+
+- `fit(tol=, patience=, max_iter=)`: pass them via `stopping`, e.g. `stopping={'abstol': .001, 'patience': 2, 'max_iter': 300}`. `Stopping.from_dict()` is removed (use `Stopping(**kwargs)`), so `stopping={'tol': ...}` now raises: use `abstol`.
+- `Predictions.to_dataframe(type='components')`: use `type='observed_states'`.
+- `complete_times(group_colname=)`: use `group_colnames` (now required). `complete_times(global_max=)` is removed; it had no effect (use `max_dt_colname`). `complete_times` no longer appends `max_dt_colname` to the caller's `group_colnames` list.
+- `Predictions.with_new_start_times()` and `get_state_at_times()` no longer take `start_offsets`/`dt_unit` (call `set_metadata()` first). Passing them already failed with a `TypeError`.
+
+### Overridable design models
+
+`StateSpaceModel.forward()` now builds its transition and measurement models through two methods,
+`_make_transition_model(num_groups, num_timesteps)` and `_make_measurement_model(num_groups, num_timesteps, **kwargs)`,
+instead of constructing `TransitionModel` and `MeasurementModel` inline. The defaults are unchanged. A subclass can
+override them to change the design matrices without copying `forward()`: e.g. a transition from one process's state
+to another's, which the default block-diagonal (by process) transition matrix can't express.
+
 ### Other changes
 
 - Passing a `Covariance` created for one role as another now raises a `ValueError` that says how to create the right one: e.g. `initial_covariance=Covariance.from_processes(processes)` (which makes a process-covariance, whose elements without process-noise get no parameters, so a fixed season would get zero initial variance) used to warn only `Id already set to process_covariance, overwriting`.
 - The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
 - `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
-- Deprecation warnings are now `FutureWarning` instead of `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code). This covers the old `torchcast.covariance.base` import path, `fit(tol=, patience=, max_iter=)`, `Stopping.from_dict(tol=)` (previously a plain `UserWarning`), `Predictions` arguments `start_offsets`/`dt_unit` and `type='components'`, `complete_times()` arguments `group_colname` and `global_max=True`, and `BinomialFilter(do_post_hoc_correction=True/False)`.
+- The deprecation warning for the old `torchcast.covariance.base` import path is now a `FutureWarning` instead of a `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code).
 - A model's default monte-carlo noise for the log-prob (`mc_sampling`, a `FixedWhiteNoise`) is seeded from
   `torch.initial_seed()` instead of numpy's unseeded random state, so `torch.manual_seed()` before creating the model
   makes a fit with a monte-carlo loss (e.g. a `BinomialFilter`'s) reproducible. Before, each model got different
@@ -130,85 +205,6 @@ inflate the variance.
   `_update_step()` to adjust its inputs (as `BinomialFilter` did) should override `_prepare_update()` instead.
 - Adds `benchmarks/profile_simple_model.py`, for checking performance against other git refs.
 - `load_air_quality_data(dt_unit, outage_prob=...)` can simulate sensor outages for the PM2.5 and PM10 sensors (persistent, and rarely both at once; see `outage_persistence`, `outage_corr`, `outage_seed`), as used by the air-quality example.
-
-### Bug fix that changes predictions: `to_dataframe(conf=None)`
-
-- The `std` column of `Predictions.to_dataframe(conf=None)` was 0.76x the actual standard-deviation. **Code that
-  uses this column -- e.g. for a manual bias-corrected back-transform like `exp(mean + std**2 / 2)` -- will now get
-  larger (correct) values.** Consider using `to_dataframe(transform=...)` instead, which back-transforms correctly.
-### New option: `joseph_form`
-
-`KalmanFilter(joseph_form=False)` (and `BinomialFilter`) uses the simpler covariance update `P - K H P` (symmetrized) instead of the Joseph form `(I - K H) P (I - K H)' + K R K'`. It uses less memory during training (in a test with a state-size of 44: ~20-25% less peak memory for forward + backward) and is faster, but it's less numerically robust: errors in the kalman gain have a first-order (rather than second-order) effect on the covariance, which can lose positive-definiteness. The default is unchanged (`joseph_form=True`), as are models saved by older versions.
-
-### New option: `Covariance(method='sd_corr')`
-
-A parameterization that separates scale from correlation: `diag(std) @ R @ diag(std)`, with `log_std_devs` and `corr_unconstrained` (canonical partial correlations, as in Stan's `cholesky_factor_corr`). With the default `log_cholesky`, the off-diagonal parameters are in absolute units and also change the variances, which makes optimization badly conditioned when some elements have much smaller variance than others (e.g. an initial covariance with small treatment-effect states next to large baseline states). In `sd_corr` parameters, the loss's hessian doesn't depend on the elements' scales, and std-devs and correlations can be frozen separately (`Covariance.get_param_idx()`, `Covariance.get_off_diag_idx()` give the parameter-indices for elements/pairs). The default is unchanged.
-
-- `Covariance.to_method(method)` converts a (fitted) module to another parameterization, exactly; `Covariance.from_matrix(cov, method=...)` and `Covariance.set_matrix_(cov)` set the parameters from a covariance matrix.
-- `Covariance.get_corr_cholesky()` gives the cholesky factor of the correlation matrix (e.g. for an LKJ prior), for any method.
-- Loading a state-dict saved with a different `method` now raises an error that points to `to_method()`.
-- Bug fix: `BinomialFilter(measure_covariance=...)` failed when passed a `Covariance` (rather than a dict of its arguments).
-
-### New option: uncorrelated groups of processes or measures (`corr_groups`)
-
-`Covariance.from_processes(processes, corr_groups=[['transient_a', 'transient_b']])` (and `Covariance.from_measures(measures, corr_groups=...)`, keyed on measure names) makes the listed processes correlated with each other but uncorrelated with all the others; processes not in any group form one more group together, and a process's own state-elements always stay correlated. E.g. a random-walk level and a decaying level on the same measure are poorly identified with correlated process-noise (only their sum is observed, and correlated shocks let many combinations of their variances fit equally well); grouping the decaying levels separates them, while keeping the correlations between measures within each group. Groups (rather than arbitrary pairs) are exactly the zero-patterns that masking can guarantee to keep a covariance positive semi-definite.
-
-- Implemented as `Covariance(..., corr_mask=)`: a `(rank, rank)` tensor that the covariance is multiplied by elementwise. It's validated to be symmetric, with ones on the diagonal, and positive semi-definite (which, by the Schur product theorem, guarantees the masked covariance is too). The parameters for masked-out entries remain, but get no gradient. Modules without a mask (incl. those pickled or saved by older versions) are unchanged.
-- `KalmanFilter` now warns when two level-like processes on the same measure (state-elements with process-noise, a fixed measurement-weight, that transition only to themselves -- e.g. `LocalLevel`, `LocalTrend`'s position) have correlated process-noise, with a ready-made `corr_groups` that puts the decaying ones in their own group.
-- `LocalLevel`'s docs note that `decay=True` can't give a half-life below ~13 timesteps, and encourage setting the bounds from domain-knowledge.
-
-### New option: decaying processes' initial covariance from their stationary covariance (`stationary`)
-
-`Covariance.from_processes(processes, cov_type='initial', stationary=['transient_a', 'transient_b'])` ties the listed decaying processes' initial covariance to their stationary covariance instead of free parameters: `Q[i, j] / (1 - decay_i * decay_j)` between their elements (`Q` the base process-covariance, before any `predict_variance`; the `KalmanFilter` computes it), so e.g. decaying levels whose process-noise is correlated across measures start correlated too. With a learned decay, a free initial variance is poorly identified: a faster decay with a larger initial variance fits the start of a series about as well as a slower decay with a smaller one, so the decay is pinned down by the first few timesteps rather than the whole series (in a fitted model, the Hessian's weakest directions loaded mainly on a decay rate together with the initial-covariance parameters). The listed processes' elements get no parameters in the initial covariance (the new `Covariance(stationary_idx=...)`), and their initial covariance with other elements is zero: there's no stationary covariance with a non-stationary element such as a random walk, and keeping free correlations alongside a computed variance would bring back parameters that trade off against the decay. Each listed element needs process-noise, a decay that's less than 1, and no transitions into it from other elements. A learned decay may be bounded at 1 (e.g. `decay=(.5, 1.0)`): the stationary variance grows without bound as the decay nears 1, so the likelihood keeps it below, and an error is raised if it reaches 1. A decay fixed at 1 (or no decay) is rejected.
-
-- `stationary` is a list of process ids, or a dict of process ids to `True`/`False`: `False` keeps free parameters on purpose, e.g. for a decaying level that captures how far series start from their long-run level after a common start event (sign-up, launch), whose initial spread is larger than its stationary one.
-- Listing processes in `stationary` changes the initial covariance's parameters and its `mask` buffer (both shrink), so a state-dict saved without it won't load into a model with it. To warm-start, drop all of the saved `initial_covariance.*` entries (not just the cholesky parameters), and set the free block with `set_matrix_()` if needed.
-- `KalmanFilter` now warns when a level-like process has a learned decay (including one bounded at 1) and a free initial variance (unless it's `False` in `stationary`), with a ready-made `stationary=[...]` line. Nothing changes by default.
-
-### Behavior change: `corr_mask`/`corr_groups` mask the cholesky factor, removing redundant parameters
-
-Previously the mask was applied to the covariance after `L @ L.t()`, so the factor's entries for masked-out pairs were still parameters that fed the in-group entries (e.g. a variance is `exp(2 * log_diag[i]) + sum_j L[i, j]^2`, including masked `j`). That left exact ridges: e.g. shrinking a `cholesky_log_diag` while growing a masked `cholesky_off_diag` left the model unchanged, which shows up as a singular or indefinite Hessian (in a fitted model with `corr_groups`, the Hessian's most negative eigenvector loaded on one process-variance and the masked off-diagonal entries), slow L-BFGS convergence, and poor Laplace approximations. Now, for a binary `corr_mask` (as `corr_groups` builds; a positive semi-definite 0/1 mask is always a grouping), "log_cholesky" and "sd_corr" (on the correlation's cholesky factor) have no parameters for masked-out pairs: `cholesky_off_diag`/`corr_unconstrained` hold one entry per pair that isn't masked out, scattered into the factor (`get_off_diag_idx()` accounts for this, and raises for a masked-out pair). The representable covariances are unchanged (a covariance that's zero across groups has a cholesky factor that's zero there too), so fitted predictions aren't affected, only the optimization. Other masks (e.g. entries of 0.5) behave as before.
-
-### Removed: `Covariance(method='low_rank')` for new models
-
-`low_rank` (a factor model, `V @ V.t() + D`) is no longer available when creating a `Covariance`; use "log_cholesky" (the default) or "sd_corr". Its free diagonal `D` can collapse toward zero, leaving a near-singular covariance that's nearly certain about most directions and very loose about the rest. Tried as the default for large initial covariances, it fit about as well as "log_cholesky" but forecast worse: in the air-quality example's multivariate model (a 28-element initial covariance, with 12 stations to learn it from), the 30-day-ahead backtest error rose from 147.3 to 150.6, losing the multivariate model's advantage over the univariate one (150.3). There, the initial covariance is a weakly identified prior over static states, and within the low-rank family maximum likelihood preferred an inflated prior. A low-rank option with a better-behaved residual (e.g. probabilistic PCA) may come later.
-
-- Pickled models with a "low_rank" covariance still load and work, with a `FutureWarning`; `.to_method('log_cholesky')` converts one exactly.
-- Loading a state-dict saved with "low_rank" (e.g. a measure-covariance with more than 5 measures, which used to default to it) raises an error that says how to keep the fitted covariance: unpickle the saved model, or load the state-dict with an older torchcast and convert it with `.to_method('log_cholesky')`.
-
-### Behavior change: default covariance methods
-
-- `Covariance.from_measures()` no longer switches to "low_rank" for more than 5 measures: every covariance now defaults to "log_cholesky".
-- `Covariance.from_processes()` and `Covariance.from_measures()` take `method` as an explicit argument.
-
-### Behavior change: `BinomialFilter(do_post_hoc_correction=...)` modes
-
-The post-hoc correction's sharpness was always `exp(w * log(num_obs) + b)`. When `num_obs` doesn't vary in the data, the slope `w` can't be identified (an exactly flat direction in the likelihood, with a singular Hessian); with binary data (`num_obs=1`) it has no effect at all, and is never trained. `do_post_hoc_correction` now takes:
-
-- `'static'`: one learned sharpness, with no slope.
-- `'num_obs'`: the previous form, with a slope on `log(num_obs)`; for data whose `num_obs` varies.
-- `'auto'` (the default): `'static'` or `'num_obs'`, chosen by `BinomialFilter.fit()` from whether the `num_obs` passed to it varies (before it creates the optimizer). Calling the model while it's still `'auto'` (e.g. training with your own loop, or `StateSpaceTrainer`) raises an error asking you to choose.
-- `'none'`: no correction.
-- `True` (the previous default) and `False` are deprecated, with a `FutureWarning`; they mean `'auto'` and `'none'`.
-
-Back-compatibility: with `'auto'` (the default, or the deprecated `True`), loading a state-dict matches its saved correction (a saved slope means `'num_obs'`), so older models load with the same predictions; an explicit mode that doesn't match raises. Older pickled models get `'num_obs'` (or `'none'`). Note that older binary-data models keep their untrained slope until re-fit.
-
-### Removed: long-deprecated arguments
-
-These have warned with a `FutureWarning` since v1.1.0 or earlier, and now raise:
-
-- `fit(tol=, patience=, max_iter=)`: pass them via `stopping`, e.g. `stopping={'abstol': .001, 'patience': 2, 'max_iter': 300}`. `Stopping.from_dict()` is removed (use `Stopping(**kwargs)`), so `stopping={'tol': ...}` now raises: use `abstol`.
-- `Predictions.to_dataframe(type='components')`: use `type='observed_states'`.
-- `complete_times(group_colname=)`: use `group_colnames` (now required). `complete_times(global_max=)` is removed; it had no effect (use `max_dt_colname`). `complete_times` no longer appends `max_dt_colname` to the caller's `group_colnames` list.
-- `Predictions.with_new_start_times()` and `get_state_at_times()` no longer take `start_offsets`/`dt_unit` (call `set_metadata()` first). Passing them already failed with a `TypeError`.
-
-### Overridable design models
-
-`StateSpaceModel.forward()` now builds its transition and measurement models through two methods,
-`_make_transition_model(num_groups, num_timesteps)` and `_make_measurement_model(num_groups, num_timesteps, **kwargs)`,
-instead of constructing `TransitionModel` and `MeasurementModel` inline. The defaults are unchanged. A subclass can
-override them to change the design matrices without copying `forward()`: e.g. a transition from one process's state
-to another's, which the default block-diagonal (by process) transition matrix can't express.
 
 ## v1.2.0
 

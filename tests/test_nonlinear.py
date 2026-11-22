@@ -579,8 +579,9 @@ def _make_binomial(**kwargs):
 
 def test_post_hoc_correction_modes():
     # booleans are deprecated aliases:
-    with pytest.warns(FutureWarning, match="``do_post_hoc_correction=True`` is deprecated; use ``'auto'``"):
-        assert _make_binomial(do_post_hoc_correction=True).post_hoc_correction == 'auto'
+    # (``True`` keeps its previous behavior, rather than becoming the new default, 'auto')
+    with pytest.warns(FutureWarning, match="``do_post_hoc_correction=True`` is deprecated; use ``'num_obs'``"):
+        assert _make_binomial(do_post_hoc_correction=True).post_hoc_correction == 'num_obs'
     with pytest.warns(FutureWarning, match="``do_post_hoc_correction=False`` is deprecated; use ``'none'``"):
         assert _make_binomial(do_post_hoc_correction=False).post_hoc_correction == 'none'
     assert _make_binomial().post_hoc_correction == 'auto'
@@ -651,15 +652,19 @@ def test_post_hoc_correction_loading():
         saved = _make_binomial(do_post_hoc_correction=mode)
         with torch.no_grad():
             expected = saved(y).means
-        # a model created with the default ('auto', or the deprecated ``True``) matches the saved parameters:
-        for default in ('auto', True):
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', FutureWarning)
-                loaded = _make_binomial(do_post_hoc_correction=default)
-            loaded.load_state_dict(saved.state_dict())
-            assert loaded.post_hoc_correction == mode
-            with torch.no_grad():
-                torch.testing.assert_close(loaded(y).means, expected)
+        # a model created with the default ('auto') matches the saved parameters:
+        loaded = _make_binomial()
+        loaded.load_state_dict(saved.state_dict())
+        assert loaded.post_hoc_correction == mode
+        with torch.no_grad():
+            torch.testing.assert_close(loaded(y).means, expected)
+    # the deprecated ``True`` (= 'num_obs') loads what it saved before 2.0, a correction with a slope:
+    saved = _make_binomial(do_post_hoc_correction='num_obs')
+    with pytest.warns(FutureWarning):
+        loaded = _make_binomial(do_post_hoc_correction=True)
+    loaded.load_state_dict(saved.state_dict())
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(y).means, saved(y).means)
     # an explicit mismatch raises:
     with pytest.raises(RuntimeError, match="saved with 'num_obs'"):
         _make_binomial(do_post_hoc_correction='static').load_state_dict(
