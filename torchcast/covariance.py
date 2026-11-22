@@ -17,6 +17,12 @@ from torchcast.process.process import Process
 DEFAULT_MCOV_MULTI = 1.0
 DEFAULT_PCOV_MULTI = 0.1  # less than measure-cov by default
 DEFAULT_ICOV_MULTI = 0.5  # somewhere in between
+# the ids that ``Covariance.from_processes()``/``from_measures()`` give, and how to create each (see ``set_id()``):
+_HOW_TO_CREATE = {
+    'process_covariance': "Covariance.from_processes(processes, cov_type='process', ...)",
+    'initial_covariance': "Covariance.from_processes(processes, cov_type='initial', ...)",
+    'measure_covariance': "Covariance.from_measures(measures, ...)",
+}
 # ``Covariance.from_processes(cov_type='initial')`` uses method='low_rank' by default from this many elements on:
 LOW_RANK_MIN_INITIAL = 15
 
@@ -418,6 +424,12 @@ class Covariance(nn.Module):
     @jit.ignore
     def set_id(self, id: str) -> 'Covariance':
         if self.id and id != self.id:
+            if self.id in _HOW_TO_CREATE:
+                # e.g. ``Covariance.from_processes(processes)`` (a process-covariance) passed as an initial covariance:
+                raise ValueError(
+                    f"This covariance was created as ``{self.id}``, but it's being used as ``{id}``. "
+                    f"Create the ``{id}`` with ``{_HOW_TO_CREATE.get(id, 'Covariance.from_processes()')}``."
+                )
             warn(f"Id already set to {self.id}, overwriting")
         self.id = id
         return self

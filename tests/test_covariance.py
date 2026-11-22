@@ -940,3 +940,26 @@ def test_covariance_base_shim():
         warnings.simplefilter('error')
         assert getattr(base, '__sphinx_mock__', None) is None
         base.__file__
+
+
+def test_covariance_in_the_wrong_slot_raises():
+    processes = [LocalLevel(id='level', measure='y')]
+    # e.g. forgetting ``cov_type='initial'``, which makes a process-covariance (different elements get parameters):
+    with pytest.raises(ValueError, match=r"created as ``process_covariance``.*cov_type='initial'"):
+        KalmanFilter(
+            processes=processes, measures=['y'], initial_covariance=Covariance.from_processes(processes)
+        )
+    with pytest.raises(ValueError, match=r"created as ``initial_covariance``.*cov_type='process'"):
+        KalmanFilter(
+            processes=processes,
+            measures=['y'],
+            process_covariance=Covariance.from_processes(processes, cov_type='initial')
+        )
+    with pytest.raises(ValueError, match=r"used as ``measure_covariance``.*from_measures"):
+        KalmanFilter(
+            processes=processes, measures=['y'], measure_covariance=Covariance.from_processes(processes)
+        )
+    # a covariance with a custom id is renamed, with a warning, as before:
+    custom = Covariance(rank=1, init_diag_multi=1., id='my_covariance')
+    with pytest.warns(UserWarning, match="Id already set to my_covariance"):
+        KalmanFilter(processes=processes, measures=['y'], initial_covariance=custom)

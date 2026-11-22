@@ -100,6 +100,7 @@ inflate the variance.
 
 ### Other changes
 
+- Passing a `Covariance` created for one role as another now raises a `ValueError` that says how to create the right one: e.g. `initial_covariance=Covariance.from_processes(processes)` (which makes a process-covariance, whose elements without process-noise get no parameters, so a fixed season would get zero initial variance) used to warn only `Id already set to process_covariance, overwriting`.
 - The internal helper `torchcast.covariance.mini_cov_mask()` is now a private method of `Covariance`.
 - `Covariance.log_chol_to_chol()` is deprecated (with a `FutureWarning`): it's now a function, `torchcast.covariance.log_chol_to_chol()`, like the module's other helpers.
 - Deprecation warnings are now `FutureWarning` instead of `DeprecationWarning`, which Python hides unless it's triggered directly from `__main__` (e.g. not from your own package's code). This covers the old `torchcast.covariance.base` import path, `fit(tol=, patience=, max_iter=)`, `Stopping.from_dict(tol=)` (previously a plain `UserWarning`), `Predictions` arguments `start_offsets`/`dt_unit` and `type='components'`, `complete_times()` arguments `group_colname` and `global_max=True`, and `BinomialFilter(do_post_hoc_correction=True/False)`.
