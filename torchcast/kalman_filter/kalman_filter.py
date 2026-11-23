@@ -433,7 +433,8 @@ class KalmanFilter(StateSpaceModel):
         # posterior over the full combo-table; combos that differ only in the class share a likelihood
         log_post = log_prior + log_liks[:, mapping]
         combo_post = torch.softmax(log_post, -1)
-        means, covs = zip(*states)  # (a StateTuple iterates as (mean, cov))
+        # (not ``zip(*states)``: iterating a StateTuple breaks the graph with ``compile_steps()``)
+        means, covs = [state.mean for state in states], [state.cov for state in states]
         return self._collapse_states(
             means=means[0] if len(means) == 1 else torch.cat(means),
             covs=covs[0] if len(covs) == 1 else torch.cat(covs),

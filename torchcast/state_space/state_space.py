@@ -38,6 +38,8 @@ class StateSpaceModel(torch.nn.Module):
      outliers, which are then explained by a mixture component rather than updating the state. Can also pass a list of
      :class:`.MixtureComponent` objects, as shorthand for ``MixtureModel(components)``.
     """
+    # see ``compile_steps()``; a class attribute, so models pickled before it existed have it:
+    _step_compile_kwargs: Optional[dict] = None
 
     def __init__(self,
                  processes: Sequence['Process'],
@@ -106,6 +108,32 @@ class StateSpaceModel(torch.nn.Module):
         if 'mixture' not in state and 'mixture' not in state.get('_modules', {}):
             state['mixture'] = None
         super().__setstate__(state)
+
+    def compile_steps(self, enable: bool = True, **compile_kwargs) -> 'StateSpaceModel':
+        """
+        Experimental. Compile (with :func:`torch.compile`) the predict-step and update-step that ``forward()`` runs at
+        each timestep, fusing their many small operations. This mostly helps with small batches of long series, where
+        the per-operation overhead dominates. The first ``forward()`` call compiles (slow); later calls with the same
+        shapes reuse the compiled steps.
+
+        :param enable: Pass False to stop using compiled steps.
+        :param compile_kwargs: Keyword-arguments for :func:`torch.compile`, e.g. ``mode='reduce-overhead'`` (CUDA
+         graphs) on a GPU.
+        :return: This model.
+        """
+        self._step_compile_kwargs = compile_kwargs if enable else None
+        return self
+
+    def _get_step_functions(self) -> tuple[Callable, Callable]:
+        """
+        The predict-step and update-step for ``forward()``'s time-loop: compiled if ``compile_steps()`` was called.
+        """
+        if self._step_compile_kwargs is None:
+            return self._predict_cov, self._update_step_with_nans
+        return (
+            torch.compile(self._predict_cov, **self._step_compile_kwargs),
+            torch.compile(self._update_step_with_nans, **self._step_compile_kwargs),
+        )
 
     @property
     def _non_gaussian_measures(self) -> Sequence[str]:
@@ -258,6 +286,7 @@ class StateSpaceModel(torch.nn.Module):
             raise RuntimeError(f"Unexpected kwargs in {type(self).__name__}.forward(): {set(unused_kwargs)})")
 
         # first loop through to do predict -> update
+        predict_cov, update_step = self._get_step_functions()
         scaling1step = init_multiplier
         scale1s = []
         scaling_states1 = []  # the scaler's state (incl. the multiplier) before each step's update
@@ -271,7 +300,7 @@ class StateSpaceModel(torch.nn.Module):
         for t in range(out_timesteps):
             tmask = groups_per_time[t]
             mean1step, transition_mat = transition_model(meanu, time=t, mask=tmask)
-            cov1step = self._predict_cov(
+            cov1step = predict_cov(
                 cov=covu,
                 transition_mat=transition_mat,
                 **{k: v[t] for k, v in predict_kwargs.items()},
@@ -303,7 +332,7 @@ class StateSpaceModel(torch.nn.Module):
             elif t < len(inputs):
                 measured_mean, measure_mat = measurement_model(mean1step, time=t)
                 measure_cov = self._apply_cov_scaling(measure_covs[t], scaling1step)
-                state = self._update_step_with_nans(
+                state = update_step(
                     input=inputs[t],
                     mean=mean1step,
                     cov=cov1step,

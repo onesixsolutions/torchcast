@@ -6,12 +6,14 @@ from typing import Callable
 
 import pytest
 import torch
+import torch._dynamo
 
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel
 from torchcast.internals.utils import get_nan_groups, get_groups_per_time
 
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.exp_smooth import ExpSmoother
+from torchcast.mixture import MixtureComponent
 
 import numpy as np
 from filterpy.kalman import KalmanFilter as filterpy_KalmanFilter
@@ -741,3 +743,34 @@ def test_get_groups_per_time():
     assert groups_per_time[2].tolist() == [0, 2]
     assert groups_per_time[3].tolist() == [0, 2]
     assert groups_per_time[4].tolist() == []
+
+
+@pytest.mark.parametrize('mixture', [False, True])
+def test_compile_steps(mixture: bool):
+    """
+    ``compile_steps()`` gives the same results. (The 'eager' backend only traces the steps with dynamo, which is what
+    can go wrong in torchcast's code, without the time it takes inductor to compile them.)
+    """
+    if not torch._dynamo.is_dynamo_supported():
+        pytest.skip("torch.compile isn't supported on this python version")
+    torch.manual_seed(0)
+    kf = KalmanFilter(
+        processes=[LocalTrend(id='a', measure='a'), LocalLevel(id='b', measure='b')],
+        measures=['a', 'b'],
+        mixture=[MixtureComponent(measure='a', offset_init=-3., prob_init=.1, id='low')] if mixture else None
+    )
+    y = torch.randn(5, 20, 2).cumsum(1)
+    y[:, ::7, 1] = float('nan')
+    y[2, 10:13] = float('nan')
+    last_measured = torch.tensor([19, 14, 19, 12, 19], dtype=torch.int)
+
+    expected = kf(y, last_measured_per_group=last_measured).log_prob(y).nansum()
+    expected_grads = torch.autograd.grad(expected, list(kf.parameters()), allow_unused=True)
+    kf.compile_steps(backend='eager')
+    lp = kf(y, last_measured_per_group=last_measured).log_prob(y).nansum()
+    grads = torch.autograd.grad(lp, list(kf.parameters()), allow_unused=True)
+    assert torch.allclose(lp, expected)
+    for g, eg in zip(grads, expected_grads):
+        assert (g is None) == (eg is None)
+        if g is not None:
+            assert torch.allclose(g, eg)
