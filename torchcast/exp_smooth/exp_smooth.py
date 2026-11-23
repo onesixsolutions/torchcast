@@ -10,7 +10,7 @@ from torch import Tensor
 
 from torchcast.exp_smooth.smoothing_matrix import SmoothingMatrix
 from torchcast.covariance import Covariance
-from torchcast.internals.utils import update_tensor, transpose_last_dims
+from torchcast.internals.utils import update_tensor
 from torchcast.process import Process
 from torchcast.state_space import StateSpaceModel
 
@@ -39,18 +39,6 @@ class ExpSmoother(StateSpaceModel):
         # initial covariance is always zero. this will be replaced by the 1-step covariance in the first call to predict
         m = list(self.processes.values())[0].initial_mean  # get a parameter, any parameter, to get device
         return torch.zeros((num_groups, num_times, self.state_rank, self.state_rank), dtype=m.dtype, device=m.device)
-
-    def _mask_mats(self,
-                   groups: torch.Tensor,
-                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-                   **kwargs) -> dict[str, torch.Tensor]:
-        out = super()._mask_mats(groups, masks, **kwargs)
-        if masks is None:
-            return out
-        val_id, m1d, m2d = masks
-        Kt = transpose_last_dims(kwargs['K'])
-        out['K'] = transpose_last_dims(Kt[m1d])
-        return out
 
     def _parse_kwargs(self,
                       num_groups: int,
@@ -92,7 +80,7 @@ class ExpSmoother(StateSpaceModel):
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
                      K: torch.Tensor,
-                     val_idx: Optional[torch.Tensor] = None,
+                     observed: Optional[torch.Tensor] = None,
                      **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         if kwargs:
             raise TypeError(f"`{type(self).__name__}._update_step()` received unexpected kwargs: {list(kwargs)}")

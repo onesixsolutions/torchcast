@@ -10,7 +10,7 @@ from torchcast.internals.batch_design import TransitionModel, MeasurementModel, 
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import (
-    repeat, true1d_idx, get_nan_groups, get_nan_groups_per_time, get_groups_per_time, stack_per_time
+    repeat, true1d_idx, get_nan_groups, get_nan_masks_per_time, get_groups_per_time, stack_per_time
 )
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
@@ -206,16 +206,17 @@ class StateSpaceModel(torch.nn.Module):
             out_timesteps=out_timesteps
         )
 
-        # the groups to update at each timestep (None = all of them), and the nan-groups for the update-step: computed
-        # up front (precomputed by ``fit()``), so the time-loop doesn't make a GPU wait for the CPU at each timestep.
+        # the groups to update at each timestep (None = all of them), and the missing measures for the update-step:
+        # computed up front (precomputed by ``fit()``), so the time-loop doesn't make a GPU wait for the CPU at each
+        # timestep.
         last_measured_per_group = kwargs.pop('last_measured_per_group', None)
         if last_measured_per_group is None:
             groups_per_time = [None] * out_timesteps
         else:
             groups_per_time = get_groups_per_time(last_measured_per_group, out_timesteps)
-        nan_groups = kwargs.pop('nan_groups', None)
-        if nan_groups is None and inputs:
-            nan_groups = get_nan_groups_per_time(torch.isnan(y))
+        nan_masks = kwargs.pop('nan_masks', None)
+        if nan_masks is None and inputs:
+            nan_masks = get_nan_masks_per_time(torch.isnan(y))
 
         # todo: update Covariance class to make this less hacky:
         mcov_kwargs = {}
@@ -309,7 +310,7 @@ class StateSpaceModel(torch.nn.Module):
                     measured_mean=measured_mean,
                     measure_mat=measure_mat,
                     measure_cov=measure_cov,
-                    nan_groups=nan_groups[t],
+                    nan_mask=nan_masks[t],
                     combo_prior=combo_prior,
                     **{k: v[t] for k, v in update_kwargs.items()}
                 )
@@ -616,7 +617,7 @@ class StateSpaceModel(torch.nn.Module):
 
         # precompute nan-groups for forward pass
         isnan = torch.isnan(y)
-        kwargs['nan_groups'] = get_nan_groups_per_time(isnan)
+        kwargs['nan_masks'] = get_nan_masks_per_time(isnan)
 
         # see `last_measured_per_group` in forward docstring
         # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
@@ -797,85 +798,57 @@ class StateSpaceModel(torch.nn.Module):
                                measured_mean: torch.Tensor,
                                measure_mat: torch.Tensor,
                                measure_cov: torch.Tensor,
-                               nan_groups: Optional[Sequence[tuple[torch.Tensor, Optional[torch.Tensor]]]] = None,
+                               nan_mask: Optional[tuple[torch.Tensor, bool]] = None,
                                combo_prior: Optional[torch.Tensor] = None,
                                **kwargs) -> StateTuple:
         """
-        Calls ``_update_step()`` once for each group of rows sharing a pattern of missing measures, with the
-        measurement tensors subset to the observed measures.
+        Calls ``_update_step()``, with any missing measures masked out: a missing measure gets a residual of zero, a row
+        of zeros in the measurement-matrix, and a measurement-noise that's uncorrelated with the other measures' (with
+        a variance of one). Its column of the kalman-gain is then exactly zero, so the update is the same as one with
+        that measure dropped -- but every group has the same shapes, so it's one batched update (rather than one per
+        pattern of missing measures). Groups with no observed measures keep their state.
 
+        :param nan_mask: None if nothing is missing; otherwise ``(isnan, has_empty_rows)``, see
+         ``get_nan_masks_per_time``. Computed from ``input`` if not passed.
         :param combo_prior: If the model has mixture components, a ``(num_groups, num_combos)`` tensor of prior
          combo-probabilities.
-        :return: A ``StateTuple``. If ``combo_prior`` was passed, its ``combo_probs`` is the posterior (rows with no
-         observed measures keep their prior).
+        :return: A ``StateTuple``. If ``combo_prior`` was passed, its ``combo_probs`` is the posterior.
         """
         if combo_prior is not None:
             kwargs['combo_prior'] = combo_prior
-
-        if nan_groups is None:
-            nan_groups = get_nan_groups(torch.isnan(input))
-        if len(nan_groups) == 1:
-            group_idx, masks = nan_groups[0]
-            if len(group_idx) == len(input) and masks is None:
-                # no nans, no masking:
-                return _as_state_tuple(self._update_step(
-                    input=input,
-                    mean=mean,
-                    cov=cov,
-                    measured_mean=measured_mean,
-                    measure_mat=measure_mat,
-                    measure_cov=measure_cov,
-                    **kwargs
-                ))
-        elif not len(nan_groups):
-            # all nans, nothing to do:
-            return StateTuple(mean, cov, combo_probs=combo_prior)
-
-        new_mean = mean.clone()
-        new_cov = cov.clone()
-        new_combo_post = None if combo_prior is None else combo_prior.clone()
-        for groups, masks in nan_groups:
-            masked = self._mask_mats(
-                groups,
-                masks,
+        if nan_mask is None and input.isnan().any():
+            nan_mask = get_nan_masks_per_time(input.isnan().unsqueeze(1))[0]
+        if nan_mask is None:
+            return _as_state_tuple(self._update_step(
                 input=input,
+                mean=mean,
+                cov=cov,
                 measured_mean=measured_mean,
                 measure_mat=measure_mat,
                 measure_cov=measure_cov,
                 **kwargs
-            )
-            if combo_prior is not None:
-                # handled here, since `_mask_mats` only subsets extra kwargs when masks is None:
-                masked['combo_prior'] = combo_prior[groups]
-
-            state = _as_state_tuple(self._update_step(
-                mean=mean[groups],
-                cov=cov[groups],
-                **masked,
-                **{k: v for k, v in kwargs.items() if k not in masked}
             ))
-            new_mean[groups], new_cov[groups] = state
-            if new_combo_post is not None:
-                new_combo_post[groups] = state.combo_probs
-        return StateTuple(new_mean, new_cov, combo_probs=new_combo_post)
 
-    def _mask_mats(self,
-                   groups: torch.Tensor,
-                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-                   **kwargs) -> dict[str, torch.Tensor]:
-        out = {}
-        if masks is None:
-            for nm, mat in kwargs.items():
-                out[nm] = mat[groups]
-        else:
-            val_idx, m1d, m2d = masks
-            out['val_idx'] = val_idx
-            for nm, mat in kwargs.items():
-                if nm in ('input', 'measured_mean', 'measure_mat'):
-                    out[nm] = mat[m1d]
-                elif nm == 'measure_cov':
-                    out[nm] = mat[m2d]
-        return out
+        isnan, has_empty_rows = nan_mask
+        observed = ~isnan
+        both_observed = observed.unsqueeze(-1) & observed.unsqueeze(-2)
+        eye = torch.eye(measure_cov.shape[-1], dtype=measure_cov.dtype, device=measure_cov.device)
+        state = _as_state_tuple(self._update_step(
+            input=torch.where(isnan, measured_mean, input),
+            mean=mean,
+            cov=cov,
+            measured_mean=measured_mean,
+            measure_mat=measure_mat * observed.unsqueeze(-1),
+            measure_cov=torch.where(both_observed, measure_cov, eye),
+            observed=observed,
+            **kwargs
+        ))
+        if has_empty_rows:
+            # (their gain is zero, but e.g. ``ExpSmoother``'s update doesn't return a covariance)
+            any_observed = observed.any(-1)
+            state.mean = torch.where(any_observed.unsqueeze(-1), state.mean, mean)
+            state.cov = torch.where(any_observed[:, None, None], state.cov, cov)
+        return state
 
     def _update_step(self,
                      input: torch.Tensor,
@@ -884,7 +857,7 @@ class StateSpaceModel(torch.nn.Module):
                      measured_mean: torch.Tensor,
                      measure_mat: torch.Tensor,
                      measure_cov: torch.Tensor,
-                     val_idx: Optional[torch.Tensor] = None,
+                     observed: Optional[torch.Tensor] = None,
                      **kwargs) -> 'StateTuple':
         """
         :param input: A (n_groups, n_measures) tensor of observations.
@@ -895,10 +868,9 @@ class StateSpaceModel(torch.nn.Module):
         :param measure_mat: A (n_groups, n_measures, n_states) tensor for converting state tensors to
          measurement-space.
         :param measure_cov: A (n_groups, n_measures, n_measures) tensor with measurement covariance.
-        :param val_idx: An optional indexing tensor. If not None, this indicates which dims from the original state
-         were selected for this update (with the others presumably getting dropped in ``_update_step_with_nans``). If
-         None then nothing was dropped. Useful if you want to know (e.g.) which measures are being used in the current
-         call to _update_step().
+        :param observed: None if no measures are missing; otherwise a (n_groups, n_measures) boolean tensor of which
+         measures are observed. The missing ones are already masked out of the other arguments (see
+         ``_update_step_with_nans``), but e.g. a mixture's offsets also need masking.
         :return: A StateTuple capturing the updated mean/cov.
         """
         raise NotImplementedError

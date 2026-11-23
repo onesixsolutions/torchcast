@@ -230,23 +230,37 @@ def test_update_step_unobserved_mixture_measure():
     mean = torch.randn(4, 2)
     cov = torch.eye(2).expand(4, -1, -1) * .5
     # only 'y2' observed:
+    input = torch.randn(4, 2)
+    input[:, 0] = float('nan')
     kwargs = dict(
-        input=torch.randn(4, 1),
+        input=input,
+        mean=mean,
+        cov=cov,
+        measured_mean=mean,
+        measure_mat=torch.eye(2).expand(4, -1, -1),
+        measure_cov=torch.tensor([[.3, .1], [.1, .3]]).expand(4, -1, -1),
+    )
+    # no fallback to the base-rates: the prior comes from forward()
+    with pytest.raises(ValueError, match='combo_prior'):
+        kf._update_step_with_nans(**kwargs)
+    base_probs = kf.mixture.get_base_probs().expand(4, -1)
+    state = kf._update_step_with_nans(**kwargs, combo_prior=base_probs)
+    expected_mean, expected_cov = kf_plain._update_step_with_nans(**kwargs)
+    assert torch.allclose(state.mean, expected_mean)
+    assert torch.allclose(state.cov, expected_cov)
+    # ... which is the update with 'y1' dropped:
+    dropped_mean, dropped_cov = kf_plain._update_step(
+        input=input[:, [1]],
         mean=mean,
         cov=cov,
         measured_mean=mean[:, [1]],
         measure_mat=torch.tensor([[[0., 1.]]]).expand(4, -1, -1),
         measure_cov=torch.full((4, 1, 1), .3),
     )
-    # no fallback to the base-rates: the prior comes from forward()
-    with pytest.raises(ValueError, match='combo_prior'):
-        kf._update_step(**kwargs, val_idx=torch.tensor([1]))
-    state = kf._update_step(**kwargs, val_idx=torch.tensor([1]), combo_prior=kf.mixture.get_base_probs().expand(4, -1))
-    expected_mean, expected_cov = kf_plain._update_step(**kwargs, val_idx=torch.tensor([1]))
-    assert torch.allclose(state.mean, expected_mean)
-    assert torch.allclose(state.cov, expected_cov)
+    assert torch.allclose(state.mean, dropped_mean)
+    assert torch.allclose(state.cov, dropped_cov)
     # the regime is unobserved, so the posterior is the prior:
-    assert torch.allclose(state.combo_probs, kf.mixture.get_base_probs().expand(4, -1))
+    assert torch.allclose(state.combo_probs, base_probs)
 
 
 @torch.no_grad()

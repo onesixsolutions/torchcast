@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel
-from torchcast.internals.utils import get_nan_groups, get_nan_groups_per_time, get_groups_per_time
+from torchcast.internals.utils import get_nan_groups, get_groups_per_time
 
 from torchcast.kalman_filter import KalmanFilter
 from torchcast.exp_smooth import ExpSmoother
@@ -53,16 +53,6 @@ def test_nans(ndim: int, n_step: int):
                         assert set(group_idx.tolist()) == {2}
             else:
                 assert masks is None
-
-    # ... and its version for all timesteps at once:
-    for t, nan_groups_t in enumerate(get_nan_groups_per_time(torch.isnan(data))):
-        expected = get_nan_groups(torch.isnan(data[:, t]))
-        assert len(nan_groups_t) == len(expected)
-        for (group_idx, masks), (exp_group_idx, exp_masks) in zip(nan_groups_t, expected):
-            assert torch.equal(group_idx, exp_group_idx)
-            assert (masks is None) == (exp_masks is None)
-            if masks is not None:
-                assert torch.equal(masks[0], exp_masks[0])
 
     # test `update`
     # TODO: measure dim vs. state-dim

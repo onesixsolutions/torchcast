@@ -233,21 +233,6 @@ class BinomialFilter(KalmanFilter):
             mixture=self.mixture,
         )
 
-    def _mask_mats(self,
-                   groups: torch.Tensor,
-                   masks: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-                   binary_idx: Optional[Sequence[int]] = None,
-                   **kwargs) -> dict:
-        out = super()._mask_mats(groups, masks, **kwargs)
-        if masks is None or binary_idx is None:
-            return out
-        val_idx = masks[0]
-        out['binary_idx'] = torch.isin(val_idx, torch.as_tensor(binary_idx)).nonzero().squeeze(-1)
-        _binary_subset_idx = torch.tensor([i1 for i1, i2 in enumerate(binary_idx) if i2 in val_idx], dtype=torch.long)
-        m1d = torch.meshgrid(groups, _binary_subset_idx, indexing='ij')
-        out['num_obs'] = kwargs['num_obs'][m1d]
-        return out
-
     @torch.no_grad()
     def _get_good_initial_value_from_y(self,
                                        y: torch.Tensor,
@@ -315,13 +300,18 @@ class BinomialFilter(KalmanFilter):
                         measure_cov: torch.Tensor,
                         num_obs: Optional[torch.Tensor],
                         binary_idx: Sequence[int],
+                        observed: Optional[torch.Tensor] = None,
                         **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         input, measured_mean, measure_cov = super()._prepare_update(
             input=input,
             measured_mean=measured_mean,
             measure_cov=measure_cov,
+            observed=observed,
             **kwargs
         )
+        if observed is not None and isinstance(num_obs, torch.Tensor):
+            # a missing measure's ``num_obs`` (e.g. 0) is irrelevant, but mustn't make its masked-out values non-finite:
+            num_obs = torch.where(observed[:, binary_idx], num_obs, 1)
 
         # (the input and num_obs were validated up front, in ``_validate_binary_input()``)
         # use num_obs to normalize input if observed_counts=True:

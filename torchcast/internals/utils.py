@@ -224,47 +224,25 @@ def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tup
     return out
 
 
-def get_nan_groups_per_time(isnan: torch.Tensor) -> list[list[tuple[torch.Tensor, Optional[tuple]]]]:
+def get_nan_masks_per_time(isnan: torch.Tensor) -> list[Optional[tuple[torch.Tensor, bool]]]:
     """
-    :func:`get_nan_groups` for each timestep of a ``(num_groups, num_timesteps, num_measures)`` tensor, with the
-    indices on ``isnan``'s device, so that the forward-pass's time-loop doesn't make a GPU wait for the CPU (or copy
-    indices to the GPU) at each timestep. They're computed on the cpu, then copied to the device all at once. The
-    ``valid_idx`` (the first of the ``masks``) stays on the cpu: it's used for python-side lookups (e.g. which measures
-    are observed).
+    For each timestep of a ``(num_groups, num_timesteps, num_measures)`` tensor: None if nothing is missing, otherwise
+    ``(isnan_t, has_empty_rows)`` -- the ``(num_groups, num_measures)`` mask, and whether any group has no observed
+    measures at all. Whether there's anything missing is checked once, on the cpu, so the forward-pass's time-loop
+    doesn't make a GPU wait for the CPU at each timestep.
     """
-    device = isnan.device
-    per_time = [get_nan_groups(isnan_t) for isnan_t in isnan.cpu().unbind(1)]
-    if device.type == 'cpu':
-        return per_time
-
-    # copy all the indices at once:
-    flat = [idx for nan_groups in per_time for group_idx, masks in nan_groups
-            for idx in ((group_idx,) if masks is None else (group_idx, masks[0]))]
-    if not flat:
-        return per_time
-    on_device = iter(torch.cat(flat).to(device).split([len(idx) for idx in flat]))
-
-    out = []
-    for nan_groups in per_time:
-        out.append([])
-        for group_idx, masks in nan_groups:
-            group_idx = next(on_device)
-            if masks is not None:
-                valid_idx = next(on_device)
-                masks = (
-                    masks[0],
-                    torch.meshgrid(group_idx, valid_idx, indexing='ij'),
-                    torch.meshgrid(group_idx, valid_idx, valid_idx, indexing='ij'),
-                )
-            out[-1].append((group_idx, masks))
-    return out
+    isnan_cpu = isnan.cpu()
+    any_nan = isnan_cpu.any(-1)  # (num_groups, num_timesteps)
+    has_nan = any_nan.any(0).tolist()
+    has_empty_rows = isnan_cpu.all(-1).any(0).tolist()
+    return [(isnan[:, t], has_empty_rows[t]) if has_nan[t] else None for t in range(isnan.shape[1])]
 
 
 def get_groups_per_time(last_measured_per_group: torch.Tensor, num_timesteps: int) -> list[Optional[torch.Tensor]]:
     """
     For each timestep, the groups that are still being measured (i.e. not past their last measurement): None if that's
     all of them, otherwise an index-tensor on ``last_measured_per_group``'s device. Computed on the cpu, then copied to
-    the device all at once (see :func:`get_nan_groups_per_time`).
+    the device all at once.
     """
     last_measured = last_measured_per_group.cpu()
     times = torch.arange(num_timesteps)
