@@ -10,7 +10,7 @@ from torchcast.internals.batch_design import TransitionModel, MeasurementModel, 
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
 from torchcast.internals.utils import (
-    repeat, true1d_idx, get_nan_groups, get_nan_masks_per_time, get_groups_per_time, stack_per_time
+    repeat, true1d_idx, get_nan_groups, get_nan_masks_per_time, get_groups_per_time, stack_per_time, update_tensor
 )
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
@@ -130,10 +130,16 @@ class StateSpaceModel(torch.nn.Module):
         """
         if self._step_compile_kwargs is None:
             return self._predict_cov, self._update_step_with_nans
-        return (
-            torch.compile(self._predict_cov, **self._step_compile_kwargs),
-            torch.compile(self._update_step_with_nans, **self._step_compile_kwargs),
-        )
+        compiled_predict_cov = torch.compile(self._predict_cov, **self._step_compile_kwargs)
+
+        def predict_cov(cov: torch.Tensor, mask: Optional[torch.Tensor], **kwargs) -> torch.Tensor:
+            # the compiled step predicts all groups, then the groups not in ``mask`` get their ``cov`` back, outside
+            # it: the number of groups in ``mask`` varies over time, which would recompile (and, in torch 2.5, inductor
+            # failed on the backward of the indexing).
+            new_cov = compiled_predict_cov(cov=cov, mask=None, **kwargs)
+            return new_cov if mask is None else update_tensor(cov, new=new_cov[mask], mask=mask)
+
+        return predict_cov, torch.compile(self._update_step_with_nans, **self._step_compile_kwargs)
 
     @property
     def _non_gaussian_measures(self) -> Sequence[str]:

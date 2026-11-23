@@ -389,7 +389,6 @@ class KalmanFilter(StateSpaceModel):
         # here is crude, and whose log-prob is computed separately from the gaussian measures' (so using their
         # correlation here would be inconsistent with training).
         score_idx = [i for i, m in enumerate(self.measures) if m not in self._non_gaussian_measures]
-        score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
 
         # each effective combo offsets the measured-mean and adds to the measurement-noise variance. all effective
         # combos are updated together, along a leading combo-dimension; tensors that don't depend on the combo
@@ -425,10 +424,14 @@ class KalmanFilter(StateSpaceModel):
             )
             for idx, joseph in groups
         ]
-        log_liks = mvnorm_log_prob(
-            resid=(input - shift - measured_mean)[..., score_idx],
-            cov=system_cov[..., score_idx.unsqueeze(-1), score_idx.unsqueeze(0)]
-        ).T  # (G, num_effective)
+        score_resid, score_cov = input - shift - measured_mean, system_cov
+        if len(score_idx) < len(self.measures):
+            # (``index_select``, not advanced indexing: inductor failed on the latter's backward with
+            # ``compile_steps()``, in torch 2.5)
+            score_idx = torch.as_tensor(score_idx, dtype=torch.long, device=input.device)
+            score_resid = score_resid.index_select(-1, score_idx)
+            score_cov = score_cov.index_select(-1, score_idx).index_select(-2, score_idx)
+        log_liks = mvnorm_log_prob(resid=score_resid, cov=score_cov).T  # (G, num_effective)
 
         # posterior over the full combo-table; combos that differ only in the class share a likelihood
         log_post = log_prior + log_liks[:, mapping]
