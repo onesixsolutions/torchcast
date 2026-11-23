@@ -257,7 +257,7 @@ class KalmanFilter(StateSpaceModel):
                      Q: torch.Tensor,
                      scaling: Optional[torch.Tensor] = None,
                      mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if mask is None or mask.all():
+        if mask is None:
             mask = slice(None)
         F = transition_mat[mask]
         Q = Q[mask]

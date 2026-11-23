@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
-from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups
+from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, get_nan_groups_per_time, get_groups_per_time
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
 from torchcast.mixture import MixtureModel, MixtureComponent
@@ -204,14 +204,16 @@ class StateSpaceModel(torch.nn.Module):
             out_timesteps=out_timesteps
         )
 
-        # # used by fit() to reduce unneeded computations:
+        # the groups to update at each timestep (None = all of them), and the nan-groups for the update-step: computed
+        # up front (precomputed by ``fit()``), so the time-loop doesn't make a GPU wait for the CPU at each timestep.
         last_measured_per_group = kwargs.pop('last_measured_per_group', None)
         if last_measured_per_group is None:
-            last_measured_per_group = torch.full((num_groups,), out_timesteps, dtype=torch.int, device=meanu.device)
+            groups_per_time = [None] * out_timesteps
+        else:
+            groups_per_time = get_groups_per_time(last_measured_per_group, out_timesteps)
         nan_groups = kwargs.pop('nan_groups', None)
-        if nan_groups is None:
-            nan_groups = [None] * out_timesteps
-        # # /
+        if nan_groups is None and inputs:
+            nan_groups = get_nan_groups_per_time(torch.isnan(y))
 
         # todo: update Covariance class to make this less hacky:
         mcov_kwargs = {}
@@ -264,7 +266,7 @@ class StateSpaceModel(torch.nn.Module):
         combo1s = []
         combous = []
         for t in range(out_timesteps):
-            tmask = (t <= last_measured_per_group)
+            tmask = groups_per_time[t]
             mean1step, transition_mat = transition_model(meanu, time=t, mask=tmask)
             cov1step = self._predict_cov(
                 cov=covu,
@@ -342,7 +344,7 @@ class StateSpaceModel(torch.nn.Module):
                     if tu_h >= out_timesteps:
                         break
                     if h > 1:
-                        tmask = (tu_h <= last_measured_per_group)
+                        tmask = groups_per_time[tu_h]
                         meanp, F = transition_model(meanp, time=tu_h, mask=tmask)
                         covp = self._predict_cov(
                             cov=covp,
@@ -471,22 +473,28 @@ class StateSpaceModel(torch.nn.Module):
          combo-probabilities from the update-step. Residuals are then weighted by the probability that each measure
          is in its standard regime, so that residuals explained by a mixture component don't inflate the scaling.
         """
-        if self.adaptive_scaling:
-            idx = self.measure_covariance.non_empty_idx
-            nan_mask = input[..., idx].isnan()
-            resid = input[..., idx].nan_to_num() - measured_mean[..., idx]
-            if self.mixture is None or combo_probs is None:
-                multi = self.adaptive_scaling(resid, nan_mask)
-            else:
-                weights = self.mixture.get_standard_probs(combo_probs, [self.measures[i] for i in idx])
-                multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
-
-            # Handle empty measures (those not in the covariance structure)
-            multi_padded = torch.ones_like(input)
-            multi_padded[..., idx] = multi
-            return multi_padded
-        else:
+        if not self.adaptive_scaling:
             return None
+        idx = self.measure_covariance.non_empty_idx
+        all_measures = len(idx) == len(self.measures)
+        obs, mmean = input, measured_mean
+        if not all_measures:
+            # (skipped when possible: indexing with a list copies it to the device)
+            obs, mmean = input[..., idx], measured_mean[..., idx]
+        nan_mask = obs.isnan()
+        resid = obs.nan_to_num() - mmean
+        if self.mixture is None or combo_probs is None:
+            multi = self.adaptive_scaling(resid, nan_mask)
+        else:
+            weights = self.mixture.get_standard_probs(combo_probs, [self.measures[i] for i in idx])
+            multi = self.adaptive_scaling(resid, nan_mask, weights=weights)
+        if all_measures:
+            return multi
+
+        # Handle empty measures (those not in the covariance structure)
+        multi_padded = torch.ones_like(input)
+        multi_padded[..., idx] = multi
+        return multi_padded
 
     def fit(self,
             y: torch.Tensor,
@@ -564,7 +572,7 @@ class StateSpaceModel(torch.nn.Module):
 
         # precompute nan-groups for forward pass
         isnan = torch.isnan(y)
-        kwargs['nan_groups'] = [get_nan_groups(isnan_t) for isnan_t in isnan.unbind(1)]
+        kwargs['nan_groups'] = get_nan_groups_per_time(isnan)
 
         # see `last_measured_per_group` in forward docstring
         # todo: duplicate code in ``TimeSeriesDataset.get_durations()``
@@ -732,6 +740,10 @@ class StateSpaceModel(torch.nn.Module):
                      scaling: torch.Tensor,
                      mask: Optional[torch.Tensor],
                      **kwargs) -> torch.Tensor:
+        """
+        :param mask: The groups to update (the others keep their ``cov``): None for all of them, otherwise an
+         index-tensor.
+        """
         raise NotImplementedError
 
     def _update_step_with_nans(self,

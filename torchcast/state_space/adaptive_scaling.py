@@ -180,8 +180,7 @@ class EWMAdaptiveScaler(AdaptiveScaler):
             self._time = self._time + weights * (~skip_mask)
 
         sq_resids = residuals ** 2
-        alpha = torch.zeros_like(sq_resids)
-        alpha[~skip_mask] = self.alpha[~skip_mask]
+        alpha = torch.where(skip_mask, 0., self.alpha)
         if weights is not None:
             # an observation with weight w moves the running average w-as-much. (note this is different from
             # down-weighting the residual itself, which would imply the observation is small, rather than that it

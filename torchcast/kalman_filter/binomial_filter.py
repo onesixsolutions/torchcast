@@ -323,27 +323,16 @@ class BinomialFilter(KalmanFilter):
             **kwargs
         )
 
-        # validate input:
-        if (input[:, binary_idx] < 0).any():
-            raise ValueError("BinomialFilter does not support negative inputs.")
-
-        # validate num_obs, use to normalize input if observed_counts=True:
+        # (the input and num_obs were validated up front, in ``_validate_binary_input()``)
+        # use num_obs to normalize input if observed_counts=True:
         if self.observed_counts is None:
             if num_obs is None:
                 num_obs = 1
-            elif (num_obs != 1).any():
-                raise ValueError(
-                    "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
-                    "or proportions (observed_counts=False)."
-                )
         elif self.observed_counts:
             if num_obs is None:
                 raise ValueError("num_obs should be passed because observed_counts=True")
             input = input.clone()
             input[:, binary_idx] = input[:, binary_idx] / num_obs
-
-        if (input[:, binary_idx] > 1).any():
-            raise ValueError("Some inputs are > num_obs")
 
         # adjust measure-cov based on binomial identity relationship:
         bin_measure_cov = torch.zeros_like(measure_cov)
@@ -403,6 +392,28 @@ class BinomialFilter(KalmanFilter):
         exp_neg = torch.exp(-s * x)
         return s * exp_neg / (exp_neg + 1) ** 2
 
+    def _validate_binary_input(self, y: torch.Tensor, num_obs: Union[torch.Tensor, int]):
+        """
+        Validate the binary measures' observations and ``num_obs``, once for the whole input (rather than in each
+        update-step, where each check would make a GPU wait for the CPU).
+        """
+        binary_idx = [i for i, m in enumerate(self.measures) if m in self.binary_measures]
+        y_binary = y[..., binary_idx]
+        if (y_binary < 0).any():
+            raise ValueError("BinomialFilter does not support negative inputs.")
+
+        if self.observed_counts is None:
+            if (torch.as_tensor(num_obs) != 1).any():
+                raise ValueError(
+                    "If `num_obs` is supplied, must specify whether observed values are counts (observed_counts=True) "
+                    "or proportions (observed_counts=False)."
+                )
+        elif self.observed_counts:
+            y_binary = y_binary / num_obs
+
+        if (y_binary > 1).any():
+            raise ValueError("Some inputs are > num_obs")
+
     @torch.jit.ignore()
     def forward(self,
                 y: Optional[torch.Tensor] = None,
@@ -428,6 +439,8 @@ class BinomialFilter(KalmanFilter):
         if 'num_obs' not in kwargs:
             kwargs['num_obs'] = 1
         prediction_kwargs['num_obs'] = kwargs['num_obs']
+        if y is not None:
+            self._validate_binary_input(y, kwargs['num_obs'])
 
         return super().forward(
             y=y,

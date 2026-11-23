@@ -116,7 +116,7 @@ class ExpSmoother(StateSpaceModel):
 
         # fastpath: if the call to update returned the zero-dim tensor (see _update above) then we are done
         if len(cov.shape):
-            if mask is None or mask.all():
+            if mask is None:
                 mask = slice(None)
             F = transition_mat[mask]
             # we'll hit this under two conditions:

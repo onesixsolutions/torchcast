@@ -152,13 +152,14 @@ def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[sl
 
     :param orig: The original tensor.
     :param new: The new tensor. Should have the same shape as ``orig[mask]``.
-    :param mask: A boolean mask Tensor.
-    :return: If ``mask`` is all True, returns ``new`` (not a copy). Otherwise, returns a new tensor with the same shape
-     as ``orig`` where the elements in ``mask`` are replaced with the elements in ``new``.
+    :param mask: A boolean mask Tensor, or an index Tensor (which, unlike a boolean mask, doesn't make a GPU tensor
+     sync with the CPU).
+    :return: If ``mask`` is None or all True, returns ``new`` (not a copy). Otherwise, returns a new tensor with the same
+     shape as ``orig`` where the elements in ``mask`` are replaced with the elements in ``new``.
     """
     if isinstance(mask, slice) and mask == slice(None):
         mask = None
-    if mask is None or mask.all():
+    if mask is None or (mask.dtype == torch.bool and mask.all()):
         return new
     else:
         out = orig.clone()
@@ -208,6 +209,61 @@ def get_nan_groups(isnan: torch.Tensor) -> List[Tuple[torch.Tensor, Optional[tup
                 m2d = torch.meshgrid(group_idx, valid_idx, valid_idx, indexing='ij')
                 masks = (valid_idx, m1d, m2d)
                 out.append((group_idx, masks))
+    return out
+
+
+def get_nan_groups_per_time(isnan: torch.Tensor) -> list[list[tuple[torch.Tensor, Optional[tuple]]]]:
+    """
+    :func:`get_nan_groups` for each timestep of a ``(num_groups, num_timesteps, num_measures)`` tensor, with the
+    indices on ``isnan``'s device, so that the forward-pass's time-loop doesn't make a GPU wait for the CPU (or copy
+    indices to the GPU) at each timestep. They're computed on the cpu, then copied to the device all at once. The
+    ``valid_idx`` (the first of the ``masks``) stays on the cpu: it's used for python-side lookups (e.g. which measures
+    are observed).
+    """
+    device = isnan.device
+    per_time = [get_nan_groups(isnan_t) for isnan_t in isnan.cpu().unbind(1)]
+    if device.type == 'cpu':
+        return per_time
+
+    # copy all the indices at once:
+    flat = [idx for nan_groups in per_time for group_idx, masks in nan_groups
+            for idx in ((group_idx,) if masks is None else (group_idx, masks[0]))]
+    if not flat:
+        return per_time
+    on_device = iter(torch.cat(flat).to(device).split([len(idx) for idx in flat]))
+
+    out = []
+    for nan_groups in per_time:
+        out.append([])
+        for group_idx, masks in nan_groups:
+            group_idx = next(on_device)
+            if masks is not None:
+                valid_idx = next(on_device)
+                masks = (
+                    masks[0],
+                    torch.meshgrid(group_idx, valid_idx, indexing='ij'),
+                    torch.meshgrid(group_idx, valid_idx, valid_idx, indexing='ij'),
+                )
+            out[-1].append((group_idx, masks))
+    return out
+
+
+def get_groups_per_time(last_measured_per_group: torch.Tensor, num_timesteps: int) -> list[Optional[torch.Tensor]]:
+    """
+    For each timestep, the groups that are still being measured (i.e. not past their last measurement): None if that's
+    all of them, otherwise an index-tensor on ``last_measured_per_group``'s device. Computed on the cpu, then copied to
+    the device all at once (see :func:`get_nan_groups_per_time`).
+    """
+    last_measured = last_measured_per_group.cpu()
+    times = torch.arange(num_timesteps)
+    active = times.unsqueeze(-1) <= last_measured.unsqueeze(0)  # (num_timesteps, num_groups)
+    partial_times = (~active.all(-1)).nonzero().view(-1).tolist()
+    out: list[Optional[torch.Tensor]] = [None] * num_timesteps
+    if partial_times:
+        idx = [active[t].nonzero().view(-1) for t in partial_times]
+        on_device = torch.cat(idx).to(last_measured_per_group.device).split([len(i) for i in idx])
+        for t, group_idx in zip(partial_times, on_device):
+            out[t] = group_idx
     return out
 
 

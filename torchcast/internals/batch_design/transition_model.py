@@ -47,7 +47,7 @@ class TransitionModel(DesignModel):
                  time: int,
                  mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         assert time >= 0
-        if mask is None or mask.all():
+        if mask is None:
             mask = slice(None)
         F = self.transition_mats[time]
         new_mean = update_tensor(mean, new=(F[mask] @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
