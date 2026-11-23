@@ -1,8 +1,8 @@
-from typing import Sequence, Optional
+from typing import Sequence, Optional, Union
 from functools import cached_property
 
 import torch
-from torchcast.internals.utils import update_tensor
+from torchcast.internals.utils import update_tensor, stack_per_time
 
 from .design_model import DesignModel
 
@@ -44,11 +44,23 @@ class TransitionModel(DesignModel):
 
     def __call__(self,
                  mean: torch.Tensor,
-                 time: int,
+                 time: Union[int, Sequence[int]],
                  mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
-        assert time >= 0
+        """
+        :param mean: A ``(num_groups, state_rank)`` tensor; or, if ``time`` is a sequence, a ``(num_groups,
+         len(time), state_rank)`` tensor.
+        :param time: The timestep; or a sequence of timesteps, one for each row of ``mean``'s second dimension.
+        :param mask: The groups to update (the others keep their ``mean``): None for all of them, otherwise an
+         index-tensor.
+        :return: The new mean, and the transition-matrix (for a sequence of ``time``, with a time-dimension, see
+         ``stack_per_time``).
+        """
         if mask is None:
             mask = slice(None)
-        F = self.transition_mats[time]
+        if isinstance(time, int):
+            assert time >= 0
+            F = self.transition_mats[time]
+        else:
+            F = stack_per_time(self.transition_mats, time)
         new_mean = update_tensor(mean, new=(F[mask] @ mean[mask].unsqueeze(-1)).squeeze(-1), mask=mask)
         return new_mean, F

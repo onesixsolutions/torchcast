@@ -130,7 +130,7 @@ class ExpSmoother(StateSpaceModel):
             #     we will use cov1step for those group*measures that were just updated -- which is again what we want.
             new_cov = update_tensor(
                 orig=new_cov,
-                new=new_cov[mask] + F @ cov[mask] @ F.permute(0, 2, 1),
+                new=new_cov[mask] + F @ cov[mask] @ F.transpose(-1, -2),
                 mask=mask
             )
         return new_cov

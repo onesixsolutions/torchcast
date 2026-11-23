@@ -9,7 +9,9 @@ from tqdm.auto import tqdm
 from torchcast.internals.batch_design import TransitionModel, MeasurementModel, MeasureFun
 from torchcast.internals.hessian import hessian
 from torchcast.internals.monte_carlo import FixedWhiteNoise
-from torchcast.internals.utils import repeat, true1d_idx, get_nan_groups, get_nan_groups_per_time, get_groups_per_time
+from torchcast.internals.utils import (
+    repeat, true1d_idx, get_nan_groups, get_nan_groups_per_time, get_groups_per_time, stack_per_time
+)
 from torchcast.covariance import Covariance
 from torchcast.process.regression import Process
 from torchcast.mixture import MixtureModel, MixtureComponent
@@ -324,53 +326,22 @@ class StateSpaceModel(torch.nn.Module):
             if self.mixture is not None and t + 1 < out_timesteps:
                 combo_prior = self.mixture.get_next_prior(combo_post, base_probs[t + 1])
 
-        # 2nd loop to get n_step predicts:
-        meanps = {}
-        covps = {}
-        combops = {}
-        scalingps = {}  # (the state of the update each prediction was rolled forward from)
-        for t1 in range(out_timesteps):
-            # tu: time of update
-            # t1: time of 1step
-            tu = t1 - 1
-
-            # - if every_step, we run this loop every iter
-            # - if not every_step, we run this loop every nth iter
-            if every_step or (t1 % n_step) == 0:
-                # already had to generate h=1 above:
-                meanp, covp, scaling, combop = mean1s[t1], cov1s[t1], scale1s[t1], combo1s[t1]
-                for h in range(1, n_step + 1):
-                    tu_h = tu + h
-                    if tu_h >= out_timesteps:
-                        break
-                    if h > 1:
-                        tmask = groups_per_time[tu_h]
-                        meanp, F = transition_model(meanp, time=tu_h, mask=tmask)
-                        covp = self._predict_cov(
-                            cov=covp,
-                            transition_mat=F,
-                            **{k: v[tu_h] for k, v in predict_kwargs.items()},
-                            scaling=scaling,
-                            mask=tmask
-                        )
-                        if combop is not None:
-                            combop = self.mixture.get_next_prior(combop, base_probs[tu_h])
-                    if tu_h not in meanps:
-                        meanps[tu_h] = meanp
-                        covps[tu_h] = covp
-                        combops[tu_h] = combop
-                        scalingps[tu_h] = scaling_states1[t1]
-                        measure_covs[tu_h] = self._apply_cov_scaling(measure_covs[tu_h], scaling)
-                    else:
-                        # n_step>1 generally should only assign to meanps when tu_h = tu + n_step;
-                        # but the exception is the first n_step timesteps where we do not have the 'forecast-from'
-                        # timepoint in the input
-                        assert every_step
-
-        preds = [
-            StateTuple(meanps[t], covps[t], combo_probs=combops[t], scaling=scalingps[t])
-            for t in range(out_timesteps)
-        ]
+        # n-step predictions: each timestep's prediction is rolled forward from the 1-step prediction at its origin.
+        preds, scaling = self._get_n_step_predictions(
+            origins=self._get_n_step_origins(out_timesteps, n_step=n_step, every_step=every_step),
+            mean1s=mean1s,
+            cov1s=cov1s,
+            scale1s=scale1s,
+            combo1s=combo1s,
+            scaling_states1=scaling_states1,
+            transition_model=transition_model,
+            predict_kwargs=predict_kwargs,
+            groups_per_time=groups_per_time,
+            last_measured_per_group=last_measured_per_group,
+            base_probs=base_probs,
+        )
+        if scaling is not None:
+            measure_covs = self._apply_cov_scaling(torch.stack(measure_covs, 1), scaling)
 
         if include_updates_in_output:
             updates = [
@@ -392,6 +363,81 @@ class StateSpaceModel(torch.nn.Module):
             start_offsets=start_offsets if start_offsets is not None else np.zeros(num_groups, dtype='int'),
             dt_unit=self.dt_unit
         )
+
+    @staticmethod
+    def _get_n_step_origins(num_timesteps: int, n_step: int, every_step: bool) -> list[int]:
+        """
+        For each timestep, the timestep of the 1-step prediction that its prediction is rolled forward from. With
+        ``every_step``, that's ``n_step - 1`` timesteps earlier (or the first timestep, for the first ``n_step - 1``
+        timesteps, whose predictions are then fewer steps ahead); otherwise the last multiple of ``n_step``.
+        """
+        if every_step:
+            return [max(0, t - n_step + 1) for t in range(num_timesteps)]
+        return [t - t % n_step for t in range(num_timesteps)]
+
+    def _get_n_step_predictions(
+            self,
+            origins: Sequence[int],
+            mean1s: Sequence[torch.Tensor],
+            cov1s: Sequence[torch.Tensor],
+            scale1s: Sequence[Optional[torch.Tensor]],
+            combo1s: Sequence[Optional[torch.Tensor]],
+            scaling_states1: Sequence[Optional[dict]],
+            transition_model: TransitionModel,
+            predict_kwargs: dict[str, Sequence],
+            groups_per_time: Sequence[Optional[torch.Tensor]],
+            last_measured_per_group: Optional[torch.Tensor],
+            base_probs: Optional[Sequence[torch.Tensor]]
+    ) -> tuple[StateTuple, Optional[torch.Tensor]]:
+        """
+        Roll the 1-step predictions forward to get the prediction for each timestep ``t``, from the 1-step prediction
+        at ``origins[t]``. All the timesteps are rolled forward together, one step at a time (with a time-dimension:
+        ``(num_groups, num_timesteps, ...)`` tensors), so this takes ``n_step - 1`` (batched) steps, not
+        ``num_timesteps * (n_step - 1)``.
+
+        :return: The stacked predictions (each with the adaptive-scaler's state at its origin), and the stacked
+         adaptive-scaling multipliers for their measure-covariances (None without adaptive-scaling).
+        """
+        num_groups = mean1s[0].shape[0]
+        means = torch.stack([mean1s[o] for o in origins], 1)
+        covs = torch.stack([cov1s[o] for o in origins], 1)
+        scaling = None
+        if any(s is not None for s in scale1s):
+            ones = torch.ones((num_groups, len(self.measures)), dtype=means.dtype, device=means.device)
+            scaling = torch.stack([ones if scale1s[o] is None else scale1s[o] for o in origins], 1)
+        combos = None
+        if combo1s[0] is not None:
+            combos = torch.stack([combo1s[o] for o in origins], 1)
+        scaling_states = None
+        if scaling_states1[0] is not None:
+            scaling_states = {k: torch.stack([scaling_states1[o][k] for o in origins], 1) for k in scaling_states1[0]}
+
+        num_steps = [t - o for t, o in enumerate(origins)]  # steps beyond the 1-step prediction
+        for step in range(1, max(num_steps, default=0) + 1):
+            rows = [t for t, n in enumerate(num_steps) if n >= step]
+            times = [origins[t] + step for t in rows]
+            idx = torch.as_tensor(rows, device=means.device)
+            mean, transition_mat = transition_model(means[:, idx], time=times)
+            cov = self._predict_cov(
+                cov=covs[:, idx],
+                transition_mat=transition_mat,
+                **{k: stack_per_time(v, times) for k, v in predict_kwargs.items()},
+                scaling=None if scaling is None else scaling[:, idx],
+                mask=None
+            )
+            if any(groups_per_time[t] is not None for t in times):
+                # groups past their last measurement keep their state:
+                active = torch.as_tensor(times, device=means.device) <= last_measured_per_group.unsqueeze(-1)
+                mean = torch.where(active.unsqueeze(-1), mean, means[:, idx])
+                cov = torch.where(active[..., None, None], cov, covs[:, idx])
+            means = means.index_copy(1, idx, mean)
+            covs = covs.index_copy(1, idx, cov)
+            if combos is not None:
+                base = torch.stack([base_probs[t].expand(num_groups, -1) for t in times], 1)
+                combo = self.mixture.get_next_prior(combos[:, idx].flatten(0, 1), base.flatten(0, 1))
+                combos = combos.index_copy(1, idx, combo.view(num_groups, len(rows), -1))
+
+        return StateTuple(means, covs, combo_probs=combos, scaling=scaling_states), scaling
 
     def _make_transition_model(self, num_groups: int, num_timesteps: int) -> TransitionModel:
         """
@@ -434,14 +480,12 @@ class StateSpaceModel(torch.nn.Module):
         if is_process_cov:
             assert cov.shape[-1] == self.state_rank
             if len(scaling.shape) == 1:
-                scaling = scaling.unsqueeze(0)
-            elif len(scaling.shape) != 2:
-                raise ValueError(f"Expected scaling to be 1d or 2d, got {scaling.shape}")
+                scaling = scaling.unsqueeze(0)  # (a leading group-dim, which e.g. the default initial cov relies on)
             # for process cov, need to map from measures to states:
-            scaling = torch.cat([
-                scaling[..., [self.measures.index(process.measure)]].repeat(1, process.rank)
-                for process in self.processes.values()
-            ], dim=-1)
+            state_measure_idx = [
+                self.measures.index(process.measure) for process in self.processes.values() for _ in range(process.rank)
+            ]
+            scaling = scaling[..., state_measure_idx]
         else:
             # for measure-cov nothing extra to do
             assert cov.shape[-1] == len(self.measures)

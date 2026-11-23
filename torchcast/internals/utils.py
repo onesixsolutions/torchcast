@@ -167,6 +167,18 @@ def update_tensor(orig: torch.Tensor, new: torch.Tensor, mask: Optional[Union[sl
         return out
 
 
+def stack_per_time(values: Sequence[torch.Tensor], times: Sequence[int]) -> torch.Tensor:
+    """
+    Stack per-timestep ``(num_groups, ...)`` values (e.g. design-matrices) at ``times`` along a new time-dimension
+    (dim 1). If they're all the same tensor -- the usual case for something that doesn't vary over time, which is
+    stored as ``[x] * num_timesteps`` -- that dimension has size 1 instead (to broadcast), and nothing is copied.
+    """
+    first = values[times[0]]
+    if all(values[t] is first for t in times):
+        return first.unsqueeze(1)
+    return torch.stack([values[t] for t in times], 1)
+
+
 def transpose_last_dims(x: torch.Tensor) -> torch.Tensor:
     args = list(range(len(x.shape)))
     args[-2], args[-1] = args[-1], args[-2]
